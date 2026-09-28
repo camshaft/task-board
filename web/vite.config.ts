@@ -6,14 +6,11 @@ import { defineConfig } from 'vite'
 // the UI can use same-origin relative URLs; in prod the backend serves the built assets.
 const BACKEND = process.env.TB_BACKEND ?? 'http://localhost:8079'
 
-// Public base path the app is served under. Defaults to '/'. Set VITE_BASE_PATH (e.g.
-// '/board') when the app sits behind a reverse proxy on a sub-path so every asset and
-// API URL is emitted with that prefix. Vite normalizes it to have a trailing slash and
-// exposes it as import.meta.env.BASE_URL, which api.ts uses to build request URLs.
-const BASE = process.env.VITE_BASE_PATH ?? '/'
-
 export default defineConfig({
-  base: BASE,
+  // Relative asset URLs (./assets/…) so a single build works at any mount point. When
+  // the app is served under a sub-path, the Rust backend injects a matching <base href>
+  // (from the X-Forwarded-Prefix header) at serve time; nothing is baked in at build.
+  base: './',
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
