@@ -872,4 +872,64 @@ mod tests {
         assert_eq!(task["metadata"], json!({"a": 1, "b": 2, "c": 3}));
         Ok(())
     }
+
+    /// The Rust impl can open a legacy board.db created before tasks.metadata existed:
+    /// init() back-fills the column, and existing rows keep working.
+    #[tokio::test]
+    async fn opens_legacy_db_without_metadata() -> anyhow::Result<()> {
+        use sqlx::Row;
+        use std::str::FromStr;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("legacy.db");
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+
+        // Build a pre-metadata DB: tasks table WITHOUT the metadata column, plus a row.
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
+            let legacy = sqlx::SqlitePool::connect_with(opts).await?;
+            sqlx::query(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, \
+                 description TEXT, status TEXT NOT NULL DEFAULT 'active', created_by TEXT, \
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            )
+            .execute(&legacy)
+            .await?;
+            sqlx::query(
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 project_id INTEGER NOT NULL, title TEXT NOT NULL, description TEXT, \
+                 status TEXT NOT NULL DEFAULT 'todo', priority TEXT, assignee TEXT, \
+                 created_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            )
+            .execute(&legacy)
+            .await?;
+            sqlx::query("INSERT INTO projects(name, created_at, updated_at) VALUES('old','t','t')")
+                .execute(&legacy)
+                .await?;
+            sqlx::query(
+                "INSERT INTO tasks(project_id, title, created_at, updated_at) \
+                 VALUES(1,'old task','t','t')",
+            )
+            .execute(&legacy)
+            .await?;
+            legacy.close().await;
+        }
+
+        // Open it with the real init: the migration adds tasks.metadata (default '{}').
+        let pool = crate::db::init(path.to_str().unwrap()).await?;
+        let has_meta = sqlx::query("PRAGMA table_info(tasks)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "metadata");
+        assert!(has_meta, "migration should have added tasks.metadata");
+
+        // The pre-existing row reads back with an empty metadata object, and new writes work.
+        let old = get_task(&pool, 1).await?;
+        assert_eq!(old["title"], json!("old task"));
+        assert_eq!(old["metadata"], json!({}));
+        set_task_props(&pool, 1, json!({"stage": "resumed"})).await?;
+        let after = get_task(&pool, 1).await?;
+        assert_eq!(after["metadata"], json!({"stage": "resumed"}));
+        Ok(())
+    }
 }

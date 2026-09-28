@@ -2,7 +2,7 @@
 //! block the single writer. A faithful port of the Python `board.db` schema.
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
 pub type Pool = SqlitePool;
@@ -100,5 +100,20 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
             sqlx::query(s).execute(&pool).await?;
         }
     }
+
+    // Migration: back-fill tasks.metadata on a DB created before it existed (CREATE
+    // TABLE IF NOT EXISTS won't add columns to an existing table). Mirrors the original
+    // Python init_db, so the Rust impl can open an old board.db in place.
+    let has_metadata = sqlx::query("PRAGMA table_info(tasks)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "metadata");
+    if !has_metadata {
+        sqlx::query("ALTER TABLE tasks ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+            .execute(&pool)
+            .await?;
+    }
+
     Ok(pool)
 }
