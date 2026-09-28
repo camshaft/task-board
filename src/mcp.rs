@@ -54,6 +54,10 @@ pub struct RegisterAgentArgs {
     pub display_name: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
+    /// Free-form charter: your role, mission, and scope on this board. Editable over time;
+    /// re-registering without it won't erase an existing charter.
+    #[serde(default)]
+    pub charter: Option<String>,
     /// If set, every event delivered to your inbox is also POSTed here (best-effort).
     #[serde(default)]
     pub webhook_url: Option<String>,
@@ -262,7 +266,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<RegisterAgentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::register_agent(&self.pool, &a.agent_id, s(&a.display_name), s(&a.kind), s(&a.webhook_url))
+        core::register_agent(&self.pool, &a.agent_id, s(&a.display_name), s(&a.kind), s(&a.charter), s(&a.webhook_url))
             .await
             .map_err(err)
             .and_then(ok)

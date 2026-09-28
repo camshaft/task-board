@@ -30,7 +30,7 @@ struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let msg = self.0.to_string();
-        let code = if msg.starts_with("no project") || msg.starts_with("no task") {
+        let code = if msg.starts_with("no project") || msg.starts_with("no task") || msg.starts_with("no agent") {
             StatusCode::NOT_FOUND
         } else if msg.starts_with("give ") {
             StatusCode::BAD_REQUEST
@@ -64,6 +64,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/meta", get(meta))
         .route("/agents", get(list_agents).post(register_agent))
+        .route("/agents/{agent_id}", get(get_agent))
         .route("/agents/{agent_id}/status", post(set_status))
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
@@ -122,6 +123,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
     Endpoint { method: "GET", path: "/api/agents", summary: "List all known agents.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
@@ -346,6 +348,8 @@ struct RegisterAgentBody {
     agent_id: String,
     display_name: Option<String>,
     kind: Option<String>,
+    /// Free-form charter (role/mission/scope). Editable; omitting it keeps the existing one.
+    charter: Option<String>,
     webhook_url: Option<String>,
 }
 
@@ -359,10 +363,15 @@ async fn register_agent(
             &b.agent_id,
             b.display_name.as_deref(),
             b.kind.as_deref(),
+            b.charter.as_deref(),
             b.webhook_url.as_deref(),
         )
         .await?,
     ))
+}
+
+async fn get_agent(State(st): State<AppState>, Path(agent_id): Path<String>) -> ApiResult {
+    Ok(Json(core::get_agent(&st.pool, &agent_id).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]
