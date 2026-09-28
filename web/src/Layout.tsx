@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { Link, Outlet, useOutletContext, useParams } from 'react-router-dom'
-import { api } from './api'
-import { useAgents, useEvents, useProjects, touched } from './resources'
+import { createProject, useAgents, useEvents, useProjects } from './resources'
 import { AGENT_DOT, relTime } from './ui'
 
 // The only thing nested routes still need handed down is the current actor (per-user
@@ -41,8 +40,7 @@ export default function Layout() {
     const name = window.prompt('Project name:')
     if (!name?.trim()) return
     try {
-      await api.createProject({ name: name.trim(), created_by: actor })
-      touched({ activity: true }) // new project shows up in the sidebar + feed
+      await createProject({ name: name.trim(), created_by: actor })
     } catch (e) {
       window.alert((e as Error).message)
     }

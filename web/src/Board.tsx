@@ -1,8 +1,7 @@
 import { useState } from 'react'
 import { Link, Outlet, useParams } from 'react-router-dom'
-import { api } from './api'
 import { useBoardContext } from './Layout'
-import { touched, useProjects, useTasks } from './resources'
+import { createTask, useProjects, useTasks } from './resources'
 import { PriorityDot, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // The kanban board for one project (from the :projectId route param). Renders its own
@@ -20,8 +19,7 @@ export default function Board() {
     if (!title?.trim()) return
     const assignee = window.prompt('Assignee (agent id, optional):') || undefined
     try {
-      await api.createTask({ project_id: project, title: title.trim(), assignee, created_by: actor })
-      touched({ projectId: project, activity: true }) // new task + updated counts/feed
+      await createTask({ project_id: project, title: title.trim(), assignee, created_by: actor })
     } catch (e) {
       setError((e as Error).message)
     }

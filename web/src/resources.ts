@@ -41,9 +41,9 @@ export function useTask(taskId: number) {
 
 /**
  * Announce that some data changed, so every dependent resource refetches. This is the
- * single choke point for reactivity: mutation helpers call it now, and the SSE stream will
- * call it per server event later — so the "what does this change affect?" logic lives here,
- * not scattered across components.
+ * single choke point for reactivity — the ONE place that maps a changed entity to the
+ * resource keys to refresh. The mutation wrappers below call it, and the SSE stream will
+ * call it per server event later; components never touch it.
  *
  * `activity: true` also refreshes the projects list (task counts) and the activity feed,
  * which nearly every write touches.
@@ -59,4 +59,34 @@ export function touched(opts: { projectId?: number; taskId?: number; activity?: 
     invalidate(keys.projects)
     invalidate(keys.events)
   }
+}
+
+// Mutations. Components call these instead of `api.*` for writes: each performs the request
+// and then funnels through touched(), deriving the affected scope from the response (which
+// carries project_id / task id), so components never remember to invalidate anything. api.ts
+// stays pure transport; this is the reactive abstraction the UI actually uses.
+
+export async function createProject(b: Parameters<typeof api.createProject>[0]) {
+  const p = await api.createProject(b)
+  touched({ activity: true }) // new project appears in the sidebar + feed
+  return p
+}
+
+export async function createTask(b: Parameters<typeof api.createTask>[0]) {
+  const t = await api.createTask(b)
+  touched({ projectId: t.project_id, activity: true })
+  return t
+}
+
+export async function updateTask(id: number, b: Parameters<typeof api.updateTask>[1]) {
+  const t = await api.updateTask(id, b)
+  // Status/assignee moves shift the task between board columns and change counts.
+  touched({ taskId: t.id, projectId: t.project_id, activity: true })
+  return t
+}
+
+export async function commentTask(id: number, b: Parameters<typeof api.commentTask>[1]) {
+  const r = await api.commentTask(id, b)
+  touched({ taskId: id, activity: true })
+  return r
 }

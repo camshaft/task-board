@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate, useOutletContext, useParams } from 'react-router-dom'
-import { api, type TaskStatus } from './api'
-import { touched, useTask } from './resources'
+import { type TaskStatus } from './api'
+import { commentTask, updateTask, useTask } from './resources'
 import { relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // Context handed down by the Board route (the parent <Outlet/>).
@@ -22,17 +22,12 @@ export function TaskDrawer() {
   const [busy, setBusy] = useState(false)
 
   const onClose = () => navigate(`/projects/${projectId}`)
-  // Every mutation here funnels through touched(): it refreshes this task, its project's
-  // board (status/assignee moves between columns), and the activity feed. The subscribed
-  // components re-render on their own — no manual refetch/callback plumbing.
-  const onChanged = () => touched({ taskId: id, projectId: Number(projectId), activity: true })
 
   async function setStatus(status: TaskStatus) {
     if (!task || status === task.status) return
     setBusy(true)
     try {
-      await api.updateTask(task.id, { status, actor })
-      onChanged()
+      await updateTask(task.id, { status, actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -46,8 +41,7 @@ export function TaskDrawer() {
     if (assignee == null) return
     setBusy(true)
     try {
-      await api.updateTask(task.id, { assignee, actor })
-      onChanged()
+      await updateTask(task.id, { assignee, actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -60,9 +54,8 @@ export function TaskDrawer() {
     if (!body || !task) return
     setBusy(true)
     try {
-      await api.commentTask(task.id, { body, author: actor })
+      await commentTask(task.id, { body, author: actor })
       setComment('')
-      onChanged()
     } catch (e) {
       setError((e as Error).message)
     } finally {
