@@ -59,20 +59,29 @@ flake.nix    packages.default + nixosModules.task-board
 ```sh
 # backend: unit tests + run
 nix develop --command cargo test
-nix develop --command cargo run          # serves :8079 (MCP + API; UI if TB_WEB_DIR set)
+nix develop --command cargo run                       # defaults: :8079 (MCP + API)
+nix develop --command cargo run -- --config config.example.toml
 
 # web UI with hot reload (proxies /api and /mcp to the backend on :8079)
 cd web && npm install && npm run dev
 ```
 
-Config via env: `TB_DB_PATH`, `TB_MCP_HOST`, `TB_MCP_PORT`, `TB_WEBHOOK_TIMEOUT`,
-`TB_WEB_DIR` (directory of built UI assets to serve at `/`).
+## Configuration
+
+All settings live in one documented TOML file — see [`config.example.toml`](config.example.toml).
+Pass it with `--config <path>`; with no flag the built-in defaults apply, and any key you
+omit keeps its default. The settings are `db_path`, `host`, `port`, and
+`webhook_timeout_secs`.
+
+The one thing *not* in the config file is `--web-dir` (the directory of built UI assets
+to serve at `/`) — that's a packaging detail, baked into the binary by `nix build` and
+overridable via the flag or the `TB_WEB_DIR` env var in dev.
 
 ## Production
 
 **No Node/Vite at runtime.** `vite build` compiles the UI to static files at *build*
 time; the Rust binary serves them. `nix build` produces a single wrapped binary with
-`TB_WEB_DIR` baked to the built assets:
+`--web-dir` baked to the built assets:
 
 ```sh
 nix build .#task-board

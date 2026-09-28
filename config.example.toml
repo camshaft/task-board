@@ -1,0 +1,18 @@
+# task-board configuration.
+#
+# Pass this file with `--config <path>`; with no flag the built-in defaults below apply.
+# Every key is optional — omit one to keep its default.
+
+# Path to the SQLite database file. Its parent directory is created on startup.
+# Opening a database from an older version is fine (the schema is migrated in place).
+db_path = "/data/task-board/board.db"
+
+# Address to bind. "0.0.0.0" listens on all interfaces; "127.0.0.1" is local-only.
+host = "0.0.0.0"
+
+# Port for all three surfaces: MCP (/mcp), the REST API (/api), and the web UI (/).
+port = 8079
+
+# Timeout, in seconds, for best-effort webhook POSTs to agents that registered a
+# webhook_url. Delivery is fire-and-forget; this just bounds how long each attempt waits.
+webhook_timeout_secs = 5

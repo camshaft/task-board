@@ -24,6 +24,49 @@ use tower_http::trace::TraceLayer;
 /// the config through every core signature.
 pub static WEBHOOK_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
+const USAGE: &str = "\
+task-board — agent coordination board (MCP + REST + UI)
+
+USAGE:
+    task-board [--config <path>] [--web-dir <path>]
+
+OPTIONS:
+    --config <path>    TOML config file (see config.example.toml). Omit for defaults.
+    --web-dir <path>   Directory of built UI assets to serve at /. Usually set by
+                       packaging; falls back to the TB_WEB_DIR env var.
+    -h, --help         Print this help.
+";
+
+/// The two command-line inputs. Everything else lives in the TOML config file.
+struct CliArgs {
+    config: Option<String>,
+    web_dir: Option<String>,
+}
+
+impl CliArgs {
+    fn parse(args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
+        let mut config = None;
+        let mut web_dir = None;
+        let mut it = args;
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--config" => {
+                    config = Some(it.next().ok_or_else(|| anyhow::anyhow!("--config needs a path"))?);
+                }
+                "--web-dir" => {
+                    web_dir = Some(it.next().ok_or_else(|| anyhow::anyhow!("--web-dir needs a path"))?);
+                }
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                other => anyhow::bail!("unknown argument `{other}`\n\n{USAGE}"),
+            }
+        }
+        Ok(Self { config, web_dir })
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -33,7 +76,17 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = config::Config::from_env();
+    let args = CliArgs::parse(std::env::args().skip(1))?;
+    // web_dir isn't a config-file setting: it's where the bundled UI assets live, set by
+    // packaging (the Nix wrapper passes --web-dir). Fall back to TB_WEB_DIR for dev.
+    let web_dir = args
+        .web_dir
+        .or_else(|| std::env::var("TB_WEB_DIR").ok())
+        .filter(|s| !s.is_empty());
+    let cfg = match &args.config {
+        Some(path) => config::Config::load(std::path::Path::new(path), web_dir)?,
+        None => config::Config::defaults(web_dir),
+    };
     let _ = WEBHOOK_TIMEOUT.set(cfg.webhook_timeout);
 
     let pool = db::init(&cfg.db_path).await?;

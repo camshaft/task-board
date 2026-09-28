@@ -24,11 +24,11 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [ makeWrapper ];
 
-  # Bake the built UI path in so the service serves the UI out of the box. Overridable
-  # by setting TB_WEB_DIR in the environment.
+  # Bake the built UI path in so the service serves the UI out of the box. This is a
+  # packaging detail (not a user setting), so it's a default CLI arg, not config.
   postInstall = ''
     wrapProgram "$out/bin/task-board" \
-      --set-default TB_WEB_DIR "${web}"
+      --add-flags "--web-dir ${web}"
   '';
 
   # Expose the raw web assets for consumers that want to serve them elsewhere.

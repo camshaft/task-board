@@ -11,6 +11,15 @@ self:
 let
   cfg = config.services.task-board;
   pkg = self.packages.${pkgs.system}.task-board;
+
+  # The daemon reads a TOML config file (--config); generate it from the options below.
+  settings = {
+    db_path = cfg.dbPath;
+    host = cfg.host;
+    port = cfg.port;
+    webhook_timeout_secs = cfg.webhookTimeout;
+  };
+  configFile = (pkgs.formats.toml { }).generate "task-board.toml" settings;
 in
 {
   options.services.task-board = {
@@ -26,25 +35,25 @@ in
     host = lib.mkOption {
       type = lib.types.str;
       default = "0.0.0.0";
-      description = "Address to bind (TB_MCP_HOST).";
+      description = "Address to bind.";
     };
 
     port = lib.mkOption {
       type = lib.types.port;
       default = 8079;
-      description = "Port to listen on for MCP, REST, and the UI (TB_MCP_PORT).";
+      description = "Port to listen on for MCP, REST, and the UI.";
     };
 
     dbPath = lib.mkOption {
       type = lib.types.path;
       default = "/data/task-board/board.db";
-      description = "SQLite database path (TB_DB_PATH). Kept off the root fs, on /data.";
+      description = "SQLite database path. Kept off the root fs, on /data.";
     };
 
     webhookTimeout = lib.mkOption {
       type = lib.types.number;
       default = 5;
-      description = "Best-effort webhook POST timeout in seconds (TB_WEBHOOK_TIMEOUT).";
+      description = "Best-effort webhook POST timeout in seconds.";
     };
 
     openFirewall = lib.mkOption {
@@ -80,10 +89,6 @@ in
       after = [ "network.target" ];
 
       environment = {
-        TB_MCP_HOST = cfg.host;
-        TB_MCP_PORT = toString cfg.port;
-        TB_DB_PATH = cfg.dbPath;
-        TB_WEBHOOK_TIMEOUT = toString cfg.webhookTimeout;
         RUST_LOG = lib.mkDefault "info,task_board=debug";
       };
 
@@ -91,7 +96,7 @@ in
         # Create/own the DB directory as root before dropping privileges (the /data role
         # provides the mount; this just makes the subdir). The `+` runs it as root.
         ExecStartPre = "+${pkgs.coreutils}/bin/install -d -o ${cfg.user} -g ${cfg.group} -m 0750 ${builtins.dirOf cfg.dbPath}";
-        ExecStart = lib.getExe cfg.package;
+        ExecStart = "${lib.getExe cfg.package} --config ${configFile}";
         User = cfg.user;
         Group = cfg.group;
         Restart = "on-failure";
