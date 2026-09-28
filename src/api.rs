@@ -14,10 +14,14 @@ use serde_json::{json, Value};
 
 use crate::core;
 use crate::db::Pool;
+use crate::sse::{self, StreamEvent};
+use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Pool,
+    /// Live activity bus: the SSE tailer publishes here, `GET /api/stream` subscribes.
+    pub events_tx: broadcast::Sender<StreamEvent>,
 }
 
 /// Map an anyhow error to a JSON HTTP response. "no project/task ..." -> 404/400.
@@ -72,6 +76,7 @@ pub fn router(state: AppState) -> Router {
         .route("/subscriptions", post(subscribe).delete(unsubscribe))
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
+        .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
         .with_state(state)
@@ -132,6 +137,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task or project.", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
 ];
 
 /// Build the JSON Schemas for every referenced request body, keyed by struct name.
@@ -581,6 +587,32 @@ struct EventsQuery {
 
 async fn get_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) -> ApiResult {
     Ok(Json(core::get_events(&st.pool, q.since_seq, q.limit).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct StreamQuery {
+    /// Fallback for `Last-Event-ID` — EventSource can't set headers on the initial
+    /// connection, so a client resuming a known position may pass it here instead.
+    last_event_id: Option<i64>,
+}
+
+/// `GET /api/stream` — Server-Sent Events feed of board activity. Subscribe FIRST, then let
+/// the sse layer compute replay, so no event is lost in the gap between the replay snapshot
+/// and going live. A reconnecting browser sends the last seq it saw via the `Last-Event-ID`
+/// header (native EventSource behavior); we also accept `?last_event_id=` for clients that
+/// can't set it.
+async fn stream(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<StreamQuery>,
+) -> Response {
+    let rx = st.events_tx.subscribe();
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .or(q.last_event_id);
+    sse::stream(st.pool.clone(), rx, last_event_id).await
 }
 
 fn default_true() -> bool {
