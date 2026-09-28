@@ -37,7 +37,10 @@ One binary serves three things on one port (default `8079`):
   `subscribe`, `unsubscribe` · `check_notifications`, `send_message`, `get_messages`,
   `get_events`.
 - **`/api`** — a REST mirror of the same operations, for the UI and any HTTP client
-  (`GET /api/projects`, `POST /api/tasks`, `PATCH /api/tasks/:id`, …).
+  (`GET /api/projects`, `POST /api/tasks`, `PATCH /api/tasks/:id`, …). `GET /api` is a
+  self-documenting discovery index: it lists every endpoint with a summary and a JSON
+  Schema for each request body. Open it in a browser for a clickable HTML page, or fetch
+  it with `Accept: application/json` for the machine-readable document.
 - **`/`** — the web UI (Vite/React/TS/Tailwind), a kanban board with a task drawer,
   agent presence, and a live activity feed.
 

@@ -121,6 +121,14 @@ export default function App() {
         <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
           agent coordination · MCP + REST
         </span>
+        <a
+          href="/api"
+          target="_blank"
+          rel="noreferrer"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        >
+          API docs
+        </a>
         <div className="ml-auto flex items-center gap-2 text-sm">
           <label className="text-[var(--color-muted)]">you are</label>
           <input

@@ -4,10 +4,11 @@
 //! cleanly later.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use schemars::{schema_for, JsonSchema};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -55,6 +56,7 @@ fn found(v: Value) -> ApiResult {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(index))
         .route("/health", get(health))
         .route("/meta", get(meta))
         .route("/agents", get(list_agents).post(register_agent))
@@ -92,13 +94,220 @@ async fn meta() -> Json<Value> {
     }))
 }
 
+// --- Discovery ---
+
+/// One row in the endpoint catalog: HTTP method, path template, a one-line summary, and
+/// (for calls that take a JSON body) the name of the schema in the `schemas` map.
+struct Endpoint {
+    method: &'static str,
+    path: &'static str,
+    summary: &'static str,
+    /// Query-string params, for GET endpoints that take them.
+    query: &'static str,
+    /// Key into the `schemas` object for the request-body JSON Schema, if any.
+    body: Option<&'static str>,
+}
+
+/// The hand-curated map of every REST endpoint. Kept next to `router()` so the two stay
+/// in sync. `body` names a struct whose JSON Schema is generated below.
+const ENDPOINTS: &[Endpoint] = &[
+    Endpoint { method: "GET", path: "/api", summary: "This discovery index: every endpoint with its request schema.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/health", summary: "Liveness probe.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/agents", summary: "List all known agents.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
+    Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
+    Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/tasks", summary: "List tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str", body: None },
+    Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
+    Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
+    Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
+    Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task or project.", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task or project.", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
+    Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
+];
+
+/// Build the JSON Schemas for every referenced request body, keyed by struct name.
+fn body_schemas() -> Value {
+    macro_rules! schemas {
+        ($($t:ty),* $(,)?) => {{
+            let mut m = serde_json::Map::new();
+            $( m.insert(stringify!($t).into(), serde_json::to_value(schema_for!($t)).unwrap()); )*
+            Value::Object(m)
+        }};
+    }
+    schemas!(
+        RegisterAgentBody,
+        SetStatusBody,
+        CreateProjectBody,
+        CreateTaskBody,
+        UpdateTaskBody,
+        CommentBody,
+        SubscribeBody,
+        SendMessageBody,
+    )
+}
+
+/// The machine-readable discovery document (also drives the HTML page).
+fn discovery_doc() -> Value {
+    let endpoints: Vec<Value> = ENDPOINTS
+        .iter()
+        .map(|e| {
+            json!({
+                "method": e.method,
+                "path": e.path,
+                "summary": e.summary,
+                "query": e.query,
+                "body_schema": e.body,
+            })
+        })
+        .collect();
+    json!({
+        "service": "task-board",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "REST API for the agent coordination board. There is also an MCP surface at /mcp.",
+        "endpoints": endpoints,
+        "schemas": body_schemas(),
+    })
+}
+
+/// `GET /api` — the discovery root. Content-negotiates: browsers (Accept: text/html) get a
+/// clickable, documented page; API clients get the JSON discovery document.
+async fn index(headers: HeaderMap) -> Response {
+    let doc = discovery_doc();
+    let wants_html = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("text/html"))
+        .unwrap_or(false);
+    if wants_html {
+        Html(render_index_html(&doc)).into_response()
+    } else {
+        Json(doc).into_response()
+    }
+}
+
+/// Render the discovery document as a standalone HTML page (no build step, no JS deps).
+fn render_index_html(doc: &Value) -> String {
+    let mut rows = String::new();
+    for e in doc["endpoints"].as_array().unwrap() {
+        let method = e["method"].as_str().unwrap_or("");
+        let path = e["path"].as_str().unwrap_or("");
+        let summary = html_escape(e["summary"].as_str().unwrap_or(""));
+        let query = e["query"].as_str().unwrap_or("");
+        // GET endpoints with no path params are directly clickable.
+        let is_get = method == "GET";
+        let clickable = is_get && !path.contains('{');
+        let path_cell = if clickable {
+            format!("<a href=\"{p}\">{p}</a>", p = html_escape(path))
+        } else {
+            format!("<span>{}</span>", html_escape(path))
+        };
+        let query_html = if query.is_empty() {
+            String::new()
+        } else {
+            format!("<div class=\"q\">?{}</div>", html_escape(query))
+        };
+        let body_html = match e["body_schema"].as_str() {
+            Some(name) => format!("<a class=\"schema\" href=\"#schema-{n}\">{n}</a>", n = html_escape(name)),
+            None => "<span class=\"muted\">—</span>".into(),
+        };
+        rows.push_str(&format!(
+            "<tr><td><code class=\"m m-{ml}\">{method}</code></td><td class=\"path\"><code>{path_cell}</code>{query_html}</td><td>{summary}</td><td>{body_html}</td></tr>",
+            ml = method.to_lowercase(),
+        ));
+    }
+
+    let mut schema_blocks = String::new();
+    if let Some(schemas) = doc["schemas"].as_object() {
+        let mut names: Vec<&String> = schemas.keys().collect();
+        names.sort();
+        for name in names {
+            let pretty = serde_json::to_string_pretty(&schemas[name]).unwrap_or_default();
+            schema_blocks.push_str(&format!(
+                "<section id=\"schema-{n}\"><h3>{n}</h3><pre><code>{body}</code></pre></section>",
+                n = html_escape(name),
+                body = html_escape(&pretty),
+            ));
+        }
+    }
+
+    let version = doc["version"].as_str().unwrap_or("");
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>task-board API</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ margin: 0; background:#0b0d10; color:#e6e8eb; font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif; }}
+  .wrap {{ max-width: 960px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }}
+  h1 {{ font-size: 1.4rem; margin: 0 0 .25rem; }}
+  h1 .sky {{ color:#38bdf8; }}
+  .lede {{ color:#9aa4af; margin:0 0 1.5rem; }}
+  a {{ color:#7dd3fc; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  table {{ width:100%; border-collapse: collapse; }}
+  th,td {{ text-align:left; padding:.5rem .6rem; border-bottom:1px solid #1c2128; vertical-align: top; }}
+  th {{ color:#9aa4af; font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; }}
+  code {{ font-family: ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.82rem; }}
+  .path code {{ color:#e6e8eb; }}
+  .q {{ color:#6b7684; font-size:.72rem; margin-top:.1rem; }}
+  .m {{ font-weight:600; padding:.05rem .4rem; border-radius:.3rem; font-size:.72rem; }}
+  .m-get {{ background:#0e2a3a; color:#7dd3fc; }}
+  .m-post {{ background:#0f2e1c; color:#86efac; }}
+  .m-patch {{ background:#2e2410; color:#fcd34d; }}
+  .m-delete {{ background:#2e1414; color:#fca5a5; }}
+  .muted {{ color:#4b5563; }}
+  .schema {{ font-family: ui-monospace,monospace; font-size:.8rem; }}
+  section {{ margin-top:1.25rem; }}
+  section h3 {{ font-size:.9rem; margin:0 0 .4rem; color:#cbd5e1; }}
+  pre {{ background:#11151a; border:1px solid #1c2128; border-radius:.5rem; padding:.9rem 1rem; overflow:auto; }}
+  .top {{ display:flex; align-items:baseline; gap:.75rem; flex-wrap:wrap; }}
+  .badge {{ color:#6b7684; font-size:.75rem; }}
+  hr {{ border:0; border-top:1px solid #1c2128; margin:2rem 0 1rem; }}
+</style></head>
+<body><div class="wrap">
+  <div class="top">
+    <h1><span class="sky">task</span>-board API</h1>
+    <span class="badge">v{version}</span>
+    <span class="badge">· <a href="/">web UI</a> · MCP at <code>/mcp</code></span>
+  </div>
+  <p class="lede">REST surface for the agent coordination board. GET links are live — click to try them. This page is also available as JSON (send <code>Accept: application/json</code> or fetch <code>/api</code>).</p>
+  <table>
+    <thead><tr><th>Method</th><th>Path</th><th>Summary</th><th>Body</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <hr>
+  <h2 style="font-size:1rem;color:#cbd5e1;">Request body schemas</h2>
+  {schema_blocks}
+</div></body></html>"#,
+    )
+}
+
+/// Minimal HTML escaping for text interpolated into the discovery page.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 // --- Agents ---
 
 async fn list_agents(State(st): State<AppState>) -> ApiResult {
     Ok(Json(core::list_agents(&st.pool).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct RegisterAgentBody {
     agent_id: String,
     display_name: Option<String>,
@@ -122,7 +331,7 @@ async fn register_agent(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct SetStatusBody {
     status: String,
     status_message: Option<String>,
@@ -138,7 +347,7 @@ async fn set_status(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct NotificationsQuery {
     #[serde(default = "default_true")]
     mark_read: bool,
@@ -168,7 +377,7 @@ async fn get_messages(
 
 // --- Projects ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct ListProjectsQuery {
     status: Option<String>,
 }
@@ -180,7 +389,7 @@ async fn list_projects(
     Ok(Json(core::list_projects(&st.pool, q.status.as_deref()).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct CreateProjectBody {
     name: String,
     description: Option<String>,
@@ -203,7 +412,7 @@ async fn get_project(State(st): State<AppState>, Path(project_id): Path<i64>) ->
 
 // --- Tasks ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct ListTasksQuery {
     project_id: Option<i64>,
     status: Option<String>,
@@ -216,7 +425,7 @@ async fn list_tasks(State(st): State<AppState>, Query(q): Query<ListTasksQuery>)
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct CreateTaskBody {
     project_id: i64,
     title: String,
@@ -247,7 +456,7 @@ async fn get_task(State(st): State<AppState>, Path(task_id): Path<i64>) -> ApiRe
     found(core::get_task(&st.pool, task_id).await?)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct UpdateTaskBody {
     status: Option<String>,
     assignee: Option<String>,
@@ -279,7 +488,7 @@ async fn update_task(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct CommentBody {
     body: String,
     author: Option<String>,
@@ -305,7 +514,7 @@ async fn set_task_props(
 
 // --- Subscriptions ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct SubscribeBody {
     subscriber: String,
     task_id: Option<i64>,
@@ -326,7 +535,7 @@ async fn unsubscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -
 
 // --- Messages / events ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct SendMessageBody {
     from_agent: String,
     to_agent: String,
@@ -339,7 +548,7 @@ async fn send_message(State(st): State<AppState>, Json(b): Json<SendMessageBody>
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct EventsQuery {
     #[serde(default)]
     since_seq: i64,
