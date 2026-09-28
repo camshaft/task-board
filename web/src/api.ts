@@ -18,6 +18,7 @@ export interface Agent {
   status: AgentStatus
   status_message: string | null
   charter: string | null
+  metadata: Record<string, unknown>
   webhook_url: string | null
   created_at: string
   last_seen: string | null
@@ -118,8 +119,21 @@ export const api = {
     display_name?: string
     kind?: string
     charter?: string
+    metadata?: Record<string, unknown>
     webhook_url?: string
   }) => req<Agent>('POST', '/agents', b),
+  updateAgent: (
+    id: string,
+    b: {
+      display_name?: string
+      kind?: string
+      charter?: string
+      status?: string
+      status_message?: string
+      webhook_url?: string
+      metadata?: Record<string, unknown>
+    },
+  ) => req<Agent>('PATCH', `/agents/${encodeURIComponent(id)}`, b),
 
   listProjects: (status?: string) =>
     req<Project[]>('GET', `/projects${status ? `?status=${encodeURIComponent(status)}` : ''}`),
