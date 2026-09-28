@@ -1,11 +1,12 @@
-// Typed client for the task-board REST API. Requests are prefixed with the app's public
-// base path (import.meta.env.BASE_URL, always trailing-slashed) so the client works both
-// at the origin root and behind a reverse proxy on a sub-path (e.g. /board). Vite proxies
-// /api to the Rust backend in dev, and the backend serves this app in prod.
+// Typed client for the task-board REST API. Request URLs are resolved against the page's
+// base URI, which reflects the <base href> the backend injects from X-Forwarded-Prefix —
+// so the same build works at the origin root or behind a sub-path proxy (e.g. /board)
+// with no build-time configuration. Vite proxies /api to the backend in dev; the backend
+// serves this app in prod.
 
-// e.g. base '/board/' -> '/board/api', base '/' -> '/api'. Trim the trailing slash so we
-// can append '/api' + path cleanly.
-const API_ROOT = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/api`
+// e.g. baseURI 'https://h/board/' -> '.../board/api'; 'https://h/' -> '.../api'. Trailing
+// slash on baseURI matters, so the backend always emits <base href="{prefix}/">.
+const API_ROOT = new URL('api', document.baseURI).href
 
 export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled'
 export type AgentStatus = 'online' | 'busy' | 'away' | 'offline'
