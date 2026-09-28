@@ -16,6 +16,13 @@ use serde_json::Value;
 use crate::core;
 use crate::db::Pool;
 
+/// A free-form JSON object argument (task metadata / props). We type these as a map rather
+/// than a bare `serde_json::Value` so schemars emits a concrete `{"type":"object"}` schema:
+/// a bare Value serializes to a boolean/empty schema that some strict MCP clients (incl.
+/// Claude Code) reject when it appears as a named property, which fails the whole
+/// tools/list. Callers only ever pass objects here anyway (merged key/value maps).
+type JsonObject = serde_json::Map<String, Value>;
+
 #[derive(Clone)]
 pub struct Board {
     pool: Pool,
@@ -95,7 +102,7 @@ pub struct CreateTaskArgs {
     pub created_by: Option<String>,
     /// Arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...).
     #[serde(default)]
-    pub metadata: Option<Value>,
+    pub metadata: Option<JsonObject>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -117,13 +124,14 @@ pub struct UpdateTaskArgs {
     pub actor: Option<String>,
     /// MERGED into the task's props.
     #[serde(default)]
-    pub metadata: Option<Value>,
+    pub metadata: Option<JsonObject>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetTaskPropsArgs {
     pub task_id: i64,
-    pub props: Value,
+    /// Key/value properties to merge into the task's metadata.
+    pub props: JsonObject,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -288,7 +296,7 @@ impl Board {
             s(&a.assignee),
             s(&a.priority),
             s(&a.created_by),
-            a.metadata,
+            a.metadata.map(Value::Object),
         )
         .await
         .map_err(err)
@@ -311,7 +319,7 @@ impl Board {
             s(&a.description),
             s(&a.priority),
             s(&a.actor),
-            a.metadata,
+            a.metadata.map(Value::Object),
         )
         .await
         .map_err(err)
@@ -325,7 +333,10 @@ impl Board {
         &self,
         Parameters(a): Parameters<SetTaskPropsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::set_task_props(&self.pool, a.task_id, a.props).await.map_err(err).and_then(ok)
+        core::set_task_props(&self.pool, a.task_id, Value::Object(a.props))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(description = "Get one task with its comments and subscribers.")]
@@ -440,5 +451,34 @@ impl ServerHandler for Board {
                  check_notifications."
                     .to_string(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::schemars::schema_for;
+
+    // A free-form JSON object property must generate a concrete `{"type":"object"}` schema.
+    // A bare `serde_json::Value` instead yields a boolean/empty schema, which strict MCP
+    // clients (incl. Claude Code) reject as a named property — failing the whole
+    // tools/list. This guards that regression for the metadata/props args.
+    fn prop_type_is_object(schema: serde_json::Value, prop: &str) {
+        let ty = schema
+            .pointer(&format!("/properties/{prop}/type"))
+            .unwrap_or_else(|| panic!("{prop}: no `type` in schema — {schema}"));
+        // Required fields render as "object"; optional ones as ["object","null"]. Either
+        // is a concrete object schema — what matters is it's NOT a bare boolean/empty
+        // schema (which has no `type` at all and trips strict clients).
+        let is_object = ty == "object"
+            || ty.as_array().is_some_and(|a| a.iter().any(|t| t == "object"));
+        assert!(is_object, "{prop} should be an object schema, got {schema}");
+    }
+
+    #[test]
+    fn free_form_json_args_have_object_schemas() {
+        prop_type_is_object(serde_json::to_value(schema_for!(SetTaskPropsArgs)).unwrap(), "props");
+        prop_type_is_object(serde_json::to_value(schema_for!(CreateTaskArgs)).unwrap(), "metadata");
+        prop_type_is_object(serde_json::to_value(schema_for!(UpdateTaskArgs)).unwrap(), "metadata");
     }
 }
