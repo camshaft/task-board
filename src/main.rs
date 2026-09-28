@@ -95,10 +95,21 @@ async fn main() -> anyhow::Result<()> {
     // MCP over streamable-HTTP at /mcp (fresh Board handle per session).
     let ct = tokio_util::sync::CancellationToken::new();
     let mcp_pool = pool.clone();
+    // rmcp defaults to a loopback-only Host allowlist (DNS-rebinding protection). Apply the
+    // deployment's configured hosts: empty keeps the safe default, ["*"] disables the check,
+    // otherwise use the explicit allowlist. See config::Settings::mcp_allowed_hosts.
+    let mut mcp_config = StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token());
+    if cfg.mcp_allowed_hosts.iter().any(|h| h == "*") {
+        tracing::warn!("MCP Host validation disabled (mcp_allowed_hosts = [\"*\"]); any Host accepted");
+        mcp_config = mcp_config.disable_allowed_hosts();
+    } else if !cfg.mcp_allowed_hosts.is_empty() {
+        tracing::info!("MCP allowed hosts: {:?}", cfg.mcp_allowed_hosts);
+        mcp_config = mcp_config.with_allowed_hosts(cfg.mcp_allowed_hosts.clone());
+    }
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp::Board::new(mcp_pool.clone())),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+        mcp_config,
     );
 
     // REST API at /api.

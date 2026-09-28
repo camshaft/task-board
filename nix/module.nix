@@ -18,6 +18,7 @@ let
     host = cfg.host;
     port = cfg.port;
     webhook_timeout_secs = cfg.webhookTimeout;
+    mcp_allowed_hosts = cfg.mcpAllowedHosts;
   };
   configFile = (pkgs.formats.toml { }).generate "task-board.toml" settings;
 in
@@ -54,6 +55,19 @@ in
       type = lib.types.number;
       default = 5;
       description = "Best-effort webhook POST timeout in seconds.";
+    };
+
+    mcpAllowedHosts = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "green-machine.lan:8079" "board.example.com" ];
+      description = ''
+        Host authorities the MCP endpoint (/mcp) accepts in the inbound Host header.
+        rmcp only accepts loopback hosts by default (DNS-rebinding protection), so a
+        LAN-exposed or reverse-proxied deployment must list the authorities clients
+        actually send. Empty keeps the loopback-only default; a single "*" disables
+        the check entirely (any Host accepted — closed networks only).
+      '';
     };
 
     openFirewall = lib.mkOption {
