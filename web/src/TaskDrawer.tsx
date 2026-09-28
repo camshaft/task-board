@@ -1,13 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate, useOutletContext, useParams } from 'react-router-dom'
-import { api, type Task, type TaskStatus } from './api'
+import { type TaskStatus } from './api'
+import { commentTask, updateTask, useTask } from './resources'
 import { relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // Context handed down by the Board route (the parent <Outlet/>).
 interface DrawerContext {
   actor: string
-  refreshBoard: () => void
-  refreshChrome: () => void
 }
 
 // A slide-over panel showing one task (from the :taskId route param): fields, editable
@@ -15,38 +14,20 @@ interface DrawerContext {
 export function TaskDrawer() {
   const { projectId, taskId } = useParams()
   const navigate = useNavigate()
-  const { actor, refreshBoard, refreshChrome } = useOutletContext<DrawerContext>()
-  const [task, setTask] = useState<Task | null>(null)
+  const { actor } = useOutletContext<DrawerContext>()
+  const id = Number(taskId)
+  const { data: task, error: loadError } = useTask(id)
   const [error, setError] = useState<string | null>(null)
   const [comment, setComment] = useState('')
   const [busy, setBusy] = useState(false)
 
   const onClose = () => navigate(`/projects/${projectId}`)
-  const onChanged = () => {
-    refreshBoard()
-    refreshChrome()
-  }
-
-  async function load() {
-    try {
-      setTask(await api.getTask(Number(taskId)))
-    } catch (e) {
-      setError((e as Error).message)
-    }
-  }
-
-  useEffect(() => {
-    load()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId])
 
   async function setStatus(status: TaskStatus) {
     if (!task || status === task.status) return
     setBusy(true)
     try {
-      await api.updateTask(task.id, { status, actor })
-      await load()
-      onChanged()
+      await updateTask(task.id, { status, actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -60,9 +41,7 @@ export function TaskDrawer() {
     if (assignee == null) return
     setBusy(true)
     try {
-      await api.updateTask(task.id, { assignee, actor })
-      await load()
-      onChanged()
+      await updateTask(task.id, { assignee, actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -75,16 +54,16 @@ export function TaskDrawer() {
     if (!body || !task) return
     setBusy(true)
     try {
-      await api.commentTask(task.id, { body, author: actor })
+      await commentTask(task.id, { body, author: actor })
       setComment('')
-      await load()
-      onChanged()
     } catch (e) {
       setError((e as Error).message)
     } finally {
       setBusy(false)
     }
   }
+
+  const shownError = error ?? loadError?.message ?? null
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end">
@@ -96,7 +75,7 @@ export function TaskDrawer() {
       <aside className="relative z-50 flex h-full w-full max-w-xl flex-col border-l border-[var(--color-border)] bg-[var(--color-panel)] shadow-2xl">
         {!task ? (
           <div className="p-6 text-[var(--color-muted)]">
-            {error ? `Error: ${error}` : 'Loading…'}
+            {shownError ? `Error: ${shownError}` : 'Loading…'}
           </div>
         ) : (
           <>
@@ -116,9 +95,9 @@ export function TaskDrawer() {
             </header>
 
             <div className="flex-1 overflow-y-auto p-5">
-              {error && (
+              {shownError && (
                 <div className="mb-3 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
-                  {error}
+                  {shownError}
                 </div>
               )}
 

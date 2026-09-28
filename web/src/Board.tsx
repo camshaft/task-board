@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Link, Outlet, useParams } from 'react-router-dom'
-import { api, type TaskSummary } from './api'
 import { useBoardContext } from './Layout'
+import { createTask, useProjects, useTasks } from './resources'
 import { PriorityDot, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // The kanban board for one project (from the :projectId route param). Renders its own
@@ -9,36 +9,24 @@ import { PriorityDot, STATUS_LABEL, TASK_COLUMNS } from './ui'
 export default function Board() {
   const { projectId } = useParams()
   const project = Number(projectId)
-  const { actor, projects, refreshChrome } = useBoardContext()
-  const [tasks, setTasks] = useState<TaskSummary[]>([])
+  const { actor } = useBoardContext()
+  const { data: tasks = [], error: tasksError } = useTasks(project)
+  const { data: projects = [] } = useProjects()
   const [error, setError] = useState<string | null>(null)
-
-  const refreshTasks = useCallback(async () => {
-    try {
-      setTasks(await api.listTasks({ project_id: project }))
-    } catch (e) {
-      setError((e as Error).message)
-    }
-  }, [project])
-
-  useEffect(() => {
-    refreshTasks()
-  }, [refreshTasks])
 
   async function newTask() {
     const title = window.prompt('Task title:')
     if (!title?.trim()) return
     const assignee = window.prompt('Assignee (agent id, optional):') || undefined
     try {
-      await api.createTask({ project_id: project, title: title.trim(), assignee, created_by: actor })
-      refreshTasks()
-      refreshChrome()
+      await createTask({ project_id: project, title: title.trim(), assignee, created_by: actor })
     } catch (e) {
       setError((e as Error).message)
     }
   }
 
   const current = projects.find((p) => p.id === project)
+  const shownError = error ?? tasksError?.message ?? null
 
   return (
     <main className="flex min-w-0 flex-1 flex-col">
@@ -52,9 +40,9 @@ export default function Board() {
         </button>
       </div>
 
-      {error && (
+      {shownError && (
         <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
-          {error}
+          {shownError}
         </div>
       )}
 
@@ -95,9 +83,9 @@ export default function Board() {
         })}
       </div>
 
-      {/* The task drawer, when the URL is …/tasks/:taskId. It needs to refetch the board
-          (status moves) and chrome (counts) on mutation, so hand those down via context. */}
-      <Outlet context={{ actor, refreshBoard: refreshTasks, refreshChrome }} />
+      {/* The task drawer, when the URL is …/tasks/:taskId. It subscribes to its own task
+          resource and funnels mutations through touched(), so it just needs the actor. */}
+      <Outlet context={{ actor }} />
     </main>
   )
 }

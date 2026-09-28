@@ -1,16 +1,12 @@
-import { useCallback, useEffect, useState } from 'react'
-import { Link, Outlet, useNavigate, useOutletContext, useParams } from 'react-router-dom'
-import { api, type Agent, type EventRow, type Project } from './api'
+import { useState } from 'react'
+import { Link, Outlet, useOutletContext, useParams } from 'react-router-dom'
+import { createProject, useAgents, useEvents, useProjects } from './resources'
 import { AGENT_DOT, relTime } from './ui'
 
-// Shared data + helpers handed to nested routes (Board, TaskDrawer) via the router's
-// outlet context, so they don't refetch the chrome or thread props by hand.
+// The only thing nested routes still need handed down is the current actor (per-user
+// localStorage identity, not a server resource). All server data comes from the store hooks.
 export interface BoardContext {
   actor: string
-  projects: Project[]
-  // Re-fetch the chrome data (project list + counts, agents, activity feed). Nested
-  // routes call this after a mutation so sidebar counts and the feed stay current.
-  refreshChrome: () => void
 }
 
 export function useBoardContext() {
@@ -30,57 +26,23 @@ function useActor(): [string, (v: string) => void] {
 }
 
 // The persistent chrome — header, project/agent sidebar, activity feed — around an
-// <Outlet/> that renders whichever project/task the URL points at.
+// <Outlet/> that renders whichever project/task the URL points at. Every data panel here
+// subscribes to a store resource, so it re-renders on its own when that data changes.
 export default function Layout() {
-  const navigate = useNavigate()
   const { projectId } = useParams()
   const selectedProject = projectId != null ? Number(projectId) : null
   const [actor, setActor] = useActor()
-  const [projects, setProjects] = useState<Project[]>([])
-  const [agents, setAgents] = useState<Agent[]>([])
-  const [events, setEvents] = useState<EventRow[]>([])
-  const [error, setError] = useState<string | null>(null)
-
-  const refreshProjects = useCallback(async () => {
-    try {
-      setProjects(await api.listProjects())
-    } catch (e) {
-      setError((e as Error).message)
-    }
-  }, [])
-
-  const refreshSide = useCallback(async () => {
-    try {
-      setAgents(await api.listAgents())
-      setEvents((await api.getEvents(0, 30)).reverse())
-    } catch (e) {
-      setError((e as Error).message)
-    }
-  }, [])
-
-  const refreshChrome = useCallback(() => {
-    refreshProjects()
-    refreshSide()
-  }, [refreshProjects, refreshSide])
-
-  useEffect(() => {
-    refreshProjects()
-  }, [refreshProjects])
-  useEffect(() => {
-    refreshSide()
-    const t = setInterval(refreshSide, 5000)
-    return () => clearInterval(t)
-  }, [refreshSide])
+  const { data: projects = [], error: projectsError } = useProjects()
+  const { data: agents = [] } = useAgents()
+  const { data: events = [] } = useEvents()
 
   async function newProject() {
     const name = window.prompt('Project name:')
     if (!name?.trim()) return
     try {
-      const p = await api.createProject({ name: name.trim(), created_by: actor })
-      await refreshProjects()
-      navigate(`projects/${p.id}`) // opening the new project is just navigation
+      await createProject({ name: name.trim(), created_by: actor })
     } catch (e) {
-      setError((e as Error).message)
+      window.alert((e as Error).message)
     }
   }
 
@@ -112,12 +74,9 @@ export default function Layout() {
         </div>
       </header>
 
-      {error && (
+      {projectsError && (
         <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
-          {error}
-          <button className="ml-3 underline" onClick={() => setError(null)}>
-            dismiss
-          </button>
+          {projectsError.message}
         </div>
       )}
 
@@ -184,7 +143,7 @@ export default function Layout() {
         </aside>
 
         {/* Whatever the URL points at: the board for a project, plus the task drawer. */}
-        <Outlet context={{ actor, projects, refreshChrome } satisfies BoardContext} />
+        <Outlet context={{ actor } satisfies BoardContext} />
 
         {/* Event feed */}
         <aside className="hidden w-72 shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-panel)] xl:flex">
