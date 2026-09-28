@@ -160,14 +160,21 @@ export default function Layout() {
             {agents.map((a) => (
               <div
                 key={a.id}
-                className="flex items-center gap-2 rounded-md px-3 py-1.5 text-sm"
-                title={a.status_message ?? a.status}
+                className="rounded-md px-3 py-1.5 text-sm"
+                title={a.charter ?? a.status_message ?? a.status}
               >
-                <span className={`size-2 rounded-full ${AGENT_DOT[a.status] ?? 'bg-zinc-600'}`} />
-                <span className="truncate font-mono text-xs">{a.id}</span>
-                <span className="ml-auto text-[10px] text-[var(--color-muted)]">
-                  {relTime(a.last_seen)}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className={`size-2 rounded-full ${AGENT_DOT[a.status] ?? 'bg-zinc-600'}`} />
+                  <span className="truncate font-mono text-xs">{a.id}</span>
+                  <span className="ml-auto text-[10px] text-[var(--color-muted)]">
+                    {relTime(a.last_seen)}
+                  </span>
+                </div>
+                {a.charter && (
+                  <p className="mt-0.5 pl-4 text-[11px] leading-snug text-[var(--color-muted)] line-clamp-2">
+                    {a.charter}
+                  </p>
+                )}
               </div>
             ))}
             {agents.length === 0 && (

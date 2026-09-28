@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS agents (
     kind           TEXT,
     status         TEXT NOT NULL DEFAULT 'offline',
     status_message TEXT,
+    charter        TEXT,
     webhook_url    TEXT,
     created_at     TEXT NOT NULL,
     last_seen      TEXT
@@ -126,6 +127,19 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .any(|r| r.get::<String, _>("name") == "metadata");
     if !projects_have_metadata {
         sqlx::query("ALTER TABLE projects ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill agents.charter (free-form role/mission text, editable over time). Nullable,
+    // so pre-existing agents simply have no charter until they set one.
+    let agents_have_charter = sqlx::query("PRAGMA table_info(agents)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "charter");
+    if !agents_have_charter {
+        sqlx::query("ALTER TABLE agents ADD COLUMN charter TEXT")
             .execute(&pool)
             .await?;
     }

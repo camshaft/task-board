@@ -17,6 +17,7 @@ export interface Agent {
   kind: string | null
   status: AgentStatus
   status_message: string | null
+  charter: string | null
   webhook_url: string | null
   created_at: string
   last_seen: string | null
@@ -111,10 +112,12 @@ export const api = {
   streamUrl: () => `${API_ROOT}/stream`,
 
   listAgents: () => req<Agent[]>('GET', '/agents'),
+  getAgent: (id: string) => req<Agent>('GET', `/agents/${encodeURIComponent(id)}`),
   registerAgent: (b: {
     agent_id: string
     display_name?: string
     kind?: string
+    charter?: string
     webhook_url?: string
   }) => req<Agent>('POST', '/agents', b),
 

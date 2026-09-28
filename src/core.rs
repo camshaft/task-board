@@ -89,6 +89,7 @@ pub async fn register_agent(
     agent_id: &str,
     display_name: Option<&str>,
     kind: Option<&str>,
+    charter: Option<&str>,
     webhook_url: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
@@ -99,12 +100,16 @@ pub async fn register_agent(
         .await?
         .is_some();
     if exists {
+        // COALESCE so re-registering to refresh presence doesn't clobber a charter (or any
+        // other field) set earlier — only fields explicitly supplied this call overwrite.
         sqlx::query(
             "UPDATE agents SET display_name=COALESCE(?,display_name), kind=COALESCE(?,kind), \
-             webhook_url=COALESCE(?,webhook_url), status='online', last_seen=? WHERE id=?",
+             charter=COALESCE(?,charter), webhook_url=COALESCE(?,webhook_url), \
+             status='online', last_seen=? WHERE id=?",
         )
         .bind(display_name)
         .bind(kind)
+        .bind(charter)
         .bind(webhook_url)
         .bind(&ts)
         .bind(agent_id)
@@ -112,12 +117,13 @@ pub async fn register_agent(
         .await?;
     } else {
         sqlx::query(
-            "INSERT INTO agents(id, display_name, kind, status, webhook_url, created_at, last_seen) \
-             VALUES(?,?,?,'online',?,?,?)",
+            "INSERT INTO agents(id, display_name, kind, charter, status, webhook_url, created_at, last_seen) \
+             VALUES(?,?,?,?,'online',?,?,?)",
         )
         .bind(agent_id)
         .bind(display_name)
         .bind(kind)
+        .bind(charter)
         .bind(webhook_url)
         .bind(&ts)
         .bind(&ts)
@@ -178,6 +184,17 @@ pub async fn list_agents(pool: &Pool) -> anyhow::Result<Value> {
         .fetch_all(pool)
         .await?;
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
+pub async fn get_agent(pool: &Pool, agent_id: &str) -> anyhow::Result<Value> {
+    let row = sqlx::query("SELECT * FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => Ok(row_to_json(&r)),
+        None => anyhow::bail!("no agent {agent_id}"),
+    }
 }
 
 // --- Projects ---
@@ -1137,8 +1154,8 @@ mod tests {
         let db_path = tmp.path().join("board.db");
         let pool = crate::db::init(db_path.to_str().unwrap()).await?;
 
-        register_agent(&pool, "planner", Some("Planner"), None, None).await?;
-        register_agent(&pool, "fixer", Some("Fixer"), None, None).await?;
+        register_agent(&pool, "planner", Some("Planner"), None, None, None).await?;
+        register_agent(&pool, "fixer", Some("Fixer"), None, None, None).await?;
 
         let p = create_project(&pool, "Voron tuning", Some("dial in the printer"), Some("planner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
