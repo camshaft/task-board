@@ -90,3 +90,31 @@ export async function commentTask(id: number, b: Parameters<typeof api.commentTa
   touched({ taskId: id, activity: true })
   return r
 }
+
+// The compact event the SSE feed pushes (mirrors sse::StreamEvent on the server), plus the
+// synthetic resync signal the server sends when a client fell too far behind to replay.
+export interface StreamEvent {
+  seq?: number
+  type: string
+  project_id?: number | null
+  task_id?: number | null
+}
+
+/**
+ * Apply one server-sent event by funneling it through the SAME touched() choke point the
+ * local mutations use — so a change made by any other client/agent refreshes exactly the
+ * resources it affects, with no per-component wiring. `resync` means "we couldn't tell you
+ * what changed" (buffer overrun / gap too large): drop every cache entry so subscribed
+ * components refetch from scratch.
+ */
+export function applyStreamEvent(ev: StreamEvent) {
+  if (ev.type === 'resync') {
+    invalidateMatching('') // every key startsWith '' — invalidate all loaded resources
+    return
+  }
+  touched({
+    projectId: ev.project_id ?? undefined,
+    taskId: ev.task_id ?? undefined,
+    activity: true,
+  })
+}

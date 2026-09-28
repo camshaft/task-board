@@ -7,6 +7,7 @@ mod core;
 mod db;
 mod events;
 mod mcp;
+mod sse;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -126,8 +127,13 @@ async fn main() -> anyhow::Result<()> {
         mcp_config,
     );
 
+    // Live activity bus + the background tailer that feeds it from the committed event log.
+    // The sender lives in AppState so `GET /api/stream` can subscribe per connection.
+    let events_tx = sse::channel();
+    sse::spawn_tailer(pool.clone(), events_tx.clone());
+
     // REST API at /api.
-    let api_router = api::router(api::AppState { pool: pool.clone() });
+    let api_router = api::router(api::AppState { pool: pool.clone(), events_tx });
 
     let mut router = Router::new()
         .nest_service("/mcp", mcp_service)

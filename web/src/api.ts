@@ -105,6 +105,10 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
 export const api = {
   meta: () => req<Meta>('GET', '/meta'),
 
+  // Absolute URL of the SSE activity feed, resolved against the same base as every request
+  // so it works at the origin root or behind a sub-path proxy. Consumed by useLiveUpdates.
+  streamUrl: () => `${API_ROOT}/stream`,
+
   listAgents: () => req<Agent[]>('GET', '/agents'),
   registerAgent: (b: {
     agent_id: string

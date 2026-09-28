@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Link, Outlet, useOutletContext, useParams } from 'react-router-dom'
+import { useLiveUpdates } from './live'
 import { createProject, useAgents, useEvents, useProjects } from './resources'
 import { AGENT_DOT, relTime } from './ui'
 
@@ -32,6 +33,7 @@ export default function Layout() {
   const { projectId } = useParams()
   const selectedProject = projectId != null ? Number(projectId) : null
   const [actor, setActor] = useActor()
+  useLiveUpdates() // one SSE connection makes every subscribed panel live
   const { data: projects = [], error: projectsError } = useProjects()
   const { data: agents = [] } = useAgents()
   const { data: events = [] } = useEvents()
