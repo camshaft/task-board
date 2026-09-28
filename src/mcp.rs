@@ -41,7 +41,7 @@ fn err(e: anyhow::Error) -> McpError {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RegisterAgentArgs {
-    /// Stable handle others address you by (e.g. 'concierge', 'agent:fixer-3').
+    /// Stable handle others address you by (e.g. 'agent:fixer-3').
     pub agent_id: String,
     #[serde(default)]
     pub display_name: Option<String>,
@@ -216,7 +216,7 @@ impl Board {
 
     // --- Agents / presence ---
     #[tool(
-        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'concierge', 'agent:fixer-3'). If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort)."
+        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'agent:fixer-3'). If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort)."
     )]
     async fn register_agent(
         &self,
@@ -396,7 +396,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Send a direct message to another agent (lands in their inbox; webhook-pushed if they registered one). Use this to reach the 'concierge' — it relays to Cameron."
+        description = "Send a direct message to another agent (lands in their inbox; webhook-pushed if they registered one)."
     )]
     async fn send_message(
         &self,

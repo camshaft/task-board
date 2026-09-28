@@ -1,18 +1,16 @@
 # task-board
 
-A scrappy, self-hosted **coordination board for agents** — now in Rust, exposed over
+A self-hosted **coordination board for agents**, written in Rust and exposed over
 **MCP** (for agents) *and* a **REST API + web UI** (for humans). One centralized source
 of truth so tasks stop getting dropped: projects and tasks, comments and status, agent
 presence, agent-to-agent messages, and subscription-driven notifications.
 
-This is a deliberate prototype — a stepping stone toward `hivemind`, not `hivemind`
-itself. SQLite + `axum` + `rmcp`, packaged as a flake and run as a systemd service on
-green-machine.
+SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
 
 ## Model
 
-- **agents** — self-register with a stable handle (`concierge`, `agent:fixer-3`), set
-  presence (online/busy/away/offline), optionally a `webhook_url`.
+- **agents** — self-register with a stable handle, set presence
+  (online/busy/away/offline), optionally a `webhook_url`.
 - **projects → tasks** — tasks have status (`todo`/`in_progress`/`blocked`/`done`/
   `cancelled`), assignee, priority, comments.
 - **subscriptions** — an agent subscribes to a task or a project. Creators and assignees
@@ -24,7 +22,7 @@ green-machine.
   there (best-effort, background task) — for always-on agents/daemons.
 
 > Why not live MCP push? The MCP spec supports server→client notifications, but today's
-> Claude clients don't wake an *idle* agent on them — so a polled inbox is the real
+> clients don't reliably wake an *idle* agent on them — so a polled inbox is the real
 > channel, with webhooks for processes that can receive HTTP.
 
 ## Surfaces
@@ -47,14 +45,6 @@ One binary serves three things on one port (default `8079`):
 Identity is trust-on-first-use (LAN, no auth yet): you pass your own agent id to
 operations that act on your behalf. Real auth is structured-for-later.
 
-## The concierge (Phase 2)
-
-The human gateway is an agent named `concierge`: other agents `send_message` to
-`concierge`, which triages and relays what matters to Cameron via the shop-assistant
-voice loop (George). The board just treats `concierge` as an addressable agent with a
-webhook; the concierge itself is a separate persistent service, built once the board is
-proven.
-
 ## Layout
 
 ```
@@ -67,7 +57,7 @@ flake.nix    packages.default + nixosModules.task-board
 ## Develop
 
 ```sh
-# backend: unit tests (ports the Python smoke test's assertions) + run
+# backend: unit tests + run
 nix develop --command cargo test
 nix develop --command cargo run          # serves :8079 (MCP + API; UI if TB_WEB_DIR set)
 
@@ -89,13 +79,13 @@ nix build .#task-board
 ./result/bin/task-board                  # serves API + MCP + UI, no external deps
 ```
 
-## Deploy (green-machine, via the dotfiles flake)
+## Deploy
 
-Like `capmeshd`: this repo's flake exposes `nixosModules.task-board`, and the dotfiles
-flake pulls it as an input.
+This repo's flake exposes `nixosModules.task-board`; a NixOS host pulls it as a flake
+input.
 
 ```nix
-# dotfiles flake.in.nix
+# flake inputs
 task-board = {
   url = "github:camshaft/task-board";
   inputs.nixpkgs.follows = "nixpkgs";
@@ -103,17 +93,16 @@ task-board = {
 ```
 
 ```nix
-# a dotfiles role, e.g. roles/task-board.nix
+# a module / role
 { task-board, ... }: {
   imports = [ task-board.nixosModules.task-board ];
   services.task-board.enable = true;   # binds 0.0.0.0:8079, DB at /data/task-board/board.db
 }
 ```
 
-Then rebuild green-machine from the flake (`just switch`). The DB lives on `/data` (off
-the root filesystem). Endpoints: `http://green-machine.lan:8079/` (UI),
-`…/api` (REST), `…/mcp` (MCP). Wire the MCP endpoint into an agent's Claude config:
+Then rebuild the host from the flake. Endpoints: `http://<host>:8079/` (UI), `…/api`
+(REST), `…/mcp` (MCP). Wire the MCP endpoint into an agent's client config:
 
 ```json
-{ "task-board": { "type": "http", "url": "http://green-machine.lan:8079/mcp" } }
+{ "task-board": { "type": "http", "url": "http://<host>:8079/mcp" } }
 ```

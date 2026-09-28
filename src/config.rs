@@ -1,10 +1,9 @@
-//! Task-board settings, overridable via TB_* env vars — a faithful port of the
-//! Python `board.config` module.
+//! Task-board settings, overridable via TB_* env vars.
 
 use std::time::Duration;
 
 /// Reference vocabulary. Not hard-enforced (agents may use others), but these are the
-/// blessed values the concierge / UX understand.
+/// blessed values the UI understands.
 pub const TASK_STATUSES: &[&str] = &["todo", "in_progress", "blocked", "done", "cancelled"];
 pub const PROJECT_STATUSES: &[&str] = &["active", "archived"];
 pub const AGENT_STATUSES: &[&str] = &["online", "busy", "away", "offline"];
