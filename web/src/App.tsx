@@ -122,7 +122,7 @@ export default function App() {
           agent coordination · MCP + REST
         </span>
         <a
-          href={`${import.meta.env.BASE_URL.replace(/\/$/, '')}/api`}
+          href={new URL('api', document.baseURI).href}
           target="_blank"
           rel="noreferrer"
           className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"

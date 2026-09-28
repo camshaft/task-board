@@ -121,20 +121,20 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
-    // Optionally serve the built web UI at / (static assets, SPA fallback to index.html
-    // with a 200 so client-side routing works).
+    // Optionally serve the built web UI at /. Assets come from ServeDir; every request
+    // for index.html (the directory index at `/` and the SPA fallback) goes through
+    // `serve_index`, which injects a <base href> so the app works at the origin root or
+    // under a reverse-proxy sub-path — driven entirely by the X-Forwarded-Prefix header,
+    // nothing baked in at build time. `append_index_html_on_directories(false)` makes `/`
+    // miss in ServeDir and fall through to that handler instead of the raw file.
     if let Some(dir) = &cfg.web_dir {
-        let index_path = format!("{dir}/index.html");
-        let serve = ServeDir::new(dir).fallback(axum::routing::get(move || {
-            let index_path = index_path.clone();
-            async move {
-                match tokio::fs::read_to_string(&index_path).await {
-                    Ok(html) => Html(html).into_response(),
-                    Err(_) => (axum::http::StatusCode::NOT_FOUND, "index.html missing")
-                        .into_response(),
-                }
-            }
-        }));
+        let index_path: std::sync::Arc<str> = format!("{dir}/index.html").into();
+        let serve = ServeDir::new(dir)
+            .append_index_html_on_directories(false)
+            .fallback(axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let index_path = index_path.clone();
+                async move { serve_index(&index_path, &headers).await }
+            }));
         router = router.fallback_service(serve);
         tracing::info!("serving web UI from {dir}");
     }
@@ -150,4 +150,34 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+/// Serve index.html with a `<base href>` injected so relative asset/API URLs resolve
+/// under whatever path the app is mounted at. The mount is read from `X-Forwarded-Prefix`
+/// (set by a sub-path reverse proxy); absent that, the base is `/` (origin root). Returns
+/// 200 so client-side routing works on deep links.
+async fn serve_index(index_path: &str, headers: &axum::http::HeaderMap) -> axum::response::Response {
+    let html = match tokio::fs::read_to_string(index_path).await {
+        Ok(h) => h,
+        Err(_) => {
+            return (axum::http::StatusCode::NOT_FOUND, "index.html missing").into_response()
+        }
+    };
+    // Normalize the forwarded prefix to exactly one leading and one trailing slash, e.g.
+    // "/board" or "board/" -> "/board/", empty/unset -> "/". A trailing slash is required
+    // for <base href> to resolve "./assets/x" as "{prefix}/assets/x".
+    let prefix = headers
+        .get("x-forwarded-prefix")
+        .and_then(|v| v.to_str().ok())
+        .map(|p| p.trim().trim_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("/{p}/"))
+        .unwrap_or_else(|| "/".to_string());
+    // Inject right after <head> so it precedes every asset reference in the document.
+    let injected = format!("<base href=\"{prefix}\">");
+    let html = match html.split_once("<head>") {
+        Some((head, rest)) => format!("{head}<head>{injected}{rest}"),
+        None => format!("{injected}{html}"),
+    };
+    Html(html).into_response()
 }
