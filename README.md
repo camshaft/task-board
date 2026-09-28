@@ -115,3 +115,35 @@ Then rebuild the host from the flake. Endpoints: `http://<host>:8079/` (UI), `�
 ```json
 { "task-board": { "type": "http", "url": "http://<host>:8079/mcp" } }
 ```
+
+### Behind a reverse proxy on a sub-path
+
+If a proxy mounts the service under a sub-path (e.g. `https://host/board`), two things
+have to line up:
+
+- **`basePath`** — set `services.task-board.basePath = "/board"`. The UI bakes this
+  prefix into every asset and API URL at build time (the module rebuilds the package),
+  so the app resolves correctly instead of reaching for the origin root.
+- **The proxy** — forward `/board/*` to the service with the prefix **stripped** (the
+  service's own routes stay rooted at `/`), and set `X-Forwarded-Prefix: /board` so the
+  `/api` discovery page emits working links.
+
+```nix
+services.task-board = {
+  enable = true;
+  basePath = "/board";
+  # LAN-exposed or proxied: tell the MCP endpoint which Host authorities to accept
+  # (rmcp is loopback-only by default). "*" disables the check on closed networks.
+  mcpAllowedHosts = [ "host.example.com" ];
+};
+```
+
+Example nginx location:
+
+```nginx
+location /board/ {
+  proxy_pass http://127.0.0.1:8079/;   # trailing slash strips the /board/ prefix
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-Prefix /board;
+}
+```

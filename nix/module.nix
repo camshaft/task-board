@@ -10,7 +10,13 @@ self:
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.task-board;
-  pkg = self.packages.${pkgs.system}.task-board;
+
+  # When served under a sub-path (basePath != "/"), the UI's asset/API prefix is baked in
+  # at build time, so rebuild the package with that base. Default keeps the flake's build.
+  pkg =
+    if cfg.basePath == "/"
+    then self.packages.${pkgs.system}.task-board
+    else self.packages.${pkgs.system}.task-board.override { basePath = cfg.basePath; };
 
   # The daemon reads a TOML config file (--config); generate it from the options below.
   settings = {
@@ -31,6 +37,20 @@ in
       default = pkg;
       defaultText = lib.literalMD "the flake's `task-board` package";
       description = "The task-board package to run.";
+    };
+
+    basePath = lib.mkOption {
+      type = lib.types.str;
+      default = "/";
+      example = "/board";
+      description = ''
+        Public URL prefix the UI is served under. Leave as "/" when task-board owns the
+        origin. Set it (e.g. "/board") when a reverse proxy mounts the service on a
+        sub-path: the prefix is baked into the built UI assets, so the package is rebuilt
+        with it. The proxy should still forward the sub-path requests to the service with
+        the prefix stripped, and set the `X-Forwarded-Prefix` header so the API discovery
+        page links resolve correctly.
+      '';
     };
 
     host = lib.mkOption {

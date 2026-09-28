@@ -188,14 +188,31 @@ async fn index(headers: HeaderMap) -> Response {
         .map(|a| a.contains("text/html"))
         .unwrap_or(false);
     if wants_html {
-        Html(render_index_html(&doc)).into_response()
+        // Behind a reverse proxy on a sub-path (e.g. /board) the proxy strips the prefix
+        // before we see the request, so our own routes are still rooted at /. The proxy
+        // advertises the external mount via X-Forwarded-Prefix; honor it so the page's
+        // links resolve for the browser. Absent (direct access) => no prefix.
+        let prefix = forwarded_prefix(&headers);
+        Html(render_index_html(&doc, &prefix)).into_response()
     } else {
         Json(doc).into_response()
     }
 }
 
+/// The external path prefix this request arrived under, from `X-Forwarded-Prefix`, with
+/// any trailing slash trimmed (so `""` or `"/board"`). Empty when direct / unset.
+fn forwarded_prefix(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-prefix")
+        .and_then(|v| v.to_str().ok())
+        .map(|p| p.trim_end_matches('/').to_string())
+        .unwrap_or_default()
+}
+
 /// Render the discovery document as a standalone HTML page (no build step, no JS deps).
-fn render_index_html(doc: &Value) -> String {
+/// `prefix` is the external mount path (e.g. "/board" or ""), prepended to every link so
+/// the page works whether served at the origin root or behind a sub-path proxy.
+fn render_index_html(doc: &Value, prefix: &str) -> String {
     let mut rows = String::new();
     for e in doc["endpoints"].as_array().unwrap() {
         let method = e["method"].as_str().unwrap_or("");
@@ -206,7 +223,13 @@ fn render_index_html(doc: &Value) -> String {
         let is_get = method == "GET";
         let clickable = is_get && !path.contains('{');
         let path_cell = if clickable {
-            format!("<a href=\"{p}\">{p}</a>", p = html_escape(path))
+            // Link target carries the external prefix; the displayed text stays the clean
+            // origin-rooted path so the docs read the same regardless of mount point.
+            format!(
+                "<a href=\"{href}\">{p}</a>",
+                href = html_escape(&format!("{prefix}{path}")),
+                p = html_escape(path),
+            )
         } else {
             format!("<span>{}</span>", html_escape(path))
         };
@@ -279,9 +302,9 @@ fn render_index_html(doc: &Value) -> String {
   <div class="top">
     <h1><span class="sky">task</span>-board API</h1>
     <span class="badge">v{version}</span>
-    <span class="badge">· <a href="/">web UI</a> · MCP at <code>/mcp</code></span>
+    <span class="badge">· <a href="{prefix}/">web UI</a> · MCP at <code>{prefix}/mcp</code></span>
   </div>
-  <p class="lede">REST surface for the agent coordination board. GET links are live — click to try them. This page is also available as JSON (send <code>Accept: application/json</code> or fetch <code>/api</code>).</p>
+  <p class="lede">REST surface for the agent coordination board. GET links are live — click to try them. This page is also available as JSON (send <code>Accept: application/json</code> or fetch <code>{prefix}/api</code>).</p>
   <table>
     <thead><tr><th>Method</th><th>Path</th><th>Summary</th><th>Body</th></tr></thead>
     <tbody>{rows}</tbody>

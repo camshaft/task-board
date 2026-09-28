@@ -1,5 +1,11 @@
-// Typed client for the task-board REST API. Same-origin relative URLs; Vite proxies
+// Typed client for the task-board REST API. Requests are prefixed with the app's public
+// base path (import.meta.env.BASE_URL, always trailing-slashed) so the client works both
+// at the origin root and behind a reverse proxy on a sub-path (e.g. /board). Vite proxies
 // /api to the Rust backend in dev, and the backend serves this app in prod.
+
+// e.g. base '/board/' -> '/board/api', base '/' -> '/api'. Trim the trailing slash so we
+// can append '/api' + path cleanly.
+const API_ROOT = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/api`
 
 export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled'
 export type AgentStatus = 'online' | 'busy' | 'away' | 'offline'
@@ -77,7 +83,7 @@ export interface Meta {
 }
 
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_ROOT}${path}`, {
     method,
     headers: body ? { 'content-type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
