@@ -1,0 +1,444 @@
+//! MCP server exposing the task board to agents over streamable-HTTP.
+//!
+//! Identity is trust-on-first-use (LAN, no auth yet): tools that act on someone's behalf
+//! take an explicit agent id (you pass your own handle). Reads return pretty JSON; writes
+//! return the new/affected ids. A faithful port of the Python `board.server` tool surface.
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
+};
+use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::core;
+use crate::db::Pool;
+
+#[derive(Clone)]
+pub struct Board {
+    pool: Pool,
+    // Populated and consumed by the #[tool_router]/#[tool_handler] macros.
+    #[allow(dead_code)]
+    tool_router: ToolRouter<Board>,
+}
+
+/// Pretty-print like the Python `_j` (indent=2, default=str).
+fn j(v: &Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+fn ok(v: Value) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::success(vec![ContentBlock::text(j(&v))]))
+}
+
+fn err(e: anyhow::Error) -> McpError {
+    McpError::internal_error(e.to_string(), None)
+}
+
+// --- Parameter structs (one per tool that takes args) ---
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RegisterAgentArgs {
+    /// Stable handle others address you by (e.g. 'concierge', 'agent:fixer-3').
+    pub agent_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// If set, every event delivered to your inbox is also POSTed here (best-effort).
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetStatusArgs {
+    pub agent_id: String,
+    /// online / busy / away / offline
+    pub status: String,
+    #[serde(default)]
+    pub status_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateProjectArgs {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListProjectsArgs {
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetProjectArgs {
+    pub project_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateTaskArgs {
+    pub project_id: i64,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// Arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...).
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateTaskArgs {
+    pub task_id: i64,
+    /// todo / in_progress / blocked / done / cancelled
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Set to your agent id so you aren't notified of your own change.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// MERGED into the task's props.
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetTaskPropsArgs {
+    pub task_id: i64,
+    pub props: Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetTaskArgs {
+    pub task_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListTasksArgs {
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommentTaskArgs {
+    pub task_id: i64,
+    pub body: String,
+    #[serde(default)]
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubscribeArgs {
+    pub subscriber: String,
+    #[serde(default)]
+    pub task_id: Option<i64>,
+    #[serde(default)]
+    pub project_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckNotificationsArgs {
+    pub agent_id: String,
+    #[serde(default = "default_true")]
+    pub mark_read: bool,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendMessageArgs {
+    pub from_agent: String,
+    pub to_agent: String,
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetMessagesArgs {
+    pub agent_id: String,
+    #[serde(default = "default_true")]
+    pub mark_read: bool,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetEventsArgs {
+    #[serde(default)]
+    pub since_seq: i64,
+    #[serde(default = "default_events_limit")]
+    pub limit: i64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_limit() -> i64 {
+    50
+}
+fn default_events_limit() -> i64 {
+    100
+}
+
+fn s(o: &Option<String>) -> Option<&str> {
+    o.as_deref()
+}
+
+#[tool_router]
+impl Board {
+    pub fn new(pool: Pool) -> Self {
+        Self {
+            pool,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    // --- Agents / presence ---
+    #[tool(
+        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'concierge', 'agent:fixer-3'). If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort)."
+    )]
+    async fn register_agent(
+        &self,
+        Parameters(a): Parameters<RegisterAgentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::register_agent(&self.pool, &a.agent_id, s(&a.display_name), s(&a.kind), s(&a.webhook_url))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Set your presence: online / busy / away / offline (+ an optional note).")]
+    async fn set_status(
+        &self,
+        Parameters(a): Parameters<SetStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::set_status(&self.pool, &a.agent_id, &a.status, s(&a.status_message))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "List all registered agents with their presence and last-seen time.")]
+    async fn list_agents(&self) -> Result<CallToolResult, McpError> {
+        core::list_agents(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    // --- Projects ---
+    #[tool(description = "Create a project (a container for tasks). Returns the new project, incl. its id.")]
+    async fn create_project(
+        &self,
+        Parameters(a): Parameters<CreateProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::create_project(&self.pool, &a.name, s(&a.description), s(&a.created_by))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "List projects (optionally filtered by status) with per-status task counts.")]
+    async fn list_projects(
+        &self,
+        Parameters(a): Parameters<ListProjectsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_projects(&self.pool, s(&a.status)).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Get one project and its tasks.")]
+    async fn get_project(
+        &self,
+        Parameters(a): Parameters<GetProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_project(&self.pool, a.project_id).await.map_err(err).and_then(ok)
+    }
+
+    // --- Tasks ---
+    #[tool(
+        description = "Create a task in a project. The creator and assignee are auto-subscribed, so they get notified of future changes. `metadata` is an optional dict of arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...). Returns the new task incl. its id."
+    )]
+    async fn create_task(
+        &self,
+        Parameters(a): Parameters<CreateTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::create_task(
+            &self.pool,
+            a.project_id,
+            &a.title,
+            s(&a.description),
+            s(&a.assignee),
+            s(&a.priority),
+            s(&a.created_by),
+            a.metadata,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage)."
+    )]
+    async fn update_task(
+        &self,
+        Parameters(a): Parameters<UpdateTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::update_task(
+            &self.pool,
+            a.task_id,
+            s(&a.status),
+            s(&a.assignee),
+            s(&a.title),
+            s(&a.description),
+            s(&a.priority),
+            s(&a.actor),
+            a.metadata,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Merge arbitrary key/value properties into a task's metadata (JSON) without touching its status/assignee — e.g. {\"ipfs_cid\": \"bafy...\", \"collection\": \"crate.tokio.1.53\"}. Returns the merged metadata."
+    )]
+    async fn set_task_props(
+        &self,
+        Parameters(a): Parameters<SetTaskPropsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::set_task_props(&self.pool, a.task_id, a.props).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Get one task with its comments and subscribers.")]
+    async fn get_task(
+        &self,
+        Parameters(a): Parameters<GetTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_task(&self.pool, a.task_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee.")]
+    async fn list_tasks(
+        &self,
+        Parameters(a): Parameters<ListTasksArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Add a comment to a task. Notifies the task's subscribers/assignee (except you).")]
+    async fn comment_task(
+        &self,
+        Parameters(a): Parameters<CommentTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::comment_task(&self.pool, a.task_id, &a.body, s(&a.author))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    // --- Subscriptions ---
+    #[tool(description = "Subscribe an agent to a task OR a project so it's notified of changes there.")]
+    async fn subscribe(
+        &self,
+        Parameters(a): Parameters<SubscribeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::subscribe(&self.pool, &a.subscriber, a.task_id, a.project_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Stop notifying an agent about a task or project.")]
+    async fn unsubscribe(
+        &self,
+        Parameters(a): Parameters<SubscribeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::unsubscribe(&self.pool, &a.subscriber, a.task_id, a.project_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    // --- Notifications / direct messages ---
+    #[tool(
+        description = "Drain your inbox: the unread events on things you're subscribed to, plus direct messages sent to you. This is the primary way to 'get notified' — call it when you check in. Marks them read unless mark_read=false."
+    )]
+    async fn check_notifications(
+        &self,
+        Parameters(a): Parameters<CheckNotificationsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::check_notifications(&self.pool, &a.agent_id, a.mark_read, a.limit, None)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Send a direct message to another agent (lands in their inbox; webhook-pushed if they registered one). Use this to reach the 'concierge' — it relays to Cameron."
+    )]
+    async fn send_message(
+        &self,
+        Parameters(a): Parameters<SendMessageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::send_message(&self.pool, &a.from_agent, &a.to_agent, &a.body)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Just your direct messages (a filtered view of your inbox).")]
+    async fn get_messages(
+        &self,
+        Parameters(a): Parameters<GetMessagesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_messages(&self.pool, &a.agent_id, a.mark_read, a.limit)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Read the raw append-only event log after `since_seq` (the audit trail of everything).")]
+    async fn get_events(
+        &self,
+        Parameters(a): Parameters<GetEventsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_events(&self.pool, a.since_seq, a.limit).await.map_err(err).and_then(ok)
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for Board {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions(
+                "Task-board: a coordination board for agents. Register yourself, create \
+                 projects/tasks, comment, subscribe, and drain your inbox with \
+                 check_notifications."
+                    .to_string(),
+            )
+    }
+}

@@ -1,0 +1,15 @@
+# Rust
+/target
+
+# Nix
+/result
+/result-*
+
+# Web
+web/node_modules
+web/dist
+
+# SQLite
+*.db
+*.db-wal
+*.db-shm
