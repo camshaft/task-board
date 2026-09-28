@@ -1,27 +1,35 @@
 import { useEffect, useState } from 'react'
+import { useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import { api, type Task, type TaskStatus } from './api'
 import { relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
-// A slide-over panel showing one task: fields, editable status/assignee, comments.
-export function TaskDrawer({
-  taskId,
-  actor,
-  onClose,
-  onChanged,
-}: {
-  taskId: number
+// Context handed down by the Board route (the parent <Outlet/>).
+interface DrawerContext {
   actor: string
-  onClose: () => void
-  onChanged: () => void
-}) {
+  refreshBoard: () => void
+  refreshChrome: () => void
+}
+
+// A slide-over panel showing one task (from the :taskId route param): fields, editable
+// status/assignee, comments. Closing is just navigating back to the project.
+export function TaskDrawer() {
+  const { projectId, taskId } = useParams()
+  const navigate = useNavigate()
+  const { actor, refreshBoard, refreshChrome } = useOutletContext<DrawerContext>()
   const [task, setTask] = useState<Task | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [comment, setComment] = useState('')
   const [busy, setBusy] = useState(false)
 
+  const onClose = () => navigate(`/projects/${projectId}`)
+  const onChanged = () => {
+    refreshBoard()
+    refreshChrome()
+  }
+
   async function load() {
     try {
-      setTask(await api.getTask(taskId))
+      setTask(await api.getTask(Number(taskId)))
     } catch (e) {
       setError((e as Error).message)
     }

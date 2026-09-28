@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useState } from 'react'
-import {
-  api,
-  type Agent,
-  type EventRow,
-  type Project,
-  type TaskSummary,
-} from './api'
-import { TaskDrawer } from './TaskDrawer'
-import { AGENT_DOT, PriorityDot, relTime, STATUS_LABEL, TASK_COLUMNS } from './ui'
+import { Link, Outlet, useNavigate, useOutletContext, useParams } from 'react-router-dom'
+import { api, type Agent, type EventRow, type Project } from './api'
+import { AGENT_DOT, relTime } from './ui'
+
+// Shared data + helpers handed to nested routes (Board, TaskDrawer) via the router's
+// outlet context, so they don't refetch the chrome or thread props by hand.
+export interface BoardContext {
+  actor: string
+  projects: Project[]
+  // Re-fetch the chrome data (project list + counts, agents, activity feed). Nested
+  // routes call this after a mutation so sidebar counts and the feed stay current.
+  refreshChrome: () => void
+}
+
+export function useBoardContext() {
+  return useOutletContext<BoardContext>()
+}
 
 // Your identity on the board. Persisted so actions (comments, status changes) are
 // attributed and you aren't notified of your own changes. Trust-on-first-use, no auth.
@@ -21,37 +29,25 @@ function useActor(): [string, (v: string) => void] {
   return [actor, set]
 }
 
-export default function App() {
+// The persistent chrome — header, project/agent sidebar, activity feed — around an
+// <Outlet/> that renders whichever project/task the URL points at.
+export default function Layout() {
+  const navigate = useNavigate()
+  const { projectId } = useParams()
+  const selectedProject = projectId != null ? Number(projectId) : null
   const [actor, setActor] = useActor()
   const [projects, setProjects] = useState<Project[]>([])
   const [agents, setAgents] = useState<Agent[]>([])
-  const [selectedProject, setSelectedProject] = useState<number | null>(null)
-  const [tasks, setTasks] = useState<TaskSummary[]>([])
-  const [openTask, setOpenTask] = useState<number | null>(null)
   const [events, setEvents] = useState<EventRow[]>([])
   const [error, setError] = useState<string | null>(null)
 
   const refreshProjects = useCallback(async () => {
     try {
-      const ps = await api.listProjects()
-      setProjects(ps)
-      setSelectedProject((cur) => cur ?? (ps.length ? ps[0].id : null))
+      setProjects(await api.listProjects())
     } catch (e) {
       setError((e as Error).message)
     }
   }, [])
-
-  const refreshTasks = useCallback(async () => {
-    if (selectedProject == null) {
-      setTasks([])
-      return
-    }
-    try {
-      setTasks(await api.listTasks({ project_id: selectedProject }))
-    } catch (e) {
-      setError((e as Error).message)
-    }
-  }, [selectedProject])
 
   const refreshSide = useCallback(async () => {
     try {
@@ -62,23 +58,19 @@ export default function App() {
     }
   }, [])
 
+  const refreshChrome = useCallback(() => {
+    refreshProjects()
+    refreshSide()
+  }, [refreshProjects, refreshSide])
+
   useEffect(() => {
     refreshProjects()
   }, [refreshProjects])
-  useEffect(() => {
-    refreshTasks()
-  }, [refreshTasks])
   useEffect(() => {
     refreshSide()
     const t = setInterval(refreshSide, 5000)
     return () => clearInterval(t)
   }, [refreshSide])
-
-  const refreshAll = useCallback(() => {
-    refreshTasks()
-    refreshProjects()
-    refreshSide()
-  }, [refreshTasks, refreshProjects, refreshSide])
 
   async function newProject() {
     const name = window.prompt('Project name:')
@@ -86,38 +78,18 @@ export default function App() {
     try {
       const p = await api.createProject({ name: name.trim(), created_by: actor })
       await refreshProjects()
-      setSelectedProject(p.id)
+      navigate(`projects/${p.id}`) // opening the new project is just navigation
     } catch (e) {
       setError((e as Error).message)
     }
   }
-
-  async function newTask() {
-    if (selectedProject == null) return
-    const title = window.prompt('Task title:')
-    if (!title?.trim()) return
-    const assignee = window.prompt('Assignee (agent id, optional):') || undefined
-    try {
-      await api.createTask({
-        project_id: selectedProject,
-        title: title.trim(),
-        assignee,
-        created_by: actor,
-      })
-      refreshAll()
-    } catch (e) {
-      setError((e as Error).message)
-    }
-  }
-
-  const current = projects.find((p) => p.id === selectedProject)
 
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center gap-4 border-b border-[var(--color-border)] px-5 py-3">
-        <h1 className="text-base font-semibold tracking-tight">
+        <Link to="/" className="text-base font-semibold tracking-tight">
           <span className="text-sky-400">task</span>-board
-        </h1>
+        </Link>
         <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
           agent coordination · MCP + REST
         </span>
@@ -167,9 +139,9 @@ export default function App() {
             {projects.map((p) => {
               const total = Object.values(p.task_counts ?? {}).reduce((a, b) => a + b, 0)
               return (
-                <button
+                <Link
                   key={p.id}
-                  onClick={() => setSelectedProject(p.id)}
+                  to={`projects/${p.id}`}
                   className={`mb-1 flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm ${
                     p.id === selectedProject
                       ? 'bg-sky-500/15 text-sky-100'
@@ -178,7 +150,7 @@ export default function App() {
                 >
                   <span className="truncate">{p.name}</span>
                   <span className="ml-2 text-xs text-[var(--color-muted)]">{total}</span>
-                </button>
+                </Link>
               )
             })}
             {projects.length === 0 && (
@@ -211,59 +183,8 @@ export default function App() {
           </div>
         </aside>
 
-        {/* Board */}
-        <main className="flex min-w-0 flex-1 flex-col">
-          <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
-            <h2 className="truncate text-sm font-semibold">
-              {current?.name ?? 'Select a project'}
-            </h2>
-            {current && (
-              <button
-                onClick={newTask}
-                className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
-              >
-                + task
-              </button>
-            )}
-          </div>
-
-          <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto p-4">
-            {TASK_COLUMNS.map((col) => {
-              const items = tasks.filter((t) => t.status === col)
-              return (
-                <div key={col} className="flex w-72 shrink-0 flex-col">
-                  <div className="mb-2 flex items-center justify-between px-1">
-                    <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-                      {STATUS_LABEL[col]}
-                    </span>
-                    <span className="text-xs text-[var(--color-muted)]">{items.length}</span>
-                  </div>
-                  <div className="flex flex-1 flex-col gap-2 rounded-lg bg-[var(--color-panel)]/40 p-2">
-                    {items.map((t) => (
-                      <button
-                        key={t.id}
-                        onClick={() => setOpenTask(t.id)}
-                        className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 text-left transition hover:border-sky-500/40"
-                      >
-                        <div className="mb-2 flex items-start gap-2">
-                          <PriorityDot priority={t.priority} />
-                          <span className="text-sm leading-snug">{t.title}</span>
-                        </div>
-                        <div className="flex items-center justify-between text-xs text-[var(--color-muted)]">
-                          <span className="font-mono">#{t.id}</span>
-                          {t.assignee && <span className="font-mono">{t.assignee}</span>}
-                        </div>
-                      </button>
-                    ))}
-                    {items.length === 0 && (
-                      <div className="px-1 py-2 text-xs text-[var(--color-muted)]/60">—</div>
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </main>
+        {/* Whatever the URL points at: the board for a project, plus the task drawer. */}
+        <Outlet context={{ actor, projects, refreshChrome } satisfies BoardContext} />
 
         {/* Event feed */}
         <aside className="hidden w-72 shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-panel)] xl:flex">
@@ -295,15 +216,6 @@ export default function App() {
           </div>
         </aside>
       </div>
-
-      {openTask != null && (
-        <TaskDrawer
-          taskId={openTask}
-          actor={actor}
-          onClose={() => setOpenTask(null)}
-          onChanged={refreshAll}
-        />
-      )}
     </div>
   )
 }
