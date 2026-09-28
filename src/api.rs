@@ -569,3 +569,79 @@ fn default_limit() -> i64 {
 fn default_events_limit() -> i64 {
     100
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Every request-body struct named in `ENDPOINTS` must have a generated schema.
+    #[test]
+    fn every_body_ref_has_a_schema() {
+        let schemas = body_schemas();
+        let schemas = schemas.as_object().unwrap();
+        for e in ENDPOINTS {
+            if let Some(name) = e.body {
+                assert!(
+                    schemas.contains_key(name),
+                    "endpoint {} {} references body schema `{name}`, but body_schemas() has none",
+                    e.method,
+                    e.path,
+                );
+            }
+        }
+    }
+
+    /// The discovery catalog (`ENDPOINTS`) must match the actual axum router exactly.
+    /// axum doesn't expose its route table, so we parse the `.route(...)` lines out of
+    /// this file's own source. A new route with no catalog entry — or a stale catalog
+    /// entry for a route that's gone — fails the test.
+    #[test]
+    fn catalog_matches_router() {
+        let src = include_str!("api.rs");
+
+        // Slice out the body of `pub fn router(...) { ... }`.
+        let start = src.find("pub fn router").expect("router fn");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("router fn end");
+        let body = &body[..end];
+
+        // Each `.route("PATH", get(..).post(..))` line contributes one (METHOD, PATH)
+        // pair per HTTP-method combinator it names.
+        let mut from_router: BTreeSet<(String, String)> = BTreeSet::new();
+        for line in body.lines() {
+            let Some(after) = line.split_once(".route(\"").map(|x| x.1) else {
+                continue;
+            };
+            let (path, rest) = after.split_once('"').expect("closing quote on route path");
+            let full = if path == "/" {
+                "/api".to_string()
+            } else {
+                format!("/api{path}")
+            };
+            for (kw, method) in [
+                ("get(", "GET"),
+                ("post(", "POST"),
+                ("patch(", "PATCH"),
+                ("delete(", "DELETE"),
+                ("put(", "PUT"),
+            ] {
+                if rest.contains(kw) {
+                    from_router.insert((method.to_string(), full.clone()));
+                }
+            }
+        }
+
+        let from_catalog: BTreeSet<(String, String)> = ENDPOINTS
+            .iter()
+            .map(|e| (e.method.to_string(), e.path.to_string()))
+            .collect();
+
+        let missing: Vec<_> = from_router.difference(&from_catalog).collect();
+        let stale: Vec<_> = from_catalog.difference(&from_router).collect();
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "ENDPOINTS is out of sync with router().\n  routes missing from catalog: {missing:?}\n  stale catalog entries: {stale:?}",
+        );
+    }
+}
