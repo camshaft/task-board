@@ -186,14 +186,14 @@ mod tests {
 
         // A project created before the tailer starts must NOT be re-broadcast (it's history;
         // clients get it from their initial fetch / replay).
-        core::create_project(&pool, "old", None, Some("u")).await?;
+        core::create_project(&pool, "old", None, Some("u"), None).await?;
 
         let tx = channel();
         let mut rx = tx.subscribe();
         spawn_tailer(pool.clone(), tx);
 
         // A task created after the tailer starts should arrive on the bus.
-        let p = core::create_project(&pool, "live", None, Some("u")).await?;
+        let p = core::create_project(&pool, "live", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         let t = core::create_task(&pool, pid, "T", None, None, None, Some("u"), None).await?;
         let tid = t["id"].as_i64().unwrap();
@@ -233,7 +233,7 @@ mod tests {
     async fn fetch_since_returns_gap_in_order() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let p = core::create_project(&pool, "p", None, Some("u")).await?;
+        let p = core::create_project(&pool, "p", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         for i in 0..3 {
             core::create_task(&pool, pid, &format!("t{i}"), None, None, None, Some("u"), None).await?;

@@ -37,6 +37,9 @@ export default function Layout() {
   const { data: projects = [], error: projectsError } = useProjects()
   const { data: agents = [] } = useAgents()
   const { data: events = [] } = useEvents()
+  const [showArchived, setShowArchived] = useState(false)
+  const activeProjects = projects.filter((p) => p.status !== 'archived')
+  const archivedProjects = projects.filter((p) => p.status === 'archived')
 
   async function newProject() {
     const name = window.prompt('Project name:')
@@ -97,7 +100,7 @@ export default function Layout() {
             </button>
           </div>
           <nav className="flex-1 overflow-y-auto px-2">
-            {projects.map((p) => {
+            {activeProjects.map((p) => {
               const total = Object.values(p.task_counts ?? {}).reduce((a, b) => a + b, 0)
               return (
                 <Link
@@ -114,8 +117,37 @@ export default function Layout() {
                 </Link>
               )
             })}
-            {projects.length === 0 && (
+            {activeProjects.length === 0 && (
               <p className="px-3 py-2 text-sm text-[var(--color-muted)]">No projects yet.</p>
+            )}
+
+            {/* Archived projects: collapsed by default, but reachable so they can be
+                restored (or their tasks moved out). */}
+            {archivedProjects.length > 0 && (
+              <div className="mt-2">
+                <button
+                  onClick={() => setShowArchived((v) => !v)}
+                  className="flex w-full items-center gap-1 rounded px-3 py-1.5 text-left text-[11px] uppercase tracking-wide text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+                >
+                  <span>{showArchived ? '▾' : '▸'}</span>
+                  <span>Archived</span>
+                  <span className="ml-auto">{archivedProjects.length}</span>
+                </button>
+                {showArchived &&
+                  archivedProjects.map((p) => (
+                    <Link
+                      key={p.id}
+                      to={`projects/${p.id}`}
+                      className={`mb-1 flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm ${
+                        p.id === selectedProject
+                          ? 'bg-sky-500/15 text-sky-100'
+                          : 'text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]'
+                      }`}
+                    >
+                      <span className="truncate italic">{p.name}</span>
+                    </Link>
+                  ))}
+              </div>
             )}
           </nav>
 

@@ -27,6 +27,7 @@ export interface Project {
   name: string
   description: string | null
   status: string
+  metadata: Record<string, unknown>
   created_by: string | null
   created_at: string
   updated_at: string
@@ -120,8 +121,22 @@ export const api = {
   listProjects: (status?: string) =>
     req<Project[]>('GET', `/projects${status ? `?status=${encodeURIComponent(status)}` : ''}`),
   getProject: (id: number) => req<Project>('GET', `/projects/${id}`),
-  createProject: (b: { name: string; description?: string; created_by?: string }) =>
-    req<Project>('POST', '/projects', b),
+  createProject: (b: {
+    name: string
+    description?: string
+    created_by?: string
+    metadata?: Record<string, unknown>
+  }) => req<Project>('POST', '/projects', b),
+  updateProject: (
+    id: number,
+    b: {
+      name?: string
+      description?: string
+      status?: string
+      metadata?: Record<string, unknown>
+      actor?: string
+    },
+  ) => req<Project>('PATCH', `/projects/${id}`, b),
 
   listTasks: (q: { project_id?: number; status?: string; assignee?: string } = {}) => {
     const p = new URLSearchParams()
@@ -155,6 +170,8 @@ export const api = {
   ) => req<Task>('PATCH', `/tasks/${id}`, b),
   commentTask: (id: number, b: { body: string; author?: string }) =>
     req<{ comment_id: number; task_id: number }>('POST', `/tasks/${id}/comments`, b),
+  moveTask: (id: number, b: { to_project_id: number; actor?: string }) =>
+    req<Task>('POST', `/tasks/${id}/move`, b),
 
   getEvents: (since_seq = 0, limit = 100) =>
     req<EventRow[]>('GET', `/events?since_seq=${since_seq}&limit=${limit}`),

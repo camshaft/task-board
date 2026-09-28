@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS projects (
     name        TEXT NOT NULL,
     description TEXT,
     status      TEXT NOT NULL DEFAULT 'active',
+    metadata    TEXT NOT NULL DEFAULT '{}',
     created_by  TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
@@ -111,6 +112,20 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .any(|r| r.get::<String, _>("name") == "metadata");
     if !has_metadata {
         sqlx::query("ALTER TABLE tasks ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Same back-fill for projects.metadata (added when projects gained arbitrary props, e.g.
+    // a repo link). An old board.db created before it keeps working: existing rows default
+    // to '{}'.
+    let projects_have_metadata = sqlx::query("PRAGMA table_info(projects)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "metadata");
+    if !projects_have_metadata {
+        sqlx::query("ALTER TABLE projects ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
             .execute(&pool)
             .await?;
     }

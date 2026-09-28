@@ -187,6 +187,7 @@ pub async fn create_project(
     name: &str,
     description: Option<&str>,
     created_by: Option<&str>,
+    metadata: Option<Value>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -202,19 +203,19 @@ pub async fn create_project(
         .await?
     {
         let existing_id: i64 = row.try_get("id")?;
-        let out = fetch_one_json(&mut tx, "SELECT * FROM projects WHERE id=?", existing_id)
-            .await?
-            .unwrap_or(Value::Null);
+        let out = project_json(&mut tx, existing_id).await?.unwrap_or(Value::Null);
         tx.commit().await?;
         return Ok(out);
     }
 
+    let meta_str = metadata.unwrap_or_else(|| json!({})).to_string();
     let pid: i64 = sqlx::query(
-        "INSERT INTO projects(name, description, created_by, created_at, updated_at) \
-         VALUES(?,?,?,?,?) RETURNING id",
+        "INSERT INTO projects(name, description, metadata, created_by, created_at, updated_at) \
+         VALUES(?,?,?,?,?,?) RETURNING id",
     )
     .bind(name)
     .bind(description)
+    .bind(&meta_str)
     .bind(created_by)
     .bind(&ts)
     .bind(&ts)
@@ -232,9 +233,144 @@ pub async fn create_project(
         Recipients::Explicit(BTreeSet::new()),
     )
     .await?;
-    let out = fetch_one_json(&mut tx, "SELECT * FROM projects WHERE id=?", pid)
-        .await?
-        .unwrap_or(Value::Null);
+    let out = project_json(&mut tx, pid).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Fetch one project row as JSON with its `metadata` string parsed into an object (mirrors
+/// how get_task surfaces task metadata). Returns None if the project doesn't exist.
+async fn project_json(
+    tx: &mut Transaction<'_, Sqlite>,
+    project_id: i64,
+) -> anyhow::Result<Option<Value>> {
+    let Some(mut d) = fetch_one_json(tx, "SELECT * FROM projects WHERE id=?", project_id).await?
+    else {
+        return Ok(None);
+    };
+    if let Value::Object(ref mut m) = d {
+        let meta: Value = m
+            .get("metadata")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        m.insert("metadata".into(), meta);
+    }
+    Ok(Some(d))
+}
+
+/// Update a project's mutable fields — any subset of name, description, status, metadata.
+/// Name changes are case-insensitively unique (reusing the get-or-create invariant): renaming
+/// onto an existing project's name (other than itself) is rejected. `metadata` is MERGED into
+/// the existing props, not replaced (same semantics as tasks). Emits `project.updated`.
+pub async fn update_project(
+    pool: &Pool,
+    project_id: i64,
+    name: Option<&str>,
+    description: Option<&str>,
+    status: Option<&str>,
+    metadata: Option<Value>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+
+    let old = sqlx::query("SELECT * FROM projects WHERE id=?")
+        .bind(project_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(old) = old else {
+        anyhow::bail!("no project {project_id}");
+    };
+    let old_name: String = old.try_get("name")?;
+    let old_status: Option<String> = old.try_get("status")?;
+    let old_metadata: Option<String> = old.try_get("metadata")?;
+
+    // A rename must not collide with another project's (case-folded) name — that would
+    // reintroduce the duplicate sprawl create_project's get-or-create prevents.
+    if let Some(new_name) = name {
+        if !new_name.eq_ignore_ascii_case(&old_name) {
+            let clash = sqlx::query("SELECT 1 FROM projects WHERE name = ? COLLATE NOCASE AND id != ?")
+                .bind(new_name)
+                .bind(project_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+            if clash {
+                anyhow::bail!("give a unique name: a project named '{new_name}' already exists");
+            }
+        }
+    }
+
+    let mut set_clauses: Vec<String> = Vec::new();
+    let fields: [(&str, Option<&str>); 3] = [
+        ("name", name),
+        ("description", description),
+        ("status", status),
+    ];
+    for (col, val) in fields.iter() {
+        if val.is_some() {
+            set_clauses.push(format!("{col}=?"));
+        }
+    }
+    let merged_meta: Option<String> = if let Some(meta) = metadata {
+        let mut base: Map<String, Value> =
+            serde_json::from_str(old_metadata.as_deref().unwrap_or("{}")).unwrap_or_default();
+        if let Value::Object(m) = meta {
+            for (k, v) in m {
+                base.insert(k, v);
+            }
+        }
+        set_clauses.push("metadata=?".to_string());
+        Some(Value::Object(base).to_string())
+    } else {
+        None
+    };
+
+    if set_clauses.is_empty() {
+        // Nothing to change — return the current project unchanged.
+        let out = project_json(&mut tx, project_id).await?.unwrap_or(Value::Null);
+        tx.commit().await?;
+        return Ok(out);
+    }
+
+    let sql = format!(
+        "UPDATE projects SET {}, updated_at=? WHERE id=?",
+        set_clauses.join(", ")
+    );
+    let mut q = sqlx::query(&sql);
+    for (_, val) in fields.iter() {
+        if let Some(v) = val {
+            q = q.bind(*v);
+        }
+    }
+    if let Some(ref m) = merged_meta {
+        q = q.bind(m);
+    }
+    q = q.bind(&ts).bind(project_id);
+    q.execute(&mut *tx).await?;
+
+    // A status flip to/from 'archived' is the notable case; surface it in the event data so
+    // the feed can read "archived"/"unarchived" without diffing.
+    let status_changed = status.is_some() && status != old_status.as_deref();
+    emit(
+        &mut tx,
+        &mut hooks,
+        "project.updated",
+        actor,
+        None,
+        Some(project_id),
+        json!({
+            "name": name.unwrap_or(&old_name),
+            "status": status,
+            "status_changed": status_changed,
+        }),
+        Recipients::FromProject(project_id),
+    )
+    .await?;
+    let out = project_json(&mut tx, project_id).await?.unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -267,6 +403,13 @@ pub async fn list_projects(pool: &Pool, status: Option<&str>) -> anyhow::Result<
             cmap.insert(s, json!(n));
         }
         if let Value::Object(ref mut m) = d {
+            // metadata: parse JSON string -> object (mirrors get_project/get_task).
+            let meta: Value = m
+                .get("metadata")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| json!({}));
+            m.insert("metadata".into(), meta);
             m.insert("task_counts".into(), Value::Object(cmap));
         }
         out.push(d);
@@ -288,6 +431,13 @@ pub async fn get_project(pool: &Pool, project_id: i64) -> anyhow::Result<Value> 
     .fetch_all(pool)
     .await?;
     if let Value::Object(ref mut m) = d {
+        // metadata: parse JSON string -> object (mirrors get_task).
+        let meta: Value = m
+            .get("metadata")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        m.insert("metadata".into(), meta);
         m.insert(
             "tasks".into(),
             Value::Array(tasks.iter().map(row_to_json).collect()),
@@ -479,6 +629,72 @@ pub async fn update_task(
         )
         .await?;
     }
+    let out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", task_id)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Reparent a task onto a different project. Emits `task.moved` (carrying both the old and
+/// new project ids in its data) so subscribers on either project — and the live UI — learn
+/// the task left one board column set and joined another. No-op-safe: moving a task onto its
+/// current project just returns it unchanged.
+pub async fn move_task(
+    pool: &Pool,
+    task_id: i64,
+    to_project_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+
+    let old = sqlx::query("SELECT project_id, title FROM tasks WHERE id=?")
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(old) = old else {
+        anyhow::bail!("no task {task_id}");
+    };
+    let from_project_id: i64 = old.try_get("project_id")?;
+    let title: Option<String> = old.try_get("title")?;
+
+    if sqlx::query("SELECT 1 FROM projects WHERE id=?")
+        .bind(to_project_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no project {to_project_id}");
+    }
+
+    if from_project_id == to_project_id {
+        let out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", task_id)
+            .await?
+            .unwrap_or(Value::Null);
+        tx.commit().await?;
+        return Ok(out);
+    }
+
+    sqlx::query("UPDATE tasks SET project_id=?, updated_at=? WHERE id=?")
+        .bind(to_project_id)
+        .bind(&ts)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "task.moved",
+        actor,
+        Some(task_id),
+        Some(to_project_id),
+        json!({ "from_project_id": from_project_id, "to_project_id": to_project_id, "title": title }),
+        Recipients::FromTask,
+    )
+    .await?;
     let out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", task_id)
         .await?
         .unwrap_or(Value::Null);
@@ -924,7 +1140,7 @@ mod tests {
         register_agent(&pool, "planner", Some("Planner"), None, None).await?;
         register_agent(&pool, "fixer", Some("Fixer"), None, None).await?;
 
-        let p = create_project(&pool, "Voron tuning", Some("dial in the printer"), Some("planner")).await?;
+        let p = create_project(&pool, "Voron tuning", Some("dial in the printer"), Some("planner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None).await?;
         let tid = t["id"].as_i64().unwrap();
@@ -964,7 +1180,7 @@ mod tests {
     async fn metadata_merges() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let p = create_project(&pool, "P", None, None).await?;
+        let p = create_project(&pool, "P", None, None, None).await?;
         let pid = p["id"].as_i64().unwrap();
         let t = create_task(&pool, pid, "T", None, None, None, None, Some(json!({"a": 1}))).await?;
         let tid = t["id"].as_i64().unwrap();
@@ -1044,9 +1260,9 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
-        let a = create_project(&pool, "Backend", Some("first"), Some("u")).await?;
-        let b = create_project(&pool, "backend", Some("dupe"), Some("u")).await?;
-        let c = create_project(&pool, "BACKEND", None, None).await?;
+        let a = create_project(&pool, "Backend", Some("first"), Some("u"), None).await?;
+        let b = create_project(&pool, "backend", Some("dupe"), Some("u"), None).await?;
+        let c = create_project(&pool, "BACKEND", None, None, None).await?;
 
         assert_eq!(a["id"], b["id"]);
         assert_eq!(a["id"], c["id"]);
@@ -1112,6 +1328,152 @@ mod tests {
         // Running again is a no-op.
         let again = merge_duplicate_projects(&pool).await?;
         assert_eq!(again["merged_groups"], json!(0));
+        Ok(())
+    }
+
+    /// update_project renames, archives (status), and MERGES metadata; the reads surface
+    /// metadata as a parsed object.
+    #[tokio::test]
+    async fn update_project_renames_archives_and_merges_metadata() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        let p = create_project(&pool, "Alpha", None, Some("u"), Some(json!({"repo": "r1"}))).await?;
+        let pid = p["id"].as_i64().unwrap();
+        // create returns metadata parsed as an object, not a JSON string.
+        assert_eq!(p["metadata"], json!({"repo": "r1"}));
+
+        // Rename + add a metadata key (existing keys preserved = merge, not replace).
+        let up = update_project(&pool, pid, Some("Alpha Prime"), None, None, Some(json!({"lang": "rust"})), Some("u")).await?;
+        assert_eq!(up["name"], json!("Alpha Prime"));
+        assert_eq!(up["metadata"], json!({"repo": "r1", "lang": "rust"}));
+
+        // Archive it: it drops out of the active-filtered list but is still there.
+        update_project(&pool, pid, None, None, Some("archived"), None, Some("u")).await?;
+        let active = list_projects(&pool, Some("active")).await?;
+        assert_eq!(active.as_array().unwrap().len(), 0, "archived project hidden from active list");
+        let archived = list_projects(&pool, Some("archived")).await?;
+        assert_eq!(archived.as_array().unwrap().len(), 1);
+
+        // Restore.
+        update_project(&pool, pid, None, None, Some("active"), None, Some("u")).await?;
+        let active = list_projects(&pool, Some("active")).await?;
+        assert_eq!(active.as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// A rename that collides (case-insensitively) with another project is rejected.
+    #[tokio::test]
+    async fn update_project_rename_collision_is_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let a = create_project(&pool, "Alpha", None, Some("u"), None).await?;
+        create_project(&pool, "Beta", None, Some("u"), None).await?;
+        let aid = a["id"].as_i64().unwrap();
+
+        // Rename Alpha -> "beta" (different case) collides with the existing Beta.
+        let err = update_project(&pool, aid, Some("beta"), None, None, None, Some("u")).await;
+        assert!(err.is_err(), "rename onto an existing name should fail");
+
+        // Renaming to a different case of its OWN name is allowed (no real collision).
+        let ok = update_project(&pool, aid, Some("ALPHA"), None, None, None, Some("u")).await?;
+        assert_eq!(ok["name"], json!("ALPHA"));
+        Ok(())
+    }
+
+    /// move_task reparents a task and emits task.moved with both project ids; a no-op move
+    /// (same project) leaves it unchanged.
+    #[tokio::test]
+    async fn move_task_reparents_and_emits() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let a = create_project(&pool, "A", None, Some("u"), None).await?;
+        let b = create_project(&pool, "B", None, Some("u"), None).await?;
+        let aid = a["id"].as_i64().unwrap();
+        let bid = b["id"].as_i64().unwrap();
+        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None).await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        let moved = move_task(&pool, tid, bid, Some("u")).await?;
+        assert_eq!(moved["project_id"], json!(bid));
+        // It now lists under B, not A.
+        assert_eq!(list_tasks(&pool, Some(aid), None, None).await?.as_array().unwrap().len(), 0);
+        assert_eq!(list_tasks(&pool, Some(bid), None, None).await?.as_array().unwrap().len(), 1);
+
+        // A task.moved event was recorded carrying both ends.
+        let events = get_events(&pool, 0, 100).await?;
+        let ev = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == json!("task.moved"))
+            .expect("task.moved emitted");
+        assert_eq!(ev["data"]["from_project_id"], json!(aid));
+        assert_eq!(ev["data"]["to_project_id"], json!(bid));
+
+        // Moving onto the current project is a no-op (no new event, still on B).
+        let before = get_events(&pool, 0, 100).await?.as_array().unwrap().len();
+        move_task(&pool, tid, bid, Some("u")).await?;
+        let after = get_events(&pool, 0, 100).await?.as_array().unwrap().len();
+        assert_eq!(before, after, "no-op move should not emit an event");
+        Ok(())
+    }
+
+    /// move_task onto a non-existent project is rejected.
+    #[tokio::test]
+    async fn move_task_to_missing_project_fails() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let a = create_project(&pool, "A", None, Some("u"), None).await?;
+        let aid = a["id"].as_i64().unwrap();
+        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        assert!(move_task(&pool, tid, 9999, Some("u")).await.is_err());
+        Ok(())
+    }
+
+    /// A legacy board.db predating projects.metadata opens cleanly: init() back-fills the
+    /// column and project reads default it to {}.
+    #[tokio::test]
+    async fn opens_legacy_db_without_projects_metadata() -> anyhow::Result<()> {
+        use sqlx::Row;
+        use std::str::FromStr;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("legacy.db");
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+
+        // Pre-metadata projects table (no metadata column), plus a row.
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
+            let legacy = sqlx::SqlitePool::connect_with(opts).await?;
+            sqlx::query(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, \
+                 description TEXT, status TEXT NOT NULL DEFAULT 'active', created_by TEXT, \
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            )
+            .execute(&legacy)
+            .await?;
+            sqlx::query("INSERT INTO projects(name, created_at, updated_at) VALUES('old','t','t')")
+                .execute(&legacy)
+                .await?;
+            legacy.close().await;
+        }
+
+        let pool = crate::db::init(path.to_str().unwrap()).await?;
+        let has_meta = sqlx::query("PRAGMA table_info(projects)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "metadata");
+        assert!(has_meta, "migration should have added projects.metadata");
+
+        let got = get_project(&pool, 1).await?;
+        assert_eq!(got["name"], json!("old"));
+        assert_eq!(got["metadata"], json!({}));
+        // And a merge write works on the back-filled column.
+        update_project(&pool, 1, None, None, None, Some(json!({"repo": "r"})), Some("u")).await?;
+        let after = get_project(&pool, 1).await?;
+        assert_eq!(after["metadata"], json!({"repo": "r"}));
         Ok(())
     }
 }

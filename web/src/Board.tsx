@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link, Outlet, useParams } from 'react-router-dom'
 import { useBoardContext } from './Layout'
-import { createTask, useProjects, useTasks } from './resources'
+import { createTask, updateProject, useProjects, useTasks } from './resources'
 import { PriorityDot, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // The kanban board for one project (from the :projectId route param). Renders its own
@@ -26,18 +26,101 @@ export default function Board() {
   }
 
   const current = projects.find((p) => p.id === project)
+  const repo = typeof current?.metadata?.repo === 'string' ? current.metadata.repo : null
+
+  async function renameProject() {
+    if (!current) return
+    const name = window.prompt('Project name:', current.name)
+    if (name == null || !name.trim() || name.trim() === current.name) return
+    try {
+      await updateProject(project, { name: name.trim(), actor })
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  async function editRepo() {
+    if (!current) return
+    const url = window.prompt('Repository URL (blank to clear):', repo ?? '')
+    if (url == null) return
+    try {
+      await updateProject(project, { metadata: { repo: url.trim() }, actor })
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  async function archiveProject() {
+    if (!current) return
+    if (!window.confirm(`Archive “${current.name}”? It's hidden from the board but not deleted — you can restore it anytime.`)) return
+    try {
+      await updateProject(project, { status: 'archived', actor })
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  async function restoreProject() {
+    if (!current) return
+    try {
+      await updateProject(project, { status: 'active', actor })
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
   const shownError = error ?? tasksError?.message ?? null
 
   return (
     <main className="flex min-w-0 flex-1 flex-col">
       <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
         <h2 className="truncate text-sm font-semibold">{current?.name ?? `Project #${project}`}</h2>
+        {current?.status === 'archived' && (
+          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
+            archived
+          </span>
+        )}
+        {repo && (
+          <a
+            href={repo}
+            target="_blank"
+            rel="noreferrer"
+            className="max-w-[16rem] truncate text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+            title={repo}
+          >
+            {repo.replace(/^https?:\/\//, '')}
+          </a>
+        )}
         <button
           onClick={newTask}
           className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
         >
           + task
         </button>
+        {/* Project actions. Kept as small text buttons so the board stays the focus. */}
+        <div className="ml-auto flex items-center gap-1 text-xs text-[var(--color-muted)]">
+          <button onClick={renameProject} className="rounded px-2 py-1 hover:bg-[var(--color-panel-2)]">
+            Rename
+          </button>
+          <button onClick={editRepo} className="rounded px-2 py-1 hover:bg-[var(--color-panel-2)]">
+            {repo ? 'Edit repo' : '+ repo'}
+          </button>
+          {current?.status === 'archived' ? (
+            <button
+              onClick={restoreProject}
+              className="rounded px-2 py-1 text-sky-400 hover:bg-[var(--color-panel-2)]"
+            >
+              Restore
+            </button>
+          ) : (
+            <button
+              onClick={archiveProject}
+              className="rounded px-2 py-1 text-rose-400 hover:bg-[var(--color-panel-2)]"
+            >
+              Archive
+            </button>
+          )}
+        </div>
       </div>
 
       {shownError && (

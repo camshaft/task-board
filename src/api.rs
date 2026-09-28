@@ -68,11 +68,12 @@ pub fn router(state: AppState) -> Router {
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/projects", get(list_projects).post(create_project))
-        .route("/projects/{project_id}", get(get_project))
+        .route("/projects/{project_id}", get(get_project).patch(update_project))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
         .route("/tasks/{task_id}/comments", post(comment_task))
         .route("/tasks/{task_id}/props", patch(set_task_props))
+        .route("/tasks/{task_id}/move", post(move_task))
         .route("/subscriptions", post(subscribe).delete(unsubscribe))
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
@@ -127,12 +128,14 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
+    Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") },
     Endpoint { method: "GET", path: "/api/tasks", summary: "List tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
     Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task or project.", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task or project.", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
@@ -153,8 +156,10 @@ fn body_schemas() -> Value {
         RegisterAgentBody,
         SetStatusBody,
         CreateProjectBody,
+        UpdateProjectBody,
         CreateTaskBody,
         UpdateTaskBody,
+        MoveTaskBody,
         CommentBody,
         SubscribeBody,
         SendMessageBody,
@@ -423,6 +428,7 @@ struct CreateProjectBody {
     name: String,
     description: Option<String>,
     created_by: Option<String>,
+    metadata: Option<Value>,
 }
 
 async fn create_project(
@@ -430,13 +436,49 @@ async fn create_project(
     Json(b): Json<CreateProjectBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::create_project(&st.pool, &b.name, b.description.as_deref(), b.created_by.as_deref())
-            .await?,
+        core::create_project(
+            &st.pool,
+            &b.name,
+            b.description.as_deref(),
+            b.created_by.as_deref(),
+            b.metadata,
+        )
+        .await?,
     ))
 }
 
 async fn get_project(State(st): State<AppState>, Path(project_id): Path<i64>) -> ApiResult {
     found(core::get_project(&st.pool, project_id).await?)
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UpdateProjectBody {
+    name: Option<String>,
+    description: Option<String>,
+    /// active / archived. Archiving hides it from the sidebar; fully reversible.
+    status: Option<String>,
+    /// MERGED into the project's props (e.g. a repo link), not replaced.
+    metadata: Option<Value>,
+    actor: Option<String>,
+}
+
+async fn update_project(
+    State(st): State<AppState>,
+    Path(project_id): Path<i64>,
+    Json(b): Json<UpdateProjectBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::update_project(
+            &st.pool,
+            project_id,
+            b.name.as_deref(),
+            b.description.as_deref(),
+            b.status.as_deref(),
+            b.metadata,
+            b.actor.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 // --- Tasks ---
@@ -539,6 +581,22 @@ async fn set_task_props(
     Json(props): Json<Value>,
 ) -> ApiResult {
     Ok(Json(core::set_task_props(&st.pool, task_id, props).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MoveTaskBody {
+    to_project_id: i64,
+    actor: Option<String>,
+}
+
+async fn move_task(
+    State(st): State<AppState>,
+    Path(task_id): Path<i64>,
+    Json(b): Json<MoveTaskBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::move_task(&st.pool, task_id, b.to_project_id, b.actor.as_deref()).await?,
+    ))
 }
 
 // --- Subscriptions ---
