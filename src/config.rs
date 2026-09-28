@@ -29,6 +29,15 @@ pub struct Settings {
     pub port: u16,
     /// Timeout, in seconds, for best-effort webhook POSTs to agents that registered one.
     pub webhook_timeout_secs: f64,
+    /// Host authorities the MCP endpoint (`/mcp`) accepts in the inbound `Host` header.
+    ///
+    /// rmcp guards streamable-HTTP against DNS-rebinding by only accepting loopback hosts
+    /// by default. An empty list keeps that safe default (loopback only). When the service
+    /// is LAN-exposed or fronted by a reverse proxy that does not rewrite `Host`, list the
+    /// authorities clients actually send (e.g. "green-machine.lan:8079", "board.example.com").
+    /// A single `"*"` disables the check entirely — any `Host` is accepted (NOT recommended
+    /// for public deployments; only for closed networks).
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 impl Default for Settings {
@@ -38,6 +47,7 @@ impl Default for Settings {
             host: "0.0.0.0".to_string(),
             port: 8079,
             webhook_timeout_secs: 5.0,
+            mcp_allowed_hosts: Vec::new(),
         }
     }
 }
@@ -53,6 +63,9 @@ pub struct Config {
     pub webhook_timeout: Duration,
     /// Directory of built web UI assets to serve at `/`, if present.
     pub web_dir: Option<String>,
+    /// `Host` authorities accepted by the MCP endpoint. Empty == rmcp's loopback-only
+    /// default; `["*"]` == accept any host. See `Settings::mcp_allowed_hosts`.
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 impl Config {
@@ -79,6 +92,7 @@ impl Config {
             port: s.port,
             webhook_timeout: Duration::from_secs_f64(s.webhook_timeout_secs),
             web_dir: web_dir.filter(|s| !s.is_empty()),
+            mcp_allowed_hosts: s.mcp_allowed_hosts,
         }
     }
 }

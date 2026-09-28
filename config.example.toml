@@ -16,3 +16,11 @@ port = 8079
 # Timeout, in seconds, for best-effort webhook POSTs to agents that registered a
 # webhook_url. Delivery is fire-and-forget; this just bounds how long each attempt waits.
 webhook_timeout_secs = 5
+
+# Host authorities the MCP endpoint (/mcp) accepts in the inbound `Host` header. rmcp guards
+# streamable-HTTP against DNS rebinding by accepting only loopback hosts by default, so a
+# LAN-exposed or reverse-proxied deployment must list the authorities clients actually send.
+# Empty (the default) keeps the safe loopback-only behavior. A single "*" disables the check
+# entirely (any Host accepted) — only for closed networks, never public deployments.
+#   mcp_allowed_hosts = ["green-machine.lan:8079", "board.example.com"]
+mcp_allowed_hosts = []
