@@ -29,24 +29,30 @@ task-board — agent coordination board (MCP + REST + UI)
 
 USAGE:
     task-board [--config <path>] [--web-dir <path>]
+    task-board --dedup-projects [--config <path>]
 
 OPTIONS:
     --config <path>    TOML config file (see config.example.toml). Omit for defaults.
     --web-dir <path>   Directory of built UI assets to serve at /. Usually set by
                        packaging; falls back to the TB_WEB_DIR env var.
+    --dedup-projects   One-shot maintenance: merge case-insensitive duplicate projects
+                       (keep the earliest, repoint tasks/subs/events), then exit. Back up
+                       the DB first. Does not start the server.
     -h, --help         Print this help.
 ";
 
-/// The two command-line inputs. Everything else lives in the TOML config file.
+/// Command-line inputs. Everything else lives in the TOML config file.
 struct CliArgs {
     config: Option<String>,
     web_dir: Option<String>,
+    dedup_projects: bool,
 }
 
 impl CliArgs {
     fn parse(args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
         let mut config = None;
         let mut web_dir = None;
+        let mut dedup_projects = false;
         let mut it = args;
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -56,6 +62,7 @@ impl CliArgs {
                 "--web-dir" => {
                     web_dir = Some(it.next().ok_or_else(|| anyhow::anyhow!("--web-dir needs a path"))?);
                 }
+                "--dedup-projects" => dedup_projects = true,
                 "-h" | "--help" => {
                     print!("{USAGE}");
                     std::process::exit(0);
@@ -63,7 +70,7 @@ impl CliArgs {
                 other => anyhow::bail!("unknown argument `{other}`\n\n{USAGE}"),
             }
         }
-        Ok(Self { config, web_dir })
+        Ok(Self { config, web_dir, dedup_projects })
     }
 }
 
@@ -91,6 +98,13 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::init(&cfg.db_path).await?;
     tracing::info!("db ready at {}", cfg.db_path);
+
+    // One-shot maintenance: merge duplicate projects, report, and exit without serving.
+    if args.dedup_projects {
+        let report = core::merge_duplicate_projects(&pool).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     // MCP over streamable-HTTP at /mcp (fresh Board handle per session).
     let ct = tokio_util::sync::CancellationToken::new();

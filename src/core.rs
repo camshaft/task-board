@@ -191,6 +191,24 @@ pub async fn create_project(
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
+
+    // Get-or-create: project names are unique case-insensitively. If one already exists
+    // (any casing), return it unchanged rather than creating a duplicate — this keeps the
+    // operation idempotent for agents and prevents the mixed-case sprawl we clean up in
+    // merge_duplicate_projects().
+    if let Some(row) = sqlx::query("SELECT id FROM projects WHERE name = ? COLLATE NOCASE")
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        let existing_id: i64 = row.try_get("id")?;
+        let out = fetch_one_json(&mut tx, "SELECT * FROM projects WHERE id=?", existing_id)
+            .await?
+            .unwrap_or(Value::Null);
+        tx.commit().await?;
+        return Ok(out);
+    }
+
     let pid: i64 = sqlx::query(
         "INSERT INTO projects(name, description, created_by, created_at, updated_at) \
          VALUES(?,?,?,?,?) RETURNING id",
@@ -795,6 +813,92 @@ pub async fn get_events(pool: &Pool, since_seq: i64, limit: i64) -> anyhow::Resu
     Ok(Value::Array(out))
 }
 
+/// Merge case-insensitive duplicate projects into one canonical row each. For every group
+/// of projects whose names match ignoring case, the earliest-created (lowest id on a tie)
+/// is kept; tasks, project subscriptions, and events pointing at the others are repointed
+/// onto it, then the duplicates are deleted. Idempotent: a DB with no dupes is unchanged.
+///
+/// This is a deliberate maintenance action (exposed via the `dedup_projects` admin path),
+/// not something that runs on startup — back up the DB before invoking it.
+pub async fn merge_duplicate_projects(pool: &Pool) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+
+    // Groups with more than one project sharing a case-folded name.
+    let groups = sqlx::query(
+        "SELECT GROUP_CONCAT(id) AS ids FROM projects \
+         GROUP BY name COLLATE NOCASE HAVING COUNT(*) > 1",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut merged_groups = 0i64;
+    let mut removed = 0i64;
+    let mut details = Vec::new();
+
+    for g in &groups {
+        let ids_csv: String = g.try_get("ids")?;
+        let mut ids: Vec<i64> = ids_csv.split(',').filter_map(|s| s.parse().ok()).collect();
+        // Canonical = earliest created_at, tie-broken by lowest id (stable + deterministic).
+        // Sort by (created_at, id) using the stored rows.
+        let mut with_ts: Vec<(String, i64)> = Vec::new();
+        for id in &ids {
+            let row = sqlx::query("SELECT created_at FROM projects WHERE id=?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+            with_ts.push((row.try_get::<String, _>("created_at")?, *id));
+        }
+        with_ts.sort();
+        let keep = with_ts.first().map(|(_, id)| *id).unwrap();
+        ids.retain(|&id| id != keep);
+
+        for &dup in &ids {
+            sqlx::query("UPDATE tasks SET project_id=? WHERE project_id=?")
+                .bind(keep)
+                .bind(dup)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE events SET project_id=? WHERE project_id=?")
+                .bind(keep)
+                .bind(dup)
+                .execute(&mut *tx)
+                .await?;
+            // Repoint project subscriptions, but drop any that would collide with an
+            // existing subscription on the canonical project (UNIQUE constraint).
+            sqlx::query(
+                "DELETE FROM subscriptions WHERE target_type='project' AND target_id=? \
+                 AND subscriber IN (SELECT subscriber FROM subscriptions \
+                   WHERE target_type='project' AND target_id=?)",
+            )
+            .bind(dup)
+            .bind(keep)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE subscriptions SET target_id=? WHERE target_type='project' AND target_id=?",
+            )
+            .bind(keep)
+            .bind(dup)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM projects WHERE id=?")
+                .bind(dup)
+                .execute(&mut *tx)
+                .await?;
+            removed += 1;
+        }
+        merged_groups += 1;
+        details.push(json!({ "kept": keep, "removed": ids }));
+    }
+
+    tx.commit().await?;
+    Ok(json!({
+        "merged_groups": merged_groups,
+        "projects_removed": removed,
+        "groups": details,
+    }))
+}
+
 // The webhook timeout is carried on the pool's app state; we thread it via a thread-local
 // set at startup to avoid changing every signature. See `main.rs`.
 fn webhook_timeout(_pool: &Pool) -> Duration {
@@ -930,6 +1034,84 @@ mod tests {
         set_task_props(&pool, 1, json!({"stage": "resumed"})).await?;
         let after = get_task(&pool, 1).await?;
         assert_eq!(after["metadata"], json!({"stage": "resumed"}));
+        Ok(())
+    }
+
+    /// create_project is case-insensitively idempotent: a differently-cased name returns
+    /// the existing project instead of making a duplicate.
+    #[tokio::test]
+    async fn create_project_is_case_insensitive_get_or_create() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        let a = create_project(&pool, "Backend", Some("first"), Some("u")).await?;
+        let b = create_project(&pool, "backend", Some("dupe"), Some("u")).await?;
+        let c = create_project(&pool, "BACKEND", None, None).await?;
+
+        assert_eq!(a["id"], b["id"]);
+        assert_eq!(a["id"], c["id"]);
+        // Original row is untouched (name/description preserved, not overwritten).
+        assert_eq!(b["name"], json!("Backend"));
+        assert_eq!(b["description"], json!("first"));
+
+        let projects = list_projects(&pool, None).await?;
+        assert_eq!(projects.as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// merge_duplicate_projects folds case-variant projects into the earliest one,
+    /// repointing tasks, events, and subscriptions (deduping subscription collisions).
+    #[tokio::test]
+    async fn merge_duplicate_projects_folds_and_repoints() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Two case-variant projects created directly (bypass get-or-create) to simulate
+        // the pre-existing sprawl.
+        let ts = now_iso();
+        for (name, t) in [("Backend", "2026-01-01T00:00:00Z"), ("backend", "2026-02-01T00:00:00Z")] {
+            sqlx::query("INSERT INTO projects(name, created_at, updated_at) VALUES(?,?,?)")
+                .bind(name)
+                .bind(t)
+                .bind(&ts)
+                .execute(&pool)
+                .await?;
+        }
+        // ids: 1 = "Backend" (earlier), 2 = "backend" (later).
+        create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None).await?;
+        // Same subscriber on both projects -> collision on repoint; both on dupe only too.
+        subscribe(&pool, "alice", None, Some(1)).await?;
+        subscribe(&pool, "alice", None, Some(2)).await?; // will collide with keep=1
+        subscribe(&pool, "bob", None, Some(2)).await?; // repoints cleanly onto 1
+
+        let report = merge_duplicate_projects(&pool).await?;
+        assert_eq!(report["merged_groups"], json!(1));
+        assert_eq!(report["projects_removed"], json!(1));
+
+        // Only the earliest survives.
+        let projects = list_projects(&pool, None).await?;
+        let arr = projects.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], json!(1));
+
+        // The task moved onto the surviving project.
+        let tasks = list_tasks(&pool, Some(1), None, None).await?;
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+
+        // Subscriptions: alice (deduped to one), bob (repointed) both on project 1.
+        let subs: Vec<String> = sqlx::query(
+            "SELECT subscriber FROM subscriptions WHERE target_type='project' AND target_id=1 ORDER BY subscriber",
+        )
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>("subscriber"))
+        .collect();
+        assert_eq!(subs, vec!["alice".to_string(), "bob".to_string()]);
+
+        // Running again is a no-op.
+        let again = merge_duplicate_projects(&pool).await?;
+        assert_eq!(again["merged_groups"], json!(0));
         Ok(())
     }
 }
