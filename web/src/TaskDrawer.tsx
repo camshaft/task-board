@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import { type TaskStatus } from './api'
-import { commentTask, updateTask, useTask } from './resources'
+import { commentTask, moveTask, updateTask, useProjects, useTask } from './resources'
 import { relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // Context handed down by the Board route (the parent <Outlet/>).
@@ -17,6 +17,7 @@ export function TaskDrawer() {
   const { actor } = useOutletContext<DrawerContext>()
   const id = Number(taskId)
   const { data: task, error: loadError } = useTask(id)
+  const { data: projects = [] } = useProjects()
   const [error, setError] = useState<string | null>(null)
   const [comment, setComment] = useState('')
   const [busy, setBusy] = useState(false)
@@ -42,6 +43,34 @@ export function TaskDrawer() {
     setBusy(true)
     try {
       await updateTask(task.id, { assignee, actor })
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function move() {
+    if (!task) return
+    // A tiny prompt-based picker: list the other projects by id so the user can pick one.
+    const others = projects.filter((p) => p.id !== task.project_id)
+    if (others.length === 0) {
+      window.alert('No other project to move this task to.')
+      return
+    }
+    const menu = others.map((p) => `${p.id}: ${p.name}`).join('\n')
+    const answer = window.prompt(`Move task to which project? Enter its id:\n\n${menu}`)
+    if (answer == null) return
+    const to = Number(answer.trim())
+    if (!Number.isInteger(to) || !others.some((p) => p.id === to)) {
+      setError(`'${answer}' isn't one of the listed project ids.`)
+      return
+    }
+    setBusy(true)
+    try {
+      await moveTask(task.id, { to_project_id: to, actor })
+      // The task left this board; follow it to its new project so the drawer stays valid.
+      navigate(`/projects/${to}/tasks/${task.id}`)
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -130,6 +159,18 @@ export function TaskDrawer() {
                     className="rounded px-1.5 py-0.5 font-mono text-xs hover:bg-[var(--color-panel-2)]"
                   >
                     {task.assignee ?? '— assign —'}
+                  </button>
+                </dd>
+                <dt className="text-[var(--color-muted)]">Project</dt>
+                <dd className="col-span-2">
+                  <button
+                    onClick={move}
+                    disabled={busy}
+                    className="rounded px-1.5 py-0.5 text-xs hover:bg-[var(--color-panel-2)]"
+                    title="Move this task to another project"
+                  >
+                    {projects.find((p) => p.id === task.project_id)?.name ?? `#${task.project_id}`}
+                    <span className="ml-1 text-[var(--color-muted)]">move →</span>
                   </button>
                 </dd>
                 <dt className="text-[var(--color-muted)]">Priority</dt>

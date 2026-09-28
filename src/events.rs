@@ -30,8 +30,33 @@ pub struct WebhookDelivery {
 pub enum Recipients {
     /// Derive from the task (subscribers, project subscribers, assignee, creator).
     FromTask,
+    /// Derive from the project (its subscribers). For project-level changes (rename,
+    /// archive, ...) that aren't tied to a single task.
+    FromProject(i64),
     /// An explicit set — e.g. a direct message, or a silent project.created.
     Explicit(BTreeSet<String>),
+}
+
+/// Who hears about a project change: its subscribers, minus whoever performed the action.
+async fn recipients_for_project(
+    tx: &mut Transaction<'_, Sqlite>,
+    project_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut recips: BTreeSet<String> = BTreeSet::new();
+    let subs = sqlx::query(
+        "SELECT subscriber FROM subscriptions WHERE target_type='project' AND target_id=?",
+    )
+    .bind(project_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for s in subs {
+        recips.insert(s.try_get::<String, _>("subscriber")?);
+    }
+    if let Some(actor) = actor {
+        recips.remove(actor);
+    }
+    Ok(recips)
 }
 
 /// Who hears about a task change: its subscribers, its project's subscribers, its
@@ -115,6 +140,7 @@ pub async fn emit(
             Some(tid) => recipients_for_task(tx, tid, actor).await?,
             None => BTreeSet::new(),
         },
+        Recipients::FromProject(pid) => recipients_for_project(tx, pid, actor).await?,
     };
 
     for r in &recips {

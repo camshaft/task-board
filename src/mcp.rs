@@ -75,6 +75,38 @@ pub struct CreateProjectArgs {
     pub description: Option<String>,
     #[serde(default)]
     pub created_by: Option<String>,
+    /// Arbitrary project properties (e.g. {"repo": "https://github.com/org/repo"}).
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateProjectArgs {
+    pub project_id: i64,
+    /// New name (must be unique case-insensitively).
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// active / archived. Archiving hides it from the sidebar; fully reversible.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// MERGED into the project's props (e.g. a repo link), not replaced.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+    /// Set to your agent id so you aren't notified of your own change.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MoveTaskArgs {
+    pub task_id: i64,
+    /// The project to move the task into.
+    pub to_project_id: i64,
+    /// Set to your agent id so you aren't notified of your own change.
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -253,15 +285,23 @@ impl Board {
     }
 
     // --- Projects ---
-    #[tool(description = "Create a project (a container for tasks). Returns the new project, incl. its id.")]
+    #[tool(
+        description = "Create a project (a container for tasks). `metadata` is an optional dict of arbitrary properties (e.g. {\"repo\": \"https://github.com/org/repo\"}). Returns the new project, incl. its id."
+    )]
     async fn create_project(
         &self,
         Parameters(a): Parameters<CreateProjectArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::create_project(&self.pool, &a.name, s(&a.description), s(&a.created_by))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::create_project(
+            &self.pool,
+            &a.name,
+            s(&a.description),
+            s(&a.created_by),
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "List projects (optionally filtered by status) with per-status task counts.")]
@@ -278,6 +318,27 @@ impl Board {
         Parameters(a): Parameters<GetProjectArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_project(&self.pool, a.project_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(
+        description = "Update a project: rename it, edit its description, set metadata (MERGED, e.g. a repo link), or change its status. Set status='archived' to hide it from the board (reversible; set 'active' to restore). Pass only the fields you're changing. Set `actor` to your agent id so you aren't notified of your own change."
+    )]
+    async fn update_project(
+        &self,
+        Parameters(a): Parameters<UpdateProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::update_project(
+            &self.pool,
+            a.project_id,
+            s(&a.name),
+            s(&a.description),
+            s(&a.status),
+            a.metadata.map(Value::Object),
+            s(&a.actor),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     // --- Tasks ---
@@ -334,6 +395,19 @@ impl Board {
         Parameters(a): Parameters<SetTaskPropsArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::set_task_props(&self.pool, a.task_id, Value::Object(a.props))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Move a task to a different project. Notifies the task's subscribers. Set `actor` to your agent id so you aren't notified of your own change."
+    )]
+    async fn move_task(
+        &self,
+        Parameters(a): Parameters<MoveTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::move_task(&self.pool, a.task_id, a.to_project_id, s(&a.actor))
             .await
             .map_err(err)
             .and_then(ok)

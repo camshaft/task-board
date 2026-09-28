@@ -72,6 +72,13 @@ export async function createProject(b: Parameters<typeof api.createProject>[0]) 
   return p
 }
 
+export async function updateProject(id: number, b: Parameters<typeof api.updateProject>[1]) {
+  const p = await api.updateProject(id, b)
+  // Rename/archive/metadata all change the sidebar and the project's own view.
+  touched({ projectId: id, activity: true })
+  return p
+}
+
 export async function createTask(b: Parameters<typeof api.createTask>[0]) {
   const t = await api.createTask(b)
   touched({ projectId: t.project_id, activity: true })
@@ -89,6 +96,15 @@ export async function commentTask(id: number, b: Parameters<typeof api.commentTa
   const r = await api.commentTask(id, b)
   touched({ taskId: id, activity: true })
   return r
+}
+
+export async function moveTask(id: number, b: Parameters<typeof api.moveTask>[1]) {
+  const t = await api.moveTask(id, b)
+  // A move touches TWO task lists — source and destination. The response only names the
+  // destination, so refresh every loaded task list (taskId-only path) plus the destination.
+  touched({ taskId: t.id, activity: true })
+  touched({ projectId: t.project_id, activity: false })
+  return t
 }
 
 // The compact event the SSE feed pushes (mirrors sse::StreamEvent on the server), plus the
@@ -112,8 +128,12 @@ export function applyStreamEvent(ev: StreamEvent) {
     invalidateMatching('') // every key startsWith '' — invalidate all loaded resources
     return
   }
+  // A move leaves one project and joins another, but the compact event carries only the
+  // destination project_id — so drop the destination hint and let touched()'s taskId-only
+  // path refresh EVERY loaded task list (source board included).
+  const projectId = ev.type === 'task.moved' ? undefined : (ev.project_id ?? undefined)
   touched({
-    projectId: ev.project_id ?? undefined,
+    projectId,
     taskId: ev.task_id ?? undefined,
     activity: true,
   })
