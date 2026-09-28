@@ -58,9 +58,39 @@ pub struct RegisterAgentArgs {
     /// re-registering without it won't erase an existing charter.
     #[serde(default)]
     pub charter: Option<String>,
+    /// Arbitrary registry props (role, model, effort, interval, worktree, branch, area, repo,
+    /// ...). MERGED into any existing bag, not replaced.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
     /// If set, every event delivered to your inbox is also POSTed here (best-effort).
     #[serde(default)]
     pub webhook_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetAgentArgs {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateAgentArgs {
+    pub agent_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub charter: Option<String>,
+    /// online / busy / away / offline
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub status_message: Option<String>,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// MERGED into the agent's registry bag, not replaced.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -260,16 +290,24 @@ impl Board {
 
     // --- Agents / presence ---
     #[tool(
-        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'agent:fixer-3'). If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort)."
+        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'agent:fixer-3'). `charter` is your role/mission (free-form). `metadata` is an optional dict of registry props (role, model, effort, interval, worktree, branch, area, repo, ...), MERGED into any existing bag. If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort)."
     )]
     async fn register_agent(
         &self,
         Parameters(a): Parameters<RegisterAgentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::register_agent(&self.pool, &a.agent_id, s(&a.display_name), s(&a.kind), s(&a.charter), s(&a.webhook_url))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::register_agent(
+            &self.pool,
+            &a.agent_id,
+            s(&a.display_name),
+            s(&a.kind),
+            s(&a.charter),
+            a.metadata.map(Value::Object),
+            s(&a.webhook_url),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "Set your presence: online / busy / away / offline (+ an optional note).")]
@@ -283,9 +321,40 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "List all registered agents with their presence and last-seen time.")]
+    #[tool(description = "List all registered agents with their presence, charter, metadata, and last-seen time.")]
     async fn list_agents(&self) -> Result<CallToolResult, McpError> {
         core::list_agents(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Get one agent by id, including its charter and metadata bag. O(1) vs filtering list_agents.")]
+    async fn get_agent(
+        &self,
+        Parameters(a): Parameters<GetAgentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_agent(&self.pool, &a.agent_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(
+        description = "Update an existing agent's fields + metadata WITHOUT re-registering (this is the registry-write path: the board agent list serves as the fleet registry). Pass only the fields you're changing. `metadata` is MERGED into the existing bag, not replaced. Unlike register_agent this does not force status online and fails if the agent doesn't exist."
+    )]
+    async fn update_agent(
+        &self,
+        Parameters(a): Parameters<UpdateAgentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::update_agent(
+            &self.pool,
+            &a.agent_id,
+            s(&a.display_name),
+            s(&a.kind),
+            s(&a.charter),
+            s(&a.status),
+            s(&a.status_message),
+            s(&a.webhook_url),
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     // --- Projects ---

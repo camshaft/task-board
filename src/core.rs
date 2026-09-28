@@ -84,32 +84,71 @@ async fn fetch_one_json(
 
 // --- Agents / presence ---
 
+/// Turn an agent row into JSON with its `metadata` TEXT column parsed from a JSON string
+/// into an object (mirrors how get_project/get_task surface their metadata). `row_to_json`
+/// leaves it as a raw string, so every agent-returning path funnels through this.
+fn agent_json(row: &SqliteRow) -> Value {
+    let mut obj = match row_to_json(row) {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let meta = obj
+        .get("metadata")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| json!({}));
+    obj.insert("metadata".into(), meta);
+    Value::Object(obj)
+}
+
+/// Merge `incoming` (an object) into `base_str` (a JSON string, default '{}') and return the
+/// merged JSON as a string. Shallow key-level merge — the same semantics tasks/projects use.
+fn merge_metadata(base_str: Option<&str>, incoming: Value) -> String {
+    let mut base: Map<String, Value> =
+        serde_json::from_str(base_str.unwrap_or("{}")).unwrap_or_default();
+    if let Value::Object(m) = incoming {
+        for (k, v) in m {
+            base.insert(k, v);
+        }
+    }
+    Value::Object(base).to_string()
+}
+
 pub async fn register_agent(
     pool: &Pool,
     agent_id: &str,
     display_name: Option<&str>,
     kind: Option<&str>,
     charter: Option<&str>,
+    metadata: Option<Value>,
     webhook_url: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
-    let exists = sqlx::query("SELECT 1 FROM agents WHERE id=?")
+    let existing = sqlx::query("SELECT metadata FROM agents WHERE id=?")
         .bind(agent_id)
         .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-    if exists {
+        .await?;
+    // metadata is MERGED into any existing bag (like update_project), so re-registering with
+    // a partial bag adds/overwrites keys without dropping the rest.
+    let merged_meta: Option<String> = metadata.map(|m| {
+        let base: Option<String> = existing
+            .as_ref()
+            .and_then(|r| r.try_get::<Option<String>, _>("metadata").ok().flatten());
+        merge_metadata(base.as_deref(), m)
+    });
+    if existing.is_some() {
         // COALESCE so re-registering to refresh presence doesn't clobber a charter (or any
         // other field) set earlier — only fields explicitly supplied this call overwrite.
         sqlx::query(
             "UPDATE agents SET display_name=COALESCE(?,display_name), kind=COALESCE(?,kind), \
-             charter=COALESCE(?,charter), webhook_url=COALESCE(?,webhook_url), \
-             status='online', last_seen=? WHERE id=?",
+             charter=COALESCE(?,charter), metadata=COALESCE(?,metadata), \
+             webhook_url=COALESCE(?,webhook_url), status='online', last_seen=? WHERE id=?",
         )
         .bind(display_name)
         .bind(kind)
         .bind(charter)
+        .bind(merged_meta.as_deref())
         .bind(webhook_url)
         .bind(&ts)
         .bind(agent_id)
@@ -117,13 +156,14 @@ pub async fn register_agent(
         .await?;
     } else {
         sqlx::query(
-            "INSERT INTO agents(id, display_name, kind, charter, status, webhook_url, created_at, last_seen) \
-             VALUES(?,?,?,?,'online',?,?,?)",
+            "INSERT INTO agents(id, display_name, kind, charter, metadata, status, webhook_url, created_at, last_seen) \
+             VALUES(?,?,?,?,COALESCE(?,'{}'),'online',?,?,?)",
         )
         .bind(agent_id)
         .bind(display_name)
         .bind(kind)
         .bind(charter)
+        .bind(merged_meta.as_deref())
         .bind(webhook_url)
         .bind(&ts)
         .bind(&ts)
@@ -134,7 +174,78 @@ pub async fn register_agent(
         .bind(agent_id)
         .fetch_one(&mut *tx)
         .await?;
-    let out = row_to_json(&row);
+    let out = agent_json(&row);
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Mutate an existing agent's fields — any subset of display_name, kind, charter, status,
+/// status_message, webhook_url, metadata (MERGED). Unlike register_agent this does NOT
+/// create-or-touch-presence: it fails if the agent doesn't exist and does not force status
+/// online. This is the registry-write path (the board agent list as the fleet registry).
+#[allow(clippy::too_many_arguments)]
+pub async fn update_agent(
+    pool: &Pool,
+    agent_id: &str,
+    display_name: Option<&str>,
+    kind: Option<&str>,
+    charter: Option<&str>,
+    status: Option<&str>,
+    status_message: Option<&str>,
+    webhook_url: Option<&str>,
+    metadata: Option<Value>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let old = sqlx::query("SELECT metadata FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(old) = old else {
+        anyhow::bail!("no agent {agent_id}");
+    };
+
+    let mut set_clauses: Vec<String> = Vec::new();
+    let fields: [(&str, Option<&str>); 6] = [
+        ("display_name", display_name),
+        ("kind", kind),
+        ("charter", charter),
+        ("status", status),
+        ("status_message", status_message),
+        ("webhook_url", webhook_url),
+    ];
+    for (col, val) in fields.iter() {
+        if val.is_some() {
+            set_clauses.push(format!("{col}=?"));
+        }
+    }
+    let merged_meta: Option<String> = if let Some(meta) = metadata {
+        let old_meta: Option<String> = old.try_get("metadata")?;
+        set_clauses.push("metadata=?".to_string());
+        Some(merge_metadata(old_meta.as_deref(), meta))
+    } else {
+        None
+    };
+
+    if !set_clauses.is_empty() {
+        let sql = format!("UPDATE agents SET {} WHERE id=?", set_clauses.join(", "));
+        let mut q = sqlx::query(&sql);
+        for (_, val) in fields.iter() {
+            if let Some(v) = val {
+                q = q.bind(*v);
+            }
+        }
+        if let Some(ref m) = merged_meta {
+            q = q.bind(m);
+        }
+        q = q.bind(agent_id);
+        q.execute(&mut *tx).await?;
+    }
+
+    let row = sqlx::query("SELECT * FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let out = agent_json(&row);
     tx.commit().await?;
     Ok(out)
 }
@@ -174,7 +285,7 @@ pub async fn set_status(
         .bind(agent_id)
         .fetch_one(&mut *tx)
         .await?;
-    let out = row_to_json(&row);
+    let out = agent_json(&row);
     tx.commit().await?;
     Ok(out)
 }
@@ -183,7 +294,7 @@ pub async fn list_agents(pool: &Pool) -> anyhow::Result<Value> {
     let rows = sqlx::query("SELECT * FROM agents ORDER BY last_seen DESC")
         .fetch_all(pool)
         .await?;
-    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+    Ok(Value::Array(rows.iter().map(agent_json).collect()))
 }
 
 pub async fn get_agent(pool: &Pool, agent_id: &str) -> anyhow::Result<Value> {
@@ -192,7 +303,7 @@ pub async fn get_agent(pool: &Pool, agent_id: &str) -> anyhow::Result<Value> {
         .fetch_optional(pool)
         .await?;
     match row {
-        Some(r) => Ok(row_to_json(&r)),
+        Some(r) => Ok(agent_json(&r)),
         None => anyhow::bail!("no agent {agent_id}"),
     }
 }
@@ -1154,8 +1265,8 @@ mod tests {
         let db_path = tmp.path().join("board.db");
         let pool = crate::db::init(db_path.to_str().unwrap()).await?;
 
-        register_agent(&pool, "planner", Some("Planner"), None, None, None).await?;
-        register_agent(&pool, "fixer", Some("Fixer"), None, None, None).await?;
+        register_agent(&pool, "planner", Some("Planner"), None, None, None, None).await?;
+        register_agent(&pool, "fixer", Some("Fixer"), None, None, None, None).await?;
 
         let p = create_project(&pool, "Voron tuning", Some("dial in the printer"), Some("planner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
@@ -1207,6 +1318,52 @@ mod tests {
 
         let task = get_task(&pool, tid).await?;
         assert_eq!(task["metadata"], json!({"a": 1, "b": 2, "c": 3}));
+        Ok(())
+    }
+
+    /// The agent list can serve as the fleet registry: agents carry a merged metadata bag,
+    /// and update_agent mutates fields + merges metadata without re-registering (and without
+    /// forcing status back to online, unlike register_agent).
+    #[tokio::test]
+    async fn agent_registry_metadata() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Register with an initial bag + charter.
+        let a = register_agent(
+            &pool,
+            "v-x",
+            Some("V X"),
+            Some("vertical"),
+            Some("own X"),
+            Some(json!({"role": "vertical", "model": "opus"})),
+            None,
+        )
+        .await?;
+        assert_eq!(a["metadata"], json!({"role": "vertical", "model": "opus"}));
+        assert_eq!(a["status"], "online");
+        assert_eq!(a["charter"], "own X");
+
+        // Re-register with a partial bag: merges (model kept), doesn't clobber charter.
+        let a = register_agent(&pool, "v-x", None, None, None, Some(json!({"effort": "high"})), None).await?;
+        assert_eq!(a["metadata"], json!({"role": "vertical", "model": "opus", "effort": "high"}));
+        assert_eq!(a["charter"], "own X");
+
+        // update_agent: away without a message keeps status_message; metadata merges again.
+        update_agent(&pool, "v-x", None, None, None, Some("away"), None, None, Some(json!({"branch": "main"}))).await?;
+        let got = get_agent(&pool, "v-x").await?;
+        assert_eq!(got["status"], "away");
+        assert_eq!(
+            got["metadata"],
+            json!({"role": "vertical", "model": "opus", "effort": "high", "branch": "main"})
+        );
+
+        // update_agent on an unknown agent errors (it's a mutate, not an upsert).
+        assert!(update_agent(&pool, "nope", None, None, None, None, None, None, None).await.is_err());
+
+        // A fresh agent gets an empty bag by default, not null.
+        register_agent(&pool, "v-y", None, None, None, None, None).await?;
+        assert_eq!(get_agent(&pool, "v-y").await?["metadata"], json!({}));
         Ok(())
     }
 
