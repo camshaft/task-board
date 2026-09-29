@@ -1,4 +1,5 @@
 // Small presentational helpers shared across the app.
+import { useLayoutEffect, useRef } from 'react'
 import type { AgentStatus, TaskStatus } from './api'
 
 export const TASK_COLUMNS: TaskStatus[] = [
@@ -97,4 +98,52 @@ export function relTime(iso: string | null | undefined): string {
   if (h < 24) return `${h}h ago`
   const d = Math.round(h / 24)
   return `${d}d ago`
+}
+
+// A single-line-looking textarea that grows with its content (up to maxHeight, then scrolls) —
+// used for every comment/message composer so multi-line input isn't cramped in a fixed box.
+// Enter submits (matching the old <input> composers); Shift+Enter inserts a newline.
+export function AutoGrowTextarea({
+  value,
+  onChange,
+  onSubmit,
+  placeholder,
+  disabled,
+  className,
+  maxHeight = 200,
+}: {
+  value: string
+  onChange: (v: string) => void
+  onSubmit?: () => void
+  placeholder?: string
+  disabled?: boolean
+  className?: string
+  maxHeight?: number
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null)
+  // Resize to fit content on every value change (including a reset to '' after submit, which
+  // shrinks it back). Measuring requires clearing the height first so scrollHeight can drop.
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
+  }, [value, maxHeight])
+  return (
+    <textarea
+      ref={ref}
+      rows={1}
+      value={value}
+      disabled={disabled}
+      placeholder={placeholder}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' && !e.shiftKey && onSubmit) {
+          e.preventDefault()
+          onSubmit()
+        }
+      }}
+      className={`resize-none ${className ?? ''}`}
+    />
+  )
 }

@@ -21,7 +21,7 @@ import {
   useTasks,
 } from './resources'
 import { Markdown } from './markdown'
-import { AuthorLabel, relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
+import { AuthorLabel, AutoGrowTextarea, relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // Context handed down by the Board route (the parent <Outlet/>).
 interface DrawerContext {
@@ -654,11 +654,11 @@ export function TaskDrawer() {
             </div>
 
             <footer className="border-t border-[var(--color-border)] p-4">
-              <div className="flex gap-2">
-                <input
+              <div className="flex items-end gap-2">
+                <AutoGrowTextarea
                   value={comment}
-                  onChange={(e) => setComment(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && addComment()}
+                  onChange={setComment}
+                  onSubmit={addComment}
                   placeholder={`Comment as ${actor}…`}
                   className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm outline-none focus:border-sky-500/50"
                 />

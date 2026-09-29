@@ -11,7 +11,7 @@ import {
   useChannelPosts,
   useExternalNameResolver,
 } from './resources'
-import { AuthorLabel, relTime } from './ui'
+import { AuthorLabel, AutoGrowTextarea, relTime } from './ui'
 
 // One channel (/channels/:channelId): header (label, topic, members, invite), a threaded post
 // pane (one level of reply_to nesting), and a composer. Backed by the resource store; posts
@@ -135,11 +135,11 @@ export default function ChannelView() {
       </div>
 
       <div className="border-t border-[var(--color-border)] p-4">
-        <div className="flex gap-2">
-          <input
+        <div className="flex items-end gap-2">
+          <AutoGrowTextarea
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && send()}
+            onChange={setDraft}
+            onSubmit={send}
             placeholder={
               replyTo != null ? `Reply to #${replyTo} as ${actor}…` : `Message as ${actor}…`
             }

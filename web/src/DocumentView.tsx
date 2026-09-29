@@ -15,7 +15,7 @@ import {
   useDocumentComments,
   useExternalNameResolver,
 } from './resources'
-import { AuthorLabel, relTime } from './ui'
+import { AuthorLabel, AutoGrowTextarea, relTime } from './ui'
 
 // Read-only document viewer plus the review surface: metadata, the tasks it backs, its
 // immutable version history (each CID resolved through the IPFS gateway client-side), review
@@ -581,11 +581,11 @@ export default function DocumentView() {
               Tip: select text in the content above to anchor a comment to it.
             </p>
           )}
-          <div className="mt-2 flex gap-2">
-            <input
+          <div className="mt-2 flex items-end gap-2">
+            <AutoGrowTextarea
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && addComment()}
+              onChange={setDraft}
+              onSubmit={addComment}
               placeholder={
                 replyTo != null
                   ? `Reply to #${replyTo} as ${actor}…`
