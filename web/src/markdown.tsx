@@ -1,4 +1,12 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import { Link } from 'react-router-dom'
 
 // Minimal, dependency-free Markdown renderer. It emits a React element tree (never
@@ -163,16 +171,19 @@ function blocks(src: string, resolve: WikiResolver): ReactNode[] {
         i++
       }
       if (i < lines.length) i++ // consume closing fence
-      // A ```mermaid block renders as a diagram (lazy-loaded); anything else is a code block.
+      // ```mermaid → diagram, ```vega-lite / ```vega → chart (both lazy-loaded); else code block.
+      const code = buf.join('\n')
       out.push(
         lang === 'mermaid' ? (
-          <Mermaid key={k++} code={buf.join('\n')} />
+          <Mermaid key={k++} code={code} />
+        ) : lang === 'vega-lite' || lang === 'vegalite' || lang === 'vega' ? (
+          <VegaLite key={k++} code={code} />
         ) : (
           <pre
             key={k++}
             className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 font-mono text-xs"
           >
-            <code>{buf.join('\n')}</code>
+            <code>{code}</code>
           </pre>
         ),
       )
@@ -299,6 +310,65 @@ export function Mermaid({ code }: { code: string }) {
       className="overflow-x-auto rounded-md border border-[var(--color-border)] bg-white/95 p-3"
       // eslint-disable-next-line react-dom/no-dangerously-set-innerhtml
       dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  )
+}
+
+// A Vega-Lite chart, rendered from its declarative JSON spec (the chart IS the document — no
+// chart-builder UI). vega/vega-lite are heavy, so vega-embed is loaded lazily (its own chunk).
+// Rendered to SVG with the toolbar disabled; falls back to the raw spec on a parse/render error.
+export function VegaLite({ code }: { code: string }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [renderError, setRenderError] = useState<string | null>(null)
+  // Parse the spec during render (deterministic from `code`), so an invalid spec doesn't need
+  // an effect + setState. The effect only runs the async embed.
+  const parsed = useMemo<{ spec?: unknown; error?: string }>(() => {
+    try {
+      return { spec: JSON.parse(code) }
+    } catch {
+      return { error: 'invalid Vega-Lite JSON spec' }
+    }
+  }, [code])
+
+  useEffect(() => {
+    if (parsed.spec === undefined) return
+    let cancelled = false
+    let finalize: (() => void) | undefined
+    import('vega-embed')
+      .then(async ({ default: vegaEmbed }) => {
+        if (cancelled || !ref.current) return
+        const result = await vegaEmbed(ref.current, parsed.spec as never, {
+          actions: false,
+          renderer: 'svg',
+        })
+        if (cancelled) result.view.finalize()
+        else finalize = () => result.view.finalize()
+      })
+      .catch((e) => {
+        if (!cancelled) setRenderError((e as Error).message || 'failed to render chart')
+      })
+    return () => {
+      cancelled = true
+      finalize?.()
+    }
+  }, [parsed])
+
+  const error = parsed.error ?? renderError
+  if (error) {
+    return (
+      <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3">
+        <p className="mb-1 text-xs text-rose-300">Couldn't render chart: {error}</p>
+        <pre className="overflow-x-auto font-mono text-xs">
+          <code>{code}</code>
+        </pre>
+      </div>
+    )
+  }
+  // vega renders default (light) colors, so give it a light card for legibility on the dark UI.
+  return (
+    <div
+      ref={ref}
+      className="overflow-x-auto rounded-md border border-[var(--color-border)] bg-white/95 p-3"
     />
   )
 }
