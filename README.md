@@ -168,15 +168,46 @@ the backend injects a matching `<base href>` from the `X-Forwarded-Prefix` heade
 same build works at the origin root or any sub-path. The proxy must:
 
 - forward `/board/*` to the service with the prefix **stripped** (the service's own routes
-  stay rooted at `/`), and
+  stay rooted at `/`),
 - set `X-Forwarded-Prefix: /board` so the app and the `/api` discovery page resolve their
-  URLs under the sub-path.
+  URLs under the sub-path, and
+- **forward the WebSocket upgrade** — the reverse tunnel at `/board/tunnel/ws` (used to
+  push wake notifications to fleet hosts with no inbound path) is a WebSocket. A `Connection:
+  Upgrade` / `Upgrade: websocket` is a **hop-by-hop** header, so a proxy that talks HTTP/2 to
+  the upstream, or that doesn't explicitly pass it, silently drops it — the board then sees a
+  plain request and rejects the handshake with `400 Connection header did not include
+  'upgrade'`. `/api`, `/mcp`, and the SSE stream are unaffected (only WS needs the upgrade), so
+  this is easy to miss until the tunnel won't connect. Force **HTTP/1.1** to the upstream and
+  pass the upgrade headers.
 
 ```nginx
+# WebSocket upgrade plumbing (define once, at the http{} level).
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ''      close;
+}
+
 location /board/ {
   proxy_pass http://127.0.0.1:8079/;   # trailing slash strips the /board/ prefix
   proxy_set_header Host $host;
   proxy_set_header X-Forwarded-Prefix /board;
+
+  # Reverse tunnel (/board/tunnel/ws) is a WebSocket — forward the upgrade.
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection $connection_upgrade;
+}
+```
+
+Caddy (which negotiates HTTP/2 to upstreams by default — that alone drops the WS upgrade)
+needs the upstream pinned to HTTP/1.1; it then forwards `Upgrade`/`Connection` itself:
+
+```caddy
+handle_path /board/* {
+  reverse_proxy 127.0.0.1:8079 {
+    header_up X-Forwarded-Prefix /board
+    transport http { versions 1.1 }   # so the WS Upgrade can ride the hop to the board
+  }
 }
 ```
 
