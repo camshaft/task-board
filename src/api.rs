@@ -1088,8 +1088,9 @@ struct SetWorkspaceKindBody {
     name: String,
     /// The script fleet spin-up runs to materialize the workspace. Omit to keep the stored one.
     setup_script: Option<String>,
-    /// Free-form hints the consumer reads (cwd, launch, repo, branch, env, ...). MERGED into any
-    /// existing bag.
+    /// Hints the consumer reads. Canonical keys: `cwd` (launch dir after setup), `pre_trust`
+    /// (extra trusted paths), `env` (env map for the launched agent); other keys are free-form.
+    /// MERGED into any existing bag.
     config: Option<Value>,
     description: Option<String>,
     created_by: Option<String>,

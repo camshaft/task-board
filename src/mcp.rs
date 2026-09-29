@@ -426,8 +426,10 @@ pub struct SetWorkspaceKindArgs {
     /// The script fleet spin-up runs to materialize the workspace. Omit to keep the stored one.
     #[serde(default)]
     pub setup_script: Option<String>,
-    /// Free-form hints the consumer reads (cwd, launch, repo, branch, env, ...). MERGED into any
-    /// existing bag.
+    /// Hints the consumer reads. Canonical keys: `cwd` (dir to launch in after setup — absolute
+    /// as-is, relative resolved under the consumer's root, else the agent's own dir), `pre_trust`
+    /// (array of extra trusted paths), `env` (string→string env map for the launched agent). Any
+    /// other keys are free-form for the kind's own use. MERGED into any existing bag.
     #[serde(default)]
     pub config: Option<JsonObject>,
     #[serde(default)]
@@ -1105,7 +1107,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Define or update a custom workspace kind — a named setup_script + config an agent is configured with, so fleet spin-up supports custom environment kinds defined in board resources. Environment-specific setup lives here as board data. Idempotent on `name`: an omitted setup_script/description keeps the stored value, config MERGES. An agent selects it via metadata.workspace_kind = the name."
+        description = "Define or update a custom workspace kind — a named setup_script + config an agent is configured with, so a workspace-materializing tool (e.g. fleet spin-up) supports custom environment kinds defined in board resources. Environment-specific setup lives here as board data. Canonical config keys the consumer reads: cwd (launch dir after setup), pre_trust (extra trusted paths), env (env map); other keys are free-form. Idempotent on `name`: an omitted setup_script/description keeps the stored value, config MERGES. An agent selects it via metadata.workspace_kind = the name."
     )]
     async fn set_workspace_kind(
         &self,
