@@ -71,12 +71,28 @@ export default function DocumentView() {
             ))}
           </div>
 
-          {/* Tasks this document backs. (Deep-linking to the task drawer needs the task's
-              project_id, which the attachment summary doesn't carry yet — shown as text for now.) */}
+          {/* Tasks this document backs. Each links into its board + task drawer via the
+              summary's project_id; a task with no project (shouldn't happen) degrades to text. */}
           {doc.attached_tasks.length > 0 && (
-            <div className="mb-4 text-xs text-[var(--color-muted)]">
-              <span>Backs: </span>
-              {doc.attached_tasks.map((t) => `#${t.id} ${t.title}`).join(', ')}
+            <div className="mb-4 flex flex-wrap items-center gap-x-1 gap-y-1 text-xs text-[var(--color-muted)]">
+              <span>Backs:</span>
+              {doc.attached_tasks.map((t, i) => (
+                <span key={t.id}>
+                  {t.project_id != null ? (
+                    <Link
+                      to={`/projects/${t.project_id}/tasks/${t.id}`}
+                      className="text-sky-400 hover:text-sky-300"
+                    >
+                      #{t.id} {t.title}
+                    </Link>
+                  ) : (
+                    <span>
+                      #{t.id} {t.title}
+                    </span>
+                  )}
+                  {i < doc.attached_tasks.length - 1 && <span>,</span>}
+                </span>
+              ))}
             </div>
           )}
 
