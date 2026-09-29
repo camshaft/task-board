@@ -59,6 +59,32 @@ export function PriorityDot({ priority }: { priority: string | null }) {
   )
 }
 
+// Render the author of a post/comment. When `externalAuthor` is set — a bridged human (e.g. an
+// ingested Slack user) — show that identity as the author with a subtle "via <ingester>" hint,
+// so an ingested message reads as the person, not the fleet agent that relayed it (#141 §6).
+// `resolveExternal` maps an external id (e.g. "slack:U123") to a display name; falls back to the
+// bare id. Plain fleet-agent authors render unchanged.
+export function AuthorLabel({
+  author,
+  externalAuthor,
+  resolveExternal,
+}: {
+  author: string | null | undefined
+  externalAuthor?: string | null
+  resolveExternal?: (id: string) => string
+}) {
+  if (externalAuthor) {
+    const name = resolveExternal ? resolveExternal(externalAuthor) : externalAuthor
+    return (
+      <span>
+        <span className="font-mono">{name}</span>
+        {author && <span className="text-[var(--color-muted)]"> · via {author}</span>}
+      </span>
+    )
+  }
+  return <span className="font-mono">{author ?? 'anon'}</span>
+}
+
 export function relTime(iso: string | null | undefined): string {
   if (!iso) return ''
   const then = new Date(iso).getTime()

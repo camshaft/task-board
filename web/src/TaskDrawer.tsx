@@ -8,12 +8,13 @@ import {
   moveTask,
   reparentTask,
   updateTask,
+  useExternalNameResolver,
   useProjects,
   useTask,
   useTasks,
 } from './resources'
 import { Markdown } from './markdown'
-import { relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
+import { AuthorLabel, relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // Context handed down by the Board route (the parent <Outlet/>).
 interface DrawerContext {
@@ -31,6 +32,7 @@ export function TaskDrawer() {
   const { data: projects = [] } = useProjects()
   // Same-project tasks, for the reparent picker. Keyed on the task's project once it loads.
   const { data: siblings = [] } = useTasks(task?.project_id ?? -1)
+  const extName = useExternalNameResolver()
   const [error, setError] = useState<string | null>(null)
   const [comment, setComment] = useState('')
   const [busy, setBusy] = useState(false)
@@ -535,7 +537,11 @@ export function TaskDrawer() {
                       className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3"
                     >
                       <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
-                        <span className="font-mono">{c.author ?? 'anon'}</span>
+                        <AuthorLabel
+                          author={c.author}
+                          externalAuthor={c.external_author}
+                          resolveExternal={extName}
+                        />
                         <span>{relTime(c.created_at)}</span>
                       </div>
                       <Markdown source={c.body} className="text-sm" />

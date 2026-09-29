@@ -53,6 +53,21 @@ export interface Comment {
   author: string | null
   body: string
   created_at: string
+  // When set, an external (bridged) identity id this comment is attributed to (e.g.
+  // "slack:U123"); `author` is then the fleet agent that ingested it. origin_ref is the
+  // source item's origin id for imported/synced comments.
+  external_author?: string | null
+  origin_ref?: string | null
+}
+
+// A bridged human/actor (from listExternalIdentities), distinct from a fleet Agent.
+export interface ExternalIdentity {
+  id: string
+  source: string
+  display_name: string | null
+  metadata: Record<string, unknown>
+  created_at: string
+  updated_at: string
 }
 
 export interface Task {
@@ -148,7 +163,7 @@ export interface ChannelPost {
   type: string
   actor: string | null
   channel_id: number
-  data: { from?: string; body?: string; reply_to?: number }
+  data: { from?: string; body?: string; reply_to?: number; external_author?: string }
   created_at: string
 }
 
@@ -356,6 +371,12 @@ export const api = {
     req<Channel>('POST', `/channels/${id}/invites`, b),
   sendMessage: (b: { from_agent: string; to_agent: string; body: string }) =>
     req<{ seq: number }>('POST', '/messages', b),
+
+  listExternalIdentities: (source?: string) =>
+    req<ExternalIdentity[]>(
+      'GET',
+      `/external-identities${source ? `?source=${encodeURIComponent(source)}` : ''}`,
+    ),
 }
 
 // Resolve a bare content id to a viewable URL via the deployment's IPFS gateway. The board
