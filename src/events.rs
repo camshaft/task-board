@@ -33,7 +33,9 @@ pub enum Recipients {
     /// Derive from the project (its subscribers). For project-level changes (rename,
     /// archive, ...) that aren't tied to a single task.
     FromProject(i64),
-    /// An explicit set — e.g. a direct message, or a silent project.created.
+    /// Derive from the channel (its subscribers = its members). For channel posts and DMs.
+    FromChannel(i64),
+    /// An explicit set — e.g. a silent project.created.
     Explicit(BTreeSet<String>),
 }
 
@@ -48,6 +50,29 @@ async fn recipients_for_project(
         "SELECT subscriber FROM subscriptions WHERE target_type='project' AND target_id=?",
     )
     .bind(project_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for s in subs {
+        recips.insert(s.try_get::<String, _>("subscriber")?);
+    }
+    if let Some(actor) = actor {
+        recips.remove(actor);
+    }
+    Ok(recips)
+}
+
+/// Who hears about a channel post: the channel's subscribers (its members), minus the
+/// poster. Membership IS subscription — joining a channel is a `channel` subscription row.
+async fn recipients_for_channel(
+    tx: &mut Transaction<'_, Sqlite>,
+    channel_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut recips: BTreeSet<String> = BTreeSet::new();
+    let subs = sqlx::query(
+        "SELECT subscriber FROM subscriptions WHERE target_type='channel' AND target_id=?",
+    )
+    .bind(channel_id)
     .fetch_all(&mut **tx)
     .await?;
     for s in subs {
@@ -116,18 +141,20 @@ pub async fn emit(
     actor: Option<&str>,
     task_id: Option<i64>,
     project_id: Option<i64>,
+    channel_id: Option<i64>,
     data: Value,
     recipients: Recipients,
 ) -> anyhow::Result<i64> {
     let ts = now_iso();
     let seq: i64 = sqlx::query(
-        "INSERT INTO events(type, actor, project_id, task_id, data, created_at) \
-         VALUES(?,?,?,?,?,?) RETURNING seq",
+        "INSERT INTO events(type, actor, project_id, task_id, channel_id, data, created_at) \
+         VALUES(?,?,?,?,?,?,?) RETURNING seq",
     )
     .bind(r#type)
     .bind(actor)
     .bind(project_id)
     .bind(task_id)
+    .bind(channel_id)
     .bind(data.to_string())
     .bind(&ts)
     .fetch_one(&mut **tx)
@@ -141,6 +168,7 @@ pub async fn emit(
             None => BTreeSet::new(),
         },
         Recipients::FromProject(pid) => recipients_for_project(tx, pid, actor).await?,
+        Recipients::FromChannel(cid) => recipients_for_channel(tx, cid, actor).await?,
     };
 
     for r in &recips {
@@ -160,6 +188,7 @@ pub async fn emit(
             "actor": actor,
             "task_id": task_id,
             "project_id": project_id,
+            "channel_id": channel_id,
             "data": data,
             "created_at": ts,
         });

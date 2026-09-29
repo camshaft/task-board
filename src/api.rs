@@ -76,6 +76,10 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{task_id}/props", patch(set_task_props))
         .route("/tasks/{task_id}/move", post(move_task))
         .route("/subscriptions", post(subscribe).delete(unsubscribe))
+        .route("/channels", get(list_channels).post(create_channel))
+        .route("/channels/{channel_id}", get(get_channel))
+        .route("/channels/{channel_id}/posts", get(get_channel_posts).post(post_to_channel))
+        .route("/channels/{channel_id}/invites", post(invite_to_channel))
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
         .route("/stream", get(stream))
@@ -139,8 +143,14 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
-    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task or project.", query: "", body: Some("SubscribeBody") },
-    Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task or project.", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, or channel.", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, or channel.", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None },
+    Endpoint { method: "POST", path: "/api/channels", summary: "Create (or get) a named channel.", query: "", body: Some("CreateChannelBody") },
+    Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/channels/{channel_id}/posts", summary: "Read a channel's post history.", query: "since_seq=int&limit=int", body: None },
+    Endpoint { method: "POST", path: "/api/channels/{channel_id}/posts", summary: "Post a message to a channel.", query: "", body: Some("PostToChannelBody") },
+    Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
@@ -166,6 +176,9 @@ fn body_schemas() -> Value {
         MoveTaskBody,
         CommentBody,
         SubscribeBody,
+        CreateChannelBody,
+        PostToChannelBody,
+        InviteChannelBody,
         SendMessageBody,
     )
 }
@@ -654,17 +667,110 @@ struct SubscribeBody {
     subscriber: String,
     task_id: Option<i64>,
     project_id: Option<i64>,
+    /// Subscribe to a channel (join it). Give exactly one of task_id / project_id / channel_id.
+    channel_id: Option<i64>,
 }
 
 async fn subscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
     Ok(Json(
-        core::subscribe(&st.pool, &b.subscriber, b.task_id, b.project_id).await?,
+        core::subscribe(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id).await?,
     ))
 }
 
 async fn unsubscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
     Ok(Json(
-        core::unsubscribe(&st.pool, &b.subscriber, b.task_id, b.project_id).await?,
+        core::unsubscribe(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id).await?,
+    ))
+}
+
+// --- Channels ---
+
+#[derive(Deserialize, JsonSchema)]
+struct ListChannelsQuery {
+    /// If set, list channels this agent is a member of (incl. private/DM).
+    member: Option<String>,
+}
+
+async fn list_channels(
+    State(st): State<AppState>,
+    Query(q): Query<ListChannelsQuery>,
+) -> ApiResult {
+    Ok(Json(core::list_channels(&st.pool, q.member.as_deref()).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CreateChannelBody {
+    name: String,
+    topic: Option<String>,
+    created_by: Option<String>,
+    metadata: Option<Value>,
+}
+
+async fn create_channel(State(st): State<AppState>, Json(b): Json<CreateChannelBody>) -> ApiResult {
+    Ok(Json(
+        core::create_channel(
+            &st.pool,
+            &b.name,
+            b.topic.as_deref(),
+            b.created_by.as_deref(),
+            b.metadata,
+        )
+        .await?,
+    ))
+}
+
+async fn get_channel(State(st): State<AppState>, Path(channel_id): Path<i64>) -> ApiResult {
+    found(core::get_channel(&st.pool, channel_id).await?)
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ChannelPostsQuery {
+    #[serde(default)]
+    since_seq: i64,
+    #[serde(default = "default_events_limit")]
+    limit: i64,
+}
+
+async fn get_channel_posts(
+    State(st): State<AppState>,
+    Path(channel_id): Path<i64>,
+    Query(q): Query<ChannelPostsQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::get_channel_posts(&st.pool, channel_id, q.since_seq, q.limit).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PostToChannelBody {
+    sender: String,
+    body: String,
+    reply_to: Option<i64>,
+}
+
+async fn post_to_channel(
+    State(st): State<AppState>,
+    Path(channel_id): Path<i64>,
+    Json(b): Json<PostToChannelBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::post_to_channel(&st.pool, channel_id, &b.sender, &b.body, b.reply_to).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct InviteChannelBody {
+    agent_id: String,
+    invited_by: Option<String>,
+}
+
+async fn invite_to_channel(
+    State(st): State<AppState>,
+    Path(channel_id): Path<i64>,
+    Json(b): Json<InviteChannelBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::invite_to_channel(&st.pool, channel_id, &b.agent_id, b.invited_by.as_deref()).await?,
     ))
 }
 
