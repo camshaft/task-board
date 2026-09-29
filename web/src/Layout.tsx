@@ -78,6 +78,12 @@ export default function Layout() {
         >
           Channels
         </Link>
+        <Link
+          to="/agents"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        >
+          Agents
+        </Link>
         <a
           href={new URL('api', document.baseURI).href}
           target="_blank"
@@ -169,10 +175,16 @@ export default function Layout() {
             )}
           </nav>
 
-          <div className="border-t border-[var(--color-border)] px-4 py-3">
+          <div className="flex items-center justify-between border-t border-[var(--color-border)] px-4 py-3">
             <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
               Agents
             </span>
+            <Link
+              to="/agents"
+              className="rounded px-1.5 text-xs text-sky-400 hover:bg-[var(--color-panel-2)]"
+            >
+              all →
+            </Link>
           </div>
           <div className="max-h-64 overflow-y-auto px-2 pb-3">
             {agents.map((a) => (

@@ -23,7 +23,9 @@ import { invalidate, invalidateMatching, useResource } from './store'
 const keys = {
   projects: 'projects',
   agents: 'agents',
-  events: 'events',
+  // Keyed by window size so a wide per-agent feed (AgentView) and the compact chrome feed
+  // (Layout/Home) don't share one cache entry and clobber each other's limit.
+  events: (limit: number) => `events:${limit}`,
   tasks: (projectId: number) => `tasks:${projectId}`,
   task: (taskId: number) => `task:${taskId}`,
   documents: 'documents',
@@ -85,7 +87,7 @@ export function useExternalNameResolver(): (id: string) => string {
 }
 
 export function useEvents(limit = 30) {
-  return useResource<EventRow[]>(keys.events, () =>
+  return useResource<EventRow[]>(keys.events(limit), () =>
     api.getEvents(0, limit).then((es) => es.reverse()),
   )
 }
@@ -153,7 +155,7 @@ export function touched(
   }
   if (opts.activity !== false) {
     invalidate(keys.projects)
-    invalidate(keys.events)
+    invalidateMatching('events:') // every windowed events feed
   }
 }
 
@@ -211,6 +213,15 @@ export async function moveTask(id: number, b: Parameters<typeof api.moveTask>[1]
   touched({ taskId: t.id, activity: true })
   touched({ projectId: t.project_id, activity: false })
   return t
+}
+
+// Agent mutations. metadata is MERGED server-side (like tasks), so this can add/overwrite keys
+// but not remove one. Refresh the agent's own view and the roster (status/name show there).
+export async function updateAgent(id: string, b: Parameters<typeof api.updateAgent>[1]) {
+  const a = await api.updateAgent(id, b)
+  invalidate(keys.agent(id))
+  invalidate(keys.agents)
+  return a
 }
 
 // Document mutations. Same pattern as the task ones: perform the request, then funnel through
