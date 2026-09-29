@@ -120,12 +120,27 @@ CREATE TABLE IF NOT EXISTS document_versions (
     created_at  TEXT NOT NULL,
     UNIQUE(document_id, version_no)
 );
+-- Comments on a document, optionally anchored to a region of a specific (immutable) version.
+-- region is a JSON string of W3C/Hypothesis-style selectors (NULL for a doc-level comment).
+-- reply_to gives one-level threading, like channel posts.
+CREATE TABLE IF NOT EXISTS document_comments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id),
+    version_id  INTEGER REFERENCES document_versions(id),
+    author      TEXT,
+    body        TEXT NOT NULL,
+    region      TEXT,
+    status      TEXT NOT NULL DEFAULT 'open',
+    reply_to    INTEGER REFERENCES document_comments(id),
+    created_at  TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
 CREATE INDEX IF NOT EXISTS idx_subs_target   ON subscriptions(target_type, target_id);
 CREATE INDEX IF NOT EXISTS idx_docs_project  ON documents(project_id);
 CREATE INDEX IF NOT EXISTS idx_docversions   ON document_versions(document_id, version_no);
+CREATE INDEX IF NOT EXISTS idx_doc_comments  ON document_comments(document_id, id);
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.

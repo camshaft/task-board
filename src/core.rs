@@ -1968,6 +1968,154 @@ pub async fn list_documents(
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
+/// Turn a document_comment row into JSON with its `region` TEXT parsed back into a JSON object
+/// (null when the comment has no anchor).
+fn document_comment_json(row: &SqliteRow) -> Value {
+    let mut obj = match row_to_json(row) {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let region: Value = obj
+        .get("region")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    obj.insert("region".into(), region);
+    Value::Object(obj)
+}
+
+/// Comment on a document, optionally anchored to a `region` of a specific (immutable) `version_id`.
+/// `region` is stored verbatim as JSON (W3C/Hypothesis-style selectors) — the backend never
+/// interprets it. Auto-subscribes the commenter and emits `document.comment` (FromDocument).
+pub async fn comment_document(
+    pool: &Pool,
+    document_id: i64,
+    version_id: Option<i64>,
+    author: Option<&str>,
+    body: &str,
+    region: Option<Value>,
+    reply_to: Option<i64>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    // Validate the document exists for a clean 404 (version_id/reply_to are FK-enforced).
+    if sqlx::query("SELECT 1 FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no document {document_id}");
+    }
+    let region_str = region.map(|r| r.to_string());
+    let cid: i64 = sqlx::query(
+        "INSERT INTO document_comments(document_id, version_id, author, body, region, reply_to, created_at) \
+         VALUES(?,?,?,?,?,?,?) RETURNING id",
+    )
+    .bind(document_id)
+    .bind(version_id)
+    .bind(author)
+    .bind(body)
+    .bind(&region_str)
+    .bind(reply_to)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    auto_subscribe_document(&mut tx, author, document_id).await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.comment",
+        author,
+        None,
+        None,
+        None,
+        Some(document_id),
+        json!({ "comment_id": cid, "version_id": version_id, "body": body, "reply_to": reply_to }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = sqlx::query("SELECT * FROM document_comments WHERE id=?")
+        .bind(cid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(document_comment_json)
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Mark a comment resolved and emit `document.comment_resolved` (FromDocument).
+pub async fn resolve_comment(pool: &Pool, comment_id: i64, actor: Option<&str>) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT document_id FROM document_comments WHERE id=?")
+        .bind(comment_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no comment {comment_id}");
+    };
+    let document_id: i64 = row.try_get("document_id")?;
+    sqlx::query("UPDATE document_comments SET status='resolved' WHERE id=?")
+        .bind(comment_id)
+        .execute(&mut *tx)
+        .await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.comment_resolved",
+        actor,
+        None,
+        None,
+        None,
+        Some(document_id),
+        json!({ "comment_id": comment_id }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = sqlx::query("SELECT * FROM document_comments WHERE id=?")
+        .bind(comment_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(document_comment_json)
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// List a document's comments (oldest first), optionally filtered by version and/or status.
+pub async fn get_document_comments(
+    pool: &Pool,
+    document_id: i64,
+    version_id: Option<i64>,
+    status: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut q = String::from("SELECT * FROM document_comments WHERE document_id=?");
+    if version_id.is_some() {
+        q.push_str(" AND version_id=?");
+    }
+    if status.is_some() {
+        q.push_str(" AND status=?");
+    }
+    q.push_str(" ORDER BY id");
+    let mut query = sqlx::query(&q).bind(document_id);
+    if let Some(v) = version_id {
+        query = query.bind(v);
+    }
+    if let Some(s) = status {
+        query = query.bind(s);
+    }
+    let rows = query.fetch_all(pool).await?;
+    Ok(Value::Array(rows.iter().map(document_comment_json).collect()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2177,6 +2325,73 @@ mod tests {
         let bob2 = check_notifications(&pool, "bob", true, 50, None).await?;
         assert_eq!(bob2["count"].as_i64(), Some(0), "no events after unsubscribe");
 
+        Ok(())
+    }
+
+    /// Document comments: region-anchored + doc-level + threaded, region JSON round-trips,
+    /// comments fan out to document subscribers, filter by version/status, and resolve flips
+    /// status.
+    #[tokio::test]
+    async fn document_comments_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None).await?;
+        let did = d["id"].as_i64().unwrap();
+        let vid = d["current_version"]["id"].as_i64().unwrap();
+
+        // bob subscribes so he hears comment activity.
+        subscribe(&pool, "bob", None, None, None, Some(did), false).await?;
+
+        // A region-anchored comment (carol). The region JSON is stored verbatim.
+        let region = json!({
+            "TextQuoteSelector": { "exact": "widgets", "prefix": "the ", "suffix": " are" },
+            "TextPositionSelector": { "start": 10, "end": 17 }
+        });
+        let c =
+            comment_document(&pool, did, Some(vid), Some("carol"), "typo", Some(region.clone()), None)
+                .await?;
+        let cid = c["id"].as_i64().unwrap();
+        assert_eq!(c["status"], json!("open"));
+        assert_eq!(c["region"], region, "region round-trips as JSON");
+        assert_eq!(c["version_id"], json!(vid));
+
+        // A doc-level comment (no region), threaded under the first.
+        let c2 = comment_document(&pool, did, None, Some("dave"), "agreed", None, Some(cid)).await?;
+        assert!(c2["region"].is_null(), "doc-level comment has null region");
+        assert_eq!(c2["reply_to"], json!(cid));
+
+        // bob (subscriber) heard both comments.
+        let bob = check_notifications(&pool, "bob", true, 50, None).await?;
+        assert_eq!(bob["count"].as_i64(), Some(2), "bob: {bob}");
+        assert!(bob["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["type"] == json!("document.comment")));
+
+        // List + filters.
+        assert_eq!(get_document_comments(&pool, did, None, None).await?.as_array().unwrap().len(), 2);
+        assert_eq!(
+            get_document_comments(&pool, did, Some(vid), None).await?.as_array().unwrap().len(),
+            1,
+            "only the region comment carries this version_id"
+        );
+
+        // Resolve flips status and is filterable.
+        let r = resolve_comment(&pool, cid, Some("alice")).await?;
+        assert_eq!(r["status"], json!("resolved"));
+        assert_eq!(
+            get_document_comments(&pool, did, None, Some("open")).await?.as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            get_document_comments(&pool, did, None, Some("resolved")).await?.as_array().unwrap().len(),
+            1
+        );
+
+        // Errors: comment on a missing doc, resolve a missing comment.
+        assert!(comment_document(&pool, 999, None, Some("x"), "hi", None, None).await.is_err());
+        assert!(resolve_comment(&pool, 999, Some("x")).await.is_err());
         Ok(())
     }
 

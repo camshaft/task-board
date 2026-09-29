@@ -30,7 +30,7 @@ struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let msg = self.0.to_string();
-        let code = if msg.starts_with("no project") || msg.starts_with("no task") || msg.starts_with("no agent") || msg.starts_with("no document") {
+        let code = if msg.starts_with("no project") || msg.starts_with("no task") || msg.starts_with("no agent") || msg.starts_with("no document") || msg.starts_with("no comment") {
             StatusCode::NOT_FOUND
         } else if msg.starts_with("give ") {
             StatusCode::BAD_REQUEST
@@ -85,6 +85,8 @@ pub fn router(state: AppState) -> Router {
         .route("/documents", get(list_documents).post(create_document))
         .route("/documents/{document_id}", get(get_document))
         .route("/documents/{document_id}/versions", get(get_document_versions).post(publish_version))
+        .route("/documents/{document_id}/comments", get(get_document_comments).post(comment_document))
+        .route("/documents/{document_id}/comments/{comment_id}/resolve", post(resolve_comment))
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
@@ -161,6 +163,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/versions", summary: "Publish a new immutable version (bare CID).", query: "", body: Some("PublishVersionBody") },
+    Endpoint { method: "GET", path: "/api/documents/{document_id}/comments", summary: "List a document's comments (filter by version_id/status).", query: "version_id=int&status=str", body: None },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/comments", summary: "Comment on a document, optionally region-anchored to a version.", query: "", body: Some("CommentDocumentBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/comments/{comment_id}/resolve", summary: "Mark a document comment resolved.", query: "", body: Some("ResolveCommentBody") },
     Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
 ];
 
@@ -190,6 +195,8 @@ fn body_schemas() -> Value {
         SendMessageBody,
         CreateDocumentBody,
         PublishVersionBody,
+        CommentDocumentBody,
+        ResolveCommentBody,
     )
 }
 
@@ -921,6 +928,68 @@ async fn publish_version(
             b.created_by.as_deref(),
         )
         .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct DocumentCommentsQuery {
+    version_id: Option<i64>,
+    status: Option<String>,
+}
+
+async fn get_document_comments(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Query(q): Query<DocumentCommentsQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::get_document_comments(&st.pool, document_id, q.version_id, q.status.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CommentDocumentBody {
+    body: String,
+    /// The version this comment is written against (anchors the region to immutable content).
+    version_id: Option<i64>,
+    author: Option<String>,
+    /// Free-form JSON anchor (e.g. W3C/Hypothesis selectors). Omit for a doc-level comment.
+    region: Option<Value>,
+    /// Thread this comment under another (one-level).
+    reply_to: Option<i64>,
+}
+
+async fn comment_document(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<CommentDocumentBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::comment_document(
+            &st.pool,
+            document_id,
+            b.version_id,
+            b.author.as_deref(),
+            &b.body,
+            b.region,
+            b.reply_to,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ResolveCommentBody {
+    actor: Option<String>,
+}
+
+async fn resolve_comment(
+    State(st): State<AppState>,
+    Path((_document_id, comment_id)): Path<(i64, i64)>,
+    Json(b): Json<ResolveCommentBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::resolve_comment(&st.pool, comment_id, b.actor.as_deref()).await?,
     ))
 }
 
