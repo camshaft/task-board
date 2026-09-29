@@ -283,6 +283,74 @@ export default function DocumentView() {
             })}
           </ul>
 
+          {/* Wiki link graph: pages THIS doc links to ([[path]] in its content) and pages that
+              link back to it. Outbound targets that aren't filed yet render as dangling red-links.
+              Populated when versions are published with raw content (the server indexes the links). */}
+          {(doc.outbound_links.length > 0 || doc.backlinks.length > 0) && (
+            <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Links to ({doc.outbound_links.length})
+                </h2>
+                <ul className="space-y-1">
+                  {doc.outbound_links.map((l, i) => (
+                    <li key={i} className="text-sm">
+                      {l.target_document_id != null ? (
+                        <Link
+                          to={`/documents/${l.target_document_id}`}
+                          className="text-sky-400 hover:text-sky-300"
+                          title={l.target_path}
+                        >
+                          {l.label ?? l.target_title ?? l.target_path}
+                        </Link>
+                      ) : (
+                        <Link
+                          to="/wiki"
+                          className="text-rose-400/90 hover:text-rose-300"
+                          title={`No page filed at "${l.target_path}" yet`}
+                        >
+                          {l.label ?? l.target_path}
+                        </Link>
+                      )}
+                      <span className="ml-1 font-mono text-[11px] text-[var(--color-muted)]">
+                        {l.target_path}
+                      </span>
+                    </li>
+                  ))}
+                  {doc.outbound_links.length === 0 && (
+                    <li className="text-xs text-[var(--color-muted)]">None.</li>
+                  )}
+                </ul>
+              </div>
+              <div>
+                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Linked from ({doc.backlinks.length})
+                </h2>
+                <ul className="space-y-1">
+                  {doc.backlinks.map((b) => (
+                    <li key={b.id} className="flex items-center gap-2 text-sm">
+                      <DocStatusChip status={b.status} />
+                      <Link
+                        to={`/documents/${b.id}`}
+                        className="min-w-0 flex-1 truncate hover:text-sky-300"
+                      >
+                        {b.title}
+                      </Link>
+                      {b.path && (
+                        <span className="font-mono text-[11px] text-[var(--color-muted)]">
+                          {b.path}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                  {doc.backlinks.length === 0 && (
+                    <li className="text-xs text-[var(--color-muted)]">Nothing links here yet.</li>
+                  )}
+                </ul>
+              </div>
+            </div>
+          )}
+
           {/* Review comments: threaded (top-level + one-level replies), each open comment
               resolvable. Region-anchored comments show the version they target. */}
           <h2 className="mb-2 mt-6 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">

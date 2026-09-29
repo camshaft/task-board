@@ -1,19 +1,27 @@
-import type { ReactNode } from 'react'
+import { createContext, useContext, type ReactNode } from 'react'
+import { Link } from 'react-router-dom'
 
 // Minimal, dependency-free Markdown renderer. It emits a React element tree (never
 // dangerouslySetInnerHTML), so all text is escaped by React and link hrefs are sanitized —
 // safe for rendering agent-authored task descriptions and comments. Supports the common
-// subset: ATX headings, fenced + inline code, bold, italic, links, blockquotes, ordered /
-// unordered lists, horizontal rules, and paragraphs. Not a full CommonMark implementation;
-// anything it doesn't recognize degrades to plain text.
+// subset: ATX headings, fenced + inline code, bold, italic, links, [[wiki-links]], blockquotes,
+// ordered / unordered lists, horizontal rules, and paragraphs. Not a full CommonMark
+// implementation; anything it doesn't recognize degrades to plain text.
 
 // Only these href schemes render as links; anything else (javascript:, data:, …) falls back
 // to plain text so a crafted link can't execute.
 const SAFE_HREF = /^(https?:\/\/|mailto:|\/|#)/i
 
-// Inline spans, in priority order: code (verbatim), links, bold, italic. Returns a mix of
-// strings (React escapes them) and elements. `gen` yields globally-unique keys.
-function inline(text: string, gen: () => number): ReactNode[] {
+// Resolves a [[wiki-path]] to the document filed there, or null when nothing is (a dangling
+// link, rendered as a wiki "red link"). Provided app-wide from the live wiki listing; the
+// default resolves nothing, so a Markdown rendered outside the provider degrades gracefully.
+export type WikiResolver = (path: string) => { id: number; title: string } | null
+export const WikiLinkContext = createContext<WikiResolver>(() => null)
+
+// Inline spans, in priority order: code (verbatim), wiki-links, links, bold, italic. Returns a
+// mix of strings (React escapes them) and elements. `gen` yields globally-unique keys;
+// `resolve` maps a [[wiki-path]] to its document (or null → dangling red-link).
+function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNode[] {
   const patterns: [RegExp, (m: RegExpExecArray) => ReactNode][] = [
     [
       /`([^`]+)`/,
@@ -27,6 +35,35 @@ function inline(text: string, gen: () => number): ReactNode[] {
       ),
     ],
     [
+      // [[path]] or [[path|label]] — an internal wiki link. Resolves to the doc filed at that
+      // path; a dangling target renders as a distinct "red link" (like a real wiki).
+      /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/,
+      (m) => {
+        const path = m[1].trim()
+        const label = (m[2] ?? m[1]).trim()
+        const hit = resolve(path)
+        return hit ? (
+          <Link
+            key={gen()}
+            to={`/documents/${hit.id}`}
+            title={path}
+            className="text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          >
+            {label}
+          </Link>
+        ) : (
+          <Link
+            key={gen()}
+            to={`/wiki`}
+            title={`No page filed at "${path}" yet`}
+            className="text-rose-400/90 underline decoration-dotted underline-offset-2 hover:text-rose-300"
+          >
+            {label}
+          </Link>
+        )
+      },
+    ],
+    [
       /\[([^\]]+)\]\(([^)\s]+)\)/,
       (m) =>
         SAFE_HREF.test(m[2]) ? (
@@ -37,16 +74,16 @@ function inline(text: string, gen: () => number): ReactNode[] {
             rel="noreferrer"
             className="text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
           >
-            {inline(m[1], gen)}
+            {inline(m[1], gen, resolve)}
           </a>
         ) : (
           <span key={gen()}>{m[0]}</span>
         ),
     ],
-    [/\*\*([^*]+)\*\*/, (m) => <strong key={gen()}>{inline(m[1], gen)}</strong>],
+    [/\*\*([^*]+)\*\*/, (m) => <strong key={gen()}>{inline(m[1], gen, resolve)}</strong>],
     [
       /\*([^*]+)\*|_([^_]+)_/,
-      (m) => <em key={gen()}>{inline(m[1] ?? m[2], gen)}</em>,
+      (m) => <em key={gen()}>{inline(m[1] ?? m[2], gen, resolve)}</em>,
     ],
   ]
 
@@ -101,7 +138,7 @@ function isBlockStart(line: string): boolean {
   )
 }
 
-function blocks(src: string): ReactNode[] {
+function blocks(src: string, resolve: WikiResolver): ReactNode[] {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const out: ReactNode[] = []
   let i = 0
@@ -138,7 +175,7 @@ function blocks(src: string): ReactNode[] {
 
     const h = /^(#{1,6})\s+(.*)$/.exec(line)
     if (h) {
-      out.push(heading(h[1].length, inline(h[2], gen), k++))
+      out.push(heading(h[1].length, inline(h[2], gen, resolve), k++))
       i++
       continue
     }
@@ -160,7 +197,7 @@ function blocks(src: string): ReactNode[] {
           key={k++}
           className="border-l-2 border-[var(--color-border)] pl-3 text-[var(--color-muted)]"
         >
-          {blocks(buf.join('\n'))}
+          {blocks(buf.join('\n'), resolve)}
         </blockquote>,
       )
       continue
@@ -175,7 +212,7 @@ function blocks(src: string): ReactNode[] {
       out.push(
         <ul key={k++} className="list-disc space-y-0.5 pl-5">
           {items.map((it, j) => (
-            <li key={j}>{inline(it, gen)}</li>
+            <li key={j}>{inline(it, gen, resolve)}</li>
           ))}
         </ul>,
       )
@@ -191,7 +228,7 @@ function blocks(src: string): ReactNode[] {
       out.push(
         <ol key={k++} className="list-decimal space-y-0.5 pl-5">
           {items.map((it, j) => (
-            <li key={j}>{inline(it, gen)}</li>
+            <li key={j}>{inline(it, gen, resolve)}</li>
           ))}
         </ol>,
       )
@@ -204,12 +241,14 @@ function blocks(src: string): ReactNode[] {
       buf.push(lines[i])
       i++
     }
-    out.push(<p key={k++}>{inline(buf.join(' '), gen)}</p>)
+    out.push(<p key={k++}>{inline(buf.join(' '), gen, resolve)}</p>)
   }
   return out
 }
 
 // Render `source` as Markdown. The wrapper spaces block elements; callers set the text size.
+// [[wiki-links]] resolve against the app-wide WikiLinkContext (dangling → red-link).
 export function Markdown({ source, className }: { source: string; className?: string }) {
-  return <div className={`space-y-2 ${className ?? ''}`}>{blocks(source)}</div>
+  const resolve = useContext(WikiLinkContext)
+  return <div className={`space-y-2 ${className ?? ''}`}>{blocks(source, resolve)}</div>
 }
