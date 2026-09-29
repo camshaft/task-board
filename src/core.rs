@@ -1205,6 +1205,8 @@ pub async fn comment_task(
         Recipients::FromTask,
     )
     .await?;
+    // If this task mirrors a promoted channel thread, fan the comment back out as a thread reply.
+    mirror_task_comment_to_thread(&mut tx, &mut hooks, task_id, cid, author, body, external_author).await?;
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(json!({ "comment_id": cid, "task_id": task_id }))
@@ -1592,6 +1594,11 @@ pub async fn post_to_channel(
         .await?;
     }
 
+    // If this post replies to a promoted thread's root, mirror it into the linked task as a
+    // comment (live thread->task sync, #151 slice 2). Direct insert -> no echo back to the thread.
+    mirror_thread_reply_to_task(&mut tx, &mut hooks, channel_id, seq, reply_to, sender, body, external_author)
+        .await?;
+
     sqlx::query("UPDATE channels SET updated_at=? WHERE id=?")
         .bind(now_iso())
         .bind(channel_id)
@@ -1828,6 +1835,115 @@ pub async fn promote_thread(
         "imported_comments": imported,
         "already_promoted": false,
     }))
+}
+
+// --- Live thread<->task sync (design #141 §7, #151 slice 2) ---
+//
+// Loop prevention is structural: mirrors are created by DIRECT emit/insert here, never by calling
+// the public post_to_channel / comment_task verbs, so a mirrored item never re-enters the mirror
+// path. Genuine posts/comments flow through the public verbs (each mirrors exactly once); imported
+// (promote_thread) and mirrored-in comments bypass comment_task, so they never echo back.
+
+/// A new channel post that replies to a PROMOTED thread's root is mirrored into the linked task
+/// as a comment (preserving from/external-author, timestamped now, `origin_ref` = the post seq).
+/// Idempotent via comments.origin_ref. Called from post_to_channel for genuine posts only.
+#[allow(clippy::too_many_arguments)]
+async fn mirror_thread_reply_to_task(
+    tx: &mut Transaction<'_, Sqlite>,
+    hooks: &mut Vec<WebhookDelivery>,
+    channel_id: i64,
+    post_seq: i64,
+    reply_to: Option<i64>,
+    from: &str,
+    body: &str,
+    external_author: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(root_seq) = reply_to else { return Ok(()) };
+    let source_id = format!("channel:{channel_id}:{root_seq}");
+    let task_id: Option<i64> = sqlx::query(
+        "SELECT task_id FROM task_links WHERE source_kind='channel_thread' AND source_id=?",
+    )
+    .bind(&source_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|r| r.try_get("task_id"))
+    .transpose()?;
+    let Some(task_id) = task_id else { return Ok(()) };
+    let origin = post_seq.to_string();
+    if sqlx::query("SELECT 1 FROM comments WHERE task_id=? AND origin_ref=?")
+        .bind(task_id)
+        .bind(&origin)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some()
+    {
+        return Ok(()); // already mirrored this post
+    }
+    let ts = now_iso();
+    let cid: i64 = sqlx::query(
+        "INSERT INTO comments(task_id, author, body, created_at, external_author, origin_ref) \
+         VALUES(?,?,?,?,?,?) RETURNING id",
+    )
+    .bind(task_id)
+    .bind(from)
+    .bind(body)
+    .bind(&ts)
+    .bind(external_author)
+    .bind(&origin)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get("id")?;
+    let mut data = json!({ "comment_id": cid, "body": body, "mirrored_from_post": post_seq });
+    if let Some(ext) = external_author {
+        data["external_author"] = json!(ext);
+    }
+    emit(tx, hooks, "task.commented", Some(from), Some(task_id), None, None, None, data, Recipients::FromTask)
+        .await?;
+    Ok(())
+}
+
+/// A genuine task comment on a thread-linked task is mirrored back onto the thread as a channel
+/// reply (reply_to = the thread root), carrying `origin_comment` for provenance. Emitted directly
+/// as a channel.post (not via post_to_channel), so it does not re-trigger the reply→comment
+/// mirror. Called from comment_task; imported/mirrored-in comments bypass comment_task entirely.
+async fn mirror_task_comment_to_thread(
+    tx: &mut Transaction<'_, Sqlite>,
+    hooks: &mut Vec<WebhookDelivery>,
+    task_id: i64,
+    comment_id: i64,
+    author: Option<&str>,
+    body: &str,
+    external_author: Option<&str>,
+) -> anyhow::Result<()> {
+    let row = sqlx::query(
+        "SELECT metadata FROM task_links WHERE source_kind='channel_thread' AND task_id=? LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else { return Ok(()) };
+    let meta: Value = row
+        .try_get::<Option<String>, _>("metadata")?
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    let (Some(channel_id), Some(root_seq)) = (meta["channel_id"].as_i64(), meta["root_post_seq"].as_i64())
+    else {
+        return Ok(());
+    };
+    let from = author.unwrap_or("anon");
+    let mut data = json!({ "body": body, "from": from, "reply_to": root_seq, "origin_comment": comment_id });
+    if let Some(ext) = external_author {
+        data["external_author"] = json!(ext);
+    }
+    emit(tx, hooks, "channel.post", Some(from), None, None, Some(channel_id), None, data, Recipients::FromChannel(channel_id))
+        .await?;
+    sqlx::query("UPDATE channels SET updated_at=? WHERE id=?")
+        .bind(now_iso())
+        .bind(channel_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Read a channel's post backlog after `since_seq`, oldest first (a fresh joiner needs
@@ -4467,6 +4583,56 @@ mod tests {
         assert!(upsert_external_link(&pool, "slack", "C9", None, "channel", 999999, None).await.is_err());
         assert!(upsert_external_link(&pool, "  ", "C9", None, "channel", cid, None).await.is_err());
         assert!(upsert_external_link(&pool, "slack", "  ", None, "channel", cid, None).await.is_err());
+        Ok(())
+    }
+
+    /// #151 slice 2: live bidirectional thread<->task sync. A new thread reply mirrors to a task
+    /// comment and a new task comment mirrors to a thread reply — each exactly once, no echo.
+    #[tokio::test]
+    async fn thread_task_live_sync() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "concierge", None, None, None, None, None).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("concierge"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let ch = create_channel(&pool, "planning", None, Some("concierge"), None).await?;
+        let cid = ch["id"].as_i64().unwrap();
+
+        // Promote a (reply-less) thread -> task, then wire lives.
+        let root = post_to_channel(&pool, cid, "concierge", "root topic", None, None).await?;
+        let root_seq = root["seq"].as_i64().unwrap();
+        let tid = promote_thread(&pool, cid, root_seq, pid, Some("concierge")).await?["task_id"].as_i64().unwrap();
+        assert_eq!(get_task(&pool, tid).await?["comments"].as_array().unwrap().len(), 0);
+
+        // Direction 1: a new thread reply -> a task comment (attribution + origin preserved).
+        let r1 = post_to_channel(&pool, cid, "slack-bridge", "reply from ada", Some(root_seq), Some("slack:U1")).await?;
+        let r1_seq = r1["seq"].as_i64().unwrap();
+        let comments = get_task(&pool, tid).await?["comments"].as_array().unwrap().clone();
+        assert_eq!(comments.len(), 1, "thread reply mirrored to a task comment");
+        assert_eq!(comments[0]["body"], json!("reply from ada"));
+        assert_eq!(comments[0]["author"], json!("slack-bridge"));
+        assert_eq!(comments[0]["external_author"], json!("slack:U1"));
+        assert_eq!(comments[0]["origin_ref"], json!(r1_seq.to_string()));
+        // No echo: the mirrored comment did NOT create another thread post.
+        assert_eq!(get_channel_posts(&pool, cid, 0, 100).await?.as_array().unwrap().len(), 2, "root + r1 only");
+
+        // Direction 2: a new task comment -> a thread reply.
+        comment_task(&pool, tid, "reply from board", Some("worker"), None).await?;
+        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts = posts.as_array().unwrap();
+        assert_eq!(posts.len(), 3, "root + r1 + the mirrored comment");
+        let mirrored = posts.iter().find(|p| p["data"]["origin_comment"].is_i64()).unwrap();
+        assert_eq!(mirrored["data"]["reply_to"], json!(root_seq));
+        assert_eq!(mirrored["data"]["from"], json!("worker"));
+        assert_eq!(mirrored["data"]["body"], json!("reply from board"));
+        // No echo: the mirrored post did NOT create another task comment (still r1-mirror + worker's).
+        assert_eq!(get_task(&pool, tid).await?["comments"].as_array().unwrap().len(), 2, "no echo comment");
+
+        // Safety: a comment on a NON-linked task posts nothing to the channel.
+        let solo = create_task(&pool, pid, "solo", None, None, None, Some("worker"), None, None).await?["id"].as_i64().unwrap();
+        comment_task(&pool, solo, "unrelated", Some("worker"), None).await?;
+        assert_eq!(get_channel_posts(&pool, cid, 0, 100).await?.as_array().unwrap().len(), 3, "unlinked task doesn't post");
         Ok(())
     }
 }
