@@ -90,6 +90,8 @@ pub fn router(state: AppState) -> Router {
         .route("/documents/{document_id}/submit-review", post(submit_for_review))
         .route("/documents/{document_id}/request-changes", post(request_changes))
         .route("/documents/{document_id}/approve", post(approve_document))
+        .route("/documents/{document_id}/attach", post(attach_document))
+        .route("/documents/{document_id}/detach", post(detach_document))
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
@@ -172,6 +174,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-review", summary: "Submit a document for review (status -> in_review).", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/request-changes", summary: "Request changes on a document (status -> changes_requested).", query: "", body: Some("RequestChangesBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/approve", summary: "Approve a document (stamps the current version, status -> approved).", query: "", body: Some("DocumentActorBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/attach", summary: "Attach a document to a task (notifies both sides).", query: "", body: Some("AttachDocumentBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/detach", summary: "Detach a document from a task.", query: "", body: Some("AttachDocumentBody") },
     Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
 ];
 
@@ -205,6 +209,7 @@ fn body_schemas() -> Value {
         ResolveCommentBody,
         DocumentActorBody,
         RequestChangesBody,
+        AttachDocumentBody,
     )
 }
 
@@ -1040,6 +1045,32 @@ async fn approve_document(
 ) -> ApiResult {
     Ok(Json(
         core::approve_document(&st.pool, document_id, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AttachDocumentBody {
+    task_id: i64,
+    actor: Option<String>,
+}
+
+async fn attach_document(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<AttachDocumentBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::attach_document(&st.pool, document_id, b.task_id, b.actor.as_deref()).await?,
+    ))
+}
+
+async fn detach_document(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<AttachDocumentBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::detach_document(&st.pool, document_id, b.task_id, b.actor.as_deref()).await?,
     ))
 }
 

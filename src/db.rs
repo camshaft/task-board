@@ -134,6 +134,14 @@ CREATE TABLE IF NOT EXISTS document_comments (
     reply_to    INTEGER REFERENCES document_comments(id),
     created_at  TEXT NOT NULL
 );
+-- Many-to-many links between documents and tasks (a design doc can back several tasks).
+CREATE TABLE IF NOT EXISTS document_attachments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id),
+    task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    created_at  TEXT NOT NULL,
+    UNIQUE(document_id, task_id)
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
@@ -141,6 +149,8 @@ CREATE INDEX IF NOT EXISTS idx_subs_target   ON subscriptions(target_type, targe
 CREATE INDEX IF NOT EXISTS idx_docs_project  ON documents(project_id);
 CREATE INDEX IF NOT EXISTS idx_docversions   ON document_versions(document_id, version_no);
 CREATE INDEX IF NOT EXISTS idx_doc_comments  ON document_comments(document_id, id);
+CREATE INDEX IF NOT EXISTS idx_doc_attach_task ON document_attachments(task_id);
+CREATE INDEX IF NOT EXISTS idx_doc_attach_doc  ON document_attachments(document_id);
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
