@@ -191,8 +191,8 @@ CREATE TABLE IF NOT EXISTS task_links (
 -- (e.g. the Slack channel of a thread). board_kind is channel, task, or thread and board_id is
 -- the board-side id. UNIQUE(source, external_id) keeps the mapping idempotent -- one external
 -- entity maps to one board entity per system.
--- (Keep schema comments free of semicolons: this SCHEMA string is applied statement-by-statement
--- by splitting on the semicolon, so a semicolon in a comment would truncate the statement.)
+-- (This SCHEMA is applied statement-by-statement by split_schema_statements, which strips these
+-- comments before splitting on the semicolon, so a comment may safely contain one.)
 CREATE TABLE IF NOT EXISTS external_links (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     source             TEXT NOT NULL,
@@ -263,6 +263,29 @@ CREATE INDEX IF NOT EXISTS idx_docembeds_source ON document_embeds(source_docume
 CREATE INDEX IF NOT EXISTS idx_docembeds_target ON document_embeds(target_path);
 "#;
 
+/// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
+/// multi-statement execute). Strips `--` line comments FIRST, then splits on ';'. Doing the
+/// strip before the split is what lets a comment safely contain a semicolon: historically a `;`
+/// inside a `-- comment` truncated the CREATE statement mid-definition and broke init with a
+/// cryptic "near ...: syntax error" (a trap that bit repeatedly). Assumes no `--` appears inside
+/// a string literal in the schema — none does, it is plain DDL; revisit if that ever changes.
+fn split_schema_statements(schema: &str) -> Vec<String> {
+    let without_comments: String = schema
+        .lines()
+        .map(|line| match line.find("--") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    without_comments
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
 pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     if let Some(parent) = std::path::Path::new(db_path).parent() {
@@ -300,12 +323,10 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     // connection (or per-write BEGIN IMMEDIATE), not a wider undifferentiated pool.
     let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
 
-    // executescript-equivalent: split on ';' and run each statement.
-    for stmt in SCHEMA.split(';') {
-        let s = stmt.trim();
-        if !s.is_empty() {
-            sqlx::query(s).execute(&pool).await?;
-        }
+    // executescript-equivalent: sqlx has no multi-statement execute, so apply the schema one
+    // statement at a time (split_schema_statements strips comments, then splits on ';').
+    for stmt in split_schema_statements(SCHEMA) {
+        sqlx::query(&stmt).execute(&pool).await?;
     }
 
     // Migration: back-fill tasks.metadata on a DB created before it existed (CREATE
@@ -528,6 +549,33 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the recurring "semicolon in a schema comment" trap: a `;` inside a `--`
+    /// comment used to truncate the following CREATE statement (init failed with a cryptic
+    /// "near ...: syntax error"). split_schema_statements strips comments before splitting, so a
+    /// comment may now contain semicolons and no comment text survives into a statement.
+    #[test]
+    fn split_schema_strips_comments_and_tolerates_semicolons_in_them() {
+        let schema = "\
+-- a leading comment; with a semicolon in it
+CREATE TABLE a (id INTEGER); -- trailing; comment; here
+CREATE TABLE b (id INTEGER);
+-- a dangling; comment; after the last statement
+";
+        let stmts = split_schema_statements(schema);
+        assert_eq!(stmts.len(), 2, "expected exactly two statements, got: {stmts:?}");
+        assert!(stmts[0].starts_with("CREATE TABLE a"), "got: {:?}", stmts[0]);
+        assert!(stmts[1].starts_with("CREATE TABLE b"), "got: {:?}", stmts[1]);
+        assert!(
+            stmts.iter().all(|s| !s.contains("comment")),
+            "comment text leaked into a statement: {stmts:?}"
+        );
+        // Sanity-check the real embedded SCHEMA too: it splits into many statements and none of
+        // them still carry a `--` comment marker.
+        let real = split_schema_statements(SCHEMA);
+        assert!(real.len() > 5, "SCHEMA should split into many statements, got {}", real.len());
+        assert!(real.iter().all(|s| !s.contains("--")), "a `--` comment survived the split");
+    }
 
     /// Regression for the #63 crash-loop: a DB whose `documents` table predates the `path`
     /// column must migrate cleanly. `path` is back-filled by an ALTER after the SCHEMA apply
