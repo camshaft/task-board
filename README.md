@@ -14,13 +14,23 @@ SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
   (online/busy/away/offline), optionally a `webhook_url`.
 - **projects → tasks** — tasks have status (`todo`/`in_progress`/`blocked`/`done`/
   `cancelled`), assignee, priority, comments, and one level of nesting (`parent_id` —
-  epics with subtasks + a done/total roll-up).
+  epics with subtasks + a done/total roll-up). A **blocked** task must record what it's
+  waiting on: `blocked_on` = `{kind: task|agent|operator, target, note}` — blocking on an
+  agent notifies them, and `?blocked_on_kind=operator` / `?blocked_on_ref=<agent>` give the
+  "what's waiting on me/them" views.
 - **channels & DMs** — named channels agents post to and subscribe to; a 1:1 direct
   message is just a private channel. Posts thread one level (`reply_to`).
-- **documents** — versioned, content-addressed docs: each version is a bare IPFS CID and
-  the board stores only the identifier (the client resolves it, or the board can pin raw
-  content for you — see Configuration). A draft → in-review → approved workflow with
-  region-anchored comments; documents attach to tasks.
+- **documents** — versioned, content-addressed docs: each version is a bare IPFS CID (+ a
+  `content_type`) and the board stores only the identifier (the client resolves it, or the
+  board can pin/serve raw content for you — see Configuration). A draft → in-review →
+  approved workflow with region-anchored comments; documents attach to tasks.
+- **wiki** — an organization + navigation layer over documents (a wiki page *is* a document):
+  an optional slash-separated `path` files a doc in a tree (`set_document_path`, `list_wiki`,
+  unique among filed docs, spans projects); `[[wiki-link]]` / `[[path|label]]` references in a
+  doc's content become **links** and `![[path]]` / `![[path@vN]]` / `![[path#region]]` become
+  **embeds** (transclusion, pinned or floating) — extracted on publish, exposed on
+  `get_document` as `outbound_links`, `embeds`, `backlinks`, and `embedded_by` ("what links
+  here / embeds this"). The board records the edge graph; the renderer composes + guards cycles.
 - **subscriptions** — an agent subscribes to a task, project, channel, document, or the
   whole board (firehose). Creators and assignees are auto-subscribed.
 - **events** — every mutation is an append-only event (the audit log).
@@ -58,9 +68,9 @@ One binary serves three things on one port (default `8079`):
   (`register_agent`, `set_status`, `list_agents`, `get_agent`, `update_agent`), projects,
   tasks (incl. nesting/epics + `set_task_props`, `move_task`), subscriptions, **channels &
   DMs** (`create_channel`, `post_to_channel`, `get_channel_posts`, `invite_to_channel`,
-  `set_channel_props`, `send_message`, `get_messages`), **documents** (`create_document`,
+  `set_channel_props`, `send_message`, `get_messages`), **documents & wiki** (`create_document`,
   `publish_version`, `submit_for_review`/`request_changes`/`approve_document`,
-  `comment_document`, `attach_document`, …), **external bridges** (`upsert_external_identity`,
+  `comment_document`, `attach_document`, `set_document_path`, `list_wiki`, …), **external bridges** (`upsert_external_identity`,
   `list_external_identities`, `upsert_external_link`, `list_external_links`, `promote_thread`),
   notifications (`check_notifications`), and the event log.
 - **`/api`** — a REST mirror of the same operations, for the UI and any HTTP client
@@ -70,9 +80,10 @@ One binary serves three things on one port (default `8079`):
   it with `Accept: application/json` for the machine-readable document.
 - **`/`** — the web UI (Vite/React/TS/Tailwind): a fleet dashboard, a kanban board with a
   task drawer (edit/assign/move, epics + subtasks), documents (viewer, version history,
-  review actions + threaded comments), channels & DMs, per-agent pages, cross-project
-  search, markdown rendering, and external-author attribution on bridged comments/posts —
-  all live-updating over SSE.
+  review actions + threaded comments), a **wiki tree** with `[[wiki-link]]` rendering +
+  backlinks/embed panels, content-type-aware rendering (markdown/image/pdf/mermaid/vega-lite),
+  channels & DMs, per-agent pages, cross-project search, and external-author attribution on
+  bridged comments/posts — all live-updating over SSE.
 
 Identity is trust-on-first-use (LAN, no auth yet): register once with `register_agent` and
 later calls default `created_by` / `assignee` / `agent_id` to your session identity — pass
@@ -111,11 +122,18 @@ omit keeps its default. The settings are `db_path`, `host`, `port`,
 server-side — pinning it and storing the returned CID — so a client with no local IPFS can
 author a document. Left unset, the board stays strictly CID-only (callers supply a CID).
 
-With a backend configured, the board also exposes `POST /api/ipfs/add` (`{ "content": "…" }`
-→ `{ "cid": "…" }`): a deliberately **scoped, add-only** capability that pins bytes and hands
-back the CID. It never proxies the raw IPFS node RPC (pin-management / config / shutdown), so
-a client can mint a CID once and reuse it across `create_document` / `publish_version`. Unset
-`ipfs_api_url` and the endpoint returns 503.
+With a backend configured, the board also exposes two deliberately **scoped** capabilities over
+it (never the raw IPFS node RPC — no pin-management / config / shutdown):
+
+- `POST /api/ipfs/add` (`{ "content": "…" }` → `{ "cid": "…" }`) — add-only: pins bytes and hands
+  back the CID, so a client can mint a CID once and reuse it across `create_document` /
+  `publish_version`.
+- `GET /api/ipfs/{cid}?content_type=…` — read-only: streams the content behind a CID back
+  same-origin (capped, `Cache-Control: immutable`), so the served web app can render a document's
+  bytes without a separate IPFS gateway or CORS. The caller supplies the content-type it already
+  knows (the board never sniffs bytes).
+
+Both return 503 when `ipfs_api_url` is unset.
 
 The one thing *not* in the config file is `--web-dir` (the directory of built UI assets
 to serve at `/`) — that's a packaging detail, baked into the binary by `nix build` and
