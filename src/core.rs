@@ -2605,6 +2605,7 @@ async fn document_json(
 
 /// Create a document with its first version. The `cid` is stored verbatim (the board does not
 /// resolve or validate it). Returns the document JSON with its current version + version list.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_document(
     pool: &Pool,
     title: &str,
@@ -2613,8 +2614,10 @@ pub async fn create_document(
     summary: Option<&str>,
     created_by: Option<&str>,
     metadata: Option<Value>,
+    content_type: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
+    let ct = content_type.unwrap_or("text/markdown");
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let meta_str = metadata.unwrap_or_else(|| json!({})).to_string();
@@ -2634,14 +2637,15 @@ pub async fn create_document(
     .await?
     .try_get("id")?;
     let vid: i64 = sqlx::query(
-        "INSERT INTO document_versions(document_id, version_no, cid, summary, created_by, created_at) \
-         VALUES(?,1,?,?,?,?) RETURNING id",
+        "INSERT INTO document_versions(document_id, version_no, cid, summary, created_by, created_at, content_type) \
+         VALUES(?,1,?,?,?,?,?) RETURNING id",
     )
     .bind(did)
     .bind(cid)
     .bind(summary)
     .bind(created_by)
     .bind(&ts)
+    .bind(ct)
     .fetch_one(&mut *tx)
     .await?
     .try_get("id")?;
@@ -2661,7 +2665,7 @@ pub async fn create_document(
         project_id,
         None,
         Some(did),
-        json!({ "title": title, "slug": slug, "cid": cid, "version_no": 1 }),
+        json!({ "title": title, "slug": slug, "cid": cid, "version_no": 1, "content_type": ct }),
         Recipients::FromDocument(did),
     )
     .await?;
@@ -2680,8 +2684,10 @@ pub async fn publish_version(
     cid: &str,
     summary: Option<&str>,
     created_by: Option<&str>,
+    content_type: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
+    let ct = content_type.unwrap_or("text/markdown");
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let Some(doc) = sqlx::query("SELECT status, project_id FROM documents WHERE id=?")
@@ -2701,8 +2707,8 @@ pub async fn publish_version(
     .await?
     .try_get("n")?;
     let vid: i64 = sqlx::query(
-        "INSERT INTO document_versions(document_id, version_no, cid, summary, created_by, created_at) \
-         VALUES(?,?,?,?,?,?) RETURNING id",
+        "INSERT INTO document_versions(document_id, version_no, cid, summary, created_by, created_at, content_type) \
+         VALUES(?,?,?,?,?,?,?) RETURNING id",
     )
     .bind(document_id)
     .bind(next_no)
@@ -2710,6 +2716,7 @@ pub async fn publish_version(
     .bind(summary)
     .bind(created_by)
     .bind(&ts)
+    .bind(ct)
     .fetch_one(&mut *tx)
     .await?
     .try_get("id")?;
@@ -2736,7 +2743,7 @@ pub async fn publish_version(
         project_id,
         None,
         Some(document_id),
-        json!({ "version_no": next_no, "cid": cid, "summary": summary, "status": new_status }),
+        json!({ "version_no": next_no, "cid": cid, "summary": summary, "status": new_status, "content_type": ct }),
         Recipients::FromDocument(document_id),
     )
     .await?;
@@ -3312,6 +3319,7 @@ mod tests {
             Some("first draft"),
             Some("alice"),
             Some(json!({ "tags": ["design"] })),
+            None,
         )
         .await?;
         let did = d["id"].as_i64().unwrap();
@@ -3324,7 +3332,7 @@ mod tests {
         assert_eq!(d["versions"].as_array().unwrap().len(), 1);
 
         // Publish version 2 -> current advances, immutable history grows.
-        let d2 = publish_version(&pool, did, "bafyv2", Some("revise"), Some("alice")).await?;
+        let d2 = publish_version(&pool, did, "bafyv2", Some("revise"), Some("alice"), None).await?;
         assert_eq!(d2["current_version"]["version_no"], json!(2));
         assert_eq!(d2["current_version"]["cid"], json!("bafyv2"));
         assert_eq!(d2["versions"].as_array().unwrap().len(), 2);
@@ -3353,7 +3361,7 @@ mod tests {
             .bind(did)
             .execute(&pool)
             .await?;
-        let d3 = publish_version(&pool, did, "bafyv3", None, Some("alice")).await?;
+        let d3 = publish_version(&pool, did, "bafyv3", None, Some("alice"), None).await?;
         assert_eq!(d3["status"], json!("in_review"), "new version supersedes approval");
 
         // Missing document -> error.
@@ -3370,13 +3378,13 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // alice creates a doc (auto-subscribed as author).
-        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None).await?;
+        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None).await?;
         let did = d["id"].as_i64().unwrap();
         // bob explicitly subscribes to the document.
         subscribe(&pool, "bob", None, None, None, Some(did), false).await?;
 
         // carol publishes v2 -> author (alice) + subscriber (bob) hear it; carol (actor) does not.
-        publish_version(&pool, did, "bafy2", Some("second"), Some("carol")).await?;
+        publish_version(&pool, did, "bafy2", Some("second"), Some("carol"), None).await?;
 
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
@@ -3402,7 +3410,7 @@ mod tests {
 
         // Unsubscribing stops delivery.
         unsubscribe(&pool, "bob", None, None, None, Some(did), false).await?;
-        publish_version(&pool, did, "bafy3", None, Some("alice")).await?;
+        publish_version(&pool, did, "bafy3", None, Some("alice"), None).await?;
         let bob2 = check_notifications(&pool, "bob", true, 50, None).await?;
         assert_eq!(bob2["count"].as_i64(), Some(0), "no events after unsubscribe");
 
@@ -3416,7 +3424,7 @@ mod tests {
     async fn document_comments_roundtrip() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None).await?;
+        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None).await?;
         let did = d["id"].as_i64().unwrap();
         let vid = d["current_version"]["id"].as_i64().unwrap();
 
@@ -3491,7 +3499,7 @@ mod tests {
     async fn document_review_workflow() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Design", None, "bafy1", None, Some("alice"), None).await?;
+        let d = create_document(&pool, "Design", None, "bafy1", None, Some("alice"), None, None).await?;
         let did = d["id"].as_i64().unwrap();
         assert_eq!(d["status"], json!("draft"));
 
@@ -3507,7 +3515,7 @@ mod tests {
         assert_eq!(rc["status"], json!("changes_requested"));
 
         // Author publishes a new version -> reopens review (per publish_version).
-        let v2 = publish_version(&pool, did, "bafy2", Some("addressed"), Some("alice")).await?;
+        let v2 = publish_version(&pool, did, "bafy2", Some("addressed"), Some("alice"), None).await?;
         assert_eq!(v2["status"], json!("in_review"), "a new version reopens review");
         let v2id = v2["current_version"]["id"].as_i64().unwrap();
 
@@ -3518,7 +3526,7 @@ mod tests {
         assert_eq!(ap["approved_by"], json!("operator"));
 
         // Approval is a stamp, not a lock: publishing again reopens review but keeps the stamp.
-        let v3 = publish_version(&pool, did, "bafy3", None, Some("alice")).await?;
+        let v3 = publish_version(&pool, did, "bafy3", None, Some("alice"), None).await?;
         assert_eq!(v3["status"], json!("in_review"));
         assert_eq!(v3["approved_version_id"], json!(v2id), "stamp persists across a new version");
 
@@ -3555,7 +3563,7 @@ mod tests {
         let t = create_task(&pool, pid, "Build widget", None, Some("alice"), None, Some("alice"), None, None)
             .await?;
         let tid = t["id"].as_i64().unwrap();
-        let d = create_document(&pool, "Widget design", None, "bafy1", None, Some("bob"), None).await?;
+        let d = create_document(&pool, "Widget design", None, "bafy1", None, Some("bob"), None, None).await?;
         let did = d["id"].as_i64().unwrap();
 
         // Drain the create notifications so the attach fan-out is isolated.
@@ -3623,14 +3631,14 @@ mod tests {
 
         let a = create_document(
             &pool, "A", Some(pid), "bafyA", None, Some("alice"),
-            Some(json!({ "tags": ["design", "rfc"] })),
+            Some(json!({ "tags": ["design", "rfc"] })), None,
         ).await?;
         let aid = a["id"].as_i64().unwrap();
         let b = create_document(
-            &pool, "B", None, "bafyB", None, Some("bob"), Some(json!({ "tags": ["ops"] })),
+            &pool, "B", None, "bafyB", None, Some("bob"), Some(json!({ "tags": ["ops"] })), None,
         ).await?;
         let bid = b["id"].as_i64().unwrap();
-        let c = create_document(&pool, "C", Some(pid), "bafyC", None, Some("alice"), None).await?;
+        let c = create_document(&pool, "C", Some(pid), "bafyC", None, Some("alice"), None, None).await?;
         let cid = c["id"].as_i64().unwrap();
         approve_document(&pool, cid, Some("op")).await?;
 
@@ -4714,6 +4722,37 @@ mod tests {
         assert_eq!(by_b[0]["actor"], json!("b"));
 
         assert!(get_events(&pool, 0, 500, Some("nobody")).await?.as_array().unwrap().is_empty());
+        Ok(())
+    }
+
+    /// #107: a document version records its content_type (MIME); create/publish accept it,
+    /// defaulting to text/markdown, and reads expose it per version.
+    #[tokio::test]
+    async fn document_version_content_type() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // v1 with an explicit non-markdown type.
+        let d = create_document(&pool, "Diagram", None, "bafypng", None, Some("alice"), None, Some("image/png")).await?;
+        let did = d["id"].as_i64().unwrap();
+        assert_eq!(d["current_version"]["content_type"], json!("image/png"));
+
+        // A later version can change the type; the authoritative type is per-version.
+        let d2 = publish_version(&pool, did, "bafypdf", Some("as pdf"), Some("alice"), Some("application/pdf")).await?;
+        assert_eq!(d2["current_version"]["content_type"], json!("application/pdf"));
+
+        // Omitting content_type defaults to text/markdown (back-compat).
+        let d3 = publish_version(&pool, did, "bafymd", None, Some("alice"), None).await?;
+        assert_eq!(d3["current_version"]["content_type"], json!("text/markdown"));
+
+        // get_document_versions surfaces content_type per version.
+        let vers = get_document_versions(&pool, did).await?;
+        let types: Vec<&str> = vers.as_array().unwrap().iter().map(|v| v["content_type"].as_str().unwrap()).collect();
+        assert_eq!(types, vec!["text/markdown", "application/pdf", "image/png"], "newest first");
+
+        // A default create_document (no content_type) is text/markdown, matching the initial docs work.
+        let plain = create_document(&pool, "Notes", None, "bafymd2", None, Some("bob"), None, None).await?;
+        assert_eq!(plain["current_version"]["content_type"], json!("text/markdown"));
         Ok(())
     }
 }

@@ -500,6 +500,10 @@ pub struct CreateDocumentArgs {
     /// Arbitrary props (tags, etc). MERGED is not applicable on create — set the initial bag.
     #[serde(default)]
     pub metadata: Option<JsonObject>,
+    /// MIME type of v1's bytes (default text/markdown), e.g. image/png, application/pdf,
+    /// text/vnd.mermaid. The board records only the label; rendering is the client's job.
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -517,6 +521,9 @@ pub struct PublishVersionArgs {
     pub summary: Option<String>,
     #[serde(default)]
     pub created_by: Option<String>,
+    /// MIME type of this version's bytes (default text/markdown). The board records only the label.
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1123,6 +1130,7 @@ impl Board {
             s(&a.summary),
             s(&a.created_by),
             a.metadata.map(Value::Object),
+            s(&a.content_type),
         )
         .await
         .map_err(err)
@@ -1139,7 +1147,7 @@ impl Board {
         let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
             .await
             .map_err(err)?;
-        core::publish_version(&self.pool, a.document_id, &cid, s(&a.summary), s(&a.created_by))
+        core::publish_version(&self.pool, a.document_id, &cid, s(&a.summary), s(&a.created_by), s(&a.content_type))
             .await
             .map_err(err)
             .and_then(ok)
