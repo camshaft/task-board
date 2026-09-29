@@ -69,22 +69,8 @@ export function TaskDrawer() {
     }
   }
 
-  async function move() {
-    if (!task) return
-    // A tiny prompt-based picker: list the other projects by id so the user can pick one.
-    const others = projects.filter((p) => p.id !== task.project_id)
-    if (others.length === 0) {
-      window.alert('No other project to move this task to.')
-      return
-    }
-    const menu = others.map((p) => `${p.id}: ${p.name}`).join('\n')
-    const answer = window.prompt(`Move task to which project? Enter its id:\n\n${menu}`)
-    if (answer == null) return
-    const to = Number(answer.trim())
-    if (!Number.isInteger(to) || !others.some((p) => p.id === to)) {
-      setError(`'${answer}' isn't one of the listed project ids.`)
-      return
-    }
+  async function move(to: number) {
+    if (!task || to === task.project_id) return
     setBusy(true)
     try {
       await moveTask(task.id, { to_project_id: to, actor })
@@ -298,15 +284,35 @@ export function TaskDrawer() {
                 </dd>
                 <dt className="text-[var(--color-muted)]">Project</dt>
                 <dd className="col-span-2">
-                  <button
-                    onClick={move}
-                    disabled={busy}
-                    className="rounded px-1.5 py-0.5 text-xs hover:bg-[var(--color-panel-2)]"
-                    title="Move this task to another project"
-                  >
-                    {projects.find((p) => p.id === task.project_id)?.name ?? `#${task.project_id}`}
-                    <span className="ml-1 text-[var(--color-muted)]">move →</span>
-                  </button>
+                  {(() => {
+                    // Move targets: active projects, plus the current one guaranteed present
+                    // (so it stays the selected option even if it's since been archived).
+                    const targets = projects.filter(
+                      (p) => p.status !== 'archived' || p.id === task.project_id,
+                    )
+                    if (!targets.some((p) => p.id === task.project_id)) {
+                      targets.unshift({
+                        ...(projects.find((p) => p.id === task.project_id) ?? ({} as never)),
+                        id: task.project_id,
+                        name: `#${task.project_id}`,
+                      })
+                    }
+                    return (
+                      <select
+                        value={task.project_id}
+                        disabled={busy}
+                        onChange={(e) => void move(Number(e.target.value))}
+                        title="Move this task to another project"
+                        className="rounded border border-[var(--color-border)] bg-[var(--color-panel-2)] px-1.5 py-0.5 text-xs outline-none focus:border-sky-500/50"
+                      >
+                        {targets.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </select>
+                    )
+                  })()}
                 </dd>
                 <dt className="text-[var(--color-muted)]">Parent</dt>
                 <dd className="col-span-2">
