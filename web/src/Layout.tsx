@@ -2,8 +2,8 @@ import { useCallback, useMemo, useState } from 'react'
 import { Link, Outlet, useOutletContext, useParams } from 'react-router-dom'
 import { useLiveUpdates } from './live'
 import { WikiLinkContext, type WikiResolver } from './markdown'
-import { createProject, eventHref, useAgents, useEvents, useProjects, useWiki } from './resources'
-import { AGENT_DOT, relTime } from './ui'
+import { createProject, eventHref, useEvents, useProjects, useWiki } from './resources'
+import { relTime } from './ui'
 
 // The only thing nested routes still need handed down is the current actor (per-user
 // localStorage identity, not a server resource). All server data comes from the store hooks.
@@ -36,7 +36,6 @@ export default function Layout() {
   const [actor, setActor] = useActor()
   useLiveUpdates() // one SSE connection makes every subscribed panel live
   const { data: projects = [], error: projectsError } = useProjects()
-  const { data: agents = [] } = useAgents()
   const { data: events = [] } = useEvents()
   // Wiki path -> doc index, so [[wiki-links]] in any rendered markdown resolve app-wide (and
   // live-update as pages are filed). A miss renders as a dangling red-link.
@@ -220,46 +219,6 @@ export default function Layout() {
               </div>
             )}
           </nav>
-
-          <div className="flex items-center justify-between border-t border-[var(--color-border)] px-4 py-3">
-            <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-              Agents
-            </span>
-            <Link
-              to="/agents"
-              onClick={closeSidebar}
-              className="rounded px-1.5 text-xs text-sky-400 hover:bg-[var(--color-panel-2)]"
-            >
-              all →
-            </Link>
-          </div>
-          <div className="max-h-64 overflow-y-auto px-2 pb-3">
-            {agents.map((a) => (
-              <Link
-                key={a.id}
-                to={`/agents/${encodeURIComponent(a.id)}`}
-                onClick={closeSidebar}
-                className="block rounded-md px-3 py-1.5 text-sm hover:bg-[var(--color-panel-2)]"
-                title={a.charter ?? a.status_message ?? a.status}
-              >
-                <div className="flex items-center gap-2">
-                  <span className={`size-2 rounded-full ${AGENT_DOT[a.status] ?? 'bg-zinc-600'}`} />
-                  <span className="truncate font-mono text-xs">{a.id}</span>
-                  <span className="ml-auto text-[10px] text-[var(--color-muted)]">
-                    {relTime(a.last_seen)}
-                  </span>
-                </div>
-                {a.charter && (
-                  <p className="mt-0.5 pl-4 text-[11px] leading-snug text-[var(--color-muted)] line-clamp-2">
-                    {a.charter}
-                  </p>
-                )}
-              </Link>
-            ))}
-            {agents.length === 0 && (
-              <p className="px-3 py-1.5 text-sm text-[var(--color-muted)]">None online.</p>
-            )}
-          </div>
         </aside>
 
         {/* Whatever the URL points at: the board for a project, plus the task drawer. Wrapped so
