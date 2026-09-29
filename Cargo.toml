@@ -16,7 +16,7 @@ rmcp = { version = "3", features = [
     "schemars",
     "transport-streamable-http-server",
 ] }
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-util = "0.7"
@@ -39,3 +39,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tempfile = "3"
+# WS client for the /tunnel/ws round-trip integration test (plain ws://, no TLS backend).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+futures-util = "0.3"

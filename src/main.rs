@@ -9,6 +9,7 @@ mod events;
 mod ipfs;
 mod mcp;
 mod sse;
+mod tunnel;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -141,9 +142,14 @@ async fn main() -> anyhow::Result<()> {
         ipfs_api_url: cfg.ipfs_api_url.clone(),
     });
 
+    // Reverse tunnel for fleet hosts with no inbound path: they dial /tunnel/ws and the board
+    // pushes wakes down the socket. Top-level (not under /api) — it's a WS upgrade, not REST.
+    let tunnels = tunnel::registry();
+
     let mut router = Router::new()
         .nest_service("/mcp", mcp_service)
         .nest("/api", api_router)
+        .merge(tunnel::ws_router(tunnels.clone()))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
