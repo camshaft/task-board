@@ -4049,7 +4049,7 @@ async fn document_transition(
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let Some(row) =
-        sqlx::query("SELECT project_id, current_version_id FROM documents WHERE id=?")
+        sqlx::query("SELECT project_id, current_version_id, title FROM documents WHERE id=?")
             .bind(document_id)
             .fetch_optional(&mut *tx)
             .await?
@@ -4058,6 +4058,17 @@ async fn document_transition(
     };
     let project_id: Option<i64> = row.try_get("project_id")?;
     let current_version_id: Option<i64> = row.try_get("current_version_id")?;
+    let title: Option<String> = row.try_get("title")?;
+    // Enrich the event payload so a drained notification is self-describing — which document, its
+    // title, and the new status — letting the owner act (e.g. on approval) without a lookup. The
+    // approver is the event `actor`, already surfaced on the notification. (task #310)
+    if let Value::Object(ref mut m) = data {
+        m.insert("document_id".into(), json!(document_id));
+        if let Some(t) = &title {
+            m.insert("title".into(), json!(t));
+        }
+        m.insert("status".into(), json!(new_status));
+    }
     if stamp_approval {
         sqlx::query(
             "UPDATE documents SET status=?, approved_version_id=?, approved_by=?, updated_at=? WHERE id=?",
@@ -4816,6 +4827,43 @@ mod tests {
         // The commenter (actor) is not notified of their own comment.
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
         assert_eq!(bob["count"].as_i64(), Some(0), "actor excluded from own comment: {bob}");
+        Ok(())
+    }
+
+    /// A document's owner is notified when it's approved (and on the other review transitions),
+    /// with a self-describing payload — document_id, title, new status — plus the approver as the
+    /// event actor, so they can act without a lookup. The approver is excluded from their own
+    /// event. (operator #310.)
+    #[tokio::test]
+    async fn document_approval_notifies_owner_with_context() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(&pool, "Design X", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // bob (a reviewer) approves alice's document.
+        approve_document(&pool, did, Some("bob")).await?;
+
+        let alice = check_notifications(&pool, "alice", true, 50, None).await?;
+        let n = &alice["notifications"][0];
+        assert_eq!(n["type"], json!("document.approved"));
+        assert_eq!(n["actor"], json!("bob"), "the approver is surfaced as the event actor");
+        assert_eq!(n["data"]["document_id"], json!(did));
+        assert_eq!(n["data"]["title"], json!("Design X"));
+        assert_eq!(n["data"]["status"], json!("approved"));
+        // The approver is not notified of their own action.
+        let bob = check_notifications(&pool, "bob", true, 50, None).await?;
+        assert_eq!(bob["count"].as_i64(), Some(0), "approver excluded from own event");
+
+        // request_changes carries the same self-describing context.
+        request_changes(&pool, did, Some("bob"), Some("tighten §2")).await?;
+        let alice2 = check_notifications(&pool, "alice", true, 50, None).await?;
+        let m = &alice2["notifications"][0];
+        assert_eq!(m["type"], json!("document.changes_requested"));
+        assert_eq!(m["data"]["document_id"], json!(did));
+        assert_eq!(m["data"]["title"], json!("Design X"));
+        assert_eq!(m["data"]["status"], json!("changes_requested"));
+        assert_eq!(m["data"]["note"], json!("tighten §2"));
         Ok(())
     }
 
