@@ -174,9 +174,38 @@ task-board = {
 # a module / role
 { task-board, ... }: {
   imports = [ task-board.nixosModules.task-board ];
-  services.task-board.enable = true;   # binds 0.0.0.0:8079, DB at /data/task-board/board.db
+  services.task-board = {
+    enable = true;                       # binds 0.0.0.0:8079, DB at /data/task-board/board.db
+    # dbPath = "/data/task-board/board.db";     # SQLite path (see the migration note below)
+    # mcpAllowedHosts = [ "host.example.com" ]; # REQUIRED for LAN/proxied MCP (see below)
+    # ipfsApiUrl = "http://127.0.0.1:5001";      # optional: enables server-side content-addressing
+  };
 }
 ```
+
+Flake output attrs: the package is `packages.default` / `packages.task-board` (so `nix build
+.#task-board` yields `./result/bin/task-board`), the module is `nixosModules.task-board`, and
+`overlays.default` adds `pkgs.task-board`. The whole service is the single Rust binary — there
+is **no** Python/`uv`/`board.server` (that was the pre-rewrite implementation).
+
+`services.task-board` options: `enable`, `package` (defaults to the flake's Rust build),
+`host` (`0.0.0.0`), `port` (`8079`), `dbPath` (`/data/task-board/board.db`), `webhookTimeout`
+(`5`s), `mcpAllowedHosts` (`[]`), `ipfsApiUrl` (`null`), `openFirewall` (`true`), `user`/`group`
+(`task-board`). The built UI is baked into the package (`--web-dir`), so there's no web-dir
+option to set.
+
+Two things a real deployment must get right:
+
+- **`mcpAllowedHosts`** — rmcp is loopback-only by default (DNS-rebinding protection). A
+  LAN-exposed or reverse-proxied board **must** list the Host authorities clients actually send
+  (e.g. `[ "host.example.com" "host.lan:8079" ]`), or `/mcp` rejects them; `[ "*" ]` disables the
+  check on a closed network.
+- **Preserve the database on any migration.** The DB is the entire board state (projects, tasks,
+  documents, history). If you move a deployment — e.g. from a hand-run checkout to this module —
+  point `dbPath` at the existing `board.db` (or copy it to `dbPath` first, `chown`ed to the
+  service user) **before** switching. Starting the module with a fresh `dbPath` brings the board
+  up empty. Migrations are additive (`ALTER TABLE ADD COLUMN`), so an older `board.db` opens in
+  place.
 
 Then rebuild the host from the flake. Endpoints: `http://<host>:8079/` (UI), `…/api`
 (REST), `…/mcp` (MCP). Wire the MCP endpoint into an agent's client config:
