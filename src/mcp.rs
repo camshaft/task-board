@@ -412,6 +412,23 @@ pub struct GetDocumentCommentsArgs {
     pub status: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocumentActorArgs {
+    pub document_id: i64,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestChangesArgs {
+    pub document_id: i64,
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Optional note explaining what needs to change.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -900,6 +917,33 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(description = "Submit a document for review (status -> in_review). Notifies the document's subscribers.")]
+    async fn submit_for_review(
+        &self,
+        Parameters(a): Parameters<DocumentActorArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::submit_for_review(&self.pool, a.document_id, s(&a.actor)).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Request changes on a document (status -> changes_requested), with an optional note. Notifies the author + subscribers; the author then publishes a new version.")]
+    async fn request_changes(
+        &self,
+        Parameters(a): Parameters<RequestChangesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::request_changes(&self.pool, a.document_id, s(&a.actor), s(&a.note))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Approve a document: stamps the current version as approved (approved_version_id + approved_by) and sets status=approved. Not a lock — publishing a new version reopens review. Notifies subscribers.")]
+    async fn approve_document(
+        &self,
+        Parameters(a): Parameters<DocumentActorArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::approve_document(&self.pool, a.document_id, s(&a.actor)).await.map_err(err).and_then(ok)
     }
 }
 

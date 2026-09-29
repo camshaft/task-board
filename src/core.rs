@@ -2116,6 +2116,131 @@ pub async fn get_document_comments(
     Ok(Value::Array(rows.iter().map(document_comment_json).collect()))
 }
 
+/// Shared driver for a document status transition: set the status (optionally stamping the
+/// current version as approved), emit an event to the doc's subscribers, and return the updated
+/// document. Approval is a stamp on a specific version, not a lock — publishing again reopens
+/// review (see publish_version).
+async fn document_transition(
+    pool: &Pool,
+    document_id: i64,
+    new_status: &str,
+    stamp_approval: bool,
+    actor: Option<&str>,
+    event_type: &str,
+    mut data: Value,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) =
+        sqlx::query("SELECT project_id, current_version_id FROM documents WHERE id=?")
+            .bind(document_id)
+            .fetch_optional(&mut *tx)
+            .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let project_id: Option<i64> = row.try_get("project_id")?;
+    let current_version_id: Option<i64> = row.try_get("current_version_id")?;
+    if stamp_approval {
+        sqlx::query(
+            "UPDATE documents SET status=?, approved_version_id=?, approved_by=?, updated_at=? WHERE id=?",
+        )
+        .bind(new_status)
+        .bind(current_version_id)
+        .bind(actor)
+        .bind(&ts)
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+        if let Value::Object(ref mut m) = data {
+            m.insert("approved_version_id".into(), json!(current_version_id));
+        }
+    } else {
+        sqlx::query("UPDATE documents SET status=?, updated_at=? WHERE id=?")
+            .bind(new_status)
+            .bind(&ts)
+            .bind(document_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    emit(
+        &mut tx,
+        &mut hooks,
+        event_type,
+        actor,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        data,
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Move a document into review (typically from draft or changes_requested). Convenience — a
+/// publish_version also reopens review. Emits document.submitted_for_review.
+pub async fn submit_for_review(
+    pool: &Pool,
+    document_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    document_transition(
+        pool,
+        document_id,
+        "in_review",
+        false,
+        actor,
+        "document.submitted_for_review",
+        json!({}),
+    )
+    .await
+}
+
+/// Request changes on a document (status -> changes_requested), with an optional note. Emits
+/// document.changes_requested so the author (a subscriber) is notified.
+pub async fn request_changes(
+    pool: &Pool,
+    document_id: i64,
+    actor: Option<&str>,
+    note: Option<&str>,
+) -> anyhow::Result<Value> {
+    document_transition(
+        pool,
+        document_id,
+        "changes_requested",
+        false,
+        actor,
+        "document.changes_requested",
+        json!({ "note": note }),
+    )
+    .await
+}
+
+/// Approve a document: stamp the current version as approved_version_id, record approved_by,
+/// set status=approved. Emits document.approved.
+pub async fn approve_document(
+    pool: &Pool,
+    document_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    document_transition(
+        pool,
+        document_id,
+        "approved",
+        true,
+        actor,
+        "document.approved",
+        json!({}),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2392,6 +2517,64 @@ mod tests {
         // Errors: comment on a missing doc, resolve a missing comment.
         assert!(comment_document(&pool, 999, None, Some("x"), "hi", None, None).await.is_err());
         assert!(resolve_comment(&pool, 999, Some("x")).await.is_err());
+        Ok(())
+    }
+
+    /// The review loop: submit -> request_changes -> publish (reopens) -> approve stamps the
+    /// current version -> publishing again reopens review. Each transition notifies subscribers.
+    #[tokio::test]
+    async fn document_review_workflow() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(&pool, "Design", None, "bafy1", None, Some("alice"), None).await?;
+        let did = d["id"].as_i64().unwrap();
+        assert_eq!(d["status"], json!("draft"));
+
+        // The operator subscribes and drives the review.
+        subscribe(&pool, "operator", None, None, None, Some(did), false).await?;
+
+        // Author submits for review.
+        let r = submit_for_review(&pool, did, Some("alice")).await?;
+        assert_eq!(r["status"], json!("in_review"));
+
+        // Operator requests changes.
+        let rc = request_changes(&pool, did, Some("operator"), Some("tighten section 2")).await?;
+        assert_eq!(rc["status"], json!("changes_requested"));
+
+        // Author publishes a new version -> reopens review (per publish_version).
+        let v2 = publish_version(&pool, did, "bafy2", Some("addressed"), Some("alice")).await?;
+        assert_eq!(v2["status"], json!("in_review"), "a new version reopens review");
+        let v2id = v2["current_version"]["id"].as_i64().unwrap();
+
+        // Operator approves -> stamps the current version.
+        let ap = approve_document(&pool, did, Some("operator")).await?;
+        assert_eq!(ap["status"], json!("approved"));
+        assert_eq!(ap["approved_version_id"], json!(v2id), "approval stamps the current version");
+        assert_eq!(ap["approved_by"], json!("operator"));
+
+        // Approval is a stamp, not a lock: publishing again reopens review but keeps the stamp.
+        let v3 = publish_version(&pool, did, "bafy3", None, Some("alice")).await?;
+        assert_eq!(v3["status"], json!("in_review"));
+        assert_eq!(v3["approved_version_id"], json!(v2id), "stamp persists across a new version");
+
+        // The operator (a subscriber) heard the author-driven transitions (submit, both publishes)
+        // but not their own request_changes/approve (actor excluded).
+        let ops = check_notifications(&pool, "operator", true, 50, None).await?;
+        let types: Vec<String> = ops["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap().to_string())
+            .collect();
+        assert!(types.contains(&"document.submitted_for_review".to_string()), "{types:?}");
+        assert!(types.contains(&"document.version_published".to_string()), "{types:?}");
+        assert!(
+            !types.contains(&"document.approved".to_string()),
+            "actor excluded from own approve: {types:?}"
+        );
+
+        // Missing doc errors.
+        assert!(approve_document(&pool, 999, Some("x")).await.is_err());
         Ok(())
     }
 
