@@ -13,7 +13,7 @@ import Home from './Home.tsx'
 import Layout from './Layout.tsx'
 import Search from './Search.tsx'
 import Wiki from './Wiki.tsx'
-import { TaskDrawer } from './TaskDrawer.tsx'
+import { TaskDrawer, TaskRedirect } from './TaskDrawer.tsx'
 
 // The app may be served under a reverse-proxy sub-path (e.g. /board), which the backend
 // signals via the <base href> it injects from X-Forwarded-Prefix. document.baseURI
@@ -38,6 +38,8 @@ createRoot(document.getElementById('root')!).render(
           <Route path="agents/:agentId" element={<AgentView />} />
           <Route path="channels" element={<Channels />} />
           <Route path="channels/:channelId" element={<ChannelView />} />
+          {/* Bare task deep-link: resolves the task's project and redirects to the nested URL. */}
+          <Route path="tasks/:taskId" element={<TaskRedirect />} />
           <Route path="projects/:projectId" element={<Board />}>
             <Route path="tasks/:taskId" element={<TaskDrawer />} />
           </Route>
