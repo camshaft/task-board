@@ -1131,7 +1131,7 @@ impl Board {
 
     // --- Documents ---
     #[tool(
-        description = "Create a versioned document. Content lives on IPFS. Normally pass `cid` (a bare content id) — the board stores the identifier only and NEVER resolves it or composes a URL. If you have no local IPFS, pass raw `content` instead and the board content-addresses it server-side (requires the deployment to configure an IPFS backend; otherwise you get a clear error asking for a `cid`). Optionally attach it to a `project_id` and set `metadata` (tags, etc). Creates version 1. Returns the document with its current version + version list. When you pass raw `content`, the board indexes any [[wiki-link]] / [[path|label]] references in it into the document's outbound links (resolved against document paths, so links can dangle until a target is filed)."
+        description = "Create a versioned document. Content lives on IPFS. Normally pass `cid` (a bare content id) — the board stores the identifier only and NEVER resolves it or composes a URL. If you have no local IPFS, pass raw `content` instead and the board content-addresses it server-side (requires the deployment to configure an IPFS backend; otherwise you get a clear error asking for a `cid`). Optionally attach it to a `project_id` and set `metadata` (tags, etc). Creates version 1. Returns the document with its current version + version list. When you pass raw `content`, the board indexes any [[wiki-link]] / [[path|label]] references (outbound links) and ![[path]] / ![[path@vN#region]] references (embeds/transclusions) in it, resolved against document paths, so edges can dangle until a target is filed."
     )]
     async fn create_document(
         &self,
@@ -1157,7 +1157,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Publish a new immutable version of a document. Pass `cid` (bare content id; the board does not resolve it) or, with no local IPFS, raw `content` to content-address server-side (requires a configured IPFS backend). Appends the version, advances the current pointer, and returns the updated document. A new version drops an approved/changes_requested doc back to in_review. When you pass raw `content`, the board also re-indexes the document's [[wiki-link]] / [[path|label]] references into its outbound links (a CID-only publish leaves prior links untouched, since the board never fetches the bytes)."
+        description = "Publish a new immutable version of a document. Pass `cid` (bare content id; the board does not resolve it) or, with no local IPFS, raw `content` to content-address server-side (requires a configured IPFS backend). Appends the version, advances the current pointer, and returns the updated document. A new version drops an approved/changes_requested doc back to in_review. When you pass raw `content`, the board also re-indexes the document's [[wiki-link]] outbound links and ![[embed]] transclusions (a CID-only publish leaves prior edges untouched, since the board never fetches the bytes)."
     )]
     async fn publish_version(
         &self,
