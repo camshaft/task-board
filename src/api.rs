@@ -50,6 +50,10 @@ impl IntoResponse for ApiError {
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
+        } else if msg.starts_with("no IPFS backend") {
+            // The board has no IPFS backend configured, so server-side content-addressing
+            // is unavailable — the deployment hasn't enabled it (set ipfs_api_url).
+            StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
@@ -98,6 +102,7 @@ pub fn router(state: AppState) -> Router {
         .route("/channels/{channel_id}/invites", post(invite_to_channel))
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
+        .route("/ipfs/add", post(ipfs_add))
         .route("/documents", get(list_documents).post(create_document))
         .route("/documents/{document_id}", get(get_document))
         .route("/documents/{document_id}/versions", get(get_document_versions).post(publish_version))
@@ -179,6 +184,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
+    Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author).", query: "project_id=int&status=str&tag=str&task_id=int&author=str", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
@@ -226,6 +232,7 @@ fn body_schemas() -> Value {
         DocumentActorBody,
         RequestChangesBody,
         AttachDocumentBody,
+        IpfsAddBody,
     )
 }
 
@@ -896,6 +903,33 @@ async fn get_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) ->
     Ok(Json(core::get_events(&st.pool, q.since_seq, q.limit).await?))
 }
 
+// --- Content-addressing ---
+
+#[derive(Deserialize, JsonSchema)]
+struct IpfsAddBody {
+    /// Raw content to content-address. The board pins it via the configured IPFS backend and
+    /// returns the resulting CID — so a client with no local IPFS can obtain a CID to hand to
+    /// create_document / publish_version. Requires the deployment to set `ipfs_api_url`.
+    content: String,
+}
+
+/// `POST /api/ipfs/add` — content-address raw `content` server-side and return its CID.
+///
+/// This is a deliberately *scoped, add-only* capability over the configured IPFS backend: the
+/// only operation exposed is "pin these bytes, give me the CID". It never proxies the raw Kubo
+/// RPC (which also carries pin-management / config / shutdown), so exposing this publicly is
+/// just an open *add* endpoint, not an open node. Requires `ipfs_api_url`; without a backend it
+/// returns 503 (the deployment hasn't enabled server-side content-addressing).
+async fn ipfs_add(State(st): State<AppState>, Json(b): Json<IpfsAddBody>) -> ApiResult {
+    let Some(url) = st.ipfs_api_url.as_deref() else {
+        return Err(ApiError(anyhow::anyhow!(
+            "no IPFS backend configured (set ipfs_api_url); this board can't content-address content server-side"
+        )));
+    };
+    let cid = ipfs::add(url, b.content.into_bytes()).await?;
+    Ok(Json(json!({ "cid": cid })))
+}
+
 // --- Documents ---
 
 #[derive(Deserialize)]
@@ -1185,6 +1219,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A "no IPFS backend" error (the /api/ipfs/add guard when ipfs_api_url is unset) maps to
+    /// 503, not a generic 500 — the feature is unavailable, not faulted.
+    #[test]
+    fn no_ipfs_backend_maps_to_503() {
+        let resp =
+            ApiError(anyhow::anyhow!("no IPFS backend configured (set ipfs_api_url)")).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// The discovery catalog (`ENDPOINTS`) must match the actual axum router exactly.
