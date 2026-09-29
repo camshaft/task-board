@@ -258,6 +258,16 @@ pub async fn emit(
                     payload: payload.clone(),
                 });
             }
+
+            // Best-effort live-tunnel wake: for a recipient reachable over a reverse tunnel,
+            // push the same notification (with `recipient` set, matching the webhook body) as a
+            // `req` frame the daemon replays locally — so an idle agent wakes without polling.
+            // A missing/failed tunnel is fine: the inbox row above + the agent's poll deliver it.
+            let mut wake = payload.clone();
+            if let Value::Object(ref mut m) = wake {
+                m.insert("recipient".into(), Value::String(r.clone()));
+            }
+            crate::tunnel::try_wake(r, &wake);
         }
     }
 

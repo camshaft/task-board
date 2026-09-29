@@ -145,6 +145,9 @@ async fn main() -> anyhow::Result<()> {
     // Reverse tunnel for fleet hosts with no inbound path: they dial /tunnel/ws and the board
     // pushes wakes down the socket. Top-level (not under /api) — it's a WS upgrade, not REST.
     let tunnels = tunnel::registry();
+    // Make the registry reachable from the event-emit path (events::emit) so a committed
+    // notification can also push a best-effort wake down a live tunnel.
+    tunnel::init_global(tunnels.clone());
 
     let mut router = Router::new()
         .nest_service("/mcp", mcp_service)
