@@ -44,6 +44,7 @@ export interface TaskSummary {
   assignee: string | null
   priority: string | null
   project_id?: number
+  parent_id?: number | null
   updated_at?: string
 }
 
