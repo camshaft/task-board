@@ -40,6 +40,7 @@ impl IntoResponse for ApiError {
             || msg.starts_with("no document")
             || msg.starts_with("no comment")
             || msg.starts_with("no parent task")
+            || msg == "not found"
         {
             StatusCode::NOT_FOUND
         } else if msg.starts_with("give ")
@@ -108,6 +109,8 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(get_events))
         .route("/external-identities", get(list_external_identities).post(upsert_external_identity))
         .route("/external-links", get(list_external_links).post(upsert_external_link))
+        .route("/workspace-kinds", get(list_workspace_kinds).post(set_workspace_kind))
+        .route("/workspace-kinds/{name}", get(get_workspace_kind).delete(delete_workspace_kind))
         .route("/ipfs/add", post(ipfs_add))
         .route("/ipfs/{cid}", get(ipfs_cat))
         .route("/wiki", get(list_wiki))
@@ -203,6 +206,10 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/external-identities", summary: "Register/update an external identity (a bridged human/actor, e.g. slack:U123).", query: "", body: Some("UpsertExternalIdentityBody") },
     Endpoint { method: "GET", path: "/api/external-links", summary: "List bridged links (channel-map / issue↔task / thread↔task), filter by source/board_kind/board_id.", query: "source=str&board_kind=str&board_id=int", body: None },
     Endpoint { method: "POST", path: "/api/external-links", summary: "Map a board entity (channel|task|thread) to an external one; idempotent on (source, external_id).", query: "", body: Some("UpsertExternalLinkBody") },
+    Endpoint { method: "GET", path: "/api/workspace-kinds", summary: "List custom workspace kinds (named env setup definitions fleet spin-up materializes from board data).", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/workspace-kinds", summary: "Define/update a workspace kind (setup_script + config an agent is configured with); idempotent on name, config merges.", query: "", body: Some("SetWorkspaceKindBody") },
+    Endpoint { method: "GET", path: "/api/workspace-kinds/{name}", summary: "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize a workspace.", query: "", body: None },
+    Endpoint { method: "DELETE", path: "/api/workspace-kinds/{name}", summary: "Retire a workspace kind by name.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author; archived hidden unless include_archived=true).", query: "project_id=int&status=str&tag=str&task_id=int&author=str&include_archived=bool", body: None },
@@ -262,6 +269,7 @@ fn body_schemas() -> Value {
         UpsertExternalIdentityBody,
         UpsertExternalLinkBody,
         PromoteThreadBody,
+        SetWorkspaceKindBody,
     )
 }
 
@@ -1068,6 +1076,48 @@ async fn upsert_external_identity(
         core::upsert_external_identity(&st.pool, &b.id, &b.source, b.display_name.as_deref(), b.metadata)
             .await?,
     ))
+}
+
+async fn list_workspace_kinds(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_workspace_kinds(&st.pool).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetWorkspaceKindBody {
+    /// The kind key an agent's `metadata.workspace_kind` references.
+    name: String,
+    /// The script fleet spin-up runs to materialize the workspace. Omit to keep the stored one.
+    setup_script: Option<String>,
+    /// Free-form hints the consumer reads (cwd, launch, repo, branch, env, ...). MERGED into any
+    /// existing bag.
+    config: Option<Value>,
+    description: Option<String>,
+    created_by: Option<String>,
+}
+
+async fn set_workspace_kind(
+    State(st): State<AppState>,
+    Json(b): Json<SetWorkspaceKindBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_workspace_kind(
+            &st.pool,
+            &b.name,
+            b.setup_script.as_deref(),
+            b.config,
+            b.description.as_deref(),
+            b.created_by.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+async fn get_workspace_kind(State(st): State<AppState>, Path(name): Path<String>) -> ApiResult {
+    found(core::get_workspace_kind(&st.pool, &name).await?)
+}
+
+async fn delete_workspace_kind(State(st): State<AppState>, Path(name): Path<String>) -> ApiResult {
+    Ok(Json(core::delete_workspace_kind(&st.pool, &name).await?))
 }
 
 #[derive(Deserialize)]

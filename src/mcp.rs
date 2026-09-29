@@ -420,6 +420,27 @@ pub struct ListExternalIdentitiesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetWorkspaceKindArgs {
+    /// The kind key an agent's `metadata.workspace_kind` references.
+    pub name: String,
+    /// The script fleet spin-up runs to materialize the workspace. Omit to keep the stored one.
+    #[serde(default)]
+    pub setup_script: Option<String>,
+    /// Free-form hints the consumer reads (cwd, launch, repo, branch, env, ...). MERGED into any
+    /// existing bag.
+    #[serde(default)]
+    pub config: Option<JsonObject>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceKindNameArgs {
+    /// The workspace kind's name.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetChannelPropsArgs {
     pub channel_id: i64,
     /// Key/value properties to merge into the channel's metadata — e.g. the outbound
@@ -1081,6 +1102,48 @@ impl Board {
         Parameters(a): Parameters<ListExternalIdentitiesArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::list_external_identities(&self.pool, s(&a.source)).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(
+        description = "Define or update a custom workspace kind — a named setup_script + config an agent is configured with, so fleet spin-up supports custom environment kinds defined in board resources. Environment-specific setup lives here as board data. Idempotent on `name`: an omitted setup_script/description keeps the stored value, config MERGES. An agent selects it via metadata.workspace_kind = the name."
+    )]
+    async fn set_workspace_kind(
+        &self,
+        Parameters(a): Parameters<SetWorkspaceKindArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let creator = self.me_opt(None);
+        core::set_workspace_kind(
+            &self.pool,
+            &a.name,
+            s(&a.setup_script),
+            a.config.map(Value::Object),
+            s(&a.description),
+            creator.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(description = "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize an agent's workspace.")]
+    async fn get_workspace_kind(
+        &self,
+        Parameters(a): Parameters<WorkspaceKindNameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_workspace_kind(&self.pool, &a.name).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "List all custom workspace kinds (named env setup definitions fleet spin-up materializes from board data).")]
+    async fn list_workspace_kinds(&self) -> Result<CallToolResult, McpError> {
+        core::list_workspace_kinds(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Retire a workspace kind by name.")]
+    async fn delete_workspace_kind(
+        &self,
+        Parameters(a): Parameters<WorkspaceKindNameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::delete_workspace_kind(&self.pool, &a.name).await.map_err(err).and_then(ok)
     }
 
     #[tool(

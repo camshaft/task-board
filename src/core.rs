@@ -2674,6 +2674,125 @@ fn hydrate_external_identity(r: &SqliteRow) -> Value {
     v
 }
 
+// --- Workspace kinds (named env setup stored as board data; fleet spin-up consumes them) ---
+
+/// Create or update a workspace kind — a named workspace definition (a `setup_script` plus a
+/// `config` bag an agent is configured with). Environment-specific setup lives here as board
+/// data, so fleet spin-up supports custom environment kinds defined in board resources. Idempotent
+/// on `name`: an omitted `setup_script`/`description` keeps the stored value, `config` is MERGED,
+/// and `created_at`/`created_by` are preserved; `updated_at` is bumped. Returns the stored record.
+pub async fn set_workspace_kind(
+    pool: &Pool,
+    name: &str,
+    setup_script: Option<&str>,
+    config: Option<Value>,
+    description: Option<&str>,
+    created_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("give a `name` for the workspace kind");
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let existing = sqlx::query(
+        "SELECT setup_script, config, description, created_by, created_at FROM workspace_kinds WHERE name=?",
+    )
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // Merge config into any existing bag (mirrors the other upserts).
+    let mut cfg: Map<String, Value> = existing
+        .as_ref()
+        .and_then(|r| r.try_get::<Option<String>, _>("config").ok().flatten())
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if let Some(Value::Object(incoming)) = config {
+        cfg.extend(incoming);
+    }
+    let cfg_str = Value::Object(cfg).to_string();
+    // Keep the stored script/description/creator/created_at when this call omits them.
+    let final_script = setup_script
+        .map(str::to_string)
+        .or_else(|| existing.as_ref().and_then(|r| r.try_get::<Option<String>, _>("setup_script").ok().flatten()))
+        .unwrap_or_default();
+    let final_desc = description
+        .map(str::to_string)
+        .or_else(|| existing.as_ref().and_then(|r| r.try_get::<Option<String>, _>("description").ok().flatten()));
+    let final_creator = existing
+        .as_ref()
+        .and_then(|r| r.try_get::<Option<String>, _>("created_by").ok().flatten())
+        .or_else(|| created_by.map(str::to_string));
+    let created_at = existing
+        .as_ref()
+        .and_then(|r| r.try_get::<Option<String>, _>("created_at").ok().flatten())
+        .unwrap_or_else(|| ts.clone());
+    sqlx::query(
+        "INSERT INTO workspace_kinds(name, setup_script, config, description, created_by, created_at, updated_at) \
+         VALUES(?,?,?,?,?,?,?) \
+         ON CONFLICT(name) DO UPDATE SET \
+            setup_script=excluded.setup_script, config=excluded.config, \
+            description=excluded.description, updated_at=excluded.updated_at",
+    )
+    .bind(name)
+    .bind(&final_script)
+    .bind(&cfg_str)
+    .bind(&final_desc)
+    .bind(&final_creator)
+    .bind(&created_at)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    get_workspace_kind(pool, name).await
+}
+
+/// Fetch one workspace kind by name (with `config` parsed). Null if unknown. This is what fleet
+/// spin-up reads to materialize an agent's workspace.
+pub async fn get_workspace_kind(pool: &Pool, name: &str) -> anyhow::Result<Value> {
+    let row = sqlx::query("SELECT * FROM workspace_kinds WHERE name=?")
+        .bind(name.trim())
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some(r) => hydrate_workspace_kind(&r),
+        None => Value::Null,
+    })
+}
+
+/// List all workspace kinds, ordered by name.
+pub async fn list_workspace_kinds(pool: &Pool) -> anyhow::Result<Value> {
+    let rows = sqlx::query("SELECT * FROM workspace_kinds ORDER BY name")
+        .fetch_all(pool)
+        .await?;
+    Ok(Value::Array(rows.iter().map(hydrate_workspace_kind).collect()))
+}
+
+/// Retire a workspace kind. Returns `{name, deleted}` (deleted=false if it didn't exist).
+pub async fn delete_workspace_kind(pool: &Pool, name: &str) -> anyhow::Result<Value> {
+    let name = name.trim();
+    let res = sqlx::query("DELETE FROM workspace_kinds WHERE name=?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(json!({ "name": name, "deleted": res.rows_affected() > 0 }))
+}
+
+/// Row -> JSON with the `config` TEXT column parsed into an object (like other hydrators).
+fn hydrate_workspace_kind(r: &SqliteRow) -> Value {
+    let mut v = row_to_json(r);
+    if let Value::Object(ref mut m) = v {
+        let cfg: Value = m
+            .get("config")
+            .and_then(|x| x.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        m.insert("config".into(), cfg);
+    }
+    v
+}
+
 // --- External links (bridged mappings: channel-map, issue↔task, thread↔task) ---
 
 /// The board entity kinds an external link may target.
@@ -5639,6 +5758,50 @@ mod tests {
         assert_eq!(plain["created"], json!(true));
         let pc = comment_task(&pool, tid, "manual comment", Some("gh"), None, None).await?;
         assert_eq!(pc["created"], json!(true));
+        Ok(())
+    }
+
+    /// Workspace kinds (task 287): define/get/list/delete a named env-setup resource, with
+    /// omitted setup_script/description preserved on update and `config` merged.
+    #[tokio::test]
+    async fn workspace_kind_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Define.
+        let k = set_workspace_kind(
+            &pool,
+            "custom-env",
+            Some("checkout && build"),
+            Some(json!({ "cwd": "/w", "repo": "r" })),
+            Some("a custom workspace"),
+            Some("board-pm"),
+        )
+        .await?;
+        assert_eq!(k["name"], json!("custom-env"));
+        assert_eq!(k["setup_script"], json!("checkout && build"));
+        assert_eq!(k["config"]["cwd"], json!("/w"));
+        assert_eq!(k["description"], json!("a custom workspace"));
+        assert_eq!(k["created_by"], json!("board-pm"));
+
+        // Get (config parsed).
+        let g = get_workspace_kind(&pool, "custom-env").await?;
+        assert_eq!(g["config"]["repo"], json!("r"));
+
+        // Update: omit script + description (kept), merge a new config key (cwd/repo kept).
+        let u = set_workspace_kind(&pool, "custom-env", None, Some(json!({ "branch": "main" })), None, None).await?;
+        assert_eq!(u["setup_script"], json!("checkout && build"), "omitted script kept");
+        assert_eq!(u["description"], json!("a custom workspace"), "omitted description kept");
+        assert_eq!(u["config"]["cwd"], json!("/w"), "prior config key kept");
+        assert_eq!(u["config"]["branch"], json!("main"), "new config key merged in");
+        assert_eq!(u["created_by"], json!("board-pm"), "creator preserved");
+
+        // List, unknown, delete (idempotent).
+        assert_eq!(list_workspace_kinds(&pool).await?.as_array().unwrap().len(), 1);
+        assert!(get_workspace_kind(&pool, "nope").await?.is_null());
+        assert_eq!(delete_workspace_kind(&pool, "custom-env").await?["deleted"], json!(true));
+        assert!(get_workspace_kind(&pool, "custom-env").await?.is_null());
+        assert_eq!(delete_workspace_kind(&pool, "custom-env").await?["deleted"], json!(false));
         Ok(())
     }
 
