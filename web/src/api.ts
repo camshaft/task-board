@@ -128,6 +128,30 @@ export interface DocumentComment {
   created_at: string
 }
 
+export interface Channel {
+  id: number
+  name: string | null
+  topic: string | null
+  status: string
+  private: boolean
+  dm_key: string | null
+  metadata: Record<string, unknown>
+  members?: string[]
+  member_count?: number
+  created_at: string
+}
+
+// A post from get_channel_posts: a channel.post (named channel) or message.direct (DM) event.
+// The author is data.from (falls back to the event actor); reply_to threads one level.
+export interface ChannelPost {
+  seq: number
+  type: string
+  actor: string | null
+  channel_id: number
+  data: { from?: string; body?: string; reply_to?: number }
+  created_at: string
+}
+
 export interface EventRow {
   seq: number
   type: string
@@ -304,6 +328,34 @@ export const api = {
     req<Document>('POST', `/documents/${id}/request-changes`, b),
   approveDocument: (id: number, b: { actor?: string } = {}) =>
     req<Document>('POST', `/documents/${id}/approve`, b),
+
+  // Channels + DMs. `member` returns that agent's channels (incl. private/DMs); omitted lists
+  // public channels only.
+  listChannels: (member?: string) =>
+    req<Channel[]>(
+      'GET',
+      `/channels${member ? `?member=${encodeURIComponent(member)}` : ''}`,
+    ),
+  getChannel: (id: number) => req<Channel>('GET', `/channels/${id}`),
+  createChannel: (b: {
+    name: string
+    topic?: string
+    created_by?: string
+    metadata?: Record<string, unknown>
+  }) => req<Channel>('POST', '/channels', b),
+  getChannelPosts: (id: number, q: { since_seq?: number; limit?: number } = {}) => {
+    const p = new URLSearchParams()
+    if (q.since_seq != null) p.set('since_seq', String(q.since_seq))
+    if (q.limit != null) p.set('limit', String(q.limit))
+    const qs = p.toString()
+    return req<ChannelPost[]>('GET', `/channels/${id}/posts${qs ? `?${qs}` : ''}`)
+  },
+  postToChannel: (id: number, b: { sender: string; body: string; reply_to?: number }) =>
+    req<{ seq: number }>('POST', `/channels/${id}/posts`, b),
+  inviteToChannel: (id: number, b: { agent_id: string; invited_by?: string }) =>
+    req<Channel>('POST', `/channels/${id}/invites`, b),
+  sendMessage: (b: { from_agent: string; to_agent: string; body: string }) =>
+    req<{ seq: number }>('POST', '/messages', b),
 }
 
 // Resolve a bare content id to a viewable URL via the deployment's IPFS gateway. The board

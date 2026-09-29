@@ -6,6 +6,8 @@
 import {
   api,
   type Agent,
+  type Channel,
+  type ChannelPost,
   type Document,
   type DocumentComment,
   type DocumentSummary,
@@ -29,6 +31,9 @@ const keys = {
   agent: (id: string) => `agent:${id}`,
   // Keyed under the `tasks:` prefix so touched()'s task-list invalidation refreshes it too.
   agentTasks: (id: string) => `tasks:agent:${id}`,
+  channels: (member?: string) => (member ? `channels:${member}` : 'channels'),
+  channel: (id: number) => `channel:${id}`,
+  channelPosts: (id: number) => `channelPosts:${id}`,
 }
 
 export function useProjects() {
@@ -46,6 +51,19 @@ export function useAgent(id: string) {
 // An agent's assigned tasks across every project (assignee filter, no project_id).
 export function useAgentTasks(id: string) {
   return useResource<TaskSummary[]>(keys.agentTasks(id), () => api.listTasks({ assignee: id }))
+}
+
+// Channels: public list, or a member's list (incl. private/DMs) when `member` is given.
+export function useChannels(member?: string) {
+  return useResource<Channel[]>(keys.channels(member), () => api.listChannels(member))
+}
+
+export function useChannel(id: number) {
+  return useResource<Channel>(keys.channel(id), () => api.getChannel(id))
+}
+
+export function useChannelPosts(id: number) {
+  return useResource<ChannelPost[]>(keys.channelPosts(id), () => api.getChannelPosts(id))
 }
 
 export function useEvents(limit = 30) {
@@ -88,7 +106,13 @@ export function useDocumentComments(documentId: number) {
  * which nearly every write touches.
  */
 export function touched(
-  opts: { projectId?: number; taskId?: number; documentId?: number; activity?: boolean } = {},
+  opts: {
+    projectId?: number
+    taskId?: number
+    documentId?: number
+    channelId?: number
+    activity?: boolean
+  } = {},
 ) {
   if (opts.taskId != null) invalidate(keys.task(opts.taskId))
   if (opts.projectId != null) invalidate(keys.tasks(opts.projectId))
@@ -102,6 +126,12 @@ export function touched(
     invalidate(keys.document(opts.documentId))
     invalidate(keys.documentComments(opts.documentId))
     invalidate(keys.documents)
+  }
+  if (opts.channelId != null) {
+    // A channel's posts + its own view, and every loaded channel list (public + per-member).
+    invalidate(keys.channelPosts(opts.channelId))
+    invalidate(keys.channel(opts.channelId))
+    invalidateMatching('channels')
   }
   if (opts.activity !== false) {
     invalidate(keys.projects)
@@ -212,6 +242,28 @@ export async function approveDocument(
   return d
 }
 
+// Channel mutations. Same pattern: perform the request, then funnel through touched() keyed on
+// the channel so its post pane, its own view, and the channel lists refresh — locally and (via
+// the SSE path below) when another client/agent posts.
+
+export async function postToChannel(id: number, b: Parameters<typeof api.postToChannel>[1]) {
+  const r = await api.postToChannel(id, b)
+  touched({ channelId: id, activity: true })
+  return r
+}
+
+export async function createChannel(b: Parameters<typeof api.createChannel>[0]) {
+  const c = await api.createChannel(b)
+  touched({ channelId: c.id, activity: true })
+  return c
+}
+
+export async function inviteToChannel(id: number, b: Parameters<typeof api.inviteToChannel>[1]) {
+  const c = await api.inviteToChannel(id, b)
+  touched({ channelId: id, activity: true })
+  return c
+}
+
 // The compact event the SSE feed pushes (mirrors sse::StreamEvent on the server), plus the
 // synthetic resync signal the server sends when a client fell too far behind to replay.
 export interface StreamEvent {
@@ -220,6 +272,7 @@ export interface StreamEvent {
   project_id?: number | null
   task_id?: number | null
   document_id?: number | null
+  channel_id?: number | null
 }
 
 /**
@@ -243,6 +296,8 @@ export function applyStreamEvent(ev: StreamEvent) {
     taskId: ev.task_id ?? undefined,
     // document.* events (and attach/detach, which also carry a task_id) refresh the doc views.
     documentId: ev.document_id ?? undefined,
+    // channel.post / message.direct carry channel_id → refresh that channel's post pane.
+    channelId: ev.channel_id ?? undefined,
     activity: true,
   })
 }
