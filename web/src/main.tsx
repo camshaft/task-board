@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Route, Routes } from 'react-router-dom'
 import './index.css'
+import AgentView from './AgentView.tsx'
 import Board from './Board.tsx'
 import Documents from './Documents.tsx'
 import DocumentView from './DocumentView.tsx'
@@ -28,6 +29,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="search" element={<Search />} />
           <Route path="documents" element={<Documents />} />
           <Route path="documents/:documentId" element={<DocumentView />} />
+          <Route path="agents/:agentId" element={<AgentView />} />
           <Route path="projects/:projectId" element={<Board />}>
             <Route path="tasks/:taskId" element={<TaskDrawer />} />
           </Route>

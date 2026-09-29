@@ -170,9 +170,10 @@ export default function Layout() {
           </div>
           <div className="max-h-64 overflow-y-auto px-2 pb-3">
             {agents.map((a) => (
-              <div
+              <Link
                 key={a.id}
-                className="rounded-md px-3 py-1.5 text-sm"
+                to={`/agents/${encodeURIComponent(a.id)}`}
+                className="block rounded-md px-3 py-1.5 text-sm hover:bg-[var(--color-panel-2)]"
                 title={a.charter ?? a.status_message ?? a.status}
               >
                 <div className="flex items-center gap-2">
@@ -187,7 +188,7 @@ export default function Layout() {
                     {a.charter}
                   </p>
                 )}
-              </div>
+              </Link>
             ))}
             {agents.length === 0 && (
               <p className="px-3 py-1.5 text-sm text-[var(--color-muted)]">None online.</p>
