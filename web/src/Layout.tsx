@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { Link, Outlet, useOutletContext, useParams } from 'react-router-dom'
 import { useLiveUpdates } from './live'
-import { createProject, useAgents, useEvents, useProjects } from './resources'
+import { WikiLinkContext, type WikiResolver } from './markdown'
+import { createProject, useAgents, useEvents, useProjects, useWiki } from './resources'
 import { AGENT_DOT, relTime } from './ui'
 
 // The only thing nested routes still need handed down is the current actor (per-user
@@ -37,6 +38,15 @@ export default function Layout() {
   const { data: projects = [], error: projectsError } = useProjects()
   const { data: agents = [] } = useAgents()
   const { data: events = [] } = useEvents()
+  // Wiki path -> doc index, so [[wiki-links]] in any rendered markdown resolve app-wide (and
+  // live-update as pages are filed). A miss renders as a dangling red-link.
+  const { data: wikiDocs = [] } = useWiki()
+  const wikiByPath = useMemo(() => {
+    const m = new Map<string, { id: number; title: string }>()
+    for (const d of wikiDocs) if (d.path) m.set(d.path, { id: d.id, title: d.title })
+    return m
+  }, [wikiDocs])
+  const resolveWikiLink = useCallback<WikiResolver>((path) => wikiByPath.get(path) ?? null, [wikiByPath])
   const [showArchived, setShowArchived] = useState(false)
   // The left sidebar is an off-canvas drawer on small screens (toggled from the header) and a
   // static column on lg+. Navigating from a drawer link closes it so the content is visible.
@@ -252,8 +262,11 @@ export default function Layout() {
           </div>
         </aside>
 
-        {/* Whatever the URL points at: the board for a project, plus the task drawer. */}
-        <Outlet context={{ actor } satisfies BoardContext} />
+        {/* Whatever the URL points at: the board for a project, plus the task drawer. Wrapped so
+            [[wiki-links]] in any markdown below resolve against the live wiki. */}
+        <WikiLinkContext.Provider value={resolveWikiLink}>
+          <Outlet context={{ actor } satisfies BoardContext} />
+        </WikiLinkContext.Provider>
 
         {/* Event feed */}
         <aside className="hidden w-72 shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-panel)] xl:flex">

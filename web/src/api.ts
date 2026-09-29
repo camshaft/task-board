@@ -122,8 +122,27 @@ export interface DocumentSummary {
   updated_at: string
 }
 
+// An outbound wiki link from a document ([[target_path]] / [[target_path|label]] in its content).
+// target_* are null when the link dangles — nothing is filed at that path yet (render as a red-link).
+export interface OutboundLink {
+  target_path: string
+  label: string | null
+  target_document_id: number | null
+  target_title: string | null
+  target_status: string | null
+}
+
+// A backlink: a document whose content links to THIS document's path ("what links here").
+export interface Backlink {
+  id: number
+  title: string
+  path: string | null
+  status: string
+  label: string | null
+}
+
 // A full document (getDocument): metadata + resolved current version + full version list +
-// the tasks it's attached to.
+// the tasks it's attached to + its wiki link graph (outbound links + backlinks).
 export interface Document extends DocumentSummary {
   metadata: Record<string, unknown>
   approved_by: string | null
@@ -131,6 +150,8 @@ export interface Document extends DocumentSummary {
   current_version: DocumentVersion | null
   versions: DocumentVersion[]
   attached_tasks: { id: number; title: string; status: TaskStatus; project_id: number | null }[]
+  outbound_links: OutboundLink[]
+  backlinks: Backlink[]
 }
 
 export interface DocumentComment {
