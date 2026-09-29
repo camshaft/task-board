@@ -2727,7 +2727,9 @@ struct WikiEdge {
 fn extract_wiki_edges(content: &str) -> Vec<WikiEdge> {
     let bytes = content.as_bytes();
     let mut out: Vec<WikiEdge> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // De-dup per (kind, path) so a doc that BOTH [[links]] and ![[embeds]] the same path keeps
+    // both edges (links and embeds live in separate tables — task 108).
+    let mut seen: BTreeSet<(&str, String)> = BTreeSet::new();
     let mut i = 0usize;
     while i + 1 < bytes.len() {
         if bytes[i] == b'[' && bytes[i + 1] == b'[' {
@@ -2750,11 +2752,12 @@ fn extract_wiki_edges(content: &str) -> Vec<WikiEdge> {
                     None => (left, None),
                 };
                 let path = normalize_wiki_path(raw_path);
-                if !path.is_empty() && seen.insert(path.clone()) {
+                let kind = if is_embed { "embed" } else { "link" };
+                if !path.is_empty() && seen.insert((kind, path.clone())) {
                     out.push(WikiEdge {
                         path,
                         label: label.filter(|l| !l.is_empty()),
-                        kind: if is_embed { "embed" } else { "link" },
+                        kind,
                         // A pin/region only makes sense for an embed; ignore them on a link.
                         version_no: if is_embed { version_no } else { None },
                         region: if is_embed { region.filter(|r| !r.is_empty()) } else { None },
@@ -2780,37 +2783,54 @@ async fn refresh_document_links(
     content: &str,
     ts: &str,
 ) -> anyhow::Result<()> {
+    // Links and embeds live in separate tables so a doc can both link and embed the same path.
     sqlx::query("DELETE FROM document_links WHERE source_document_id=?")
         .bind(source_document_id)
         .execute(&mut **tx)
         .await?;
-    for e in extract_wiki_edges(content) {
-        // Resolve an embed's version pin to the immutable version id, if that doc+version exists.
-        let target_version_id: Option<i64> = match e.version_no {
-            Some(no) => sqlx::query(
-                "SELECT dv.id FROM documents d JOIN document_versions dv ON dv.document_id = d.id \
-                 WHERE d.path=? AND dv.version_no=?",
-            )
-            .bind(&e.path)
-            .bind(no)
-            .fetch_optional(&mut **tx)
-            .await?
-            .and_then(|r| r.try_get::<i64, _>("id").ok()),
-            None => None,
-        };
-        sqlx::query(
-            "INSERT INTO document_links(source_document_id, target_path, label, kind, \
-             target_version_id, region, created_at) VALUES(?,?,?,?,?,?,?)",
-        )
+    sqlx::query("DELETE FROM document_embeds WHERE source_document_id=?")
         .bind(source_document_id)
-        .bind(&e.path)
-        .bind(e.label.as_deref())
-        .bind(e.kind)
-        .bind(target_version_id)
-        .bind(e.region.as_deref())
-        .bind(ts)
         .execute(&mut **tx)
         .await?;
+    for e in extract_wiki_edges(content) {
+        if e.kind == "embed" {
+            // Resolve an embed's @vN pin to the immutable version id, if that doc+version exists.
+            let target_version_id: Option<i64> = match e.version_no {
+                Some(no) => sqlx::query(
+                    "SELECT dv.id FROM documents d JOIN document_versions dv ON dv.document_id = d.id \
+                     WHERE d.path=? AND dv.version_no=?",
+                )
+                .bind(&e.path)
+                .bind(no)
+                .fetch_optional(&mut **tx)
+                .await?
+                .and_then(|r| r.try_get::<i64, _>("id").ok()),
+                None => None,
+            };
+            sqlx::query(
+                "INSERT INTO document_embeds(source_document_id, target_path, label, \
+                 target_version_id, region, created_at) VALUES(?,?,?,?,?,?)",
+            )
+            .bind(source_document_id)
+            .bind(&e.path)
+            .bind(e.label.as_deref())
+            .bind(target_version_id)
+            .bind(e.region.as_deref())
+            .bind(ts)
+            .execute(&mut **tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO document_links(source_document_id, target_path, label, kind, created_at) \
+                 VALUES(?,?,?,'link',?)",
+            )
+            .bind(source_document_id)
+            .bind(&e.path)
+            .bind(e.label.as_deref())
+            .bind(ts)
+            .execute(&mut **tx)
+            .await?;
+        }
     }
     Ok(())
 }
@@ -2870,44 +2890,45 @@ async fn document_json(
         .await?;
         m.insert("outbound_links".into(), Value::Array(out_links.iter().map(row_to_json).collect()));
 
-        // Outbound embeds (![[target]] this doc transcludes, kind='embed'). Carries the pinned
-        // target_version_id (null = floats to the target's current version) and an optional
-        // region fragment for a partial embed, plus the resolved target doc.
+        // Outbound embeds (![[target]] this doc transcludes) from the document_embeds table.
+        // Carries the pinned target_version_id (null = floats to the target's current version)
+        // and an optional region fragment for a partial embed, plus the resolved target doc.
         let embeds = sqlx::query(
-            "SELECT l.target_path, l.label, l.target_version_id, l.region, \
+            "SELECT e.target_path, e.label, e.target_version_id, e.region, \
              d.id AS target_document_id, d.title AS target_title, d.status AS target_status \
-             FROM document_links l LEFT JOIN documents d ON d.path = l.target_path \
-             WHERE l.source_document_id=? AND l.kind='embed' ORDER BY l.target_path",
+             FROM document_embeds e LEFT JOIN documents d ON d.path = e.target_path \
+             WHERE e.source_document_id=? ORDER BY e.target_path",
         )
         .bind(document_id)
         .fetch_all(&mut **tx)
         .await?;
         m.insert("embeds".into(), Value::Array(embeds.iter().map(row_to_json).collect()));
 
-        // Incoming edges to THIS doc's path: backlinks (things that LINK here) and embedded_by
-        // (things that EMBED here -- the "what depends on me before I change it" payoff). Both
+        // Incoming edges to THIS doc's path: backlinks (docs that LINK here) and embedded_by
+        // (docs that EMBED here -- the "what depends on me before I change it" payoff). Both
         // empty when this doc is unfiled (no path), since an edge can only target a path.
         let (backlinks, embedded_by) = match m.get("path").and_then(|v| v.as_str()) {
             Some(p) => {
-                let incoming = sqlx::query(
-                    "SELECT s.id, s.title, s.path, s.status, l.label, l.kind, l.region \
+                let back = sqlx::query(
+                    "SELECT s.id, s.title, s.path, s.status, l.label \
                      FROM document_links l JOIN documents s ON s.id = l.source_document_id \
-                     WHERE l.target_path=? ORDER BY s.path, s.id",
+                     WHERE l.target_path=? AND l.kind='link' ORDER BY s.path, s.id",
                 )
                 .bind(p)
                 .fetch_all(&mut **tx)
                 .await?;
-                let mut back = Vec::new();
-                let mut emb = Vec::new();
-                for r in &incoming {
-                    let v = row_to_json(r);
-                    if v.get("kind").and_then(|k| k.as_str()) == Some("embed") {
-                        emb.push(v);
-                    } else {
-                        back.push(v);
-                    }
-                }
-                (Value::Array(back), Value::Array(emb))
+                let emb = sqlx::query(
+                    "SELECT s.id, s.title, s.path, s.status, e.label, e.region \
+                     FROM document_embeds e JOIN documents s ON s.id = e.source_document_id \
+                     WHERE e.target_path=? ORDER BY s.path, s.id",
+                )
+                .bind(p)
+                .fetch_all(&mut **tx)
+                .await?;
+                (
+                    Value::Array(back.iter().map(row_to_json).collect()),
+                    Value::Array(emb.iter().map(row_to_json).collect()),
+                )
             }
             None => (Value::Array(Vec::new()), Value::Array(Vec::new())),
         };
@@ -3922,13 +3943,16 @@ mod tests {
         let sid = s["id"].as_i64().unwrap();
 
         let s_doc = get_document(&pool, sid).await?;
-        // Links and embeds are separated by kind. Note: [[lib/widget]] and ![[lib/widget]] share
-        // a path, so the first-seen (the link) wins that path -> one link, and embeds are the
-        // distinct-path ![[..]] targets (@v1 collapses to lib/widget too, already taken).
+        // Links and embeds are separate tables, so [[lib/widget]] (a link) and ![[lib/widget]]
+        // (an embed) to the SAME path are BOTH recorded (task 108 fix — the bug was the embed
+        // being dropped). Within embeds, the float ![[lib/widget]] is seen before ![[lib/widget@v1]]
+        // so it wins that path (one embed edge per path).
         let links = s_doc["outbound_links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["target_path"] == json!("lib/widget")), "the link is recorded");
         let embeds = s_doc["embeds"].as_array().unwrap();
-        // lib/widget was claimed by the link (first-seen), so the surviving embed is lib/notes.
+        let w_emb = embeds.iter().find(|e| e["target_path"] == json!("lib/widget")).unwrap();
+        assert!(w_emb["target_version_id"].is_null(), "float embed (![[lib/widget]]) wins over the later @v1; floats");
+        assert_eq!(w_emb["target_document_id"], json!(tid), "embed resolves to the filed doc");
         let notes = embeds.iter().find(|e| e["target_path"] == json!("lib/notes")).unwrap();
         assert_eq!(notes["region"], json!("intro"), "region fragment captured");
         assert!(notes["target_document_id"].is_null(), "lib/notes dangles (unfiled)");
@@ -3944,11 +3968,13 @@ mod tests {
         let floating = emb.iter().find(|e| e["target_path"] == json!("lib/widget-x")).unwrap();
         assert!(floating["target_version_id"].is_null(), "unpinned embed floats (null version)");
 
-        // embedded_by: the Widget doc sees who embeds it (Page2's pinned embed), separate from links.
+        // embedded_by: the Widget doc sees who embeds it. Page2 pins it; Page floats it.
         let t_doc = get_document(&pool, tid).await?;
         let emb_by = t_doc["embedded_by"].as_array().unwrap();
         assert!(emb_by.iter().any(|e| e["id"] == json!(s2["id"].as_i64().unwrap())), "Page2 embeds Widget");
-        // The plain link from the first Page shows up as a backlink, not an embed.
+        // The task-108 bug case: Page BOTH links and embeds lib/widget, so it must appear in
+        // BOTH backlinks AND embedded_by (previously the embed was silently dropped).
+        assert!(emb_by.iter().any(|e| e["id"] == json!(sid)), "Page embeds Widget (same path it also links)");
         assert!(t_doc["backlinks"].as_array().unwrap().iter().any(|b| b["id"] == json!(sid)), "Page links Widget");
         Ok(())
     }

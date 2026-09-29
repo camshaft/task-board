@@ -205,21 +205,35 @@ CREATE TABLE IF NOT EXISTS external_links (
     updated_at         TEXT NOT NULL,
     UNIQUE(source, external_id)
 );
--- Edges between documents: one row per distinct target a source document points at, of two
--- kinds. kind='link' is a [[wiki-link]] (a jump) and kind='embed' is a ![[transclusion]] that
--- renders in place. We store only the raw target_path (and optional |label), never a resolved
--- id -- the target is resolved at read time by joining on documents.path, so edges stay correct
--- as docs are filed, renamed, or unfiled (an edge can also dangle, pointing at a path nothing
--- occupies yet). Edges are recomputed from content whenever a version is published WITH raw
--- content (the board only sees a CID otherwise, so a CID-only publish leaves prior edges as-is).
--- For an embed, target_version_id pins it to an immutable version (NULL = floats to the target's
--- current version) and region holds an optional raw fragment/selector for a partial embed.
+-- [[wiki-link]] edges between documents (a jump). One row per distinct target_path a source
+-- links to. We store only the raw target_path (and optional |label), never a resolved id -- the
+-- target is resolved at read time by joining on documents.path, so edges stay correct as docs
+-- are filed, renamed, or unfiled (a link can also dangle, pointing at a path nothing occupies
+-- yet). Edges are recomputed from content whenever a version is published WITH raw content (the
+-- board only sees a CID otherwise, so a CID-only publish leaves prior edges as-is). The kind /
+-- target_version_id / region columns are legacy (embeds moved to document_embeds so a doc can
+-- both link AND embed the same path -- see task 108) and are effectively always link/null now.
 CREATE TABLE IF NOT EXISTS document_links (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     source_document_id INTEGER NOT NULL REFERENCES documents(id),
     target_path        TEXT NOT NULL,
     label              TEXT,
     kind               TEXT NOT NULL DEFAULT 'link',
+    target_version_id  INTEGER REFERENCES document_versions(id),
+    region             TEXT,
+    created_at         TEXT NOT NULL,
+    UNIQUE(source_document_id, target_path)
+);
+-- ![[transclusion]] edges (embed one doc's content inside another, rendered in place). Kept in a
+-- SEPARATE table from links so a document can BOTH link and embed the same target_path without
+-- the (source, target_path) uniqueness colliding (task 108). Same resolve-at-read-time model as
+-- links. target_version_id pins the embed to an immutable version (NULL = floats to the target's
+-- current version) and region holds an optional raw #fragment/selector for a partial embed.
+CREATE TABLE IF NOT EXISTS document_embeds (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_document_id INTEGER NOT NULL REFERENCES documents(id),
+    target_path        TEXT NOT NULL,
+    label              TEXT,
     target_version_id  INTEGER REFERENCES document_versions(id),
     region             TEXT,
     created_at         TEXT NOT NULL,
@@ -245,6 +259,8 @@ CREATE INDEX IF NOT EXISTS idx_external_links_board ON external_links(board_kind
 -- (document_links is a brand-new table with no back-filled columns, so indexing it here is safe.)
 CREATE INDEX IF NOT EXISTS idx_doclinks_source ON document_links(source_document_id);
 CREATE INDEX IF NOT EXISTS idx_doclinks_target ON document_links(target_path);
+CREATE INDEX IF NOT EXISTS idx_docembeds_source ON document_embeds(source_document_id);
+CREATE INDEX IF NOT EXISTS idx_docembeds_target ON document_embeds(target_path);
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
