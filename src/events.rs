@@ -91,12 +91,25 @@ async fn recipients_for_channel(
 
 /// Who hears about a document change: its subscribers, minus whoever performed the action.
 /// Document subscription is the same machinery as channels — a `document` subscription row.
+/// Who hears about a document change (a comment, a new version, a review action): its owner
+/// (creator) and its subscribers — minus whoever performed the action. The owner is included
+/// explicitly, like a task's created_by, so they always hear about their own document even if a
+/// subscription row is missing (e.g. a doc created before auto-subscribe existed).
 async fn recipients_for_document(
     tx: &mut Transaction<'_, Sqlite>,
     document_id: i64,
     actor: Option<&str>,
 ) -> anyhow::Result<BTreeSet<String>> {
     let mut recips: BTreeSet<String> = BTreeSet::new();
+    if let Some(row) = sqlx::query("SELECT created_by FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        if let Ok(Some(owner)) = row.try_get::<Option<String>, _>("created_by") {
+            recips.insert(owner);
+        }
+    }
     let subs = sqlx::query(
         "SELECT subscriber FROM subscriptions WHERE target_type='document' AND target_id=?",
     )

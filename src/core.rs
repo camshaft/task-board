@@ -3708,7 +3708,10 @@ pub async fn comment_document(
     .await?
     .try_get("id")?;
     auto_subscribe_document(&mut tx, author, document_id).await?;
-    let mut data = json!({ "comment_id": cid, "version_id": version_id, "body": body, "reply_to": reply_to });
+    // Carry document_id in the payload so a drained notification identifies which document the
+    // comment is on (the inbox row itself doesn't surface document_id), letting the owner navigate
+    // straight to it to respond.
+    let mut data = json!({ "document_id": document_id, "comment_id": cid, "version_id": version_id, "body": body, "reply_to": reply_to });
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
     }
@@ -4537,6 +4540,36 @@ mod tests {
         let bob2 = check_notifications(&pool, "bob", true, 50, None).await?;
         assert_eq!(bob2["count"].as_i64(), Some(0), "no events after unsubscribe");
 
+        Ok(())
+    }
+
+    /// A document's owner (creator) is notified when someone comments on it, even if the owner
+    /// holds no subscription row — the owner is included explicitly, like a task's created_by, so
+    /// a comment always reaches the person who should respond. (operator #30 seq-2746 / task #300.)
+    #[tokio::test]
+    async fn document_owner_notified_on_comment_without_subscription() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // Remove the owner's auto-subscription, so the ONLY way alice can hear the comment is via
+        // the explicit owner inclusion (this is the gap the fix closes).
+        unsubscribe(&pool, "alice", None, None, None, Some(did), false).await?;
+
+        // bob comments on alice's doc.
+        comment_document(&pool, did, None, Some("bob"), "please clarify §2", None, None, None).await?;
+
+        // alice (the owner) is still notified, despite having no subscription row.
+        let alice = check_notifications(&pool, "alice", true, 50, None).await?;
+        assert_eq!(alice["count"].as_i64(), Some(1), "owner notified without a subscription: {alice}");
+        assert_eq!(alice["notifications"][0]["type"], json!("document.comment"));
+        // The payload identifies the document so the owner can navigate to it to respond.
+        assert_eq!(alice["notifications"][0]["data"]["document_id"], json!(did));
+
+        // The commenter (actor) is not notified of their own comment.
+        let bob = check_notifications(&pool, "bob", true, 50, None).await?;
+        assert_eq!(bob["count"].as_i64(), Some(0), "actor excluded from own comment: {bob}");
         Ok(())
     }
 
