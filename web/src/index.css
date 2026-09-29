@@ -24,3 +24,10 @@ body {
     ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
     sans-serif;
 }
+
+/* Region-anchored document comments: the CSS Custom Highlight API paints the quoted text of
+   each region comment over the rendered content (no DOM surgery), so anchors are visible. */
+::highlight(tb-region) {
+  background-color: rgba(245, 200, 66, 0.28);
+  color: inherit;
+}
