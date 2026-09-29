@@ -3,7 +3,17 @@
 // fetch or branch on event types themselves. Mutations and (later) SSE events funnel through
 // `touched(...)` — the ONE place that maps a changed entity to the resource keys to refresh.
 
-import { api, type Agent, type EventRow, type Project, type Task, type TaskSummary } from './api'
+import {
+  api,
+  type Agent,
+  type Document,
+  type DocumentComment,
+  type DocumentSummary,
+  type EventRow,
+  type Project,
+  type Task,
+  type TaskSummary,
+} from './api'
 import { invalidate, invalidateMatching, useResource } from './store'
 
 // Resource keys. Keep these in one place so producers (touched) and consumers (hooks) agree.
@@ -13,6 +23,9 @@ const keys = {
   events: 'events',
   tasks: (projectId: number) => `tasks:${projectId}`,
   task: (taskId: number) => `task:${taskId}`,
+  documents: 'documents',
+  document: (documentId: number) => `document:${documentId}`,
+  documentComments: (documentId: number) => `documentComments:${documentId}`,
 }
 
 export function useProjects() {
@@ -39,6 +52,20 @@ export function useTask(taskId: number) {
   return useResource<Task>(keys.task(taskId), () => api.getTask(taskId))
 }
 
+export function useDocuments() {
+  return useResource<DocumentSummary[]>(keys.documents, () => api.listDocuments())
+}
+
+export function useDocument(documentId: number) {
+  return useResource<Document>(keys.document(documentId), () => api.getDocument(documentId))
+}
+
+export function useDocumentComments(documentId: number) {
+  return useResource<DocumentComment[]>(keys.documentComments(documentId), () =>
+    api.getDocumentComments(documentId),
+  )
+}
+
 /**
  * Announce that some data changed, so every dependent resource refetches. This is the
  * single choke point for reactivity — the ONE place that maps a changed entity to the
@@ -48,12 +75,21 @@ export function useTask(taskId: number) {
  * `activity: true` also refreshes the projects list (task counts) and the activity feed,
  * which nearly every write touches.
  */
-export function touched(opts: { projectId?: number; taskId?: number; activity?: boolean } = {}) {
+export function touched(
+  opts: { projectId?: number; taskId?: number; documentId?: number; activity?: boolean } = {},
+) {
   if (opts.taskId != null) invalidate(keys.task(opts.taskId))
   if (opts.projectId != null) invalidate(keys.tasks(opts.projectId))
   else if (opts.taskId != null) {
     // Task changed but we don't know its project here — refresh all loaded task lists.
     invalidateMatching('tasks:')
+  }
+  if (opts.documentId != null) {
+    // A document's own view + its comments, and the documents list (a new version, status
+    // change, or fresh doc all show there).
+    invalidate(keys.document(opts.documentId))
+    invalidate(keys.documentComments(opts.documentId))
+    invalidate(keys.documents)
   }
   if (opts.activity !== false) {
     invalidate(keys.projects)
@@ -107,6 +143,53 @@ export async function moveTask(id: number, b: Parameters<typeof api.moveTask>[1]
   return t
 }
 
+// Document mutations. Same pattern as the task ones: perform the request, then funnel through
+// touched() keyed on the document so its viewer, comment panel, and the documents list all
+// refresh — locally and (via the SSE path below) when another client makes the change.
+
+export async function commentDocument(id: number, b: Parameters<typeof api.commentDocument>[1]) {
+  const r = await api.commentDocument(id, b)
+  touched({ documentId: id, activity: true })
+  return r
+}
+
+export async function resolveDocumentComment(
+  id: number,
+  commentId: number,
+  b: Parameters<typeof api.resolveComment>[2] = {},
+) {
+  const r = await api.resolveComment(id, commentId, b)
+  touched({ documentId: id, activity: true })
+  return r
+}
+
+export async function submitDocumentForReview(
+  id: number,
+  b: Parameters<typeof api.submitDocumentForReview>[1] = {},
+) {
+  const d = await api.submitDocumentForReview(id, b)
+  touched({ documentId: id, activity: true })
+  return d
+}
+
+export async function requestDocumentChanges(
+  id: number,
+  b: Parameters<typeof api.requestDocumentChanges>[1] = {},
+) {
+  const d = await api.requestDocumentChanges(id, b)
+  touched({ documentId: id, activity: true })
+  return d
+}
+
+export async function approveDocument(
+  id: number,
+  b: Parameters<typeof api.approveDocument>[1] = {},
+) {
+  const d = await api.approveDocument(id, b)
+  touched({ documentId: id, activity: true })
+  return d
+}
+
 // The compact event the SSE feed pushes (mirrors sse::StreamEvent on the server), plus the
 // synthetic resync signal the server sends when a client fell too far behind to replay.
 export interface StreamEvent {
@@ -114,6 +197,7 @@ export interface StreamEvent {
   type: string
   project_id?: number | null
   task_id?: number | null
+  document_id?: number | null
 }
 
 /**
@@ -135,6 +219,8 @@ export function applyStreamEvent(ev: StreamEvent) {
   touched({
     projectId,
     taskId: ev.task_id ?? undefined,
+    // document.* events (and attach/detach, which also carry a task_id) refresh the doc views.
+    documentId: ev.document_id ?? undefined,
     activity: true,
   })
 }
