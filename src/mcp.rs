@@ -214,6 +214,9 @@ pub struct ListTasksArgs {
     pub status: Option<String>,
     #[serde(default)]
     pub assignee: Option<String>,
+    /// Only tasks with no assignee (assignee IS NULL). Takes precedence over `assignee`.
+    #[serde(default)]
+    pub unassigned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -554,12 +557,12 @@ impl Board {
         core::get_task(&self.pool, a.task_id).await.map_err(err).and_then(ok)
     }
 
-    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee.")]
+    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee (takes precedence over `assignee`).")]
     async fn list_tasks(
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee))
+        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false))
             .await
             .map_err(err)
             .and_then(ok)
