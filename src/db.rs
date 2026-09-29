@@ -119,6 +119,9 @@ CREATE TABLE IF NOT EXISTS document_versions (
     summary     TEXT,
     created_by  TEXT,
     created_at  TEXT NOT NULL,
+    -- MIME type of the bytes the CID points at (e.g. text/markdown, image/png, application/pdf).
+    -- The board records only the label and never fetches/transcodes -- rendering is the client's job.
+    content_type TEXT NOT NULL DEFAULT 'text/markdown',
     UNIQUE(document_id, version_no)
 );
 -- Comments on a document, optionally anchored to a region of a specific (immutable) version.
@@ -375,6 +378,19 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .any(|r| r.get::<String, _>("name") == "external_author");
     if !doc_comments_have_ext_author {
         sqlx::query("ALTER TABLE document_comments ADD COLUMN external_author TEXT")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill document_versions.content_type (documents became any MIME type, not just markdown).
+    // Existing versions default to text/markdown, matching the initial docs work.
+    let versions_have_content_type = sqlx::query("PRAGMA table_info(document_versions)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "content_type");
+    if !versions_have_content_type {
+        sqlx::query("ALTER TABLE document_versions ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text/markdown'")
             .execute(&pool)
             .await?;
     }

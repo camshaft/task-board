@@ -1107,6 +1107,8 @@ struct CreateDocumentBody {
     summary: Option<String>,
     created_by: Option<String>,
     metadata: Option<Value>,
+    /// MIME type of v1's bytes (default text/markdown). The board records only the label.
+    content_type: Option<String>,
 }
 
 async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumentBody>) -> ApiResult {
@@ -1121,6 +1123,7 @@ async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumen
             b.summary.as_deref(),
             b.created_by.as_deref(),
             b.metadata,
+            b.content_type.as_deref(),
         )
         .await?,
     ))
@@ -1147,6 +1150,8 @@ struct PublishVersionBody {
     content: Option<String>,
     summary: Option<String>,
     created_by: Option<String>,
+    /// MIME type of this version's bytes (default text/markdown). The board records only the label.
+    content_type: Option<String>,
 }
 
 async fn publish_version(
@@ -1163,6 +1168,7 @@ async fn publish_version(
             &cid,
             b.summary.as_deref(),
             b.created_by.as_deref(),
+            b.content_type.as_deref(),
         )
         .await?,
     ))
