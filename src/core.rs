@@ -4635,4 +4635,43 @@ mod tests {
         assert_eq!(get_channel_posts(&pool, cid, 0, 100).await?.as_array().unwrap().len(), 3, "unlinked task doesn't post");
         Ok(())
     }
+
+    /// #145: commenting on a task notifies every SUBSCRIBER (not just assignee/creator), excludes
+    /// the comment's author, and auto-subscribes the commenter — and each task.commented carries
+    /// `task_id`, which is what the webhook/tunnel wake payload uses to drive the agent loop's
+    /// `[notification] task #<id>` wake (the reactive path; the wake fan-out itself lives in
+    /// events::emit -> try_wake / fire_webhooks and is exercised by the tunnel integration test).
+    #[tokio::test]
+    async fn comment_notifies_subscribers_for_wake() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "creator", None, None, None, None, None).await?;
+        register_agent(&pool, "watcher", None, None, None, None, None).await?;
+        register_agent(&pool, "op1", None, None, None, None, None).await?;
+        let pid = create_project(&pool, "P", None, Some("creator"), None).await?["id"].as_i64().unwrap();
+        // Task with NO assignee, so `watcher` is a PURE subscriber (not assignee/creator).
+        let tid = create_task(&pool, pid, "T", None, None, None, Some("creator"), None, None).await?["id"].as_i64().unwrap();
+        subscribe(&pool, "watcher", Some(tid), None, None, None, false).await?;
+
+        // op1 comments -> the pure subscriber hears it; the author (op1) does not hear its own.
+        comment_task(&pool, tid, "first", Some("op1"), None).await?;
+        let w = check_notifications(&pool, "watcher", true, 50, None).await?;
+        assert_eq!(w["count"].as_i64(), Some(1), "pure subscriber notified: {w}");
+        assert_eq!(w["notifications"][0]["type"], json!("task.commented"));
+        assert_eq!(w["notifications"][0]["task_id"], json!(tid), "wake payload carries task_id");
+        assert_eq!(check_notifications(&pool, "op1", true, 50, None).await?["count"].as_i64(), Some(0), "author not notified of own comment");
+
+        // Commenting auto-subscribed op1, so it hears a subsequent comment by someone else.
+        comment_task(&pool, tid, "second", Some("watcher"), None).await?;
+        let o = check_notifications(&pool, "op1", true, 50, None).await?;
+        assert_eq!(o["count"].as_i64(), Some(1), "commenter auto-subscribed, hears later comments: {o}");
+        assert_eq!(o["notifications"][0]["type"], json!("task.commented"));
+
+        // Every task.commented event carries task_id (the wake/webhook payload's routing key).
+        let events = get_events(&pool, 0, 500).await?;
+        let commented: Vec<&Value> = events.as_array().unwrap().iter().filter(|e| e["type"] == json!("task.commented")).collect();
+        assert_eq!(commented.len(), 2);
+        assert!(commented.iter().all(|e| e["task_id"] == json!(tid)));
+        Ok(())
+    }
 }
