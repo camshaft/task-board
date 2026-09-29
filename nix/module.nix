@@ -13,12 +13,15 @@ let
   pkg = self.packages.${pkgs.system}.task-board;
 
   # The daemon reads a TOML config file (--config); generate it from the options below.
+  # ipfs_api_url is only emitted when set (TOML has no null) — absent keeps the board CID-only.
   settings = {
     db_path = cfg.dbPath;
     host = cfg.host;
     port = cfg.port;
     webhook_timeout_secs = cfg.webhookTimeout;
     mcp_allowed_hosts = cfg.mcpAllowedHosts;
+  } // lib.optionalAttrs (cfg.ipfsApiUrl != null) {
+    ipfs_api_url = cfg.ipfsApiUrl;
   };
   configFile = (pkgs.formats.toml { }).generate "task-board.toml" settings;
 in
@@ -67,6 +70,18 @@ in
         LAN-exposed or reverse-proxied deployment must list the authorities clients
         actually send. Empty keeps the loopback-only default; a single "*" disables
         the check entirely (any Host accepted — closed networks only).
+      '';
+    };
+
+    ipfsApiUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "http://127.0.0.1:5001";
+      description = ''
+        Optional IPFS HTTP API base URL. When set, the board can content-address raw
+        document `content` server-side (pin via /api/v0/add and store the returned CID), so a
+        client with no local IPFS can author a document. Typically the loopback Kubo API on
+        this host. Null (the default) keeps the board strictly CID-only: callers supply a CID.
       '';
     };
 
