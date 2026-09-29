@@ -675,6 +675,10 @@ struct CreateTaskBody {
     metadata: Option<Value>,
     /// Optional parent task (makes this a child/subtask). Must be in the same project.
     parent_id: Option<i64>,
+    /// Optional external reference for idempotent ingest: if a task is already linked on
+    /// (source, external_id), the existing task is returned (`created:false`) instead of a
+    /// duplicate. Lets a bridge adapter create-from-external exactly-once.
+    external_link: Option<core::ExternalRef>,
 }
 
 async fn create_task(State(st): State<AppState>, Json(b): Json<CreateTaskBody>) -> ApiResult {
@@ -689,6 +693,7 @@ async fn create_task(State(st): State<AppState>, Json(b): Json<CreateTaskBody>) 
             b.created_by.as_deref(),
             b.metadata,
             b.parent_id,
+            b.external_link,
         )
         .await?,
     ))
@@ -767,6 +772,10 @@ struct CommentBody {
     /// Optional external identity id (e.g. "slack:U123") this comment is attributed to — for an
     /// ingested human author. `author` stays the fleet agent that performed the write.
     external_author: Option<String>,
+    /// Optional external reference for idempotent ingest: if a comment is already linked on
+    /// (source, external_id), the existing comment is returned (`created:false`) instead of a
+    /// duplicate. Lets a bridge adapter mirror an external comment exactly-once.
+    external_link: Option<core::ExternalRef>,
 }
 
 async fn comment_task(
@@ -775,7 +784,7 @@ async fn comment_task(
     Json(b): Json<CommentBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::comment_task(&st.pool, task_id, &b.body, b.author.as_deref(), b.external_author.as_deref()).await?,
+        core::comment_task(&st.pool, task_id, &b.body, b.author.as_deref(), b.external_author.as_deref(), b.external_link).await?,
     ))
 }
 

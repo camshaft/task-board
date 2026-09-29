@@ -53,8 +53,12 @@ SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
     (across those same surfaces + the inbox and event feed), so a reader sees the human's name
     while the id stays the key — unregistered ids simply fall back to the id.
   - **links** — a generic `external_links` map (`upsert_external_link` / `list_external_links`)
-    ties an external channel / thread / issue to a board channel or task; one model serves a
-    channel-map, an issue↔task bridge, and thread promotion. Idempotent per external id.
+    ties an external channel / thread / issue / comment to a board channel, task, or comment; one
+    model serves a channel-map, an issue↔task bridge, and thread promotion. Idempotent per external
+    id. For **exactly-once ingest**, `create_task` and `comment_task` take an optional
+    `external_link {source, external_id, external_parent_id?}`: if that key is already linked they
+    return the existing task/comment with `created:false` instead of a duplicate, else they create
+    it and record the link atomically (`created:true`) — so a retrying adapter can't double-post.
   - **promote_thread** — turn a channel thread into a task (root → description, replies →
     comments, attribution + timestamps preserved) with a durable link that keeps the two in
     sync **both ways** (a new reply mirrors to a comment, a new comment mirrors to a reply;
