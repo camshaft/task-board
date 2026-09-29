@@ -198,6 +198,21 @@ CREATE TABLE IF NOT EXISTS external_links (
     updated_at         TEXT NOT NULL,
     UNIQUE(source, external_id)
 );
+-- Wiki links between documents: one row per distinct [[target]] a source document links to.
+-- We store only the raw target_path (and optional |label), never a resolved target id -- the
+-- target is resolved at read time by joining on documents.path, so links stay correct as docs
+-- are filed, renamed, or unfiled (a link can also dangle, pointing at a path nothing occupies
+-- yet). Links are recomputed from content whenever a version is published WITH raw content (the
+-- board only sees a CID otherwise, so a CID-only publish leaves the prior edges untouched).
+-- Embeds (the ![[target]] transclusion form) are NOT links and are excluded here.
+CREATE TABLE IF NOT EXISTS document_links (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_document_id INTEGER NOT NULL REFERENCES documents(id),
+    target_path        TEXT NOT NULL,
+    label              TEXT,
+    created_at         TEXT NOT NULL,
+    UNIQUE(source_document_id, target_path)
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
@@ -215,6 +230,9 @@ CREATE INDEX IF NOT EXISTS idx_external_links_board ON external_links(board_kind
 -- documents(path) in the SCHEMA apply loop fails with "no such column: path" and crash-loops the
 -- process. It is created after the back-fill instead (see init), which is correct for fresh and
 -- existing DBs alike. Any future index/constraint on a back-filled column must follow the same rule.
+-- (document_links is a brand-new table with no back-filled columns, so indexing it here is safe.)
+CREATE INDEX IF NOT EXISTS idx_doclinks_source ON document_links(source_document_id);
+CREATE INDEX IF NOT EXISTS idx_doclinks_target ON document_links(target_path);
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.

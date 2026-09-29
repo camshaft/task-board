@@ -1138,6 +1138,7 @@ async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumen
             b.created_by.as_deref(),
             b.metadata,
             b.content_type.as_deref(),
+            b.content.as_deref(),
         )
         .await?,
     ))
@@ -1183,6 +1184,7 @@ async fn publish_version(
             b.summary.as_deref(),
             b.created_by.as_deref(),
             b.content_type.as_deref(),
+            b.content.as_deref(),
         )
         .await?,
     ))
