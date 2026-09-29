@@ -527,6 +527,24 @@ pub struct PublishVersionArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetDocumentPathArgs {
+    pub document_id: i64,
+    /// The wiki path to file this document under (e.g. architecture/board/events). An empty
+    /// string clears the path (unfiles the doc). Must be unique among filed documents.
+    pub path: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListWikiArgs {
+    /// Only documents filed under this path prefix (e.g. architecture returns architecture and
+    /// everything beneath it). Omit for the whole wiki tree. Results are ordered by path.
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentArgs {
     pub document_id: i64,
 }
@@ -1167,6 +1185,29 @@ impl Board {
         Parameters(a): Parameters<GetDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_document_versions(&self.pool, a.document_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(
+        description = "Set (or clear) a document's wiki path — its slash-separated place in the wiki tree (e.g. architecture/board/events). Pass an empty string to unfile the document. Paths are unique among filed documents; a collision is rejected. Emits document.updated and notifies subscribers."
+    )]
+    async fn set_document_path(
+        &self,
+        Parameters(a): Parameters<SetDocumentPathArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::set_document_path(&self.pool, a.document_id, &a.path, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "List path-filed documents as a wiki tree, ordered by path. Pass `prefix` to list only what's filed under that path (the prefix itself and everything beneath it); omit it for the whole wiki. Unfiled documents (no path) are excluded — use list_documents for those."
+    )]
+    async fn list_wiki(
+        &self,
+        Parameters(a): Parameters<ListWikiArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_wiki(&self.pool, s(&a.prefix)).await.map_err(err).and_then(ok)
     }
 
     #[tool(description = "List documents for discovery, filtered by any combination of project, status (draft / in_review / approved / changes_requested), tag (a value in metadata.tags), task_id (docs attached to that task), and author. Filters AND together.")]

@@ -2788,7 +2788,7 @@ pub async fn list_documents(
     author: Option<&str>,
 ) -> anyhow::Result<Value> {
     let mut q = String::from(
-        "SELECT id, title, slug, project_id, status, current_version_id, approved_version_id, \
+        "SELECT id, title, slug, path, project_id, status, current_version_id, approved_version_id, \
          created_by, updated_at FROM documents",
     );
     // conds and the binds below MUST stay in the same order.
@@ -2831,6 +2831,97 @@ pub async fn list_documents(
         query = query.bind(tg);
     }
     let rows = query.fetch_all(pool).await?;
+    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
+// --- Wiki: hierarchical paths over documents (#105) ---
+
+/// File a document at a wiki `path` (or unfile it). A wiki page IS a document; the path is just
+/// where it lives in the tree. Passing an empty/whitespace path clears it (unfiles). A non-empty
+/// path is trimmed and must be unique across documents — a collision is a client error. Emits
+/// `document.updated` so a tree view live-updates. Returns the updated document.
+pub async fn set_document_path(
+    pool: &Pool,
+    document_id: i64,
+    path: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let trimmed = path.trim().trim_matches('/');
+    let new_path: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let Some(doc) = sqlx::query("SELECT project_id FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let project_id: Option<i64> = doc.try_get("project_id")?;
+    // Collision: another document already filed at this path.
+    if let Some(p) = new_path {
+        if let Some(row) = sqlx::query("SELECT id FROM documents WHERE path=? AND id<>?")
+            .bind(p)
+            .bind(document_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let other: i64 = row.try_get("id")?;
+            anyhow::bail!("give a different `path`: '{p}' is already used by document {other}");
+        }
+    }
+    sqlx::query("UPDATE documents SET path=?, updated_at=? WHERE id=?")
+        .bind(new_path)
+        .bind(&ts)
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.updated",
+        actor,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        json!({ "path": new_path }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// List filed (path-bearing) documents for the wiki tree, optionally restricted to a path
+/// `prefix` — the prefix itself plus everything nested under `prefix/`. Ordered by path, so a
+/// client can render the tree directly. Returns doc summaries (incl. `path`).
+pub async fn list_wiki(pool: &Pool, prefix: Option<&str>) -> anyhow::Result<Value> {
+    let rows = match prefix.map(|p| p.trim().trim_matches('/')).filter(|p| !p.is_empty()) {
+        Some(p) => {
+            sqlx::query(
+                "SELECT id, title, slug, path, project_id, status, current_version_id, \
+                 approved_version_id, created_by, updated_at FROM documents \
+                 WHERE path IS NOT NULL AND (path=? OR path LIKE ? || '/%') ORDER BY path",
+            )
+            .bind(p)
+            .bind(p)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "SELECT id, title, slug, path, project_id, status, current_version_id, \
+                 approved_version_id, created_by, updated_at FROM documents \
+                 WHERE path IS NOT NULL ORDER BY path",
+            )
+            .fetch_all(pool)
+            .await?
+        }
+    };
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
@@ -3366,6 +3457,57 @@ mod tests {
 
         // Missing document -> error.
         assert!(get_document(&pool, 424242).await.is_err());
+        Ok(())
+    }
+
+    /// The wiki layer: a document can be filed at a slash-separated path (unique among filed
+    /// docs), renamed, and cleared; list_wiki returns filed docs ordered by path and honors a
+    /// prefix filter (the prefix node plus everything beneath it).
+    #[tokio::test]
+    async fn wiki_path_filing_and_listing() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let mk = |title: &'static str| {
+            let pool = pool.clone();
+            async move { create_document(&pool, title, None, "bafy", None, Some("alice"), None, None).await }
+        };
+        let a = mk("A").await?["id"].as_i64().unwrap();
+        let b = mk("B").await?["id"].as_i64().unwrap();
+        let c = mk("C").await?["id"].as_i64().unwrap();
+
+        // File a doc; leading/trailing slashes are trimmed, and get_document reflects the path.
+        let filed = set_document_path(&pool, a, "/architecture/board/events/", Some("alice")).await?;
+        assert_eq!(filed["path"], json!("architecture/board/events"));
+        assert_eq!(get_document(&pool, a).await?["path"], json!("architecture/board/events"));
+
+        // Collision: filing another doc at the same path is rejected (400-mapped "give " error).
+        let err = set_document_path(&pool, b, "architecture/board/events", None).await.unwrap_err();
+        assert!(err.to_string().starts_with("give "), "collision error, got: {err}");
+
+        // File the rest of the tree, plus one doc outside it.
+        set_document_path(&pool, b, "architecture/board/schema", None).await?;
+        set_document_path(&pool, c, "runbooks/deploy", None).await?;
+
+        // Whole wiki: all three, ordered by path (architecture/* before runbooks/*).
+        let all = list_wiki(&pool, None).await?;
+        let all = all.as_array().unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0]["path"], json!("architecture/board/events"));
+        assert_eq!(all[1]["path"], json!("architecture/board/schema"));
+        assert_eq!(all[2]["path"], json!("runbooks/deploy"));
+
+        // Prefix filter: only the architecture subtree.
+        let arch = list_wiki(&pool, Some("architecture")).await?;
+        assert_eq!(arch.as_array().unwrap().len(), 2);
+        // A prefix must not match a sibling that merely shares a string head.
+        assert_eq!(list_wiki(&pool, Some("runbooks")).await?.as_array().unwrap().len(), 1);
+
+        // Rename frees the old path (b can now take it) and clearing unfiles a doc.
+        set_document_path(&pool, a, "architecture/board/events-v2", None).await?;
+        set_document_path(&pool, b, "architecture/board/events", None).await?; // no longer a collision
+        set_document_path(&pool, c, "", None).await?; // clear -> unfiled
+        assert!(get_document(&pool, c).await?["path"].is_null());
+        assert_eq!(list_wiki(&pool, None).await?.as_array().unwrap().len(), 2);
         Ok(())
     }
 
