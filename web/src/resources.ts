@@ -12,6 +12,7 @@ import {
   type DocumentComment,
   type DocumentSummary,
   type EventRow,
+  type ExternalIdentity,
   type Project,
   type Task,
   type TaskSummary,
@@ -34,6 +35,7 @@ const keys = {
   channels: (member?: string) => (member ? `channels:${member}` : 'channels'),
   channel: (id: number) => `channel:${id}`,
   channelPosts: (id: number) => `channelPosts:${id}`,
+  externalIdentities: 'externalIdentities',
 }
 
 export function useProjects() {
@@ -64,6 +66,22 @@ export function useChannel(id: number) {
 
 export function useChannelPosts(id: number) {
   return useResource<ChannelPost[]>(keys.channelPosts(id), () => api.getChannelPosts(id))
+}
+
+// Bridged external identities, keyed by id → display name for attribution rendering. Reference
+// data that changes rarely; a component that shows an external author looks up its display name
+// here (falling back to the bare id when absent).
+export function useExternalIdentities() {
+  return useResource<ExternalIdentity[]>(keys.externalIdentities, () =>
+    api.listExternalIdentities(),
+  )
+}
+
+// A resolver from an external identity id (e.g. "slack:U123") to its display name, falling back
+// to the bare id. Used with <AuthorLabel> to render ingested (bridged) authors as the person.
+export function useExternalNameResolver(): (id: string) => string {
+  const { data } = useExternalIdentities()
+  return (id: string) => data?.find((e) => e.id === id)?.display_name ?? id
 }
 
 export function useEvents(limit = 30) {

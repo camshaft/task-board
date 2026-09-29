@@ -4,8 +4,14 @@ import { type ChannelPost } from './api'
 import { channelLabel } from './Channels'
 import { useBoardContext } from './Layout'
 import { Markdown } from './markdown'
-import { inviteToChannel, postToChannel, useChannel, useChannelPosts } from './resources'
-import { relTime } from './ui'
+import {
+  inviteToChannel,
+  postToChannel,
+  useChannel,
+  useChannelPosts,
+  useExternalNameResolver,
+} from './resources'
+import { AuthorLabel, relTime } from './ui'
 
 // One channel (/channels/:channelId): header (label, topic, members, invite), a threaded post
 // pane (one level of reply_to nesting), and a composer. Backed by the resource store; posts
@@ -16,6 +22,7 @@ export default function ChannelView() {
   const id = Number(channelId)
   const { data: channel, error: chErr, loading } = useChannel(id)
   const { data: posts = [] } = useChannelPosts(id)
+  const extName = useExternalNameResolver()
   const [draft, setDraft] = useState('')
   const [replyTo, setReplyTo] = useState<number | null>(null)
   const [busy, setBusy] = useState(false)
@@ -109,12 +116,12 @@ export default function ChannelView() {
         <ul className="space-y-2">
           {topLevel.map((p) => (
             <li key={p.seq}>
-              <PostRow p={p} author={author(p)} onReply={() => setReplyTo(p.seq)} />
+              <PostRow p={p} author={author(p)} extName={extName} onReply={() => setReplyTo(p.seq)} />
               {repliesOf(p.seq).length > 0 && (
                 <ul className="mt-1.5 space-y-1.5 border-l border-[var(--color-border)] pl-4">
                   {repliesOf(p.seq).map((r) => (
                     <li key={r.seq}>
-                      <PostRow p={r} author={author(r)} />
+                      <PostRow p={r} author={author(r)} extName={extName} />
                     </li>
                   ))}
                 </ul>
@@ -159,11 +166,25 @@ export default function ChannelView() {
   )
 }
 
-function PostRow({ p, author, onReply }: { p: ChannelPost; author: string; onReply?: () => void }) {
+function PostRow({
+  p,
+  author,
+  extName,
+  onReply,
+}: {
+  p: ChannelPost
+  author: string
+  extName: (id: string) => string
+  onReply?: () => void
+}) {
   return (
     <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3">
       <div className="mb-1 flex items-center gap-2 text-xs text-[var(--color-muted)]">
-        <span className="font-mono">{author}</span>
+        <AuthorLabel
+          author={author}
+          externalAuthor={p.data.external_author}
+          resolveExternal={extName}
+        />
         <span>· {relTime(p.created_at)}</span>
         {onReply && (
           <button onClick={onReply} className="ml-auto hover:text-sky-300">
