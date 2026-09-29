@@ -6,6 +6,7 @@ mod config;
 mod core;
 mod db;
 mod events;
+mod ipfs;
 mod mcp;
 mod sse;
 
@@ -121,8 +122,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("MCP allowed hosts: {:?}", cfg.mcp_allowed_hosts);
         mcp_config = mcp_config.with_allowed_hosts(cfg.mcp_allowed_hosts.clone());
     }
+    let mcp_ipfs = cfg.ipfs_api_url.clone();
     let mcp_service = StreamableHttpService::new(
-        move || Ok(mcp::Board::new(mcp_pool.clone())),
+        move || Ok(mcp::Board::new(mcp_pool.clone(), mcp_ipfs.clone())),
         LocalSessionManager::default().into(),
         mcp_config,
     );
@@ -133,7 +135,11 @@ async fn main() -> anyhow::Result<()> {
     sse::spawn_tailer(pool.clone(), events_tx.clone());
 
     // REST API at /api.
-    let api_router = api::router(api::AppState { pool: pool.clone(), events_tx });
+    let api_router = api::router(api::AppState {
+        pool: pool.clone(),
+        events_tx,
+        ipfs_api_url: cfg.ipfs_api_url.clone(),
+    });
 
     let mut router = Router::new()
         .nest_service("/mcp", mcp_service)

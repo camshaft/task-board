@@ -24,3 +24,10 @@ webhook_timeout_secs = 5
 # entirely (any Host accepted) — only for closed networks, never public deployments.
 #   mcp_allowed_hosts = ["green-machine.lan:8079", "board.example.com"]
 mcp_allowed_hosts = []
+
+# Optional IPFS HTTP API base URL. When set, the board can content-address raw document
+# `content` server-side (pin via /api/v0/add and store the returned CID), so a client with no
+# local IPFS can author a document by sending content instead of a precomputed CID. When unset
+# (the default), the board stays CID-only: callers must supply a bare CID. Typically the
+# loopback Kubo API on the host running the board.
+#   ipfs_api_url = "http://127.0.0.1:5001"

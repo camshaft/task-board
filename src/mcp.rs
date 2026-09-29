@@ -26,6 +26,9 @@ type JsonObject = serde_json::Map<String, Value>;
 #[derive(Clone)]
 pub struct Board {
     pool: Pool,
+    /// Optional IPFS HTTP API for server-side content-addressing of raw document `content`.
+    /// `None` keeps the board CID-only. See `crate::ipfs`.
+    ipfs_api_url: Option<String>,
     // Populated and consumed by the #[tool_router]/#[tool_handler] macros.
     #[allow(dead_code)]
     tool_router: ToolRouter<Board>,
@@ -356,7 +359,14 @@ pub struct GetEventsArgs {
 pub struct CreateDocumentArgs {
     pub title: String,
     /// Bare IPFS content id for version 1. Stored verbatim; the board never resolves it.
-    pub cid: String,
+    /// Optional if `content` is given (and the board has an IPFS backend configured).
+    #[serde(default)]
+    pub cid: Option<String>,
+    /// Raw content for version 1, content-addressed server-side when no `cid` is given (needs
+    /// a configured IPFS backend). Lets a client with no local IPFS author a document. Supply
+    /// exactly one of `cid` / `content`.
+    #[serde(default)]
+    pub content: Option<String>,
     /// Optionally attach the document to a project.
     #[serde(default)]
     pub project_id: Option<i64>,
@@ -374,7 +384,13 @@ pub struct CreateDocumentArgs {
 pub struct PublishVersionArgs {
     pub document_id: i64,
     /// Bare IPFS content id for the new version. Stored verbatim; the board never resolves it.
-    pub cid: String,
+    /// Optional if `content` is given (and the board has an IPFS backend configured).
+    #[serde(default)]
+    pub cid: Option<String>,
+    /// Raw content for the new version, content-addressed server-side when no `cid` is given.
+    /// Supply exactly one of `cid` / `content`.
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -478,9 +494,10 @@ fn s(o: &Option<String>) -> Option<&str> {
 
 #[tool_router]
 impl Board {
-    pub fn new(pool: Pool) -> Self {
+    pub fn new(pool: Pool, ipfs_api_url: Option<String>) -> Self {
         Self {
             pool,
+            ipfs_api_url,
             tool_router: Self::tool_router(),
         }
     }
@@ -857,17 +874,20 @@ impl Board {
 
     // --- Documents ---
     #[tool(
-        description = "Create a versioned document. Content lives on IPFS: pass `cid` (a bare content id) — the board stores the identifier only and NEVER resolves it or composes a URL (the client does). Optionally attach it to a `project_id` and set `metadata` (tags, etc). Creates version 1. Returns the document with its current version + version list."
+        description = "Create a versioned document. Content lives on IPFS. Normally pass `cid` (a bare content id) — the board stores the identifier only and NEVER resolves it or composes a URL. If you have no local IPFS, pass raw `content` instead and the board content-addresses it server-side (requires the deployment to configure an IPFS backend; otherwise you get a clear error asking for a `cid`). Optionally attach it to a `project_id` and set `metadata` (tags, etc). Creates version 1. Returns the document with its current version + version list."
     )]
     async fn create_document(
         &self,
         Parameters(a): Parameters<CreateDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
+            .await
+            .map_err(err)?;
         core::create_document(
             &self.pool,
             &a.title,
             a.project_id,
-            &a.cid,
+            &cid,
             s(&a.summary),
             s(&a.created_by),
             a.metadata.map(Value::Object),
@@ -878,13 +898,16 @@ impl Board {
     }
 
     #[tool(
-        description = "Publish a new immutable version of a document from a `cid` (bare content id; the board does not resolve it). Appends the version, advances the current pointer, and returns the updated document. A new version drops an approved/changes_requested doc back to in_review."
+        description = "Publish a new immutable version of a document. Pass `cid` (bare content id; the board does not resolve it) or, with no local IPFS, raw `content` to content-address server-side (requires a configured IPFS backend). Appends the version, advances the current pointer, and returns the updated document. A new version drops an approved/changes_requested doc back to in_review."
     )]
     async fn publish_version(
         &self,
         Parameters(a): Parameters<PublishVersionArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::publish_version(&self.pool, a.document_id, &a.cid, s(&a.summary), s(&a.created_by))
+        let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
+            .await
+            .map_err(err)?;
+        core::publish_version(&self.pool, a.document_id, &cid, s(&a.summary), s(&a.created_by))
             .await
             .map_err(err)
             .and_then(ok)
