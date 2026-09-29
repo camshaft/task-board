@@ -93,16 +93,17 @@ export function useExternalNameResolver(): (id: string) => string {
 }
 
 export function useEvents(limit = 30) {
-  return useResource<EventRow[]>(keys.events(limit), () =>
-    api.getEvents(0, limit).then((es) => es.reverse()),
-  )
+  // order='desc' → the server returns the LATEST `limit` events, newest-first, so the feed
+  // tracks recent activity (an SSE event invalidates this key, and the refetch surfaces the new
+  // event at the top). Not the oldest window with a client-side reverse.
+  return useResource<EventRow[]>(keys.events(limit), () => api.getEvents(0, limit, undefined, 'desc'))
 }
 
 // One agent's own activity, server-filtered by actor so the feed is complete (not truncated to
-// a client-side window). Newest first, matching useEvents.
+// a client-side window). Newest first (order='desc'), matching useEvents.
 export function useAgentActivity(agentId: string, limit = 100) {
   return useResource<EventRow[]>(keys.agentActivity(agentId), () =>
-    api.getEvents(0, limit, agentId).then((es) => es.reverse()),
+    api.getEvents(0, limit, agentId, 'desc'),
   )
 }
 

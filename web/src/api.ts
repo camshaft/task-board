@@ -358,10 +358,13 @@ export const api = {
   moveTask: (id: number, b: { to_project_id: number; actor?: string }) =>
     req<Task>('POST', `/tasks/${id}/move`, b),
 
-  getEvents: (since_seq = 0, limit = 100, actor?: string) =>
+  // order='desc' returns the LATEST `limit` events, newest-first (for an activity feed); the
+  // default 'asc' returns oldest-first above `since_seq` (for incremental tailing). Both compose
+  // with `since_seq` and `actor`.
+  getEvents: (since_seq = 0, limit = 100, actor?: string, order?: 'asc' | 'desc') =>
     req<EventRow[]>(
       'GET',
-      `/events?since_seq=${since_seq}&limit=${limit}${actor ? `&actor=${encodeURIComponent(actor)}` : ''}`,
+      `/events?since_seq=${since_seq}&limit=${limit}${actor ? `&actor=${encodeURIComponent(actor)}` : ''}${order ? `&order=${order}` : ''}`,
     ),
 
   listDocuments: (
