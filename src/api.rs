@@ -100,6 +100,7 @@ pub fn router(state: AppState) -> Router {
         .route("/channels/{channel_id}", get(get_channel))
         .route("/channels/{channel_id}/posts", get(get_channel_posts).post(post_to_channel))
         .route("/channels/{channel_id}/props", patch(set_channel_props))
+        .route("/channels/{channel_id}/promote-thread", post(promote_thread))
         .route("/channels/{channel_id}/invites", post(invite_to_channel))
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
@@ -184,6 +185,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/channels/{channel_id}/posts", summary: "Read a channel's post history.", query: "since_seq=int&limit=int", body: None },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/posts", summary: "Post a message to a channel.", query: "", body: Some("PostToChannelBody") },
     Endpoint { method: "PATCH", path: "/api/channels/{channel_id}/props", summary: "Merge props into a channel's metadata (e.g. the outbound reflect-back policy).", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/channels/{channel_id}/promote-thread", summary: "Promote a channel thread into a task (root→description, replies→comments); idempotent.", query: "", body: Some("PromoteThreadBody") },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
@@ -239,6 +241,7 @@ fn body_schemas() -> Value {
         AttachDocumentBody,
         IpfsAddBody,
         UpsertExternalIdentityBody,
+        PromoteThreadBody,
     )
 }
 
@@ -878,6 +881,26 @@ async fn set_channel_props(
     Json(props): Json<Value>,
 ) -> ApiResult {
     Ok(Json(core::set_channel_props(&st.pool, channel_id, props).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PromoteThreadBody {
+    /// Seq of the thread's root post; its direct replies (reply_to == this) become comments.
+    root_post_seq: i64,
+    /// Project the new task is created in.
+    project_id: i64,
+    actor: Option<String>,
+}
+
+async fn promote_thread(
+    State(st): State<AppState>,
+    Path(channel_id): Path<i64>,
+    Json(b): Json<PromoteThreadBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::promote_thread(&st.pool, channel_id, b.root_post_seq, b.project_id, b.actor.as_deref())
+            .await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]

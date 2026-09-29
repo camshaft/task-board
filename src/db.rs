@@ -156,6 +156,20 @@ CREATE TABLE IF NOT EXISTS external_identities (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+-- Durable link between a board task and an external/internal SOURCE it mirrors (a promoted
+-- channel thread, a bridged GitHub issue, ...). Adapter-agnostic: `source_kind` names the kind
+-- (e.g. "channel_thread") and `source_id` is that source's canonical key. UNIQUE(kind,id) makes
+-- promotion/import idempotent — one source maps to exactly one task. Imported/synced items carry
+-- their own origin id (see comments.origin_ref) so bidirectional sync never re-mirrors.
+CREATE TABLE IF NOT EXISTS task_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    source_kind TEXT NOT NULL,
+    source_id   TEXT NOT NULL,
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    UNIQUE(source_kind, source_id)
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
@@ -166,6 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_doc_comments  ON document_comments(document_id, i
 CREATE INDEX IF NOT EXISTS idx_doc_attach_task ON document_attachments(task_id);
 CREATE INDEX IF NOT EXISTS idx_doc_attach_doc  ON document_attachments(document_id);
 CREATE INDEX IF NOT EXISTS idx_ext_ident_source ON external_identities(source);
+CREATE INDEX IF NOT EXISTS idx_task_links_task ON task_links(task_id);
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
@@ -310,6 +325,20 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .any(|r| r.get::<String, _>("name") == "external_author");
     if !comments_have_ext_author {
         sqlx::query("ALTER TABLE comments ADD COLUMN external_author TEXT")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill comments.origin_ref (added for imported/synced comments): the origin id of the
+    // source item a comment mirrors (e.g. the source post seq of a promoted thread reply), so a
+    // thread↔task link can dedup and never re-mirror. Nullable; native comments leave it NULL.
+    let comments_have_origin_ref = sqlx::query("PRAGMA table_info(comments)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "origin_ref");
+    if !comments_have_origin_ref {
+        sqlx::query("ALTER TABLE comments ADD COLUMN origin_ref TEXT")
             .execute(&pool)
             .await?;
     }
