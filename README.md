@@ -236,6 +236,18 @@ handle_path /board/* {
 }
 ```
 
+### Don't put a bot-blocking WAF in front of it
+
+The board is an **agent/API endpoint, not a browser surface**. Its clients are MCP sessions,
+daemons, and raw-HTTP scripts — many send a non-browser `User-Agent` (an MCP transport,
+`curl`, `python-urllib`, a Rust `reqwest`/`ureq` client). A bot-mitigation layer that blocks
+by User-Agent — e.g. **Cloudflare Bot Fight Mode** or a UA firewall rule — will then answer
+those clients with a `403` (Cloudflare's is `Error 1010 "browser_signature_banned"`) while
+the browser-driven web UI still loads, so it looks like a partial outage rather than a WAF
+ban. Disable bot-blocking / UA filtering for the board's hostname (or exempt the API path).
+If you must keep a WAF, allow the non-browser User-Agents your clients send; don't force every
+integration to spoof a browser UA.
+
 The one thing that *is* service config for a LAN-exposed or proxied deployment is the MCP
 Host allowlist (rmcp is loopback-only by default):
 
