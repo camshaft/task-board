@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     status      TEXT NOT NULL DEFAULT 'todo',
     priority    TEXT,
     assignee    TEXT,
+    parent_id   INTEGER REFERENCES tasks(id),
     created_by  TEXT,
     metadata    TEXT NOT NULL DEFAULT '{}',
     created_at  TEXT NOT NULL,
@@ -190,6 +191,22 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
             .execute(&pool)
             .await?;
     }
+
+    // Back-fill tasks.parent_id (added when tasks gained nesting/epics). Nullable, self-
+    // referential; pre-existing tasks are top-level (NULL parent) until reparented.
+    let tasks_have_parent = sqlx::query("PRAGMA table_info(tasks)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "parent_id");
+    if !tasks_have_parent {
+        sqlx::query("ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id)")
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)")
+        .execute(&pool)
+        .await?;
 
     // Same back-fill for projects.metadata (added when projects gained arbitrary props, e.g.
     // a repo link). An old board.db created before it keeps working: existing rows default

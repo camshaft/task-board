@@ -199,7 +199,7 @@ mod tests {
         // A task created after the tailer starts should arrive on the bus.
         let p = core::create_project(&pool, "live", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = core::create_task(&pool, pid, "T", None, None, None, Some("u"), None).await?;
+        let t = core::create_task(&pool, pid, "T", None, None, None, Some("u"), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Poll the bus (tailer wakes every TAIL_INTERVAL) until we see the task event.
@@ -240,7 +240,7 @@ mod tests {
         let p = core::create_project(&pool, "p", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         for i in 0..3 {
-            core::create_task(&pool, pid, &format!("t{i}"), None, None, None, Some("u"), None).await?;
+            core::create_task(&pool, pid, &format!("t{i}"), None, None, None, Some("u"), None, None).await?;
         }
 
         let all = fetch_since(&pool, 0, BATCH).await?;

@@ -170,6 +170,9 @@ pub struct CreateTaskArgs {
     /// Arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...).
     #[serde(default)]
     pub metadata: Option<JsonObject>,
+    /// Optional parent task (makes this a child/subtask). The parent must be in the same project.
+    #[serde(default)]
+    pub parent_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -193,6 +196,9 @@ pub struct UpdateTaskArgs {
     /// MERGED into the task's props.
     #[serde(default)]
     pub metadata: Option<JsonObject>,
+    /// Reparent: set a parent task id (same project), or 0 to clear the parent (make top-level).
+    #[serde(default)]
+    pub parent_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -218,6 +224,12 @@ pub struct ListTasksArgs {
     /// Only tasks with no assignee (assignee IS NULL). Takes precedence over `assignee`.
     #[serde(default)]
     pub unassigned: Option<bool>,
+    /// Only the direct children of this task (an epic's subtasks). Takes precedence over `top_level`.
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+    /// Only top-level tasks (no parent) — epics + loose tasks, the default board view.
+    #[serde(default)]
+    pub top_level: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -597,7 +609,7 @@ impl Board {
 
     // --- Tasks ---
     #[tool(
-        description = "Create a task in a project. The creator and assignee are auto-subscribed, so they get notified of future changes. `metadata` is an optional dict of arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...). Returns the new task incl. its id."
+        description = "Create a task in a project. The creator and assignee are auto-subscribed, so they get notified of future changes. `metadata` is an optional dict of arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...). Pass `parent_id` to nest it under an epic (same project). Returns the new task incl. its id."
     )]
     async fn create_task(
         &self,
@@ -612,6 +624,7 @@ impl Board {
             s(&a.priority),
             s(&a.created_by),
             a.metadata.map(Value::Object),
+            a.parent_id,
         )
         .await
         .map_err(err)
@@ -619,7 +632,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. Set `assignee` to \"\" (empty string) to unassign (clear the owner) — this emits task.unassigned; setting a non-empty owner emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage)."
+        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. Set `assignee` to \"\" (empty string) to unassign (clear the owner) — this emits task.unassigned; setting a non-empty owner emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent."
     )]
     async fn update_task(
         &self,
@@ -635,6 +648,7 @@ impl Board {
             s(&a.priority),
             s(&a.actor),
             a.metadata.map(Value::Object),
+            a.parent_id,
         )
         .await
         .map_err(err)
@@ -675,12 +689,12 @@ impl Board {
         core::get_task(&self.pool, a.task_id).await.map_err(err).and_then(ok)
     }
 
-    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee (takes precedence over `assignee`).")]
+    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view).")]
     async fn list_tasks(
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false))
+        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false))
             .await
             .map_err(err)
             .and_then(ok)
