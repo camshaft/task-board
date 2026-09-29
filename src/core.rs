@@ -2164,12 +2164,23 @@ pub async fn get_messages(
     check_notifications(pool, agent_id, mark_read, limit, Some("message.direct")).await
 }
 
-pub async fn get_events(pool: &Pool, since_seq: i64, limit: i64) -> anyhow::Result<Value> {
-    let rows = sqlx::query("SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?")
-        .bind(since_seq)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+pub async fn get_events(
+    pool: &Pool,
+    since_seq: i64,
+    limit: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    // Optional `actor` filter — a complete per-agent activity feed without over-fetching.
+    let sql = if actor.is_some() {
+        "SELECT * FROM events WHERE seq>? AND actor=? ORDER BY seq LIMIT ?"
+    } else {
+        "SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?"
+    };
+    let mut q = sqlx::query(sql).bind(since_seq);
+    if let Some(a) = actor {
+        q = q.bind(a);
+    }
+    let rows = q.bind(limit).fetch_all(pool).await?;
     let mut out = Vec::new();
     for r in &rows {
         let mut d = row_to_json(r);
@@ -3713,7 +3724,7 @@ mod tests {
         let r = update_task(&pool, c2id, None, None, None, None, None, Some("u"), None, Some(0)).await?;
         assert!(r["parent_id"].is_null());
         assert_eq!(get_task(&pool, eid).await?["child_rollup"], json!({ "done": 1, "total": 1 }));
-        let evs = get_events(&pool, 0, 200).await?;
+        let evs = get_events(&pool, 0, 200, None).await?;
         assert!(evs.as_array().unwrap().iter().any(|e| e["type"] == json!("task.reparented")));
 
         // move_task guard: the epic still has a child -> cannot cross projects.
@@ -4046,7 +4057,7 @@ mod tests {
         assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false, None).await?.as_array().unwrap().len(), 1);
 
         // A task.moved event was recorded carrying both ends.
-        let events = get_events(&pool, 0, 100).await?;
+        let events = get_events(&pool, 0, 100, None).await?;
         let ev = events
             .as_array()
             .unwrap()
@@ -4057,9 +4068,9 @@ mod tests {
         assert_eq!(ev["data"]["to_project_id"], json!(bid));
 
         // Moving onto the current project is a no-op (no new event, still on B).
-        let before = get_events(&pool, 0, 100).await?.as_array().unwrap().len();
+        let before = get_events(&pool, 0, 100, None).await?.as_array().unwrap().len();
         move_task(&pool, tid, bid, Some("u")).await?;
-        let after = get_events(&pool, 0, 100).await?.as_array().unwrap().len();
+        let after = get_events(&pool, 0, 100, None).await?.as_array().unwrap().len();
         assert_eq!(before, after, "no-op move should not emit an event");
         Ok(())
     }
@@ -4119,7 +4130,7 @@ mod tests {
             update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None).await?;
         assert!(cleared["assignee"].is_null(), "assignee should be NULL after unassign");
 
-        let events = get_events(&pool, 0, 100).await?;
+        let events = get_events(&pool, 0, 100, None).await?;
         let un = events
             .as_array()
             .unwrap()
@@ -4130,7 +4141,7 @@ mod tests {
 
         // Clearing an already-unassigned task does NOT emit a second task.unassigned.
         update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None).await?;
-        let after = get_events(&pool, 0, 200).await?;
+        let after = get_events(&pool, 0, 200, None).await?;
         assert_eq!(
             after
                 .as_array()
@@ -4144,7 +4155,7 @@ mod tests {
 
         // Re-assigning to a real owner emits task.assigned.
         update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None, None).await?;
-        let evs = get_events(&pool, 0, 200).await?;
+        let evs = get_events(&pool, 0, 200, None).await?;
         assert!(
             evs.as_array().unwrap().iter().any(
                 |e| e["type"] == json!("task.assigned") && e["data"]["assignee"] == json!("bob")
@@ -4460,7 +4471,7 @@ mod tests {
 
         // Allowed author -> reflect event carrying the post details.
         post_to_channel(&pool, cid, "concierge", "to slack", None, None).await?;
-        let ev = get_events(&pool, 0, 500).await?;
+        let ev = get_events(&pool, 0, 500, None).await?;
         let r = reflects(&ev, cid);
         assert_eq!(r.len(), 1, "allowed author reflects out");
         assert_eq!(r[0]["data"]["author"], json!("concierge"));
@@ -4469,20 +4480,20 @@ mod tests {
 
         // Denied author -> no new reflect event.
         post_to_channel(&pool, cid, "worker", "internal only", None, None).await?;
-        let ev = get_events(&pool, 0, 500).await?;
+        let ev = get_events(&pool, 0, 500, None).await?;
         assert_eq!(reflects(&ev, cid).len(), 1, "denied author stays board-internal");
 
         // An unconfigured channel never reflects, even for concierge.
         let plain = create_channel(&pool, "plain", None, Some("concierge"), None).await?;
         let pid = plain["id"].as_i64().unwrap();
         post_to_channel(&pool, pid, "concierge", "hi", None, None).await?;
-        let ev = get_events(&pool, 0, 500).await?;
+        let ev = get_events(&pool, 0, 500, None).await?;
         assert_eq!(reflects(&ev, pid).len(), 0, "default policy is board-internal");
 
         // set_channel_props turns reflect-back ON for the plain channel.
         set_channel_props(&pool, pid, json!({ "direction": "out" })).await?;
         post_to_channel(&pool, pid, "concierge", "now out", None, None).await?;
-        let ev = get_events(&pool, 0, 500).await?;
+        let ev = get_events(&pool, 0, 500, None).await?;
         assert_eq!(reflects(&ev, pid).len(), 1, "policy configurable after creation");
         Ok(())
     }
@@ -4668,10 +4679,41 @@ mod tests {
         assert_eq!(o["notifications"][0]["type"], json!("task.commented"));
 
         // Every task.commented event carries task_id (the wake/webhook payload's routing key).
-        let events = get_events(&pool, 0, 500).await?;
+        let events = get_events(&pool, 0, 500, None).await?;
         let commented: Vec<&Value> = events.as_array().unwrap().iter().filter(|e| e["type"] == json!("task.commented")).collect();
         assert_eq!(commented.len(), 2);
         assert!(commented.iter().all(|e| e["task_id"] == json!(tid)));
+        Ok(())
+    }
+
+    /// get_events(actor=…) returns only that actor's events — a complete per-agent activity feed
+    /// (requested by the UI, task #124) without over-fetching + client-side filtering.
+    #[tokio::test]
+    async fn get_events_actor_filter() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "a", None, None, None, None, None).await?;
+        register_agent(&pool, "b", None, None, None, None, None).await?;
+        let pid = create_project(&pool, "P", None, Some("a"), None).await?["id"].as_i64().unwrap();
+        let tid = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None).await?["id"].as_i64().unwrap();
+        comment_task(&pool, tid, "hi", Some("b"), None).await?;
+
+        let all = get_events(&pool, 0, 500, None).await?;
+        assert!(all.as_array().unwrap().len() >= 3, "project.created + task.created + task.commented");
+
+        let by_a = get_events(&pool, 0, 500, Some("a")).await?;
+        let by_a = by_a.as_array().unwrap();
+        assert!(!by_a.is_empty());
+        assert!(by_a.iter().all(|e| e["actor"] == json!("a")), "only actor a: {by_a:?}");
+        assert!(by_a.iter().any(|e| e["type"] == json!("task.created")));
+
+        let by_b = get_events(&pool, 0, 500, Some("b")).await?;
+        let by_b = by_b.as_array().unwrap();
+        assert_eq!(by_b.len(), 1, "b only authored the comment");
+        assert_eq!(by_b[0]["type"], json!("task.commented"));
+        assert_eq!(by_b[0]["actor"], json!("b"));
+
+        assert!(get_events(&pool, 0, 500, Some("nobody")).await?.as_array().unwrap().is_empty());
         Ok(())
     }
 }

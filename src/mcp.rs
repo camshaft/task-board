@@ -472,6 +472,9 @@ pub struct GetEventsArgs {
     pub since_seq: i64,
     #[serde(default = "default_events_limit")]
     pub limit: i64,
+    /// Only events whose `actor` matches — a complete per-agent activity feed.
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1098,7 +1101,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<GetEventsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_events(&self.pool, a.since_seq, a.limit).await.map_err(err).and_then(ok)
+        core::get_events(&self.pool, a.since_seq, a.limit, s(&a.actor)).await.map_err(err).and_then(ok)
     }
 
     // --- Documents ---
