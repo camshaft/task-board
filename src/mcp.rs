@@ -378,6 +378,40 @@ pub struct ListDocumentsArgs {
     pub status: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommentDocumentArgs {
+    pub document_id: i64,
+    pub body: String,
+    /// The version this comment is written against (anchors the region to immutable content).
+    #[serde(default)]
+    pub version_id: Option<i64>,
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Free-form JSON anchor (e.g. W3C/Hypothesis selectors). Stored verbatim; omit for a
+    /// doc-level comment.
+    #[serde(default)]
+    pub region: Option<JsonObject>,
+    /// Thread this comment under another (one-level).
+    #[serde(default)]
+    pub reply_to: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResolveCommentArgs {
+    pub comment_id: i64,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetDocumentCommentsArgs {
+    pub document_id: i64,
+    #[serde(default)]
+    pub version_id: Option<i64>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -826,6 +860,46 @@ impl Board {
         Parameters(a): Parameters<ListDocumentsArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::list_documents(&self.pool, a.project_id, s(&a.status)).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(
+        description = "Comment on a document, optionally anchored to a region of a specific version. `region` is a free-form JSON selector object (e.g. W3C/Hypothesis TextQuote + TextPosition) stored verbatim — omit it for a doc-level comment. `reply_to` threads under another comment. Auto-subscribes you to the document and notifies its subscribers."
+    )]
+    async fn comment_document(
+        &self,
+        Parameters(a): Parameters<CommentDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::comment_document(
+            &self.pool,
+            a.document_id,
+            a.version_id,
+            s(&a.author),
+            &a.body,
+            a.region.map(Value::Object),
+            a.reply_to,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(description = "Mark a document comment resolved (open -> resolved). Notifies the document's subscribers.")]
+    async fn resolve_comment(
+        &self,
+        Parameters(a): Parameters<ResolveCommentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::resolve_comment(&self.pool, a.comment_id, s(&a.actor)).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "List a document's comments (oldest first), optionally filtered by version_id and/or status (open / resolved).")]
+    async fn get_document_comments(
+        &self,
+        Parameters(a): Parameters<GetDocumentCommentsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_document_comments(&self.pool, a.document_id, a.version_id, s(&a.status))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 }
 
