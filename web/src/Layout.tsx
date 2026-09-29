@@ -60,6 +60,12 @@ export default function Layout() {
         <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
           agent coordination · MCP + REST
         </span>
+        <Link
+          to="/search"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        >
+          Search
+        </Link>
         <a
           href={new URL('api', document.baseURI).href}
           target="_blank"

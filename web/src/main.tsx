@@ -5,6 +5,7 @@ import './index.css'
 import Board from './Board.tsx'
 import Home from './Home.tsx'
 import Layout from './Layout.tsx'
+import Search from './Search.tsx'
 import { TaskDrawer } from './TaskDrawer.tsx'
 
 // The app may be served under a reverse-proxy sub-path (e.g. /board), which the backend
@@ -22,6 +23,7 @@ createRoot(document.getElementById('root')!).render(
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<Home />} />
+          <Route path="search" element={<Search />} />
           <Route path="projects/:projectId" element={<Board />}>
             <Route path="tasks/:taskId" element={<TaskDrawer />} />
           </Route>
