@@ -15,6 +15,11 @@ export default function Board() {
   const { data: projects = [] } = useProjects()
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
+  // Inline new-task composer (replaces the old chained window.prompts).
+  const [composing, setComposing] = useState(false)
+  const [newTitle, setNewTitle] = useState('')
+  const [newAssignee, setNewAssignee] = useState('')
+  const [creating, setCreating] = useState(false)
 
   const toggleExpand = (id: number) =>
     setExpanded((s) => {
@@ -37,14 +42,33 @@ export default function Board() {
   }
   const topLevel = tasks.filter((t) => t.parent_id == null)
 
-  async function newTask() {
-    const title = window.prompt('Task title:')
-    if (!title?.trim()) return
-    const assignee = window.prompt('Assignee (agent id, optional):') || undefined
+  function openComposer() {
+    setError(null)
+    setComposing(true)
+  }
+
+  function cancelComposer() {
+    setComposing(false)
+    setNewTitle('')
+    setNewAssignee('')
+  }
+
+  async function submitNewTask() {
+    const title = newTitle.trim()
+    if (!title || creating) return
+    setCreating(true)
     try {
-      await createTask({ project_id: project, title: title.trim(), assignee, created_by: actor })
+      await createTask({
+        project_id: project,
+        title,
+        assignee: newAssignee.trim() || undefined,
+        created_by: actor,
+      })
+      cancelComposer()
     } catch (e) {
       setError((e as Error).message)
+    } finally {
+      setCreating(false)
     }
   }
 
@@ -115,7 +139,7 @@ export default function Board() {
           </a>
         )}
         <button
-          onClick={newTask}
+          onClick={openComposer}
           className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
         >
           + task
@@ -145,6 +169,47 @@ export default function Board() {
           )}
         </div>
       </div>
+
+      {composing && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-panel)]/40 px-4 py-2">
+          <input
+            autoFocus
+            value={newTitle}
+            disabled={creating}
+            onChange={(e) => setNewTitle(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void submitNewTask()
+              else if (e.key === 'Escape') cancelComposer()
+            }}
+            placeholder="Task title"
+            className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-sm outline-none focus:border-sky-500/50"
+          />
+          <input
+            value={newAssignee}
+            disabled={creating}
+            onChange={(e) => setNewAssignee(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void submitNewTask()
+              else if (e.key === 'Escape') cancelComposer()
+            }}
+            placeholder="assignee (optional)"
+            className="w-40 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 font-mono text-xs outline-none focus:border-sky-500/50"
+          />
+          <button
+            onClick={submitNewTask}
+            disabled={creating || !newTitle.trim()}
+            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-40"
+          >
+            Add task
+          </button>
+          <button
+            onClick={cancelComposer}
+            className="rounded-md px-2.5 py-1.5 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
 
       {shownError && (
         <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
