@@ -224,9 +224,14 @@ pub struct UpdateTaskArgs {
     /// todo / in_progress / blocked / done / cancelled
     #[serde(default)]
     pub status: Option<String>,
-    /// New owner's agent id. Pass "" (empty string) to unassign (clear the owner).
+    /// New owner's agent id. To clear the owner (unassign), set `unassign: true` rather than
+    /// sending an empty string here — some clients can't serialize "".
     #[serde(default)]
     pub assignee: Option<String>,
+    /// Clear the task's owner (set it to no assignee). Takes precedence over `assignee`. This is
+    /// the reliable, client-safe way to unassign (an empty-string `assignee` is not portable).
+    #[serde(default)]
+    pub unassign: Option<bool>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -903,6 +908,13 @@ impl Board {
         Parameters(a): Parameters<UpdateTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.me_opt(s(&a.actor));
+        // `unassign: true` clears the owner; it maps onto the core empty-string sentinel and wins
+        // over any `assignee` value (a client that can't send "" uses this instead).
+        let assignee = if a.unassign.unwrap_or(false) {
+            Some("")
+        } else {
+            s(&a.assignee)
+        };
         let blocked_on = a.blocked_on.map(|bo| {
             if bo.kind.is_empty() || bo.kind == "none" || bo.kind == "clear" {
                 Value::Null
@@ -914,7 +926,7 @@ impl Board {
             &self.pool,
             a.task_id,
             s(&a.status),
-            s(&a.assignee),
+            assignee,
             s(&a.title),
             s(&a.description),
             s(&a.priority),
@@ -1540,6 +1552,42 @@ mod tests {
         let board = Board::new(pool, None);
         let tools = board.get_info().capabilities.tools.expect("tools capability present");
         assert_eq!(tools.list_changed, Some(true));
+        Ok(())
+    }
+
+    // `unassign: true` clears a task's owner over MCP, without needing an empty-string assignee
+    // (which some clients can't serialize). It maps onto the core unassign sentinel.
+    #[tokio::test]
+    async fn update_task_unassign_flag_clears_owner() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool.clone(), None);
+        let mkfail = |e: McpError| anyhow::anyhow!("{e:?}");
+
+        let p = core::create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = core::create_task(&pool, pid, "T", None, Some("alice"), None, Some("u"), None, None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        assert_eq!(core::get_task(&pool, tid).await?["assignee"], serde_json::json!("alice"));
+
+        // unassign: true clears the owner (no empty-string assignee needed).
+        board
+            .update_task(Parameters(serde_json::from_value(
+                serde_json::json!({"task_id": tid, "unassign": true, "actor": "u"}),
+            )?))
+            .await
+            .map_err(mkfail)?;
+        assert!(core::get_task(&pool, tid).await?["assignee"].is_null());
+
+        // unassign wins over a concurrently-supplied assignee value.
+        core::update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None, None, None).await?;
+        board
+            .update_task(Parameters(serde_json::from_value(
+                serde_json::json!({"task_id": tid, "assignee": "carol", "unassign": true, "actor": "u"}),
+            )?))
+            .await
+            .map_err(mkfail)?;
+        assert!(core::get_task(&pool, tid).await?["assignee"].is_null(), "unassign takes precedence over assignee");
         Ok(())
     }
 
