@@ -164,7 +164,8 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
 
     // Back-fill agents.metadata (an arbitrary props bag, mirroring projects/tasks). This is
     // what lets the board's agent list serve as the fleet registry: role, model, effort,
-    // interval, worktree, branch, area, repo, ... all live here. Defaults to '{}'.
+    // interval, worktree, area, and `repos: [{repo, branch}, ...]` (an agent may span
+    // several repos, each checked out in its own workspace) all live here. Defaults to '{}'.
     let agents_have_metadata = sqlx::query("PRAGMA table_info(agents)")
         .fetch_all(&pool)
         .await?
