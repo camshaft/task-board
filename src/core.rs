@@ -1462,6 +1462,40 @@ pub async fn unsubscribe(
     Ok(json!({ "removed": n }))
 }
 
+/// Mute a task for an agent: suppress this task's event fan-out (comments, status changes, …)
+/// to that agent, even though they're the creator/assignee/subscriber. Lets a stood-down owner
+/// detach from FYI wakes on a task they opened — `unsubscribe` can't, because the creator is in
+/// the fan-out independent of any subscription row. Idempotent. Only this task's fan-out is
+/// affected: a direct message still reaches the agent. `unmute_task` reverses it.
+pub async fn mute_task(pool: &Pool, agent: &str, task_id: i64) -> anyhow::Result<Value> {
+    if sqlx::query("SELECT 1 FROM tasks WHERE id=?")
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no task {task_id}");
+    }
+    sqlx::query("INSERT OR IGNORE INTO task_mutes(task_id, agent, created_at) VALUES(?,?,?)")
+        .bind(task_id)
+        .bind(agent)
+        .bind(now_iso())
+        .execute(pool)
+        .await?;
+    Ok(json!({ "task_id": task_id, "agent": agent, "muted": true }))
+}
+
+/// Unmute a task for an agent (reverses `mute_task`): the agent rejoins the task's fan-out.
+pub async fn unmute_task(pool: &Pool, agent: &str, task_id: i64) -> anyhow::Result<Value> {
+    let n = sqlx::query("DELETE FROM task_mutes WHERE task_id=? AND agent=?")
+        .bind(task_id)
+        .bind(agent)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(json!({ "task_id": task_id, "agent": agent, "muted": false, "removed": n }))
+}
+
 fn target(
     task_id: Option<i64>,
     project_id: Option<i64>,
@@ -4008,6 +4042,40 @@ mod tests {
 
         // Archiving a missing document is an error.
         assert!(set_document_archived(&pool, 999_999, true, None).await.is_err());
+        Ok(())
+    }
+
+    /// Muting a task detaches an agent from its fan-out: a stood-down creator stops getting the
+    /// task's event notifications (which `unsubscribe` can't stop, since the creator is in the
+    /// fan-out independent of a subscription). Unmute restores delivery.
+    #[tokio::test]
+    async fn mute_task_detaches_from_fan_out() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("owner"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, None, None, Some("owner"), None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Baseline: another agent's comment reaches the creator (they're in the fan-out).
+        comment_task(&pool, tid, "hello", Some("bob"), None).await?;
+        let n = check_notifications(&pool, "owner", true, 50, None).await?;
+        assert_eq!(n["count"], json!(1), "creator hears the comment before muting");
+
+        // Mute for the owner → subsequent task events no longer reach them.
+        mute_task(&pool, "owner", tid).await?;
+        comment_task(&pool, tid, "hello again", Some("bob"), None).await?;
+        let n = check_notifications(&pool, "owner", true, 50, None).await?;
+        assert_eq!(n["count"], json!(0), "muted creator gets no fan-out for the task");
+
+        // Unmute → back in the fan-out.
+        unmute_task(&pool, "owner", tid).await?;
+        comment_task(&pool, tid, "third", Some("bob"), None).await?;
+        let n = check_notifications(&pool, "owner", true, 50, None).await?;
+        assert_eq!(n["count"], json!(1), "unmuted creator hears comments again");
+
+        // Muting a missing task is an error.
+        assert!(mute_task(&pool, "owner", 999_999).await.is_err());
         Ok(())
     }
 

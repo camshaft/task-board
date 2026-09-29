@@ -95,6 +95,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{task_id}/comments", post(comment_task))
         .route("/tasks/{task_id}/props", patch(set_task_props))
         .route("/tasks/{task_id}/move", post(move_task))
+        .route("/tasks/{task_id}/mute", post(mute_task))
+        .route("/tasks/{task_id}/unmute", post(unmute_task))
         .route("/subscriptions", post(subscribe).delete(unsubscribe))
         .route("/channels", get(list_channels).post(create_channel))
         .route("/channels/{channel_id}", get(get_channel))
@@ -183,6 +185,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/mute", summary: "Mute a task for an agent: detach them from its event fan-out (stop FYI notifications).", query: "", body: Some("MuteTaskBody") },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/unmute", summary: "Unmute a task for an agent (rejoin its fan-out).", query: "", body: Some("MuteTaskBody") },
     Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, document, or the whole board (board=true).", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, channel, document, or the whole board (board=true).", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None },
@@ -239,6 +243,7 @@ fn body_schemas() -> Value {
         CreateTaskBody,
         UpdateTaskBody,
         MoveTaskBody,
+        MuteTaskBody,
         CommentBody,
         SubscribeBody,
         CreateChannelBody,
@@ -842,6 +847,28 @@ async fn unsubscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -
         )
         .await?,
     ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MuteTaskBody {
+    /// The agent muting/unmuting the task (detaches this agent from the task's fan-out).
+    agent: String,
+}
+
+async fn mute_task(
+    State(st): State<AppState>,
+    Path(task_id): Path<i64>,
+    Json(b): Json<MuteTaskBody>,
+) -> ApiResult {
+    Ok(Json(core::mute_task(&st.pool, &b.agent, task_id).await?))
+}
+
+async fn unmute_task(
+    State(st): State<AppState>,
+    Path(task_id): Path<i64>,
+    Json(b): Json<MuteTaskBody>,
+) -> ApiResult {
+    Ok(Json(core::unmute_task(&st.pool, &b.agent, task_id).await?))
 }
 
 // --- Channels ---

@@ -82,6 +82,16 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at  TEXT NOT NULL,
     UNIQUE(subscriber, target_type, target_id)
 );
+-- Per-agent-per-task mute: an agent in a task's fan-out (creator/assignee/subscriber) can
+-- detach from that task's event notifications. Subtracted from the task recipient set so a
+-- stood-down owner stops getting FYI wakes on a task they opened (unsubscribe can't, since the
+-- creator is in the fan-out independent of a subscription row). UNIQUE keeps mute idempotent.
+CREATE TABLE IF NOT EXISTS task_mutes (
+    task_id    INTEGER NOT NULL REFERENCES tasks(id),
+    agent      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, agent)
+);
 CREATE TABLE IF NOT EXISTS events (
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
     type       TEXT NOT NULL,
