@@ -68,6 +68,13 @@ export interface Task {
   updated_at: string
   comments: Comment[]
   subscribers: string[]
+  attached_documents?: {
+    id: number
+    title: string
+    status: string
+    slug: string | null
+    project_id: number | null
+  }[]
 }
 
 export interface DocumentVersion {
@@ -101,7 +108,7 @@ export interface Document extends DocumentSummary {
   created_at: string
   current_version: DocumentVersion | null
   versions: DocumentVersion[]
-  attached_tasks: { id: number; title: string; status: TaskStatus }[]
+  attached_tasks: { id: number; title: string; status: TaskStatus; project_id: number | null }[]
 }
 
 export interface EventRow {

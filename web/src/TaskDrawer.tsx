@@ -1,6 +1,7 @@
 import { useState } from 'react'
-import { useNavigate, useOutletContext, useParams } from 'react-router-dom'
+import { Link, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import { type TaskStatus } from './api'
+import { DocStatusChip } from './Documents'
 import { commentTask, moveTask, updateTask, useProjects, useTask } from './resources'
 import { relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
@@ -187,6 +188,25 @@ export function TaskDrawer() {
                 <div className="mb-5">
                   <div className="mb-1 text-xs text-[var(--color-muted)]">Description</div>
                   <p className="whitespace-pre-wrap text-sm">{task.description}</p>
+                </div>
+              )}
+
+              {task.attached_documents && task.attached_documents.length > 0 && (
+                <div className="mb-5">
+                  <div className="mb-1 text-xs text-[var(--color-muted)]">Documents</div>
+                  <ul className="space-y-1.5">
+                    {task.attached_documents.map((d) => (
+                      <li key={d.id} className="flex items-center gap-2">
+                        <DocStatusChip status={d.status} />
+                        <Link
+                          to={`/documents/${d.id}`}
+                          className="min-w-0 flex-1 truncate text-sm text-sky-400 hover:text-sky-300"
+                        >
+                          {d.title}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
 

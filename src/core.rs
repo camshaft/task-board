@@ -1039,9 +1039,10 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
             .collect();
         m.insert("subscribers".into(), Value::Array(sub_ids));
 
-        // Documents attached to this task (id/title/status/slug summaries).
+        // Documents attached to this task (id/title/status/slug/project_id summaries;
+        // project_id lets a client deep-link to the document's project view).
         let docs = sqlx::query(
-            "SELECT d.id, d.title, d.status, d.slug FROM document_attachments a \
+            "SELECT d.id, d.title, d.status, d.slug, d.project_id FROM document_attachments a \
              JOIN documents d ON d.id = a.document_id WHERE a.task_id=? ORDER BY d.id",
         )
         .bind(task_id)
@@ -1937,9 +1938,10 @@ async fn document_json(
         m.insert("current_version".into(), current.unwrap_or(Value::Null));
         m.insert("versions".into(), Value::Array(versions));
 
-        // Tasks this document is attached to (id/title/status summaries).
+        // Tasks this document is attached to (id/title/status/project_id summaries;
+        // project_id lets a client deep-link into the task's board + drawer).
         let tasks = sqlx::query(
-            "SELECT t.id, t.title, t.status FROM document_attachments a \
+            "SELECT t.id, t.title, t.status, t.project_id FROM document_attachments a \
              JOIN tasks t ON t.id = a.task_id WHERE a.document_id=? ORDER BY t.id",
         )
         .bind(document_id)
@@ -2900,6 +2902,11 @@ mod tests {
         let doc = get_document(&pool, did).await?;
         assert_eq!(doc["attached_tasks"].as_array().unwrap().len(), 1);
         assert_eq!(doc["attached_tasks"][0]["id"], json!(tid));
+        // Both summaries carry project_id so a client can deep-link. The task belongs to pid;
+        // the doc was created without a project, so its summary's project_id is null (present).
+        assert_eq!(doc["attached_tasks"][0]["project_id"], json!(pid));
+        assert!(task["attached_documents"][0].as_object().unwrap().contains_key("project_id"));
+        assert!(task["attached_documents"][0]["project_id"].is_null());
 
         // Idempotent: re-attaching doesn't duplicate.
         attach_document(&pool, did, tid, Some("carol")).await?;
