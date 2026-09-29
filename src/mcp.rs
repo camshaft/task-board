@@ -1188,6 +1188,31 @@ mod tests {
             .await
             .map_err(mkfail)?;
 
+        // set_status with no agent_id acts on the session identity.
+        board
+            .set_status(Parameters(serde_json::from_value(
+                serde_json::json!({"status": "busy"}),
+            )?))
+            .await
+            .map_err(mkfail)?;
+        assert_eq!(core::get_agent(&pool, "agent:x").await?["status"], serde_json::json!("busy"));
+
+        // send_message with no from_agent is attributed to the session identity. (Register the
+        // recipient directly so it doesn't rebind this session's identity.)
+        core::register_agent(&pool, "agent:y", None, None, None, None, None).await?;
+        board
+            .send_message(Parameters(serde_json::from_value(
+                serde_json::json!({"to_agent": "agent:y", "body": "hi from session"}),
+            )?))
+            .await
+            .map_err(mkfail)?;
+        let msgs = core::get_messages(&pool, "agent:y", false, 50).await?;
+        let notes = msgs["notifications"].as_array().expect("notifications array");
+        assert!(
+            notes.iter().any(|m| m.to_string().contains("agent:x")),
+            "a DM sent with no from_agent shows the session identity as sender; got: {msgs}"
+        );
+
         // A fresh session (new Board) starts with no identity again.
         let board2 = Board::new(pool.clone(), None);
         assert!(
