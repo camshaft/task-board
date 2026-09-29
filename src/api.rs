@@ -743,8 +743,12 @@ fn blocked_on_value(b: Option<BlockedOnBody>) -> Option<Value> {
 #[derive(Deserialize, JsonSchema)]
 struct UpdateTaskBody {
     status: Option<String>,
-    /// New owner's agent id. Pass "" (empty string) to unassign (clear the owner).
+    /// New owner's agent id. To clear the owner (unassign), set `unassign: true` rather than
+    /// sending an empty string here — some clients can't serialize "".
     assignee: Option<String>,
+    /// Clear the task's owner (set it to no assignee). Takes precedence over `assignee`; the
+    /// reliable, client-safe way to unassign.
+    unassign: Option<bool>,
     title: Option<String>,
     description: Option<String>,
     priority: Option<String>,
@@ -762,12 +766,18 @@ async fn update_task(
     Path(task_id): Path<i64>,
     Json(b): Json<UpdateTaskBody>,
 ) -> ApiResult {
+    // `unassign: true` clears the owner via the core empty-string sentinel and wins over `assignee`.
+    let assignee = if b.unassign.unwrap_or(false) {
+        Some("")
+    } else {
+        b.assignee.as_deref()
+    };
     Ok(Json(
         core::update_task(
             &st.pool,
             task_id,
             b.status.as_deref(),
-            b.assignee.as_deref(),
+            assignee,
             b.title.as_deref(),
             b.description.as_deref(),
             b.priority.as_deref(),
