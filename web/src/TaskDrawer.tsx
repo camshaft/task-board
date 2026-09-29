@@ -2,7 +2,16 @@ import { useState } from 'react'
 import { Link, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import { type TaskStatus } from './api'
 import { DocStatusChip } from './Documents'
-import { commentTask, moveTask, updateTask, useProjects, useTask } from './resources'
+import {
+  commentTask,
+  createTask,
+  moveTask,
+  reparentTask,
+  updateTask,
+  useProjects,
+  useTask,
+  useTasks,
+} from './resources'
 import { relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // Context handed down by the Board route (the parent <Outlet/>).
@@ -19,6 +28,8 @@ export function TaskDrawer() {
   const id = Number(taskId)
   const { data: task, error: loadError } = useTask(id)
   const { data: projects = [] } = useProjects()
+  // Same-project tasks, for the reparent picker. Keyed on the task's project once it loads.
+  const { data: siblings = [] } = useTasks(task?.project_id ?? -1)
   const [error, setError] = useState<string | null>(null)
   const [comment, setComment] = useState('')
   const [busy, setBusy] = useState(false)
@@ -86,6 +97,65 @@ export function TaskDrawer() {
     try {
       await commentTask(task.id, { body, author: actor })
       setComment('')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function addSubtask() {
+    if (!task) return
+    const title = window.prompt('Subtask title:')
+    if (!title?.trim()) return
+    setBusy(true)
+    try {
+      await createTask({
+        project_id: task.project_id,
+        title: title.trim(),
+        parent_id: task.id,
+        created_by: actor,
+      })
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function reparent() {
+    if (!task) return
+    // Candidates: same-project tasks, excluding self and this task's own children (the obvious
+    // cycle; the server guards deeper ones and cross-project).
+    const childIds = new Set((task.children ?? []).map((c) => c.id))
+    const candidates = siblings.filter((s) => s.id !== task.id && !childIds.has(s.id))
+    if (candidates.length === 0) {
+      window.alert('No other task in this project to nest under.')
+      return
+    }
+    const menu = candidates.map((s) => `${s.id}: ${s.title}`).join('\n')
+    const answer = window.prompt(`Nest under which task? Enter its id:\n\n${menu}`)
+    if (answer == null || !answer.trim()) return
+    const to = Number(answer.trim())
+    if (!Number.isInteger(to) || !candidates.some((s) => s.id === to)) {
+      setError(`'${answer}' isn't one of the listed task ids.`)
+      return
+    }
+    setBusy(true)
+    try {
+      await reparentTask(task.id, to, actor)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function clearParent() {
+    if (!task) return
+    setBusy(true)
+    try {
+      await reparentTask(task.id, 0, actor) // 0 = clear parent (back to top-level)
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -174,6 +244,34 @@ export function TaskDrawer() {
                     <span className="ml-1 text-[var(--color-muted)]">move →</span>
                   </button>
                 </dd>
+                <dt className="text-[var(--color-muted)]">Parent</dt>
+                <dd className="col-span-2">
+                  {task.parent_id != null ? (
+                    <span className="flex items-center gap-2">
+                      <Link
+                        to={`/projects/${task.project_id}/tasks/${task.parent_id}`}
+                        className="text-sky-400 hover:text-sky-300"
+                      >
+                        #{task.parent_id} {task.parent_title ?? ''}
+                      </Link>
+                      <button
+                        onClick={clearParent}
+                        disabled={busy}
+                        className="text-xs text-[var(--color-muted)] hover:text-rose-300"
+                      >
+                        clear
+                      </button>
+                    </span>
+                  ) : (
+                    <button
+                      onClick={reparent}
+                      disabled={busy}
+                      className="text-xs text-[var(--color-muted)] hover:text-sky-300"
+                    >
+                      — set parent —
+                    </button>
+                  )}
+                </dd>
                 <dt className="text-[var(--color-muted)]">Priority</dt>
                 <dd className="col-span-2">{task.priority ?? '—'}</dd>
                 <dt className="text-[var(--color-muted)]">Created by</dt>
@@ -188,6 +286,48 @@ export function TaskDrawer() {
                 <div className="mb-5">
                   <div className="mb-1 text-xs text-[var(--color-muted)]">Description</div>
                   <p className="whitespace-pre-wrap text-sm">{task.description}</p>
+                </div>
+              )}
+
+              {/* Subtasks (one level of nesting in the UI). Offered on top-level tasks so an
+                  epic can gather children; a task that already has a parent stays a leaf here. */}
+              {task.parent_id == null && (
+                <div className="mb-5">
+                  <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
+                    <span>
+                      Subtasks
+                      {task.child_rollup && task.child_rollup.total > 0
+                        ? ` (${task.child_rollup.done}/${task.child_rollup.total} done)`
+                        : ''}
+                    </span>
+                    <button
+                      onClick={addSubtask}
+                      disabled={busy}
+                      className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)]"
+                    >
+                      + subtask
+                    </button>
+                  </div>
+                  {task.children && task.children.length > 0 ? (
+                    <ul className="space-y-1.5">
+                      {task.children.map((c) => (
+                        <li key={c.id}>
+                          <Link
+                            to={`/projects/${task.project_id}/tasks/${c.id}`}
+                            className="flex items-center gap-2 rounded px-1.5 py-1 hover:bg-[var(--color-panel-2)]"
+                          >
+                            <StatusChip status={c.status} />
+                            <span className="min-w-0 flex-1 truncate text-sm">{c.title}</span>
+                            <span className="font-mono text-[11px] text-[var(--color-muted)]">
+                              #{c.id}
+                            </span>
+                          </Link>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-xs text-[var(--color-muted)]">No subtasks yet.</p>
+                  )}
                 </div>
               )}
 
