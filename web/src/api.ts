@@ -102,6 +102,9 @@ export interface DocumentVersion {
   document_id: number
   version_no: number
   cid: string
+  // MIME type of this version's bytes (default text/markdown). The board records only the label;
+  // the client dispatches a renderer on it and resolves the CID through the IPFS gateway.
+  content_type: string | null
   summary: string | null
   created_by: string | null
   created_at: string
