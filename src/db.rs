@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_id   INTEGER REFERENCES tasks(id),
     created_by  TEXT,
     metadata    TEXT NOT NULL DEFAULT '{}',
+    -- What a BLOCKED task is waiting on (operator seq-1361), so nothing sits blocked opaquely.
+    -- blocked_on_kind is one of task, agent, operator (NULL when the task is not blocked).
+    -- blocked_on_ref is the blocking task id (as text) or agent id, NULL for operator. note is
+    -- free text. A blocked task must carry a kind (enforced in update_task).
+    blocked_on_kind TEXT,
+    blocked_on_ref  TEXT,
+    blocked_on_note TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -276,6 +283,20 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         sqlx::query("ALTER TABLE tasks ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
             .execute(&pool)
             .await?;
+    }
+
+    // Back-fill tasks.blocked_on_{kind,ref,note} (operator seq-1361: a blocked task records
+    // what it's waiting on). All nullable; existing tasks carry no blocked_on until set.
+    let tasks_cols = sqlx::query("PRAGMA table_info(tasks)").fetch_all(&pool).await?;
+    let tasks_has = |c: &str| tasks_cols.iter().any(|r| r.get::<String, _>("name") == c);
+    if !tasks_has("blocked_on_kind") {
+        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_kind TEXT").execute(&pool).await?;
+    }
+    if !tasks_has("blocked_on_ref") {
+        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_ref TEXT").execute(&pool).await?;
+    }
+    if !tasks_has("blocked_on_note") {
+        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_note TEXT").execute(&pool).await?;
     }
 
     // Back-fill tasks.parent_id (added when tasks gained nesting/epics). Nullable, self-

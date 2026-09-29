@@ -693,6 +693,7 @@ pub async fn update_task(
     actor: Option<&str>,
     metadata: Option<Value>,
     parent_id: Option<i64>,
+    blocked_on: Option<Value>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -710,6 +711,8 @@ pub async fn update_task(
     let old_project_id: i64 = old.try_get("project_id")?;
     let old_parent_id: Option<i64> = old.try_get("parent_id")?;
     let old_metadata: Option<String> = old.try_get("metadata")?;
+    let old_blocked_kind: Option<String> = old.try_get("blocked_on_kind").ok().flatten();
+    let old_blocked_ref: Option<String> = old.try_get("blocked_on_ref").ok().flatten();
 
     // Build a dynamic UPDATE from the provided fields, preserving column order.
     let mut set_clauses: Vec<String> = Vec::new();
@@ -813,6 +816,119 @@ pub async fn update_task(
         }
     }
 
+    // blocked_on (operator seq-1361): a blocked task records what it is waiting on. The param is
+    // None to leave it unchanged, Value::Null to clear it, or {kind, target, note} to set it. A
+    // task that is (or becomes) blocked MUST carry a blocked_on; a task that is not blocked never
+    // keeps one (it is auto-cleared when the task leaves the blocked state).
+    let new_status = status.unwrap_or(old_status.as_str());
+    enum BlockedChange {
+        Leave,
+        Clear,
+        Set { kind: String, target: Option<String>, note: Option<String> },
+    }
+    let change = match &blocked_on {
+        None => BlockedChange::Leave,
+        Some(Value::Null) => BlockedChange::Clear,
+        Some(Value::Object(o)) => {
+            let kind = o.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let target = o
+                .get("target")
+                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string())))
+                .filter(|s| !s.is_empty());
+            let note = o.get("note").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+            BlockedChange::Set { kind, target, note }
+        }
+        Some(_) => anyhow::bail!("give `blocked_on` as an object with a `kind`, or null to clear"),
+    };
+    if let BlockedChange::Set { kind, target, .. } = &change {
+        match kind.as_str() {
+            "task" => {
+                let Some(t) = target.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
+                    anyhow::bail!("give a `blocked_on.target` task id when kind=task");
+                };
+                if sqlx::query("SELECT 1 FROM tasks WHERE id=?").bind(t).fetch_optional(&mut *tx).await?.is_none() {
+                    anyhow::bail!("no task {t}");
+                }
+            }
+            "agent" => {
+                let Some(a) = target.as_deref() else {
+                    anyhow::bail!("give a `blocked_on.target` agent id when kind=agent");
+                };
+                if sqlx::query("SELECT 1 FROM agents WHERE id=?").bind(a).fetch_optional(&mut *tx).await?.is_none() {
+                    anyhow::bail!("no agent {a}");
+                }
+            }
+            "operator" => {}
+            other => anyhow::bail!("give a valid `blocked_on.kind` (task, agent, or operator), not '{other}'"),
+        }
+    }
+    // A blocked task must end up with a blocked_on set.
+    let will_have_blocked_on = match &change {
+        BlockedChange::Set { .. } => true,
+        BlockedChange::Clear => false,
+        BlockedChange::Leave => old_blocked_kind.is_some(),
+    };
+    if new_status == "blocked" && !will_have_blocked_on {
+        anyhow::bail!(
+            "give a `blocked_on` (kind: task, agent, or operator) — a blocked task must record what it is waiting on"
+        );
+    }
+    let mut blocked_changed = false;
+    let mut notify_agent: Option<(String, Option<String>)> = None; // (agent id, note) to notify
+    if new_status != "blocked" {
+        // Not blocked -> carry no blocked_on. Clear if there was one (or a set was attempted).
+        if old_blocked_kind.is_some() || matches!(change, BlockedChange::Set { .. }) {
+            sqlx::query(
+                "UPDATE tasks SET blocked_on_kind=NULL, blocked_on_ref=NULL, blocked_on_note=NULL, updated_at=? WHERE id=?",
+            )
+            .bind(&ts)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+            blocked_changed = true;
+        }
+    } else if let BlockedChange::Set { kind, target, note } = &change {
+        let stored_ref = if kind == "operator" { None } else { target.clone() };
+        sqlx::query(
+            "UPDATE tasks SET blocked_on_kind=?, blocked_on_ref=?, blocked_on_note=?, updated_at=? WHERE id=?",
+        )
+        .bind(kind)
+        .bind(&stored_ref)
+        .bind(note.as_deref())
+        .bind(&ts)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        blocked_changed = true;
+        // Notify a newly-blocking agent (skip if it's already blocked on the same agent).
+        if kind == "agent" {
+            if let Some(agent) = &stored_ref {
+                let already = old_blocked_kind.as_deref() == Some("agent")
+                    && old_blocked_ref.as_deref() == Some(agent.as_str());
+                if !already {
+                    notify_agent = Some((agent.clone(), note.clone()));
+                }
+            }
+        }
+    }
+    if let Some((agent, note)) = notify_agent {
+        let mut set = BTreeSet::new();
+        set.insert(agent);
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.blocked_on_you",
+            actor,
+            Some(task_id),
+            Some(old_project_id),
+            None,
+            None,
+            json!({ "title": old_title, "note": note }),
+            Recipients::Explicit(set),
+        )
+        .await?;
+    }
+
     // An empty-string assignee means "unassign" (clear to NULL) rather than a new owner to
     // subscribe. Only auto-subscribe a real, non-empty owner.
     let clearing = assignee == Some("");
@@ -889,7 +1005,7 @@ pub async fn update_task(
         )
         .await?;
     }
-    if has_fields && !status_changed && !reassigned && !unassigned {
+    if (has_fields || blocked_changed) && !status_changed && !reassigned && !unassigned && !reparented {
         emit(
             &mut tx,
             &mut hooks,
@@ -1016,6 +1132,19 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
             .unwrap_or_else(|| json!({}));
         m.insert("metadata".into(), meta);
 
+        // Collapse the raw blocked_on_* columns into one nested object (null when not blocked).
+        let blocked_on = m.get("blocked_on_kind").and_then(|v| v.as_str()).map(|kind| {
+            json!({
+                "kind": kind,
+                "target": m.get("blocked_on_ref").cloned().unwrap_or(Value::Null),
+                "note": m.get("blocked_on_note").cloned().unwrap_or(Value::Null),
+            })
+        });
+        m.remove("blocked_on_kind");
+        m.remove("blocked_on_ref");
+        m.remove("blocked_on_note");
+        m.insert("blocked_on".into(), blocked_on.unwrap_or(Value::Null));
+
         let comments = sqlx::query(
             "SELECT id, author, body, created_at, external_author, origin_ref FROM comments WHERE task_id=? ORDER BY id",
         )
@@ -1095,9 +1224,12 @@ pub async fn list_tasks(
     parent_id: Option<i64>,
     top_level: bool,
     search: Option<&str>,
+    blocked_on_kind: Option<&str>,
+    blocked_on_ref: Option<&str>,
 ) -> anyhow::Result<Value> {
     let mut q = String::from(
-        "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at FROM tasks",
+        "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at, \
+         blocked_on_kind, blocked_on_ref FROM tasks",
     );
     let mut conds: Vec<&str> = Vec::new();
     if project_id.is_some() {
@@ -1105,6 +1237,13 @@ pub async fn list_tasks(
     }
     if status.is_some() {
         conds.push("status=?");
+    }
+    // "What is waiting on me/the operator/agent X" views: filter by blocked_on kind and/or ref.
+    if blocked_on_kind.is_some() {
+        conds.push("blocked_on_kind=?");
+    }
+    if blocked_on_ref.is_some() {
+        conds.push("blocked_on_ref=?");
     }
     // Free-text search over title + description (case-insensitive LIKE). Composable with the
     // other filters and, with no project_id, spans every project.
@@ -1138,6 +1277,12 @@ pub async fn list_tasks(
     }
     if let Some(s) = status {
         query = query.bind(s);
+    }
+    if let Some(k) = blocked_on_kind {
+        query = query.bind(k);
+    }
+    if let Some(r) = blocked_on_ref {
+        query = query.bind(r);
     }
     if let Some(needle) = search {
         let like = format!("%{needle}%");
@@ -3499,8 +3644,8 @@ mod tests {
 
         subscribe(&pool, "planner", Some(tid), None, None, None, false).await?; // (already auto-subscribed as creator)
         comment_task(&pool, tid, "Start from PA=0.03", Some("planner"), None).await?;
-        update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None, None).await?;
-        update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None, None).await?;
+        update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None, None, None).await?;
+        update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None, None, None).await?;
         send_message(&pool, "fixer", "planner", "PA done, landed at 0.032").await?;
 
         // planner should hear: 2 status changes (by fixer) + 1 DM = 3; NOT its own comment.
@@ -4148,7 +4293,7 @@ mod tests {
         assert_eq!(e["child_rollup"], json!({ "done": 0, "total": 2 }));
 
         // Mark c1 done -> roll-up 1/2.
-        update_task(&pool, c1id, Some("done"), None, None, None, None, Some("u"), None, None).await?;
+        update_task(&pool, c1id, Some("done"), None, None, None, None, Some("u"), None, None, None).await?;
         assert_eq!(get_task(&pool, eid).await?["child_rollup"], json!({ "done": 1, "total": 2 }));
 
         // Child surfaces parent_id + parent_title.
@@ -4157,18 +4302,18 @@ mod tests {
         assert_eq!(c["parent_title"], json!("Epic"));
 
         // list_tasks top_level -> only the epic; parent_id -> the two children.
-        assert_eq!(ids(&list_tasks(&pool, Some(pid), None, None, false, None, true, None).await?), vec![eid]);
+        assert_eq!(ids(&list_tasks(&pool, Some(pid), None, None, false, None, true, None, None, None).await?), vec![eid]);
         assert_eq!(
-            ids(&list_tasks(&pool, Some(pid), None, None, false, Some(eid), false, None).await?),
+            ids(&list_tasks(&pool, Some(pid), None, None, false, Some(eid), false, None, None, None).await?),
             vec![c1id, c2id]
         );
 
         // Guards: self-parent + cycle rejected.
-        assert!(update_task(&pool, eid, None, None, None, None, None, Some("u"), None, Some(eid)).await.is_err());
-        assert!(update_task(&pool, eid, None, None, None, None, None, Some("u"), None, Some(c1id)).await.is_err());
+        assert!(update_task(&pool, eid, None, None, None, None, None, Some("u"), None, Some(eid), None).await.is_err());
+        assert!(update_task(&pool, eid, None, None, None, None, None, Some("u"), None, Some(c1id), None).await.is_err());
 
         // Clear c2's parent (parent_id=0) -> top-level; emits task.reparented; roll-up shrinks.
-        let r = update_task(&pool, c2id, None, None, None, None, None, Some("u"), None, Some(0)).await?;
+        let r = update_task(&pool, c2id, None, None, None, None, None, Some("u"), None, Some(0), None).await?;
         assert!(r["parent_id"].is_null());
         assert_eq!(get_task(&pool, eid).await?["child_rollup"], json!({ "done": 1, "total": 1 }));
         let evs = get_events(&pool, 0, 200, None).await?;
@@ -4205,26 +4350,26 @@ mod tests {
 
         // "widget" across ALL projects (case-insensitive) -> the two widget tasks, not the chore.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("widget")).await?),
+            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("widget"), None, None).await?),
             vec!["Fix the widget pipeline".to_string(), "Widget docs".to_string()]
         );
         // Matches description too.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("reflow")).await?),
+            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("reflow"), None, None).await?),
             vec!["Fix the widget pipeline".to_string()]
         );
         // Composable with assignee: widget + alice -> only the Beta doc task.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, Some("alice"), false, None, false, Some("widget")).await?),
+            titles(&list_tasks(&pool, None, None, Some("alice"), false, None, false, Some("widget"), None, None).await?),
             vec!["Widget docs".to_string()]
         );
         // Composable with project scope: widget in Alpha -> only the pipeline task.
         assert_eq!(
-            titles(&list_tasks(&pool, Some(pid1), None, None, false, None, false, Some("widget")).await?),
+            titles(&list_tasks(&pool, Some(pid1), None, None, false, None, false, Some("widget"), None, None).await?),
             vec!["Fix the widget pipeline".to_string()]
         );
         // No match -> empty.
-        assert!(list_tasks(&pool, None, None, None, false, None, false, Some("zzznope"))
+        assert!(list_tasks(&pool, None, None, None, false, None, false, Some("zzznope"), None, None)
             .await?
             .as_array()
             .unwrap()
@@ -4243,7 +4388,7 @@ mod tests {
         let tid = t["id"].as_i64().unwrap();
 
         set_task_props(&pool, tid, json!({"b": 2})).await?;
-        update_task(&pool, tid, None, None, None, None, None, None, Some(json!({"c": 3})), None).await?;
+        update_task(&pool, tid, None, None, None, None, None, None, Some(json!({"c": 3})), None, None).await?;
 
         let task = get_task(&pool, tid).await?;
         assert_eq!(task["metadata"], json!({"a": 1, "b": 2, "c": 3}));
@@ -4414,7 +4559,7 @@ mod tests {
         assert_eq!(arr[0]["id"], json!(1));
 
         // The task moved onto the surviving project.
-        let tasks = list_tasks(&pool, Some(1), None, None, false, None, false, None).await?;
+        let tasks = list_tasks(&pool, Some(1), None, None, false, None, false, None, None, None).await?;
         assert_eq!(tasks.as_array().unwrap().len(), 1);
 
         // Subscriptions: alice (deduped to one), bob (repointed) both on project 1.
@@ -4500,8 +4645,8 @@ mod tests {
         let moved = move_task(&pool, tid, bid, Some("u")).await?;
         assert_eq!(moved["project_id"], json!(bid));
         // It now lists under B, not A.
-        assert_eq!(list_tasks(&pool, Some(aid), None, None, false, None, false, None).await?.as_array().unwrap().len(), 0);
-        assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false, None).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_tasks(&pool, Some(aid), None, None, false, None, false, None, None, None).await?.as_array().unwrap().len(), 0);
+        assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false, None, None, None).await?.as_array().unwrap().len(), 1);
 
         // A task.moved event was recorded carrying both ends.
         let events = get_events(&pool, 0, 100, None).await?;
@@ -4534,27 +4679,27 @@ mod tests {
         create_task(&pool, pid, "free", None, None, None, Some("u"), None, None).await?;
 
         // unassigned=true -> only the ownerless task.
-        let un = list_tasks(&pool, Some(pid), None, None, true, None, false, None).await?;
+        let un = list_tasks(&pool, Some(pid), None, None, true, None, false, None, None, None).await?;
         let un = un.as_array().unwrap();
         assert_eq!(un.len(), 1);
         assert_eq!(un[0]["title"], json!("free"));
         assert!(un[0]["assignee"].is_null());
 
         // assignee equality still works when unassigned is false.
-        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false, None, false, None).await?;
+        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false, None, false, None, None, None).await?;
         let mine = mine.as_array().unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0]["title"], json!("owned"));
 
         // unassigned=true wins over a contradictory assignee= filter (no owner beats owner=alice).
-        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true, None, false, None).await?;
+        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true, None, false, None, None, None).await?;
         let both = both.as_array().unwrap();
         assert_eq!(both.len(), 1);
         assert_eq!(both[0]["title"], json!("free"));
 
         // No filter returns both.
         assert_eq!(
-            list_tasks(&pool, Some(pid), None, None, false, None, false, None).await?.as_array().unwrap().len(),
+            list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None).await?.as_array().unwrap().len(),
             2
         );
         Ok(())
@@ -4574,7 +4719,7 @@ mod tests {
 
         // Clear the owner.
         let cleared =
-            update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None).await?;
+            update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None, None).await?;
         assert!(cleared["assignee"].is_null(), "assignee should be NULL after unassign");
 
         let events = get_events(&pool, 0, 100, None).await?;
@@ -4587,7 +4732,7 @@ mod tests {
         assert_eq!(un["data"]["from"], json!("alice"), "carries the prior owner");
 
         // Clearing an already-unassigned task does NOT emit a second task.unassigned.
-        update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None).await?;
+        update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None, None).await?;
         let after = get_events(&pool, 0, 200, None).await?;
         assert_eq!(
             after
@@ -4601,7 +4746,7 @@ mod tests {
         );
 
         // Re-assigning to a real owner emits task.assigned.
-        update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None, None).await?;
+        update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None, None, None).await?;
         let evs = get_events(&pool, 0, 200, None).await?;
         assert!(
             evs.as_array().unwrap().iter().any(
@@ -5192,6 +5337,67 @@ mod tests {
         // A default create_document (no content_type) is text/markdown, matching the initial docs work.
         let plain = create_document(&pool, "Notes", None, "bafymd2", None, Some("bob"), None, None, None).await?;
         assert_eq!(plain["current_version"]["content_type"], json!("text/markdown"));
+        Ok(())
+    }
+
+    /// blocked_on (operator seq-1361): a blocked task must record what it waits on; kind=agent
+    /// notifies that agent; the operator/agent views filter by kind/ref; leaving blocked clears it.
+    #[tokio::test]
+    async fn blocked_on_records_notifies_and_clears() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        register_agent(&pool, "agent:rev", None, None, None, None, None).await?;
+        let t = create_task(&pool, pid, "Ship it", None, None, None, Some("alice"), None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        let dep = create_task(&pool, pid, "Dependency", None, None, None, Some("bob"), None, None).await?;
+        let dep_id = dep["id"].as_i64().unwrap();
+
+        // Enforcement: blocked without a blocked_on is rejected (maps to 400 via the "give " prefix).
+        let e = update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().starts_with("give "), "blocked needs a blocked_on, got: {e}");
+
+        // Block on another TASK.
+        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
+            Some(json!({"kind": "task", "target": dep_id.to_string(), "note": "waiting on dep"}))).await?;
+        let bo = get_task(&pool, tid).await?["blocked_on"].clone();
+        assert_eq!(bo["kind"], json!("task"));
+        assert_eq!(bo["target"], json!(dep_id.to_string()));
+        assert_eq!(bo["note"], json!("waiting on dep"));
+
+        // A nonexistent task target is rejected.
+        assert!(update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
+            Some(json!({"kind": "task", "target": "999999"}))).await.is_err());
+
+        // Re-block on an AGENT -> that agent is notified they're blocking.
+        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
+            Some(json!({"kind": "agent", "target": "agent:rev", "note": "need review"}))).await?;
+        let notes = check_notifications(&pool, "agent:rev", true, 50, None).await?;
+        let arr = notes["notifications"].as_array().unwrap();
+        assert!(
+            arr.iter().any(|n| n["type"] == json!("task.blocked_on_you") && n["task_id"] == json!(tid)),
+            "the blocking agent is notified: {notes}"
+        );
+
+        // "What is blocked on agent:rev" view.
+        let on_agent = list_tasks(&pool, Some(pid), None, None, false, None, false, None, Some("agent"), Some("agent:rev")).await?;
+        assert_eq!(on_agent.as_array().unwrap().len(), 1);
+
+        // Block on the OPERATOR -> ref is null, and the operator view lists it.
+        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
+            Some(json!({"kind": "operator"}))).await?;
+        let bo = get_task(&pool, tid).await?["blocked_on"].clone();
+        assert_eq!(bo["kind"], json!("operator"));
+        assert!(bo["target"].is_null());
+        let on_op = list_tasks(&pool, None, None, None, false, None, false, None, Some("operator"), None).await?;
+        assert!(on_op.as_array().unwrap().iter().any(|t| t["id"] == json!(tid)));
+
+        // Leaving blocked clears blocked_on.
+        update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("alice"), None, None, None).await?;
+        assert!(get_task(&pool, tid).await?["blocked_on"].is_null(), "unblocking clears blocked_on");
         Ok(())
     }
 }
