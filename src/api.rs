@@ -365,8 +365,9 @@ struct RegisterAgentBody {
     kind: Option<String>,
     /// Free-form charter (role/mission/scope). Editable; omitting it keeps the existing one.
     charter: Option<String>,
-    /// Arbitrary registry props (role, model, effort, interval, worktree, branch, area, repo,
-    /// ...). MERGED into any existing bag, not replaced.
+    /// Arbitrary registry props (role, model, effort, interval, worktree, area, and
+    /// `repos: [{repo, branch}, ...]` — an agent may span several repos, each checked out
+    /// in its own workspace). MERGED into any existing bag, not replaced.
     metadata: Option<Value>,
     webhook_url: Option<String>,
 }
