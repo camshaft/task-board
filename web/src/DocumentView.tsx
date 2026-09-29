@@ -12,8 +12,9 @@ import {
   submitDocumentForReview,
   useDocument,
   useDocumentComments,
+  useExternalNameResolver,
 } from './resources'
-import { relTime } from './ui'
+import { AuthorLabel, relTime } from './ui'
 
 // Read-only document viewer plus the review surface: metadata, the tasks it backs, its
 // immutable version history (each CID resolved through the IPFS gateway client-side), review
@@ -27,6 +28,7 @@ export default function DocumentView() {
   const id = Number(documentId)
   const { data: doc, error: docError, loading } = useDocument(id)
   const { data: comments = [] } = useDocumentComments(id)
+  const extName = useExternalNameResolver()
   const [actionError, setActionError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [draft, setDraft] = useState('')
@@ -230,6 +232,7 @@ export default function DocumentView() {
                   c={c}
                   versionNo={versionNo(c.version_id)}
                   busy={busy}
+                  resolveExternal={extName}
                   onResolve={() => void act(() => resolveDocumentComment(id, c.id, { actor }))}
                   onReply={() => setReplyTo(replyTo === c.id ? null : c.id)}
                   replying={replyTo === c.id}
@@ -242,6 +245,7 @@ export default function DocumentView() {
                           c={r}
                           versionNo={versionNo(r.version_id)}
                           busy={busy}
+                          resolveExternal={extName}
                           onResolve={() => void act(() => resolveDocumentComment(id, r.id, { actor }))}
                         />
                       </li>
@@ -292,6 +296,7 @@ function CommentCard({
   c,
   versionNo,
   busy,
+  resolveExternal,
   onResolve,
   onReply,
   replying,
@@ -299,6 +304,7 @@ function CommentCard({
   c: DocumentComment
   versionNo: number | null
   busy: boolean
+  resolveExternal: (id: string) => string
   onResolve: () => void
   onReply?: () => void
   replying?: boolean
@@ -311,7 +317,11 @@ function CommentCard({
       }`}
     >
       <div className="mb-1 flex items-center gap-2 text-xs text-[var(--color-muted)]">
-        <span className="font-mono">{c.author ?? 'anon'}</span>
+        <AuthorLabel
+          author={c.author}
+          externalAuthor={c.external_author}
+          resolveExternal={resolveExternal}
+        />
         {versionNo != null && <span>· on v{versionNo}</span>}
         {c.region != null && <span title="region-anchored">· 📌</span>}
         <span>· {relTime(c.created_at)}</span>

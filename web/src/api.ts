@@ -141,6 +141,8 @@ export interface DocumentComment {
   status: string
   reply_to: number | null
   created_at: string
+  // Bridged human this comment is attributed to (e.g. "slack:U123"); author is then the ingester.
+  external_author?: string | null
 }
 
 export interface Channel {

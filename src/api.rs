@@ -1137,6 +1137,9 @@ struct CommentDocumentBody {
     region: Option<Value>,
     /// Thread this comment under another (one-level).
     reply_to: Option<i64>,
+    /// Optional external identity id (e.g. "slack:U123") this comment is attributed to — for an
+    /// ingested human author. `author` stays the fleet agent that performed the write.
+    external_author: Option<String>,
 }
 
 async fn comment_document(
@@ -1153,6 +1156,7 @@ async fn comment_document(
             &b.body,
             b.region,
             b.reply_to,
+            b.external_author.as_deref(),
         )
         .await?,
     ))
