@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import { type ChannelPost } from './api'
 import { channelLabel } from './Channels'
 import { useBoardContext } from './Layout'
+import { Markdown } from './markdown'
 import { inviteToChannel, postToChannel, useChannel, useChannelPosts } from './resources'
 import { relTime } from './ui'
 
@@ -170,7 +171,7 @@ function PostRow({ p, author, onReply }: { p: ChannelPost; author: string; onRep
           </button>
         )}
       </div>
-      <p className="whitespace-pre-wrap text-sm">{p.data.body ?? ''}</p>
+      <Markdown source={p.data.body ?? ''} className="text-sm" />
     </div>
   )
 }

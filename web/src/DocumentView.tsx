@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import { type DocumentComment, ipfsUrl } from './api'
 import { DocStatusChip } from './Documents'
 import { useBoardContext } from './Layout'
+import { Markdown } from './markdown'
 import {
   approveDocument,
   commentDocument,
@@ -331,7 +332,7 @@ function CommentCard({
           )}
         </span>
       </div>
-      <p className="whitespace-pre-wrap text-sm">{c.body}</p>
+      <Markdown source={c.body} className="text-sm" />
     </div>
   )
 }
