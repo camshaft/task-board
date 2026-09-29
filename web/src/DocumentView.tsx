@@ -1,34 +1,88 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { api, type Document, ipfsUrl } from './api'
+import { api, type Document, type DocumentComment, ipfsUrl } from './api'
 import { DocStatusChip } from './Documents'
+import { useBoardContext } from './Layout'
 import { relTime } from './ui'
 
-// Read-only document viewer: metadata, the tasks it backs, and its immutable version history
-// with links that resolve each CID through the IPFS gateway (client-side). In-app markdown
-// rendering, select-to-comment, and the review actions (approve / request-changes / resolve)
-// are follow-up slices of task 101.
+// Read-only document viewer plus the review surface: metadata, the tasks it backs, its
+// immutable version history (each CID resolved through the IPFS gateway client-side), review
+// actions (submit-for-review / approve / request-changes) driven by the current status, and a
+// threaded comment panel with resolve + one-level replies. In-app markdown rendering of the
+// current version's content is a follow-up slice (needs a markdown dep + a reachable gateway).
 export default function DocumentView() {
   const { documentId } = useParams()
+  const { actor } = useBoardContext()
   const id = Number(documentId)
   const [doc, setDoc] = useState<Document | null>(null)
+  const [comments, setComments] = useState<DocumentComment[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [replyTo, setReplyTo] = useState<number | null>(null)
+
+  // Reload both the document (its status/versions can change under a review action) and its
+  // comments. Called on mount and after every mutation so the UI reflects the server.
+  const reload = useCallback(async () => {
+    const [d, c] = await Promise.all([api.getDocument(id), api.getDocumentComments(id)])
+    setDoc(d)
+    setComments(c)
+  }, [id])
 
   useEffect(() => {
     let alive = true
     setLoading(true)
-    api
-      .getDocument(id)
-      .then((d) => alive && setDoc(d))
+    reload()
       .catch((e) => alive && setError((e as Error).message))
       .finally(() => alive && setLoading(false))
     return () => {
       alive = false
     }
-  }, [id])
+  }, [reload])
+
+  // Run a mutation, surface its error, then reload. Keeps every action button uniform.
+  async function act(fn: () => Promise<unknown>) {
+    setBusy(true)
+    setError(null)
+    try {
+      await fn()
+      await reload()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function addComment() {
+    const body = draft.trim()
+    if (!body) return
+    await act(() =>
+      api.commentDocument(id, { body, author: actor, reply_to: replyTo ?? undefined }),
+    )
+    setDraft('')
+    setReplyTo(null)
+  }
+
+  function requestChanges() {
+    const note = window.prompt('What needs to change? (optional note)') ?? undefined
+    void act(() => api.requestDocumentChanges(id, { actor, note: note || undefined }))
+  }
 
   const tags = Array.isArray(doc?.metadata?.tags) ? (doc!.metadata.tags as unknown[]) : []
+
+  // Available review actions depend on status: a draft (or one with changes requested) can be
+  // submitted; a doc in review can be approved or bounced back.
+  const status = doc?.status
+  const canSubmit = status === 'draft' || status === 'changes_requested'
+  const inReview = status === 'in_review'
+
+  // Thread the comments: top-level ones in order, each followed by its (one-level) replies.
+  const topLevel = comments.filter((c) => c.reply_to == null)
+  const repliesOf = (cid: number) => comments.filter((c) => c.reply_to === cid)
+  const versionNo = (vid: number | null) =>
+    vid == null ? null : (doc?.versions.find((v) => v.id === vid)?.version_no ?? null)
 
   return (
     <main className="flex min-w-0 flex-1 flex-col">
@@ -38,6 +92,38 @@ export default function DocumentView() {
         </Link>
         <h1 className="truncate text-sm font-semibold">{doc?.title ?? `Document #${id}`}</h1>
         {doc && <DocStatusChip status={doc.status} />}
+        {/* Review actions, right-aligned. */}
+        {doc && (
+          <div className="ml-auto flex items-center gap-2">
+            {canSubmit && (
+              <button
+                disabled={busy}
+                onClick={() => void act(() => api.submitDocumentForReview(id, { actor }))}
+                className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+              >
+                Submit for review
+              </button>
+            )}
+            {inReview && (
+              <>
+                <button
+                  disabled={busy}
+                  onClick={() => void act(() => api.approveDocument(id, { actor }))}
+                  className="rounded-md bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+                >
+                  Approve
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={requestChanges}
+                  className="rounded-md px-2.5 py-1 text-xs ring-1 ring-inset ring-amber-500/40 text-amber-300 hover:bg-amber-500/10 disabled:opacity-40"
+                >
+                  Request changes
+                </button>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       {error && (
@@ -138,8 +224,122 @@ export default function DocumentView() {
               )
             })}
           </ul>
+
+          {/* Review comments: threaded (top-level + one-level replies), each open comment
+              resolvable. Region-anchored comments show the version they target. */}
+          <h2 className="mb-2 mt-6 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+            Comments ({comments.length})
+          </h2>
+          <ul className="space-y-2">
+            {topLevel.map((c) => (
+              <li key={c.id}>
+                <CommentCard
+                  c={c}
+                  versionNo={versionNo(c.version_id)}
+                  busy={busy}
+                  onResolve={() => void act(() => api.resolveComment(id, c.id, { actor }))}
+                  onReply={() => setReplyTo(replyTo === c.id ? null : c.id)}
+                  replying={replyTo === c.id}
+                />
+                {repliesOf(c.id).length > 0 && (
+                  <ul className="mt-1.5 space-y-1.5 border-l border-[var(--color-border)] pl-4">
+                    {repliesOf(c.id).map((r) => (
+                      <li key={r.id}>
+                        <CommentCard
+                          c={r}
+                          versionNo={versionNo(r.version_id)}
+                          busy={busy}
+                          onResolve={() => void act(() => api.resolveComment(id, r.id, { actor }))}
+                        />
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+            {comments.length === 0 && (
+              <li className="text-sm text-[var(--color-muted)]">No comments yet.</li>
+            )}
+          </ul>
+
+          {/* Composer. Replies target the selected comment; otherwise a doc-level comment. */}
+          <div className="mt-3 flex gap-2">
+            <input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && addComment()}
+              placeholder={
+                replyTo != null ? `Reply to #${replyTo} as ${actor}…` : `Comment as ${actor}…`
+              }
+              className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm outline-none focus:border-sky-500/50"
+            />
+            {replyTo != null && (
+              <button
+                onClick={() => setReplyTo(null)}
+                className="rounded-md px-2 py-2 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+              >
+                cancel reply
+              </button>
+            )}
+            <button
+              onClick={addComment}
+              disabled={busy || !draft.trim()}
+              className="rounded-md bg-sky-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+            >
+              Send
+            </button>
+          </div>
         </div>
       )}
     </main>
+  )
+}
+
+function CommentCard({
+  c,
+  versionNo,
+  busy,
+  onResolve,
+  onReply,
+  replying,
+}: {
+  c: DocumentComment
+  versionNo: number | null
+  busy: boolean
+  onResolve: () => void
+  onReply?: () => void
+  replying?: boolean
+}) {
+  const resolved = c.status === 'resolved'
+  return (
+    <div
+      className={`rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 ${
+        resolved ? 'opacity-60' : ''
+      }`}
+    >
+      <div className="mb-1 flex items-center gap-2 text-xs text-[var(--color-muted)]">
+        <span className="font-mono">{c.author ?? 'anon'}</span>
+        {versionNo != null && <span>· on v{versionNo}</span>}
+        {c.region != null && <span title="region-anchored">· 📌</span>}
+        <span>· {relTime(c.created_at)}</span>
+        {resolved && <span className="text-emerald-300">· resolved</span>}
+        <span className="ml-auto flex items-center gap-2">
+          {onReply && (
+            <button
+              onClick={onReply}
+              className={`hover:text-sky-300 ${replying ? 'text-sky-300' : ''}`}
+            >
+              reply
+            </button>
+          )}
+          {!resolved && (
+            <button disabled={busy} onClick={onResolve} className="hover:text-emerald-300">
+              resolve
+            </button>
+          )}
+        </span>
+      </div>
+      <p className="whitespace-pre-wrap text-sm">{c.body}</p>
+    </div>
   )
 }
