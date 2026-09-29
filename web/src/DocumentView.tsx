@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { type DocumentComment, type DocumentVersion, ipfsUrl } from './api'
 import { DocStatusChip } from './Documents'
@@ -36,6 +36,30 @@ export default function DocumentView() {
   const [replyTo, setReplyTo] = useState<number | null>(null)
   // Wiki-path filing: null = not editing, string = editing this path draft ('' clears/unfiles).
   const [editPath, setEditPath] = useState<string | null>(null)
+  // Select-to-comment: the rendered current-version content, a pending region from a text
+  // selection over it, and a nonce bumped when the content finishes loading (so the highlight
+  // pass runs once the DOM is populated).
+  const contentRef = useRef<HTMLDivElement>(null)
+  const [region, setRegion] = useState<RegionQuote | null>(null)
+  const [contentNonce, setContentNonce] = useState(0)
+
+  // Capture a text selection inside the rendered content as a text-quote region (exact + a little
+  // prefix/suffix context, for disambiguation + highlight matching against the shown version).
+  function captureSelection() {
+    const el = contentRef.current
+    const sel = window.getSelection()
+    if (!el || !sel || sel.isCollapsed || !sel.anchorNode || !el.contains(sel.anchorNode)) return
+    const exact = sel.toString().trim()
+    if (exact.length < 2) return
+    const full = el.textContent ?? ''
+    const idx = full.indexOf(exact)
+    setRegion({
+      type: 'text-quote',
+      exact,
+      prefix: idx > 0 ? full.slice(Math.max(0, idx - 32), idx) : '',
+      suffix: idx >= 0 ? full.slice(idx + exact.length, idx + exact.length + 32) : '',
+    })
+  }
 
   // Run a mutation and surface its error. The wrappers invalidate the document + its comments
   // through touched(), so the subscribed hooks refetch and this component re-renders — no
@@ -55,12 +79,43 @@ export default function DocumentView() {
   async function addComment() {
     const body = draft.trim()
     if (!body) return
+    // Anchor only top-level comments (not replies) to a selected region on the current version.
+    const anchored = replyTo == null ? region : null
     await act(() =>
-      commentDocument(id, { body, author: actor, reply_to: replyTo ?? undefined }),
+      commentDocument(id, {
+        body,
+        author: actor,
+        reply_to: replyTo ?? undefined,
+        region: anchored ?? undefined,
+        version_id: anchored ? (doc?.current_version?.id ?? undefined) : undefined,
+      }),
     )
     setDraft('')
     setReplyTo(null)
+    setRegion(null)
   }
+
+  // Highlight every region-anchored comment's quote in the shown content via the CSS Custom
+  // Highlight API — no DOM surgery, so it layers over the rendered markdown. Re-runs when the
+  // comments change or the content (re)loads. Degrades to nothing where the API is absent.
+  useEffect(() => {
+    const el = contentRef.current
+    const highlights = (globalThis.CSS as unknown as { highlights?: Map<string, unknown> })?.highlights
+    const HighlightCtor = (globalThis as unknown as { Highlight?: new () => { add: (r: Range) => void; size: number } }).Highlight
+    if (!el || !highlights || !HighlightCtor) return
+    const hl = new HighlightCtor()
+    for (const c of comments) {
+      const q = asQuote(c.region)
+      if (!q) continue
+      const r = findQuoteRange(el, q.exact, q.prefix)
+      if (r) hl.add(r)
+    }
+    if (hl.size > 0) highlights.set('tb-region', hl as unknown)
+    else highlights.delete('tb-region')
+    return () => {
+      highlights.delete('tb-region')
+    }
+  }, [comments, contentNonce])
 
   function requestChanges() {
     const note = window.prompt('What needs to change? (optional note)') ?? undefined
@@ -250,7 +305,13 @@ export default function DocumentView() {
                   {doc.current_version.content_type ?? 'text/markdown'}
                 </span>
               </h2>
-              <DocContent key={doc.current_version.id} version={doc.current_version} />
+              <div ref={contentRef} onMouseUp={captureSelection}>
+                <DocContent
+                  key={doc.current_version.id}
+                  version={doc.current_version}
+                  onLoaded={() => setContentNonce((n) => n + 1)}
+                />
+              </div>
             </div>
           )}
 
@@ -476,14 +537,38 @@ export default function DocumentView() {
             )}
           </ul>
 
-          {/* Composer. Replies target the selected comment; otherwise a doc-level comment. */}
-          <div className="mt-3 flex gap-2">
+          {/* Composer. Replies target the selected comment; a text selection over the content
+              anchors a top-level comment to that region; otherwise a doc-level comment. */}
+          {region && replyTo == null && (
+            <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs">
+              <span className="mt-0.5 shrink-0 text-amber-300">📌 on selection:</span>
+              <span className="min-w-0 flex-1 italic text-[var(--color-muted)] line-clamp-2">
+                “{region.exact}”
+              </span>
+              <button
+                onClick={() => setRegion(null)}
+                className="shrink-0 text-[var(--color-muted)] hover:text-rose-300"
+              >
+                clear
+              </button>
+            </div>
+          )}
+          {!region && replyTo == null && comments.length === 0 && (
+            <p className="mt-3 text-[11px] text-[var(--color-muted)]">
+              Tip: select text in the content above to anchor a comment to it.
+            </p>
+          )}
+          <div className="mt-2 flex gap-2">
             <input
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && addComment()}
               placeholder={
-                replyTo != null ? `Reply to #${replyTo} as ${actor}…` : `Comment as ${actor}…`
+                replyTo != null
+                  ? `Reply to #${replyTo} as ${actor}…`
+                  : region
+                    ? `Comment on selection as ${actor}…`
+                    : `Comment as ${actor}…`
               }
               className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm outline-none focus:border-sky-500/50"
             />
@@ -528,7 +613,7 @@ function kindOf(contentType: string | null): DocKind {
 // kinds (markdown/json/text) are fetched from the IPFS gateway as text; binary kinds (image/pdf)
 // are pointed at the gateway URL directly. Every path degrades gracefully to a raw link if the
 // gateway is unreachable or the type is unknown — a missing gateway never breaks the view.
-function DocContent({ version }: { version: DocumentVersion }) {
+function DocContent({ version, onLoaded }: { version: DocumentVersion; onLoaded?: () => void }) {
   const kind = kindOf(version.content_type)
   const needsText =
     kind === 'markdown' || kind === 'json' || kind === 'text' || kind === 'mermaid' || kind === 'vega'
@@ -537,9 +622,13 @@ function DocContent({ version }: { version: DocumentVersion }) {
   const [status, setStatus] = useState<'idle' | 'loading' | 'error'>(needsText ? 'loading' : 'idle')
 
   // Keyed on version id by the parent, so a version change remounts with fresh initial state —
-  // no synchronous reset here; the effect just fetches (a real external-system sync).
+  // no synchronous reset here; the effect just fetches (a real external-system sync). onLoaded
+  // lets the parent re-run its highlight pass once the content DOM is populated.
   useEffect(() => {
-    if (!needsText) return
+    if (!needsText) {
+      onLoaded?.()
+      return
+    }
     let cancelled = false
     fetch(url)
       .then((r) => {
@@ -550,6 +639,7 @@ function DocContent({ version }: { version: DocumentVersion }) {
         if (!cancelled) {
           setText(t)
           setStatus('idle')
+          onLoaded?.()
         }
       })
       .catch(() => {
@@ -558,6 +648,7 @@ function DocContent({ version }: { version: DocumentVersion }) {
     return () => {
       cancelled = true
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, needsText])
 
   const raw = (
@@ -686,7 +777,77 @@ function CommentCard({
           )}
         </span>
       </div>
+      {/* Region-anchored comment: show the quoted excerpt it targets, so the anchor is visible
+          even where the inline highlight can't match (e.g. an older version). */}
+      {asQuote(c.region) && (
+        <blockquote className="mb-1.5 border-l-2 border-amber-500/40 pl-2 text-xs italic text-[var(--color-muted)]">
+          “{asQuote(c.region)!.exact}”
+        </blockquote>
+      )}
       <Markdown source={c.body} className="text-sm" />
     </div>
   )
+}
+
+// A client-defined text-quote region selector (the board stores comment.region as opaque JSON).
+export interface RegionQuote {
+  type: 'text-quote'
+  exact: string
+  prefix?: string
+  suffix?: string
+}
+
+// Narrow an opaque comment.region to a text-quote selector (with a usable `exact`), else null.
+function asQuote(region: unknown): RegionQuote | null {
+  if (region && typeof region === 'object') {
+    const r = region as Record<string, unknown>
+    if (r.type === 'text-quote' && typeof r.exact === 'string' && r.exact.length > 0) {
+      return {
+        type: 'text-quote',
+        exact: r.exact,
+        prefix: typeof r.prefix === 'string' ? r.prefix : undefined,
+        suffix: typeof r.suffix === 'string' ? r.suffix : undefined,
+      }
+    }
+  }
+  return null
+}
+
+// Locate a quote (optionally disambiguated by its preceding prefix) in a container's rendered
+// text and return a DOM Range spanning it — walking text nodes so a match that spans elements
+// still resolves. Returns null when the quote isn't present in the shown content.
+function findQuoteRange(container: HTMLElement, exact: string, prefix?: string): Range | null {
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+  const nodes: Text[] = []
+  const starts: number[] = []
+  let full = ''
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    starts.push(full.length)
+    nodes.push(n as Text)
+    full += (n as Text).data
+  }
+  if (nodes.length === 0) return null
+  let exactAt = -1
+  if (prefix) {
+    const withPrefix = full.indexOf(prefix + exact)
+    if (withPrefix >= 0) exactAt = withPrefix + prefix.length
+  }
+  if (exactAt < 0) exactAt = full.indexOf(exact)
+  if (exactAt < 0) return null
+  const locate = (pos: number) => {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      if (starts[i] <= pos) return { node: nodes[i], offset: Math.min(pos - starts[i], nodes[i].length) }
+    }
+    return { node: nodes[0], offset: 0 }
+  }
+  const s = locate(exactAt)
+  const e = locate(exactAt + exact.length)
+  const range = document.createRange()
+  try {
+    range.setStart(s.node, s.offset)
+    range.setEnd(e.node, e.offset)
+  } catch {
+    return null
+  }
+  return range
 }
