@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { type DocumentComment, ipfsUrl } from './api'
+import { type DocumentComment, type DocumentVersion, ipfsUrl } from './api'
 import { DocStatusChip } from './Documents'
 import { useBoardContext } from './Layout'
 import { Markdown } from './markdown'
@@ -240,6 +240,20 @@ export default function DocumentView() {
             </div>
           )}
 
+          {/* Current version, rendered inline by its content_type (markdown / image / pdf / code
+              / download fallback). Content resolves through the IPFS gateway client-side. */}
+          {doc.current_version && (
+            <div className="mb-6">
+              <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                Current version
+                <span className="ml-2 font-mono text-[10px] normal-case tracking-normal">
+                  {doc.current_version.content_type ?? 'text/markdown'}
+                </span>
+              </h2>
+              <DocContent key={doc.current_version.id} version={doc.current_version} />
+            </div>
+          )}
+
           {/* Version history. Each CID resolves through the IPFS gateway (client-side). */}
           <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
             Versions
@@ -257,6 +271,11 @@ export default function DocumentView() {
                   {isCurrent && <span className="text-[10px] uppercase text-sky-300">current</span>}
                   {isApproved && (
                     <span className="text-[10px] uppercase text-emerald-300">approved</span>
+                  )}
+                  {v.content_type && v.content_type !== 'text/markdown' && (
+                    <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-muted)]">
+                      {v.content_type}
+                    </span>
                   )}
                   <a
                     href={ipfsUrl(v.cid)}
@@ -420,6 +439,124 @@ export default function DocumentView() {
         </div>
       )}
     </main>
+  )
+}
+
+// Which renderer a MIME type maps to. Absent/unknown text defaults to markdown (the board's
+// own default), so a plain doc still renders richly.
+type DocKind = 'markdown' | 'image' | 'pdf' | 'json' | 'text' | 'other'
+function kindOf(contentType: string | null): DocKind {
+  const t = (contentType ?? 'text/markdown').toLowerCase().split(';')[0].trim()
+  if (t.startsWith('image/')) return 'image'
+  if (t === 'application/pdf') return 'pdf'
+  if (t === 'text/markdown' || t === 'text/x-markdown' || t === '') return 'markdown'
+  if (t === 'application/json') return 'json'
+  if (t.startsWith('text/')) return 'text'
+  return 'other'
+}
+
+// Render one document version's content inline, dispatched by its content_type. Text-shaped
+// kinds (markdown/json/text) are fetched from the IPFS gateway as text; binary kinds (image/pdf)
+// are pointed at the gateway URL directly. Every path degrades gracefully to a raw link if the
+// gateway is unreachable or the type is unknown — a missing gateway never breaks the view.
+function DocContent({ version }: { version: DocumentVersion }) {
+  const kind = kindOf(version.content_type)
+  const needsText = kind === 'markdown' || kind === 'json' || kind === 'text'
+  const url = ipfsUrl(version.cid)
+  const [text, setText] = useState<string | null>(null)
+  const [status, setStatus] = useState<'idle' | 'loading' | 'error'>(needsText ? 'loading' : 'idle')
+
+  // Keyed on version id by the parent, so a version change remounts with fresh initial state —
+  // no synchronous reset here; the effect just fetches (a real external-system sync).
+  useEffect(() => {
+    if (!needsText) return
+    let cancelled = false
+    fetch(url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`gateway ${r.status}`)
+        return r.text()
+      })
+      .then((t) => {
+        if (!cancelled) {
+          setText(t)
+          setStatus('idle')
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setStatus('error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [url, needsText])
+
+  const raw = (
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      className="font-mono text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+    >
+      open raw ({version.cid})
+    </a>
+  )
+
+  if (kind === 'image') {
+    return (
+      <img
+        src={url}
+        alt={`document version ${version.version_no}`}
+        className="max-h-[70vh] rounded-md border border-[var(--color-border)]"
+      />
+    )
+  }
+  if (kind === 'pdf') {
+    return (
+      <iframe
+        src={url}
+        title={`document version ${version.version_no}`}
+        className="h-[70vh] w-full rounded-md border border-[var(--color-border)]"
+      />
+    )
+  }
+  if (kind === 'other') {
+    return (
+      <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-3 text-sm text-[var(--color-muted)]">
+        No inline preview for this content type. {raw}
+      </div>
+    )
+  }
+  // Text-shaped kinds.
+  if (status === 'loading') {
+    return <p className="text-sm text-[var(--color-muted)]">Loading content…</p>
+  }
+  if (status === 'error' || text === null) {
+    return (
+      <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-3 text-sm text-[var(--color-muted)]">
+        Couldn't load content from the gateway. {raw}
+      </div>
+    )
+  }
+  if (kind === 'markdown') {
+    return (
+      <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-4">
+        <Markdown source={text} className="text-sm" />
+      </div>
+    )
+  }
+  // json (pretty-printed if valid) / other text → code block.
+  let body = text
+  if (kind === 'json') {
+    try {
+      body = JSON.stringify(JSON.parse(text), null, 2)
+    } catch {
+      // Not valid JSON after all — show it verbatim.
+    }
+  }
+  return (
+    <pre className="max-h-[70vh] overflow-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3 font-mono text-xs">
+      <code>{body}</code>
+    </pre>
   )
 }
 
