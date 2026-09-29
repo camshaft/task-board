@@ -652,6 +652,11 @@ struct ListTasksQuery {
     blocked_on_kind: Option<String>,
     /// Filter by blocked_on ref (a blocking task id or agent id) — e.g. "what is blocked on me".
     blocked_on_ref: Option<String>,
+    /// Filter to tasks whose metadata has this key (a JSON path under `$.`, e.g. "observes").
+    /// Pair with `meta_value`; both must be set for the filter to apply.
+    meta_key: Option<String>,
+    /// The value `meta_key` must equal (matched against `json_extract(metadata, '$.'||key)`).
+    meta_value: Option<String>,
 }
 
 async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQuery>) -> ApiResult {
@@ -667,6 +672,8 @@ async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQue
             query.q.as_deref(),
             query.blocked_on_kind.as_deref(),
             query.blocked_on_ref.as_deref(),
+            query.meta_key.as_deref(),
+            query.meta_value.as_deref(),
         )
         .await?,
     ))
