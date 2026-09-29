@@ -112,6 +112,8 @@ export interface DocumentSummary {
   id: number
   title: string
   slug: string | null
+  // Slash-separated wiki path this doc is filed under, or null when unfiled. Drives the wiki tree.
+  path: string | null
   project_id: number | null
   status: string
   current_version_id: number | null
@@ -326,6 +328,15 @@ export const api = {
     return req<DocumentSummary[]>('GET', `/documents${qs ? `?${qs}` : ''}`)
   },
   getDocument: (id: number) => req<Document>('GET', `/documents/${id}`),
+  // Path-filed documents as a wiki tree (optionally under a path prefix), ordered by path.
+  listWiki: (prefix?: string) =>
+    req<DocumentSummary[]>(
+      'GET',
+      `/wiki${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`,
+    ),
+  // Set (or clear, with an empty string) a document's wiki path. Unique among filed docs.
+  setDocumentPath: (id: number, b: { path: string; actor?: string }) =>
+    req<Document>('POST', `/documents/${id}/path`, b),
   getDocumentVersions: (id: number) =>
     req<DocumentVersion[]>('GET', `/documents/${id}/versions`),
 

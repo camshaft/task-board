@@ -12,6 +12,7 @@ import DocumentView from './DocumentView.tsx'
 import Home from './Home.tsx'
 import Layout from './Layout.tsx'
 import Search from './Search.tsx'
+import Wiki from './Wiki.tsx'
 import { TaskDrawer } from './TaskDrawer.tsx'
 
 // The app may be served under a reverse-proxy sub-path (e.g. /board), which the backend
@@ -32,6 +33,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="search" element={<Search />} />
           <Route path="documents" element={<Documents />} />
           <Route path="documents/:documentId" element={<DocumentView />} />
+          <Route path="wiki" element={<Wiki />} />
           <Route path="agents" element={<Agents />} />
           <Route path="agents/:agentId" element={<AgentView />} />
           <Route path="channels" element={<Channels />} />
