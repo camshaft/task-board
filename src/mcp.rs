@@ -429,6 +429,14 @@ pub struct RequestChangesArgs {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachDocumentArgs {
+    pub document_id: i64,
+    pub task_id: i64,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -944,6 +952,28 @@ impl Board {
         Parameters(a): Parameters<DocumentActorArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::approve_document(&self.pool, a.document_id, s(&a.actor)).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Attach a document to a task (many-to-many). Notifies both the document's and the task's subscribers, so a task watcher learns a design doc landed. Idempotent.")]
+    async fn attach_document(
+        &self,
+        Parameters(a): Parameters<AttachDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::attach_document(&self.pool, a.document_id, a.task_id, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Detach a document from a task. Notifies both sides if a link existed.")]
+    async fn detach_document(
+        &self,
+        Parameters(a): Parameters<AttachDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::detach_document(&self.pool, a.document_id, a.task_id, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 }
 

@@ -933,6 +933,19 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
             .filter_map(|r| r.try_get::<String, _>("subscriber").ok().map(Value::String))
             .collect();
         m.insert("subscribers".into(), Value::Array(sub_ids));
+
+        // Documents attached to this task (id/title/status/slug summaries).
+        let docs = sqlx::query(
+            "SELECT d.id, d.title, d.status, d.slug FROM document_attachments a \
+             JOIN documents d ON d.id = a.document_id WHERE a.task_id=? ORDER BY d.id",
+        )
+        .bind(task_id)
+        .fetch_all(pool)
+        .await?;
+        m.insert(
+            "attached_documents".into(),
+            Value::Array(docs.iter().map(row_to_json).collect()),
+        );
     }
     Ok(d)
 }
@@ -1765,6 +1778,16 @@ async fn document_json(
             cur_id.and_then(|cid| versions.iter().find(|v| v["id"].as_i64() == Some(cid)).cloned());
         m.insert("current_version".into(), current.unwrap_or(Value::Null));
         m.insert("versions".into(), Value::Array(versions));
+
+        // Tasks this document is attached to (id/title/status summaries).
+        let tasks = sqlx::query(
+            "SELECT t.id, t.title, t.status FROM document_attachments a \
+             JOIN tasks t ON t.id = a.task_id WHERE a.document_id=? ORDER BY t.id",
+        )
+        .bind(document_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        m.insert("attached_tasks".into(), Value::Array(tasks.iter().map(row_to_json).collect()));
     }
     Ok(Some(d))
 }
@@ -2241,6 +2264,94 @@ pub async fn approve_document(
     .await
 }
 
+/// Attach a document to a task (many-to-many, idempotent). Emits document.attached to both the
+/// document's and the task's subscribers, so either side learns of the link.
+pub async fn attach_document(
+    pool: &Pool,
+    document_id: i64,
+    task_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    if sqlx::query("SELECT 1 FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no document {document_id}");
+    }
+    if sqlx::query("SELECT 1 FROM tasks WHERE id=?")
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no task {task_id}");
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO document_attachments(document_id, task_id, created_at) VALUES(?,?,?)",
+    )
+    .bind(document_id)
+    .bind(task_id)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.attached",
+        actor,
+        Some(task_id),
+        None,
+        None,
+        Some(document_id),
+        json!({ "document_id": document_id, "task_id": task_id }),
+        Recipients::FromDocumentAndTask(document_id, task_id),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "document_id": document_id, "task_id": task_id, "attached": true }))
+}
+
+/// Detach a document from a task. Emits document.detached (to both sides) only if a link existed.
+pub async fn detach_document(
+    pool: &Pool,
+    document_id: i64,
+    task_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let n = sqlx::query("DELETE FROM document_attachments WHERE document_id=? AND task_id=?")
+        .bind(document_id)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n > 0 {
+        emit(
+            &mut tx,
+            &mut hooks,
+            "document.detached",
+            actor,
+            Some(task_id),
+            None,
+            None,
+            Some(document_id),
+            json!({ "document_id": document_id, "task_id": task_id }),
+            Recipients::FromDocumentAndTask(document_id, task_id),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "removed": n }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2575,6 +2686,70 @@ mod tests {
 
         // Missing doc errors.
         assert!(approve_document(&pool, 999, Some("x")).await.is_err());
+        Ok(())
+    }
+
+    /// Attaching a document to a task links both sides (surfaced in get_task + get_document),
+    /// is idempotent, notifies both the doc's and the task's subscribers, and detaches cleanly.
+    #[tokio::test]
+    async fn document_attachment_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        // A task owned by alice, and a doc authored by bob.
+        let t = create_task(&pool, pid, "Build widget", None, Some("alice"), None, Some("alice"), None)
+            .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let d = create_document(&pool, "Widget design", None, "bafy1", None, Some("bob"), None).await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // Drain the create notifications so the attach fan-out is isolated.
+        let _ = check_notifications(&pool, "alice", true, 50, None).await?;
+        let _ = check_notifications(&pool, "bob", true, 50, None).await?;
+
+        // Attach (carol acts) -> both sides see the link.
+        let r = attach_document(&pool, did, tid, Some("carol")).await?;
+        assert_eq!(r["attached"], json!(true));
+        let task = get_task(&pool, tid).await?;
+        assert_eq!(task["attached_documents"].as_array().unwrap().len(), 1);
+        assert_eq!(task["attached_documents"][0]["id"], json!(did));
+        let doc = get_document(&pool, did).await?;
+        assert_eq!(doc["attached_tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["attached_tasks"][0]["id"], json!(tid));
+
+        // Idempotent: re-attaching doesn't duplicate.
+        attach_document(&pool, did, tid, Some("carol")).await?;
+        assert_eq!(
+            get_task(&pool, tid).await?["attached_documents"].as_array().unwrap().len(),
+            1
+        );
+
+        // Both the task owner (alice, subscribed as assignee/creator) and the doc author (bob,
+        // subscribed on create) heard document.attached; carol (actor) did not.
+        let alice = check_notifications(&pool, "alice", true, 50, None).await?;
+        let bob = check_notifications(&pool, "bob", true, 50, None).await?;
+        assert!(alice["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["type"] == json!("document.attached")), "task watcher heard it: {alice}");
+        assert!(bob["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["type"] == json!("document.attached")), "doc watcher heard it: {bob}");
+
+        // Detach removes the link and reports the removal.
+        let rm = detach_document(&pool, did, tid, Some("carol")).await?;
+        assert_eq!(rm["removed"], json!(1));
+        assert_eq!(get_task(&pool, tid).await?["attached_documents"].as_array().unwrap().len(), 0);
+        // Detaching again is a no-op (0 removed).
+        assert_eq!(detach_document(&pool, did, tid, Some("carol")).await?["removed"], json!(0));
+
+        // Attaching to a missing task or doc errors.
+        assert!(attach_document(&pool, did, 9999, Some("carol")).await.is_err());
+        assert!(attach_document(&pool, 9999, tid, Some("carol")).await.is_err());
         Ok(())
     }
 

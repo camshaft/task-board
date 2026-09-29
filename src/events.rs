@@ -37,6 +37,9 @@ pub enum Recipients {
     FromChannel(i64),
     /// Derive from the document (its subscribers). For document publishes and review activity.
     FromDocument(i64),
+    /// Union of a document's and a task's recipients — for a doc<->task attachment, so both a
+    /// doc watcher and a task watcher learn about the link. (document_id, task_id)
+    FromDocumentAndTask(i64, i64),
     /// An explicit set — e.g. a silent project.created.
     Explicit(BTreeSet<String>),
 }
@@ -197,6 +200,11 @@ pub async fn emit(
         Recipients::FromProject(pid) => recipients_for_project(tx, pid, actor).await?,
         Recipients::FromChannel(cid) => recipients_for_channel(tx, cid, actor).await?,
         Recipients::FromDocument(did) => recipients_for_document(tx, did, actor).await?,
+        Recipients::FromDocumentAndTask(did, tid) => {
+            let mut set = recipients_for_document(tx, did, actor).await?;
+            set.extend(recipients_for_task(tx, tid, actor).await?);
+            set
+        }
     };
 
     // Whole-board firehose: anyone subscribed with target_type='board' receives EVERY event,
