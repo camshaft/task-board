@@ -143,6 +143,19 @@ CREATE TABLE IF NOT EXISTS document_attachments (
     created_at  TEXT NOT NULL,
     UNIQUE(document_id, task_id)
 );
+-- External identities: humans/actors that originate from a bridged external system (Slack,
+-- GitHub, ...), kept DISTINCT from fleet `agents`. The id is namespaced `source:handle`
+-- (e.g. "slack:U123ABC"). An ingested post/comment records its external author here so it
+-- renders as that person, not as the fleet agent that performed the ingest. Shared by every
+-- bridge (Slack, GitHub) — build once.
+CREATE TABLE IF NOT EXISTS external_identities (
+    id           TEXT PRIMARY KEY,
+    source       TEXT NOT NULL,
+    display_name TEXT,
+    metadata     TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
@@ -152,6 +165,7 @@ CREATE INDEX IF NOT EXISTS idx_docversions   ON document_versions(document_id, v
 CREATE INDEX IF NOT EXISTS idx_doc_comments  ON document_comments(document_id, id);
 CREATE INDEX IF NOT EXISTS idx_doc_attach_task ON document_attachments(task_id);
 CREATE INDEX IF NOT EXISTS idx_doc_attach_doc  ON document_attachments(document_id);
+CREATE INDEX IF NOT EXISTS idx_ext_ident_source ON external_identities(source);
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
@@ -285,6 +299,20 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_document ON events(document_id, seq)")
         .execute(&pool)
         .await?;
+
+    // Back-fill comments.external_author (added for bridged/ingested attribution): when set, it
+    // holds an external_identities id so the comment renders as that person, not the fleet agent
+    // that ingested it. Nullable; existing comments stay agent-authored.
+    let comments_have_ext_author = sqlx::query("PRAGMA table_info(comments)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "external_author");
+    if !comments_have_ext_author {
+        sqlx::query("ALTER TABLE comments ADD COLUMN external_author TEXT")
+            .execute(&pool)
+            .await?;
+    }
 
     Ok(pool)
 }

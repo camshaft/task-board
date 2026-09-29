@@ -1017,7 +1017,7 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
         m.insert("metadata".into(), meta);
 
         let comments = sqlx::query(
-            "SELECT id, author, body, created_at FROM comments WHERE task_id=? ORDER BY id",
+            "SELECT id, author, body, created_at, external_author FROM comments WHERE task_id=? ORDER BY id",
         )
         .bind(task_id)
         .fetch_all(pool)
@@ -1160,6 +1160,7 @@ pub async fn comment_task(
     task_id: i64,
     body: &str,
     author: Option<&str>,
+    external_author: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -1172,17 +1173,25 @@ pub async fn comment_task(
     {
         anyhow::bail!("no task {task_id}");
     }
+    // `author` is the fleet agent that wrote/ingested the comment (drives auto-subscribe +
+    // notification actor); `external_author`, when set, is the external_identities id the
+    // comment is attributed TO — an ingested human renders as that person, not the ingester.
     let cid: i64 = sqlx::query(
-        "INSERT INTO comments(task_id, author, body, created_at) VALUES(?,?,?,?) RETURNING id",
+        "INSERT INTO comments(task_id, author, body, created_at, external_author) VALUES(?,?,?,?,?) RETURNING id",
     )
     .bind(task_id)
     .bind(author)
     .bind(body)
     .bind(&ts)
+    .bind(external_author)
     .fetch_one(&mut *tx)
     .await?
     .try_get("id")?;
     auto_subscribe(&mut tx, author, task_id).await?;
+    let mut data = json!({ "comment_id": cid, "body": body });
+    if let Some(ext) = external_author {
+        data["external_author"] = json!(ext);
+    }
     emit(
         &mut tx,
         &mut hooks,
@@ -1192,7 +1201,7 @@ pub async fn comment_task(
         None,
         None,
         None,
-        json!({ "comment_id": cid, "body": body }),
+        data,
         Recipients::FromTask,
     )
     .await?;
@@ -1503,6 +1512,7 @@ pub async fn post_to_channel(
     sender: &str,
     body: &str,
     reply_to: Option<i64>,
+    external_author: Option<&str>,
 ) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
@@ -1519,9 +1529,15 @@ pub async fn post_to_channel(
 
     join_channel(&mut tx, channel_id, sender).await?;
 
+    // `from` is the fleet agent that posted/ingested; `external_author`, when set, is the
+    // external_identities id the message is attributed to (an ingested human), carried on the
+    // post event so readers render the external person, not the ingesting agent.
     let mut data = json!({ "body": body, "from": sender });
     if let Some(parent) = reply_to {
         data["reply_to"] = json!(parent);
+    }
+    if let Some(ext) = external_author {
+        data["external_author"] = json!(ext);
     }
     let seq = emit(
         &mut tx,
@@ -1751,7 +1767,7 @@ pub async fn send_message(
     tx.commit().await?;
     // post_to_channel opens its own transaction; the DM channel is committed above so it's
     // visible. Emits message.direct to the recipient (FromChannel minus the sender).
-    post_to_channel(pool, cid, from_agent, body, None).await?;
+    post_to_channel(pool, cid, from_agent, body, None, None).await?;
     Ok(json!({ "to": to_agent, "channel_id": cid, "delivered": true }))
 }
 
@@ -1784,6 +1800,107 @@ pub async fn get_events(pool: &Pool, since_seq: i64, limit: i64) -> anyhow::Resu
         out.push(d);
     }
     Ok(Value::Array(out))
+}
+
+// --- External identities (bridged actors) ---
+
+/// Register or update an external identity — a human/actor from a bridged system (Slack,
+/// GitHub, ...), kept distinct from fleet `agents`. `id` is namespaced `source:handle` (e.g.
+/// "slack:U123ABC"). Idempotent upsert: re-registering refreshes the display name / metadata
+/// (metadata MERGED, like agents/projects) and bumps `updated_at`. Returns the stored record.
+pub async fn upsert_external_identity(
+    pool: &Pool,
+    id: &str,
+    source: &str,
+    display_name: Option<&str>,
+    metadata: Option<Value>,
+) -> anyhow::Result<Value> {
+    let id = id.trim();
+    if id.is_empty() {
+        anyhow::bail!("give an `id` for the external identity (namespaced source:handle, e.g. slack:U123)");
+    }
+    if source.trim().is_empty() {
+        anyhow::bail!("give a `source` for the external identity (e.g. slack, github)");
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    // Merge metadata into any existing bag (mirrors register_agent / update_project).
+    let existing: Option<String> = sqlx::query("SELECT metadata FROM external_identities WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .and_then(|r| r.try_get::<Option<String>, _>("metadata").ok().flatten());
+    let mut meta: Map<String, Value> = existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if let Some(Value::Object(incoming)) = metadata {
+        meta.extend(incoming);
+    }
+    let meta_str = Value::Object(meta).to_string();
+    sqlx::query(
+        "INSERT INTO external_identities(id, source, display_name, metadata, created_at, updated_at) \
+         VALUES(?,?,?,?,?,?) \
+         ON CONFLICT(id) DO UPDATE SET \
+            source=excluded.source, \
+            display_name=COALESCE(excluded.display_name, external_identities.display_name), \
+            metadata=excluded.metadata, \
+            updated_at=excluded.updated_at",
+    )
+    .bind(id)
+    .bind(source.trim())
+    .bind(display_name)
+    .bind(&meta_str)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    get_external_identity(pool, id).await
+}
+
+/// Fetch one external identity by id (with its metadata bag parsed). Null if unknown.
+pub async fn get_external_identity(pool: &Pool, id: &str) -> anyhow::Result<Value> {
+    let row = sqlx::query("SELECT * FROM external_identities WHERE id=?")
+        .bind(id.trim())
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some(r) => hydrate_external_identity(&r),
+        None => Value::Null,
+    })
+}
+
+/// List external identities, optionally filtered by `source`, newest-updated first.
+pub async fn list_external_identities(pool: &Pool, source: Option<&str>) -> anyhow::Result<Value> {
+    let rows = match source {
+        Some(src) => {
+            sqlx::query("SELECT * FROM external_identities WHERE source=? ORDER BY updated_at DESC")
+                .bind(src)
+                .fetch_all(pool)
+                .await?
+        }
+        None => {
+            sqlx::query("SELECT * FROM external_identities ORDER BY updated_at DESC")
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    Ok(Value::Array(rows.iter().map(hydrate_external_identity).collect()))
+}
+
+/// Row -> JSON with the `metadata` TEXT column parsed into an object (like other hydrators).
+fn hydrate_external_identity(r: &SqliteRow) -> Value {
+    let mut v = row_to_json(r);
+    if let Value::Object(ref mut m) = v {
+        let meta: Value = m
+            .get("metadata")
+            .and_then(|x| x.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        m.insert("metadata".into(), meta);
+    }
+    v
 }
 
 /// Merge case-insensitive duplicate projects into one canonical row each. For every group
@@ -2559,7 +2676,7 @@ mod tests {
         let tid = t["id"].as_i64().unwrap();
 
         subscribe(&pool, "planner", Some(tid), None, None, None, false).await?; // (already auto-subscribed as creator)
-        comment_task(&pool, tid, "Start from PA=0.03", Some("planner")).await?;
+        comment_task(&pool, tid, "Start from PA=0.03", Some("planner"), None).await?;
         update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None, None).await?;
         update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None, None).await?;
         send_message(&pool, "fixer", "planner", "PA done, landed at 0.032").await?;
@@ -2603,7 +2720,7 @@ mod tests {
         let aid = a["id"].as_i64().unwrap();
         let t = create_task(&pool, aid, "T", None, None, None, Some("alice"), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
-        comment_task(&pool, tid, "hi", Some("alice")).await?;
+        comment_task(&pool, tid, "hi", Some("alice"), None).await?;
         create_project(&pool, "B", None, Some("alice"), None).await?;
 
         // The watcher hears all four: project.created (A, silent to others), task.created,
@@ -3575,7 +3692,7 @@ mod tests {
 
         // carol joins explicitly, then alice posts. bob + carol hear it; alice (poster) doesn't.
         subscribe(&pool, "carol", None, None, Some(cid), None, false).await?;
-        let posted = post_to_channel(&pool, cid, "alice", "hello all", None).await?;
+        let posted = post_to_channel(&pool, cid, "alice", "hello all", None, None).await?;
         let post_seq = posted["seq"].as_i64().unwrap();
 
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
@@ -3593,7 +3710,7 @@ mod tests {
         assert_eq!(posts[0]["data"]["body"], json!("hello all"));
 
         // A threaded reply carries the parent seq.
-        post_to_channel(&pool, cid, "bob", "hi alice", Some(post_seq)).await?;
+        post_to_channel(&pool, cid, "bob", "hi alice", Some(post_seq), None).await?;
         let backlog = get_channel_posts(&pool, cid, 0, 100).await?;
         let posts = backlog.as_array().unwrap();
         assert_eq!(posts.len(), 2);
@@ -3703,10 +3820,59 @@ mod tests {
         // Channels work on the migrated DB: create, post, read back.
         let c = create_channel(&pool, "general", None, Some("alice"), None).await?;
         let cid = c["id"].as_i64().unwrap();
-        post_to_channel(&pool, cid, "alice", "first post", None).await?;
+        post_to_channel(&pool, cid, "alice", "first post", None, None).await?;
         let posts = get_channel_posts(&pool, cid, 0, 100).await?;
         assert_eq!(posts.as_array().unwrap().len(), 1);
         assert_eq!(posts[0]["data"]["body"], json!("first post"));
+        Ok(())
+    }
+
+    /// External-bridge core (#149 §4/§6): an external identity is upsertable + readable, and an
+    /// ingested comment/post attributes to it while `author`/`from` stays the fleet ingester.
+    #[tokio::test]
+    async fn external_identity_and_attribution_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "slack-bridge", Some("Slack Bridge"), None, None, None, None).await?;
+
+        // Upsert an external identity, then re-upsert to refresh + merge metadata (idempotent).
+        let e = upsert_external_identity(&pool, " slack:U123 ", "slack", Some("Ada"), Some(json!({"tz":"UTC"}))).await?;
+        assert_eq!(e["id"], json!("slack:U123"), "id is trimmed + stored");
+        assert_eq!(e["source"], json!("slack"));
+        assert_eq!(e["display_name"], json!("Ada"));
+        assert_eq!(e["metadata"]["tz"], json!("UTC"), "metadata parsed to an object");
+        let e2 = upsert_external_identity(&pool, "slack:U123", "slack", None, Some(json!({"avatar":"x"}))).await?;
+        assert_eq!(e2["display_name"], json!("Ada"), "null display_name keeps the prior value");
+        assert_eq!(e2["metadata"]["tz"], json!("UTC"), "metadata is merged, not replaced");
+        assert_eq!(e2["metadata"]["avatar"], json!("x"));
+
+        // list, filtered by source.
+        assert_eq!(list_external_identities(&pool, Some("slack")).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_external_identities(&pool, Some("github")).await?.as_array().unwrap().len(), 0);
+        assert!(get_external_identity(&pool, "slack:unknown").await?.is_null());
+
+        // A comment ingested by the bridge, attributed to the external human.
+        let p = create_project(&pool, "P", None, Some("slack-bridge"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, None, None, Some("slack-bridge"), None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        comment_task(&pool, tid, "hi from slack", Some("slack-bridge"), Some("slack:U123")).await?;
+        let task = get_task(&pool, tid).await?;
+        let c0 = &task["comments"][0];
+        assert_eq!(c0["author"], json!("slack-bridge"), "author is the fleet ingester");
+        assert_eq!(c0["external_author"], json!("slack:U123"), "attributed to the external human");
+
+        // A channel post carries the same attribution on its event data.
+        let ch = create_channel(&pool, "bridge", None, Some("slack-bridge"), None).await?;
+        let cid = ch["id"].as_i64().unwrap();
+        post_to_channel(&pool, cid, "slack-bridge", "hello", None, Some("slack:U123")).await?;
+        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        assert_eq!(posts[0]["data"]["from"], json!("slack-bridge"));
+        assert_eq!(posts[0]["data"]["external_author"], json!("slack:U123"));
+
+        // Guardrails: empty id/source are client errors.
+        assert!(upsert_external_identity(&pool, "  ", "slack", None, None).await.is_err());
+        assert!(upsert_external_identity(&pool, "slack:U9", "  ", None, None).await.is_err());
         Ok(())
     }
 }

@@ -277,6 +277,10 @@ pub struct CommentTaskArgs {
     pub body: String,
     #[serde(default)]
     pub author: Option<String>,
+    /// Optional external identity id (e.g. "slack:U123") to attribute this comment to — for an
+    /// ingested human. `author` stays the fleet agent (you) that performed the write.
+    #[serde(default)]
+    pub external_author: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -336,6 +340,10 @@ pub struct PostToChannelArgs {
     /// Optional parent post seq to reply under (one-level threading).
     #[serde(default)]
     pub reply_to: Option<i64>,
+    /// Optional external identity id (e.g. "slack:U123") to attribute this post to — for an
+    /// ingested human. `sender` stays the fleet agent (you) that performed the write.
+    #[serde(default)]
+    pub external_author: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -345,6 +353,27 @@ pub struct GetChannelPostsArgs {
     pub since_seq: i64,
     #[serde(default = "default_events_limit")]
     pub limit: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpsertExternalIdentityArgs {
+    /// Namespaced id `source:handle`, e.g. "slack:U123ABC". Idempotent upsert (re-registering
+    /// refreshes the display name / metadata).
+    pub id: String,
+    /// Originating system, e.g. "slack" or "github".
+    pub source: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Arbitrary props (avatar, real name, ...). MERGED into any existing bag.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListExternalIdentitiesArgs {
+    /// Filter by originating system (e.g. "slack"). Omit to list all.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -778,7 +807,7 @@ impl Board {
         Parameters(a): Parameters<CommentTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let author = self.me_opt(s(&a.author));
-        core::comment_task(&self.pool, a.task_id, &a.body, author.as_deref())
+        core::comment_task(&self.pool, a.task_id, &a.body, author.as_deref(), s(&a.external_author))
             .await
             .map_err(err)
             .and_then(ok)
@@ -854,7 +883,7 @@ impl Board {
         Parameters(a): Parameters<PostToChannelArgs>,
     ) -> Result<CallToolResult, McpError> {
         let sender = self.me_req(a.sender.as_deref())?;
-        core::post_to_channel(&self.pool, a.channel_id, &sender, &a.body, a.reply_to)
+        core::post_to_channel(&self.pool, a.channel_id, &sender, &a.body, a.reply_to, s(&a.external_author))
             .await
             .map_err(err)
             .and_then(ok)
@@ -869,6 +898,34 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    // --- External identities (bridged actors) ---
+    #[tool(
+        description = "Register or update an external identity — a human/actor from a bridged system (Slack, GitHub, ...), kept distinct from fleet agents. `id` is namespaced source:handle (e.g. slack:U123ABC). Idempotent: re-registering refreshes display_name/metadata. Attribute an ingested post/comment to it via the `external_author` field so it renders as that person, not you."
+    )]
+    async fn upsert_external_identity(
+        &self,
+        Parameters(a): Parameters<UpsertExternalIdentityArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::upsert_external_identity(
+            &self.pool,
+            &a.id,
+            &a.source,
+            s(&a.display_name),
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(description = "List external (bridged) identities, optionally filtered by `source` (e.g. 'slack'). Newest-updated first.")]
+    async fn list_external_identities(
+        &self,
+        Parameters(a): Parameters<ListExternalIdentitiesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_external_identities(&self.pool, s(&a.source)).await.map_err(err).and_then(ok)
     }
 
     #[tool(description = "Invite another agent into a channel: they're auto-joined and get a channel.invite in their inbox (no accept step). They can unsubscribe to leave.")]

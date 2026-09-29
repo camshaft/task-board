@@ -102,6 +102,7 @@ pub fn router(state: AppState) -> Router {
         .route("/channels/{channel_id}/invites", post(invite_to_channel))
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
+        .route("/external-identities", get(list_external_identities).post(upsert_external_identity))
         .route("/ipfs/add", post(ipfs_add))
         .route("/documents", get(list_documents).post(create_document))
         .route("/documents/{document_id}", get(get_document))
@@ -184,6 +185,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/external-identities", summary: "List external (bridged) identities, optionally filtered by source.", query: "source=str", body: None },
+    Endpoint { method: "POST", path: "/api/external-identities", summary: "Register/update an external identity (a bridged human/actor, e.g. slack:U123).", query: "", body: Some("UpsertExternalIdentityBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author).", query: "project_id=int&status=str&tag=str&task_id=int&author=str", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
@@ -233,6 +236,7 @@ fn body_schemas() -> Value {
         RequestChangesBody,
         AttachDocumentBody,
         IpfsAddBody,
+        UpsertExternalIdentityBody,
     )
 }
 
@@ -703,6 +707,9 @@ async fn update_task(
 struct CommentBody {
     body: String,
     author: Option<String>,
+    /// Optional external identity id (e.g. "slack:U123") this comment is attributed to — for an
+    /// ingested human author. `author` stays the fleet agent that performed the write.
+    external_author: Option<String>,
 }
 
 async fn comment_task(
@@ -711,7 +718,7 @@ async fn comment_task(
     Json(b): Json<CommentBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::comment_task(&st.pool, task_id, &b.body, b.author.as_deref()).await?,
+        core::comment_task(&st.pool, task_id, &b.body, b.author.as_deref(), b.external_author.as_deref()).await?,
     ))
 }
 
@@ -848,6 +855,9 @@ struct PostToChannelBody {
     sender: String,
     body: String,
     reply_to: Option<i64>,
+    /// Optional external identity id (e.g. "slack:U123") this post is attributed to — for an
+    /// ingested human author. `sender` stays the fleet agent that performed the write.
+    external_author: Option<String>,
 }
 
 async fn post_to_channel(
@@ -856,7 +866,7 @@ async fn post_to_channel(
     Json(b): Json<PostToChannelBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::post_to_channel(&st.pool, channel_id, &b.sender, &b.body, b.reply_to).await?,
+        core::post_to_channel(&st.pool, channel_id, &b.sender, &b.body, b.reply_to, b.external_author.as_deref()).await?,
     ))
 }
 
@@ -901,6 +911,41 @@ struct EventsQuery {
 
 async fn get_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) -> ApiResult {
     Ok(Json(core::get_events(&st.pool, q.since_seq, q.limit).await?))
+}
+
+// --- External identities (bridged actors) ---
+
+#[derive(Deserialize)]
+struct ListExternalIdentitiesQuery {
+    source: Option<String>,
+}
+
+async fn list_external_identities(
+    State(st): State<AppState>,
+    Query(q): Query<ListExternalIdentitiesQuery>,
+) -> ApiResult {
+    Ok(Json(core::list_external_identities(&st.pool, q.source.as_deref()).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UpsertExternalIdentityBody {
+    /// Namespaced id `source:handle`, e.g. "slack:U123ABC". Idempotent upsert.
+    id: String,
+    /// Originating system, e.g. "slack" or "github".
+    source: String,
+    display_name: Option<String>,
+    /// Arbitrary props (avatar, real name, ...). MERGED into any existing bag.
+    metadata: Option<Value>,
+}
+
+async fn upsert_external_identity(
+    State(st): State<AppState>,
+    Json(b): Json<UpsertExternalIdentityBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::upsert_external_identity(&st.pool, &b.id, &b.source, b.display_name.as_deref(), b.metadata)
+            .await?,
+    ))
 }
 
 // --- Content-addressing ---
