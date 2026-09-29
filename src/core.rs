@@ -2580,6 +2580,7 @@ fn document_comment_json(row: &SqliteRow) -> Value {
 /// Comment on a document, optionally anchored to a `region` of a specific (immutable) `version_id`.
 /// `region` is stored verbatim as JSON (W3C/Hypothesis-style selectors) — the backend never
 /// interprets it. Auto-subscribes the commenter and emits `document.comment` (FromDocument).
+#[allow(clippy::too_many_arguments)]
 pub async fn comment_document(
     pool: &Pool,
     document_id: i64,
@@ -2588,6 +2589,7 @@ pub async fn comment_document(
     body: &str,
     region: Option<Value>,
     reply_to: Option<i64>,
+    external_author: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -2602,9 +2604,11 @@ pub async fn comment_document(
         anyhow::bail!("no document {document_id}");
     }
     let region_str = region.map(|r| r.to_string());
+    // `author` = the fleet agent that wrote/ingested the comment; `external_author`, when set, is
+    // the external_identities id it's attributed to (an ingested human) — same as task comments.
     let cid: i64 = sqlx::query(
-        "INSERT INTO document_comments(document_id, version_id, author, body, region, reply_to, created_at) \
-         VALUES(?,?,?,?,?,?,?) RETURNING id",
+        "INSERT INTO document_comments(document_id, version_id, author, body, region, reply_to, created_at, external_author) \
+         VALUES(?,?,?,?,?,?,?,?) RETURNING id",
     )
     .bind(document_id)
     .bind(version_id)
@@ -2613,10 +2617,15 @@ pub async fn comment_document(
     .bind(&region_str)
     .bind(reply_to)
     .bind(&ts)
+    .bind(external_author)
     .fetch_one(&mut *tx)
     .await?
     .try_get("id")?;
     auto_subscribe_document(&mut tx, author, document_id).await?;
+    let mut data = json!({ "comment_id": cid, "version_id": version_id, "body": body, "reply_to": reply_to });
+    if let Some(ext) = external_author {
+        data["external_author"] = json!(ext);
+    }
     emit(
         &mut tx,
         &mut hooks,
@@ -2626,7 +2635,7 @@ pub async fn comment_document(
         None,
         None,
         Some(document_id),
-        json!({ "comment_id": cid, "version_id": version_id, "body": body, "reply_to": reply_to }),
+        data,
         Recipients::FromDocument(document_id),
     )
     .await?;
@@ -3154,7 +3163,7 @@ mod tests {
             "TextPositionSelector": { "start": 10, "end": 17 }
         });
         let c =
-            comment_document(&pool, did, Some(vid), Some("carol"), "typo", Some(region.clone()), None)
+            comment_document(&pool, did, Some(vid), Some("carol"), "typo", Some(region.clone()), None, None)
                 .await?;
         let cid = c["id"].as_i64().unwrap();
         assert_eq!(c["status"], json!("open"));
@@ -3162,7 +3171,7 @@ mod tests {
         assert_eq!(c["version_id"], json!(vid));
 
         // A doc-level comment (no region), threaded under the first.
-        let c2 = comment_document(&pool, did, None, Some("dave"), "agreed", None, Some(cid)).await?;
+        let c2 = comment_document(&pool, did, None, Some("dave"), "agreed", None, Some(cid), None).await?;
         assert!(c2["region"].is_null(), "doc-level comment has null region");
         assert_eq!(c2["reply_to"], json!(cid));
 
@@ -3195,8 +3204,17 @@ mod tests {
             1
         );
 
+        // An ingested comment attributed to an external human (§6): author stays the ingester,
+        // external_author carries the identity, and it round-trips through get_document_comments.
+        let c3 = comment_document(&pool, did, None, Some("slack-bridge"), "from ada", None, None, Some("slack:U1")).await?;
+        assert_eq!(c3["author"], json!("slack-bridge"));
+        assert_eq!(c3["external_author"], json!("slack:U1"));
+        let listed = get_document_comments(&pool, did, None, None).await?;
+        let c3_listed = listed.as_array().unwrap().iter().find(|x| x["id"] == c3["id"]).unwrap();
+        assert_eq!(c3_listed["external_author"], json!("slack:U1"), "attribution surfaces in the list");
+
         // Errors: comment on a missing doc, resolve a missing comment.
-        assert!(comment_document(&pool, 999, None, Some("x"), "hi", None, None).await.is_err());
+        assert!(comment_document(&pool, 999, None, Some("x"), "hi", None, None, None).await.is_err());
         assert!(resolve_comment(&pool, 999, Some("x")).await.is_err());
         Ok(())
     }

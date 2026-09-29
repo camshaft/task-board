@@ -526,6 +526,10 @@ pub struct CommentDocumentArgs {
     /// Thread this comment under another (one-level).
     #[serde(default)]
     pub reply_to: Option<i64>,
+    /// Optional external identity id (e.g. "slack:U123") to attribute this comment to — for an
+    /// ingested human. `author` stays the fleet agent (you) that performed the write.
+    #[serde(default)]
+    pub external_author: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1127,6 +1131,7 @@ impl Board {
             &a.body,
             a.region.map(Value::Object),
             a.reply_to,
+            s(&a.external_author),
         )
         .await
         .map_err(err)

@@ -133,7 +133,8 @@ CREATE TABLE IF NOT EXISTS document_comments (
     region      TEXT,
     status      TEXT NOT NULL DEFAULT 'open',
     reply_to    INTEGER REFERENCES document_comments(id),
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    external_author TEXT
 );
 -- Many-to-many links between documents and tasks (a design doc can back several tasks).
 CREATE TABLE IF NOT EXISTS document_attachments (
@@ -339,6 +340,19 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .any(|r| r.get::<String, _>("name") == "origin_ref");
     if !comments_have_origin_ref {
         sqlx::query("ALTER TABLE comments ADD COLUMN origin_ref TEXT")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill document_comments.external_author (bridged/ingested attribution, mirroring the
+    // task-comment + channel-post columns) — an ingested human's review comment renders as them.
+    let doc_comments_have_ext_author = sqlx::query("PRAGMA table_info(document_comments)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "external_author");
+    if !doc_comments_have_ext_author {
+        sqlx::query("ALTER TABLE document_comments ADD COLUMN external_author TEXT")
             .execute(&pool)
             .await?;
     }
