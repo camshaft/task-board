@@ -730,7 +730,8 @@ function DocContent({ version, onLoaded }: { version: DocumentVersion; onLoaded?
   if (kind === 'markdown') {
     return (
       <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-4">
-        <Markdown source={text} className="text-sm" />
+        {/* anchors: headings get a linkable slug id + a `#`-depth margin marker (section links). */}
+        <Markdown source={text} className="text-sm" anchors />
       </div>
     )
   }

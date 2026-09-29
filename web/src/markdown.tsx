@@ -139,22 +139,83 @@ function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNo
   return nodes
 }
 
-function heading(level: number, children: ReactNode, key: number): ReactNode {
+// Block-rendering options threaded through blocks(): `anchors` turns headings into linkable
+// sections (a slug id + a clickable `#`/`##` depth marker), and `slugs` dedupes ids within one
+// render (a repeated heading text gets `-1`, `-2`, …). Only the document viewer opts in.
+interface BlockOpts {
+  anchors: boolean
+  slugs: Map<string, number>
+}
+
+// GitHub-style heading slug: lowercase, drop punctuation/markdown markers, spaces→hyphens.
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+}
+
+function uniqueSlug(text: string, slugs: Map<string, number>): string {
+  const base = slugify(text) || 'section'
+  const n = slugs.get(base) ?? 0
+  slugs.set(base, n + 1)
+  return n === 0 ? base : `${base}-${n}`
+}
+
+// Heading sizes give a clear, readable hierarchy (bigger than the old flat text-sm). scroll-mt
+// keeps a deep-linked heading clear of the sticky header. With opts.anchors, a monospace `#`×level
+// marker precedes the text and links to the section (doubles as a visible depth indicator).
+function heading(
+  level: number,
+  children: ReactNode,
+  key: number,
+  raw: string,
+  opts: BlockOpts,
+): ReactNode {
   const cls =
-    level <= 1 ? 'text-base font-semibold' : level === 2 ? 'text-sm font-semibold' : 'text-sm font-medium'
+    level === 1
+      ? 'text-xl font-bold'
+      : level === 2
+        ? 'text-lg font-semibold'
+        : level === 3
+          ? 'text-base font-semibold'
+          : level === 4
+            ? 'text-sm font-semibold'
+            : level === 5
+              ? 'text-sm font-medium'
+              : 'text-sm font-medium text-[var(--color-muted)]'
+  const slug = opts.anchors ? uniqueSlug(raw, opts.slugs) : undefined
+  // Use an ABSOLUTE-path href (current path + #slug), not a bare `#slug`: the app injects a
+  // <base href> for sub-path proxying, and a bare fragment link resolves against the base (→ the
+  // root), navigating away from the doc. An absolute path is left alone by <base>, and since the
+  // path is unchanged it's a same-document fragment scroll (no reload, so react-router is fine).
+  const marker =
+    opts.anchors && slug ? (
+      <a
+        href={`${window.location.pathname}${window.location.search}#${slug}`}
+        aria-label="Link to this section"
+        className="mr-2 select-none font-mono font-normal text-[var(--color-muted)] opacity-50 hover:text-sky-300 hover:opacity-100"
+      >
+        {'#'.repeat(level)}
+      </a>
+    ) : null
+  const full = `scroll-mt-16 ${cls}`
   switch (level) {
     case 1:
-      return <h1 key={key} className={cls}>{children}</h1>
+      return <h1 key={key} id={slug} className={full}>{marker}{children}</h1>
     case 2:
-      return <h2 key={key} className={cls}>{children}</h2>
+      return <h2 key={key} id={slug} className={full}>{marker}{children}</h2>
     case 3:
-      return <h3 key={key} className={cls}>{children}</h3>
+      return <h3 key={key} id={slug} className={full}>{marker}{children}</h3>
     case 4:
-      return <h4 key={key} className={cls}>{children}</h4>
+      return <h4 key={key} id={slug} className={full}>{marker}{children}</h4>
     case 5:
-      return <h5 key={key} className={cls}>{children}</h5>
+      return <h5 key={key} id={slug} className={full}>{marker}{children}</h5>
     default:
-      return <h6 key={key} className={cls}>{children}</h6>
+      return <h6 key={key} id={slug} className={full}>{marker}{children}</h6>
   }
 }
 
@@ -171,7 +232,7 @@ function isBlockStart(line: string): boolean {
   )
 }
 
-function blocks(src: string, resolve: WikiResolver): ReactNode[] {
+function blocks(src: string, resolve: WikiResolver, opts: BlockOpts): ReactNode[] {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const out: ReactNode[] = []
   let i = 0
@@ -232,7 +293,7 @@ function blocks(src: string, resolve: WikiResolver): ReactNode[] {
 
     const h = /^(#{1,6})\s+(.*)$/.exec(line)
     if (h) {
-      out.push(heading(h[1].length, inline(h[2], gen, resolve), k++))
+      out.push(heading(h[1].length, inline(h[2], gen, resolve), k++, h[2], opts))
       i++
       continue
     }
@@ -254,7 +315,7 @@ function blocks(src: string, resolve: WikiResolver): ReactNode[] {
           key={k++}
           className="border-l-2 border-[var(--color-border)] pl-3 text-[var(--color-muted)]"
         >
-          {blocks(buf.join('\n'), resolve)}
+          {blocks(buf.join('\n'), resolve, opts)}
         </blockquote>,
       )
       continue
@@ -305,9 +366,19 @@ function blocks(src: string, resolve: WikiResolver): ReactNode[] {
 
 // Render `source` as Markdown. The wrapper spaces block elements; callers set the text size.
 // [[wiki-links]] resolve against the app-wide WikiLinkContext (dangling → red-link).
-export function Markdown({ source, className }: { source: string; className?: string }) {
+// `anchors` (document viewer) makes headings linkable sections with a `#`-depth margin marker.
+export function Markdown({
+  source,
+  className,
+  anchors = false,
+}: {
+  source: string
+  className?: string
+  anchors?: boolean
+}) {
   const resolve = useContext(WikiLinkContext)
-  return <div className={`space-y-2 ${className ?? ''}`}>{blocks(source, resolve)}</div>
+  const opts: BlockOpts = { anchors, slugs: new Map() }
+  return <div className={`space-y-2 ${className ?? ''}`}>{blocks(source, resolve, opts)}</div>
 }
 
 // A Mermaid diagram, rendered client-side to SVG. mermaid.js is a heavy dep, so it's loaded
