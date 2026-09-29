@@ -252,6 +252,21 @@ CREATE TABLE IF NOT EXISTS document_embeds (
     created_at         TEXT NOT NULL,
     UNIQUE(source_document_id, target_path)
 );
+-- A named, reusable WORKSPACE KIND: the setup/checkout script + config an agent is configured
+-- with when its workspace is materialized. Environment-specific setup lives here as board DATA,
+-- so fleet spin-up can support custom environment kinds defined in board resources and stay
+-- generic. `name` is the key an agent's metadata.workspace_kind references; `setup_script` is run
+-- to materialize the workspace; `config` is a free-form JSON bag of hints the consumer reads
+-- (cwd, launch, repo, branch, env, ...).
+CREATE TABLE IF NOT EXISTS workspace_kinds (
+    name         TEXT PRIMARY KEY,
+    setup_script TEXT NOT NULL DEFAULT '',
+    config       TEXT NOT NULL DEFAULT '{}',
+    description  TEXT,
+    created_by   TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
