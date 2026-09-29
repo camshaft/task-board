@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { useAgent, useAgentActivity, useAgentTasks, useProjects, updateAgent } from './resources'
+import { eventHref, useAgent, useAgentActivity, useAgentTasks, useProjects, updateAgent } from './resources'
 import { Markdown } from './markdown'
 import { AGENT_DOT, relTime, StatusChip } from './ui'
 
@@ -220,30 +220,36 @@ export default function AgentView() {
               Recent activity ({activity.length})
             </div>
             <ul className="space-y-2">
-              {activity.map((e) => (
-                <li key={e.seq} className="text-xs">
-                  <div className="flex items-center gap-1.5">
-                    <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
-                      {e.type}
-                    </span>
-                    <span className="text-[var(--color-muted)]">{relTime(e.created_at)}</span>
-                  </div>
-                  {typeof e.data?.title === 'string' && (
-                    <div className="mt-0.5 text-[var(--color-muted)]">
-                      {e.task_id != null && e.project_id != null ? (
-                        <Link
-                          to={`/projects/${e.project_id}/tasks/${e.task_id}`}
-                          className="hover:text-sky-300"
-                        >
-                          {e.data.title as string}
-                        </Link>
-                      ) : (
-                        (e.data.title as string)
-                      )}
+              {activity.map((e) => {
+                const href = eventHref(e)
+                const body = (
+                  <>
+                    <div className="flex items-center gap-1.5">
+                      <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                        {e.type}
+                      </span>
+                      <span className="text-[var(--color-muted)]">{relTime(e.created_at)}</span>
                     </div>
-                  )}
-                </li>
-              ))}
+                    {typeof e.data?.title === 'string' && (
+                      <div className="mt-0.5 text-[var(--color-muted)]">{e.data.title as string}</div>
+                    )}
+                  </>
+                )
+                return (
+                  <li key={e.seq} className="text-xs">
+                    {href ? (
+                      <Link
+                        to={href}
+                        className="-mx-1 block rounded px-1 hover:bg-[var(--color-panel-2)]"
+                      >
+                        {body}
+                      </Link>
+                    ) : (
+                      body
+                    )}
+                  </li>
+                )
+              })}
               {activity.length === 0 && (
                 <li className="text-xs text-[var(--color-muted)]">
                   No recent activity by this agent.

@@ -226,6 +226,10 @@ export interface EventRow {
   actor: string | null
   project_id: number | null
   task_id: number | null
+  // The event log also carries channel_id / document_id columns (populated for channel/document
+  // events); the API returns them, so the activity feed can deep-link to the right target.
+  channel_id?: number | null
+  document_id?: number | null
   data: Record<string, unknown>
   created_at: string
 }
