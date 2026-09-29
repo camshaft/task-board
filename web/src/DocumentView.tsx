@@ -9,6 +9,7 @@ import {
   commentDocument,
   requestDocumentChanges,
   resolveDocumentComment,
+  setDocumentPath,
   submitDocumentForReview,
   useDocument,
   useDocumentComments,
@@ -33,6 +34,8 @@ export default function DocumentView() {
   const [busy, setBusy] = useState(false)
   const [draft, setDraft] = useState('')
   const [replyTo, setReplyTo] = useState<number | null>(null)
+  // Wiki-path filing: null = not editing, string = editing this path draft ('' clears/unfiles).
+  const [editPath, setEditPath] = useState<string | null>(null)
 
   // Run a mutation and surface its error. The wrappers invalidate the document + its comments
   // through touched(), so the subscribed hooks refetch and this component re-renders — no
@@ -62,6 +65,14 @@ export default function DocumentView() {
   function requestChanges() {
     const note = window.prompt('What needs to change? (optional note)') ?? undefined
     void act(() => requestDocumentChanges(id, { actor, note: note || undefined }))
+  }
+
+  async function savePath() {
+    if (editPath === null) return
+    // Normalize: trim, drop leading/trailing slashes, collapse doubles. Empty clears the filing.
+    const path = editPath.trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/')
+    await act(() => setDocumentPath(id, { path, actor }))
+    setEditPath(null)
   }
 
   const error = actionError ?? docError?.message ?? null
@@ -150,6 +161,58 @@ export default function DocumentView() {
                 #{String(t)}
               </span>
             ))}
+          </div>
+
+          {/* Wiki filing: the slash-path this doc lives under in the /wiki tree. Editable here;
+              empty clears the filing. */}
+          <div className="mb-4 flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-[var(--color-muted)]">Wiki path</span>
+            {editPath === null ? (
+              <>
+                {doc.path ? (
+                  <Link to="/wiki" className="font-mono text-sky-400 hover:text-sky-300">
+                    {doc.path}
+                  </Link>
+                ) : (
+                  <span className="text-[var(--color-muted)]">— not filed —</span>
+                )}
+                <button
+                  disabled={busy}
+                  onClick={() => setEditPath(doc.path ?? '')}
+                  className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)] disabled:opacity-40"
+                >
+                  {doc.path ? 'edit' : 'file'}
+                </button>
+              </>
+            ) : (
+              <>
+                <input
+                  autoFocus
+                  value={editPath}
+                  disabled={busy}
+                  onChange={(e) => setEditPath(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') void savePath()
+                    else if (e.key === 'Escape') setEditPath(null)
+                  }}
+                  placeholder="e.g. architecture/board/events"
+                  className="w-64 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 font-mono outline-none focus:border-sky-500/50"
+                />
+                <button
+                  disabled={busy}
+                  onClick={savePath}
+                  className="rounded-md bg-sky-600 px-2 py-1 font-medium text-white disabled:opacity-40"
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => setEditPath(null)}
+                  className="rounded-md px-2 py-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+                >
+                  Cancel
+                </button>
+              </>
+            )}
           </div>
 
           {/* Tasks this document backs. Each links into its board + task drawer via the

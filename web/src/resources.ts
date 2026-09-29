@@ -32,6 +32,9 @@ const keys = {
   tasks: (projectId: number) => `tasks:${projectId}`,
   task: (taskId: number) => `task:${taskId}`,
   documents: 'documents',
+  // Wiki tree, keyed by path prefix ('' = whole tree). Its own prefix so touched() can refresh
+  // every loaded subtree on any document change (a path set/clear reshapes the tree).
+  wiki: (prefix?: string) => `wiki:${prefix ?? ''}`,
   document: (documentId: number) => `document:${documentId}`,
   documentComments: (documentId: number) => `documentComments:${documentId}`,
   agent: (id: string) => `agent:${id}`,
@@ -117,6 +120,10 @@ export function useDocuments() {
   return useResource<DocumentSummary[]>(keys.documents, () => api.listDocuments())
 }
 
+export function useWiki(prefix?: string) {
+  return useResource<DocumentSummary[]>(keys.wiki(prefix), () => api.listWiki(prefix))
+}
+
 export function useDocument(documentId: number) {
   return useResource<Document>(keys.document(documentId), () => api.getDocument(documentId))
 }
@@ -157,6 +164,7 @@ export function touched(
     invalidate(keys.document(opts.documentId))
     invalidate(keys.documentComments(opts.documentId))
     invalidate(keys.documents)
+    invalidateMatching('wiki:') // a path set/clear or new version reshapes the tree
   }
   if (opts.channelId != null) {
     // A channel's posts + its own view, and every loaded channel list (public + per-member).
@@ -238,6 +246,13 @@ export async function updateAgent(id: string, b: Parameters<typeof api.updateAge
 // Document mutations. Same pattern as the task ones: perform the request, then funnel through
 // touched() keyed on the document so its viewer, comment panel, and the documents list all
 // refresh — locally and (via the SSE path below) when another client makes the change.
+
+// File / rename / clear a document's wiki path. touched() refreshes the doc + the wiki tree(s).
+export async function setDocumentPath(id: number, b: Parameters<typeof api.setDocumentPath>[1]) {
+  const d = await api.setDocumentPath(id, b)
+  touched({ documentId: id, activity: true })
+  return d
+}
 
 export async function commentDocument(id: number, b: Parameters<typeof api.commentDocument>[1]) {
   const r = await api.commentDocument(id, b)
