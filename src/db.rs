@@ -270,7 +270,19 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .foreign_keys(true)
         .busy_timeout(std::time::Duration::from_secs(30));
 
-    let pool = SqlitePoolOptions::new().max_connections(8).connect_with(opts).await?;
+    // Single connection = serialized DB access (task 191). SQLite allows only one writer, and a
+    // multi-connection pool lets two deferred transactions each take a read snapshot and then
+    // race to upgrade to a write — the loser gets SQLITE_BUSY_SNAPSHOT (code 517, surfaced as
+    // "database is locked") IMMEDIATELY, which busy_timeout cannot wait out. Every agent polls
+    // check_notifications (a read-then-write: mark-read + last_seen) each tick, so under fleet
+    // concurrency that deadlock was hitting live writes. One pooled connection means only one
+    // transaction runs at a time, so there is never a competing writer to invalidate a snapshot
+    // — the contention becomes a brief queue (bounded by busy_timeout), not an error. Board ops
+    // are short, indexed, and hold no connection across an await (webhooks fire post-commit; SSE
+    // streams from the broadcast bus, not a held connection), so serial access is fine at this
+    // scale. If read throughput ever bottlenecks, the next step is a read pool + a single writer
+    // connection (or per-write BEGIN IMMEDIATE), not a wider undifferentiated pool.
+    let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
 
     // executescript-equivalent: split on ';' and run each statement.
     for stmt in SCHEMA.split(';') {
