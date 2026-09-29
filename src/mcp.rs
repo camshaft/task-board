@@ -1149,6 +1149,7 @@ impl Board {
             s(&a.created_by),
             a.metadata.map(Value::Object),
             s(&a.content_type),
+            s(&a.content),
         )
         .await
         .map_err(err)
@@ -1165,7 +1166,7 @@ impl Board {
         let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
             .await
             .map_err(err)?;
-        core::publish_version(&self.pool, a.document_id, &cid, s(&a.summary), s(&a.created_by), s(&a.content_type))
+        core::publish_version(&self.pool, a.document_id, &cid, s(&a.summary), s(&a.created_by), s(&a.content_type), s(&a.content))
             .await
             .map_err(err)
             .and_then(ok)

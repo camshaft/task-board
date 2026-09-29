@@ -2558,6 +2558,77 @@ fn slugify(title: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Normalize a wiki path the same way `set_document_path` does, so a link target and a
+/// document's stored `path` compare equal: trim whitespace and strip surrounding slashes.
+fn normalize_wiki_path(p: &str) -> String {
+    p.trim().trim_matches('/').to_string()
+}
+
+/// Extract `[[wiki-link]]` / `[[path|label]]` targets from a document's raw content. Returns
+/// (target_path, optional label) pairs de-duplicated by target_path (first occurrence wins its
+/// label), each path normalized like a document path. The `![[target]]` embed/transclusion form
+/// is deliberately skipped -- embeds are a separate edge kind (a later task), not a plain link.
+fn extract_wiki_links(content: &str) -> Vec<(String, Option<String>)> {
+    let bytes = content.as_bytes();
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            // A leading '!' turns this into an embed (![[...]]) -- not a link. Skip it.
+            if i > 0 && bytes[i - 1] == b'!' {
+                i += 2;
+                continue;
+            }
+            if let Some(close) = content[i + 2..].find("]]") {
+                let inner = &content[i + 2..i + 2 + close];
+                // Split target|label on the first '|' only (labels may contain nothing special).
+                let (raw_path, label) = match inner.split_once('|') {
+                    Some((p, l)) => (p, Some(l.trim().to_string())),
+                    None => (inner, None),
+                };
+                let path = normalize_wiki_path(raw_path);
+                let label = label.filter(|l| !l.is_empty());
+                if !path.is_empty() && seen.insert(path.clone()) {
+                    out.push((path, label));
+                }
+                i += 2 + close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Recompute a document's outbound wiki links from its raw `content`, replacing any prior edges.
+/// Only called when a caller supplies content (the board stores CIDs, not bytes, so a CID-only
+/// publish can't be re-scanned and leaves existing edges untouched).
+async fn refresh_document_links(
+    tx: &mut Transaction<'_, Sqlite>,
+    source_document_id: i64,
+    content: &str,
+    ts: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM document_links WHERE source_document_id=?")
+        .bind(source_document_id)
+        .execute(&mut **tx)
+        .await?;
+    for (path, label) in extract_wiki_links(content) {
+        sqlx::query(
+            "INSERT INTO document_links(source_document_id, target_path, label, created_at) \
+             VALUES(?,?,?,?)",
+        )
+        .bind(source_document_id)
+        .bind(&path)
+        .bind(label.as_deref())
+        .bind(ts)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Fetch a document as JSON (metadata parsed) plus its resolved `current_version` and full
 /// `versions` list (newest first). Returns None if the document doesn't exist.
 async fn document_json(
@@ -2599,6 +2670,38 @@ async fn document_json(
         .fetch_all(&mut **tx)
         .await?;
         m.insert("attached_tasks".into(), Value::Array(tasks.iter().map(row_to_json).collect()));
+
+        // Outbound wiki links ([[target]] this doc points at), each resolved to the document
+        // currently filed at that path (target_document_id/title/status are null when the link
+        // dangles -- nothing is filed there yet). Ordered by target_path for a stable render.
+        let out_links = sqlx::query(
+            "SELECT l.target_path, l.label, d.id AS target_document_id, d.title AS target_title, \
+             d.status AS target_status FROM document_links l \
+             LEFT JOIN documents d ON d.path = l.target_path \
+             WHERE l.source_document_id=? ORDER BY l.target_path",
+        )
+        .bind(document_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        m.insert("outbound_links".into(), Value::Array(out_links.iter().map(row_to_json).collect()));
+
+        // Backlinks: documents whose content links to THIS document's path. Empty when this doc
+        // is unfiled (no path), since a link can only target a path.
+        let backlinks = match m.get("path").and_then(|v| v.as_str()) {
+            Some(p) => {
+                let rows = sqlx::query(
+                    "SELECT s.id, s.title, s.path, s.status, l.label FROM document_links l \
+                     JOIN documents s ON s.id = l.source_document_id \
+                     WHERE l.target_path=? ORDER BY s.path, s.id",
+                )
+                .bind(p)
+                .fetch_all(&mut **tx)
+                .await?;
+                Value::Array(rows.iter().map(row_to_json).collect())
+            }
+            None => Value::Array(Vec::new()),
+        };
+        m.insert("backlinks".into(), backlinks);
     }
     Ok(Some(d))
 }
@@ -2615,6 +2718,7 @@ pub async fn create_document(
     created_by: Option<&str>,
     metadata: Option<Value>,
     content_type: Option<&str>,
+    content: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let ct = content_type.unwrap_or("text/markdown");
@@ -2656,6 +2760,11 @@ pub async fn create_document(
         .await?;
     // The author subscribes so they hear about future versions and review activity.
     auto_subscribe_document(&mut tx, created_by, did).await?;
+    // Index outbound wiki links when the caller supplied raw content (a CID-only create can't
+    // be scanned -- the board never fetches the bytes).
+    if let Some(c) = content {
+        refresh_document_links(&mut tx, did, c, &ts).await?;
+    }
     emit(
         &mut tx,
         &mut hooks,
@@ -2678,6 +2787,7 @@ pub async fn create_document(
 /// Append a new immutable version and advance the document's current pointer. A new version
 /// supersedes any prior approval: an `approved` / `changes_requested` document drops back to
 /// `in_review` (the review workflow itself lands in a follow-on task).
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_version(
     pool: &Pool,
     document_id: i64,
@@ -2685,6 +2795,7 @@ pub async fn publish_version(
     summary: Option<&str>,
     created_by: Option<&str>,
     content_type: Option<&str>,
+    content: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let ct = content_type.unwrap_or("text/markdown");
@@ -2734,6 +2845,10 @@ pub async fn publish_version(
         .await?;
     // The publisher subscribes (auto-join-on-post, like channels) so they hear about follow-ups.
     auto_subscribe_document(&mut tx, created_by, document_id).await?;
+    // Re-index outbound wiki links from the new content (CID-only publishes leave edges as-is).
+    if let Some(c) = content {
+        refresh_document_links(&mut tx, document_id, c, &ts).await?;
+    }
     emit(
         &mut tx,
         &mut hooks,
@@ -3411,6 +3526,7 @@ mod tests {
             Some("alice"),
             Some(json!({ "tags": ["design"] })),
             None,
+            None,
         )
         .await?;
         let did = d["id"].as_i64().unwrap();
@@ -3423,7 +3539,7 @@ mod tests {
         assert_eq!(d["versions"].as_array().unwrap().len(), 1);
 
         // Publish version 2 -> current advances, immutable history grows.
-        let d2 = publish_version(&pool, did, "bafyv2", Some("revise"), Some("alice"), None).await?;
+        let d2 = publish_version(&pool, did, "bafyv2", Some("revise"), Some("alice"), None, None).await?;
         assert_eq!(d2["current_version"]["version_no"], json!(2));
         assert_eq!(d2["current_version"]["cid"], json!("bafyv2"));
         assert_eq!(d2["versions"].as_array().unwrap().len(), 2);
@@ -3452,7 +3568,7 @@ mod tests {
             .bind(did)
             .execute(&pool)
             .await?;
-        let d3 = publish_version(&pool, did, "bafyv3", None, Some("alice"), None).await?;
+        let d3 = publish_version(&pool, did, "bafyv3", None, Some("alice"), None, None).await?;
         assert_eq!(d3["status"], json!("in_review"), "new version supersedes approval");
 
         // Missing document -> error.
@@ -3520,13 +3636,13 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // alice creates a doc (auto-subscribed as author).
-        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None).await?;
+        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None, None).await?;
         let did = d["id"].as_i64().unwrap();
         // bob explicitly subscribes to the document.
         subscribe(&pool, "bob", None, None, None, Some(did), false).await?;
 
         // carol publishes v2 -> author (alice) + subscriber (bob) hear it; carol (actor) does not.
-        publish_version(&pool, did, "bafy2", Some("second"), Some("carol"), None).await?;
+        publish_version(&pool, did, "bafy2", Some("second"), Some("carol"), None, None).await?;
 
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
@@ -3552,7 +3668,7 @@ mod tests {
 
         // Unsubscribing stops delivery.
         unsubscribe(&pool, "bob", None, None, None, Some(did), false).await?;
-        publish_version(&pool, did, "bafy3", None, Some("alice"), None).await?;
+        publish_version(&pool, did, "bafy3", None, Some("alice"), None, None).await?;
         let bob2 = check_notifications(&pool, "bob", true, 50, None).await?;
         assert_eq!(bob2["count"].as_i64(), Some(0), "no events after unsubscribe");
 
@@ -3566,7 +3682,7 @@ mod tests {
     async fn document_comments_roundtrip() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None).await?;
+        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None, None).await?;
         let did = d["id"].as_i64().unwrap();
         let vid = d["current_version"]["id"].as_i64().unwrap();
 
@@ -3641,7 +3757,7 @@ mod tests {
     async fn document_review_workflow() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Design", None, "bafy1", None, Some("alice"), None, None).await?;
+        let d = create_document(&pool, "Design", None, "bafy1", None, Some("alice"), None, None, None).await?;
         let did = d["id"].as_i64().unwrap();
         assert_eq!(d["status"], json!("draft"));
 
@@ -3657,7 +3773,7 @@ mod tests {
         assert_eq!(rc["status"], json!("changes_requested"));
 
         // Author publishes a new version -> reopens review (per publish_version).
-        let v2 = publish_version(&pool, did, "bafy2", Some("addressed"), Some("alice"), None).await?;
+        let v2 = publish_version(&pool, did, "bafy2", Some("addressed"), Some("alice"), None, None).await?;
         assert_eq!(v2["status"], json!("in_review"), "a new version reopens review");
         let v2id = v2["current_version"]["id"].as_i64().unwrap();
 
@@ -3668,7 +3784,7 @@ mod tests {
         assert_eq!(ap["approved_by"], json!("operator"));
 
         // Approval is a stamp, not a lock: publishing again reopens review but keeps the stamp.
-        let v3 = publish_version(&pool, did, "bafy3", None, Some("alice"), None).await?;
+        let v3 = publish_version(&pool, did, "bafy3", None, Some("alice"), None, None).await?;
         assert_eq!(v3["status"], json!("in_review"));
         assert_eq!(v3["approved_version_id"], json!(v2id), "stamp persists across a new version");
 
@@ -3705,7 +3821,7 @@ mod tests {
         let t = create_task(&pool, pid, "Build widget", None, Some("alice"), None, Some("alice"), None, None)
             .await?;
         let tid = t["id"].as_i64().unwrap();
-        let d = create_document(&pool, "Widget design", None, "bafy1", None, Some("bob"), None, None).await?;
+        let d = create_document(&pool, "Widget design", None, "bafy1", None, Some("bob"), None, None, None).await?;
         let did = d["id"].as_i64().unwrap();
 
         // Drain the create notifications so the attach fan-out is isolated.
@@ -3773,14 +3889,14 @@ mod tests {
 
         let a = create_document(
             &pool, "A", Some(pid), "bafyA", None, Some("alice"),
-            Some(json!({ "tags": ["design", "rfc"] })), None,
+            Some(json!({ "tags": ["design", "rfc"] })), None, None,
         ).await?;
         let aid = a["id"].as_i64().unwrap();
         let b = create_document(
-            &pool, "B", None, "bafyB", None, Some("bob"), Some(json!({ "tags": ["ops"] })), None,
+            &pool, "B", None, "bafyB", None, Some("bob"), Some(json!({ "tags": ["ops"] })), None, None,
         ).await?;
         let bid = b["id"].as_i64().unwrap();
-        let c = create_document(&pool, "C", Some(pid), "bafyC", None, Some("alice"), None, None).await?;
+        let c = create_document(&pool, "C", Some(pid), "bafyC", None, Some("alice"), None, None, None).await?;
         let cid = c["id"].as_i64().unwrap();
         approve_document(&pool, cid, Some("op")).await?;
 
@@ -4875,7 +4991,7 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // v1 with an explicit non-markdown type.
-        let d = create_document(&pool, "Diagram", None, "bafypng", None, Some("alice"), None, Some("image/png")).await?;
+        let d = create_document(&pool, "Diagram", None, "bafypng", None, Some("alice"), None, Some("image/png"), None).await?;
         let did = d["id"].as_i64().unwrap();
         assert_eq!(d["current_version"]["content_type"], json!("image/png"));
 
@@ -4884,7 +5000,7 @@ mod tests {
         assert_eq!(d2["current_version"]["content_type"], json!("application/pdf"));
 
         // Omitting content_type defaults to text/markdown (back-compat).
-        let d3 = publish_version(&pool, did, "bafymd", None, Some("alice"), None).await?;
+        let d3 = publish_version(&pool, did, "bafymd", None, Some("alice"), None, None).await?;
         assert_eq!(d3["current_version"]["content_type"], json!("text/markdown"));
 
         // get_document_versions surfaces content_type per version.
@@ -4893,7 +5009,7 @@ mod tests {
         assert_eq!(types, vec!["text/markdown", "application/pdf", "image/png"], "newest first");
 
         // A default create_document (no content_type) is text/markdown, matching the initial docs work.
-        let plain = create_document(&pool, "Notes", None, "bafymd2", None, Some("bob"), None, None).await?;
+        let plain = create_document(&pool, "Notes", None, "bafymd2", None, Some("bob"), None, None, None).await?;
         assert_eq!(plain["current_version"]["content_type"], json!("text/markdown"));
         Ok(())
     }
