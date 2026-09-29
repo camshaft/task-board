@@ -1017,7 +1017,7 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
         m.insert("metadata".into(), meta);
 
         let comments = sqlx::query(
-            "SELECT id, author, body, created_at, external_author FROM comments WHERE task_id=? ORDER BY id",
+            "SELECT id, author, body, created_at, external_author, origin_ref FROM comments WHERE task_id=? ORDER BY id",
         )
         .bind(task_id)
         .fetch_all(pool)
@@ -1650,6 +1650,184 @@ pub async fn set_channel_props(pool: &Pool, channel_id: i64, props: Value) -> an
         .await?;
     tx.commit().await?;
     Ok(json!({ "channel_id": channel_id, "metadata": meta_val }))
+}
+
+/// Derive a task title from a thread's root body: its first non-empty line, trimmed and
+/// truncated, with a fallback when the body is empty.
+fn thread_title(body: &str, channel_id: i64) -> String {
+    let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if first.is_empty() {
+        return format!("Thread from channel {channel_id}");
+    }
+    if first.chars().count() > 120 {
+        let truncated: String = first.chars().take(117).collect();
+        format!("{truncated}…")
+    } else {
+        first.to_string()
+    }
+}
+
+/// Promote a channel thread into a task (design #141 §7, implements #143). The thread's root
+/// post becomes the task description; each direct reply becomes a task comment, preserving the
+/// original author/external-author attribution and timestamp. A durable `task_links` row records
+/// the thread↔task link so the promotion is idempotent — re-promoting the same thread returns
+/// the existing task (never a duplicate, never re-imported). Imported comments carry the source
+/// post seq in `origin_ref` so later bidirectional sync (slice 2) can dedup.
+///
+/// Adapter-agnostic: the same import+link core a GitHub-issue bridge (#136) reuses — a promoted
+/// thread is just one internal source feeding it.
+pub async fn promote_thread(
+    pool: &Pool,
+    channel_id: i64,
+    root_post_seq: i64,
+    project_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let source_kind = "channel_thread";
+    let source_id = format!("channel:{channel_id}:{root_post_seq}");
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+
+    // Idempotent: a thread maps to exactly one task. Re-promoting returns the existing task.
+    if let Some(row) = sqlx::query("SELECT task_id FROM task_links WHERE source_kind=? AND source_id=?")
+        .bind(source_kind)
+        .bind(&source_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        let tid: i64 = row.try_get("task_id")?;
+        tx.commit().await?;
+        return Ok(json!({
+            "task_id": tid,
+            "channel_id": channel_id,
+            "root_post_seq": root_post_seq,
+            "already_promoted": true,
+        }));
+    }
+
+    if sqlx::query("SELECT 1 FROM projects WHERE id=?")
+        .bind(project_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no project {project_id}");
+    }
+
+    // Load the channel's posts (root + candidate replies) in one pass.
+    let posts = sqlx::query(
+        "SELECT seq, data, created_at FROM events \
+         WHERE channel_id=? AND type IN ('channel.post','message.direct') ORDER BY seq",
+    )
+    .bind(channel_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let parse = |s: Option<String>| -> Value {
+        s.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| json!({}))
+    };
+
+    // The root post must exist in this channel.
+    let Some(root) = posts.iter().find(|r| r.try_get::<i64, _>("seq").ok() == Some(root_post_seq))
+    else {
+        anyhow::bail!("no post {root_post_seq} in channel {channel_id}");
+    };
+    let root_data = parse(root.try_get("data")?);
+    let root_body = root_data["body"].as_str().unwrap_or("").to_string();
+    let root_created: String = root.try_get("created_at")?;
+    let title = thread_title(&root_body, channel_id);
+
+    // Create the task: root body -> description, timestamped at the thread's root.
+    let tid: i64 = sqlx::query(
+        "INSERT INTO tasks(project_id, title, description, created_by, metadata, status, created_at, updated_at) \
+         VALUES(?,?,?,?, '{}', 'todo', ?, ?) RETURNING id",
+    )
+    .bind(project_id)
+    .bind(&title)
+    .bind(&root_body)
+    .bind(actor)
+    .bind(&root_created)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    auto_subscribe(&mut tx, actor, tid).await?;
+
+    // Record the link FIRST (idempotency anchor), atomic with the import below.
+    sqlx::query(
+        "INSERT INTO task_links(task_id, source_kind, source_id, metadata, created_at) VALUES(?,?,?,?,?)",
+    )
+    .bind(tid)
+    .bind(source_kind)
+    .bind(&source_id)
+    .bind(json!({ "channel_id": channel_id, "root_post_seq": root_post_seq }).to_string())
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+
+    // Import each DIRECT reply (one-level threading) as a comment, oldest first, preserving
+    // author / external_author / timestamp, and stamping origin_ref with the source post seq.
+    let mut imported = 0i64;
+    for r in &posts {
+        let seq: i64 = r.try_get("seq")?;
+        if seq == root_post_seq {
+            continue;
+        }
+        let data = parse(r.try_get("data")?);
+        if data["reply_to"].as_i64() != Some(root_post_seq) {
+            continue;
+        }
+        let created: String = r.try_get("created_at")?;
+        sqlx::query(
+            "INSERT INTO comments(task_id, author, body, created_at, external_author, origin_ref) \
+             VALUES(?,?,?,?,?,?)",
+        )
+        .bind(tid)
+        .bind(data["from"].as_str())
+        .bind(data["body"].as_str().unwrap_or(""))
+        .bind(&created)
+        .bind(data["external_author"].as_str())
+        .bind(seq.to_string())
+        .execute(&mut *tx)
+        .await?;
+        imported += 1;
+    }
+
+    emit(
+        &mut tx,
+        &mut hooks,
+        "task.created",
+        actor,
+        Some(tid),
+        Some(project_id),
+        None,
+        None,
+        json!({ "title": title, "promoted_from": source_id }),
+        Recipients::FromTask,
+    )
+    .await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "channel.thread_promoted",
+        actor,
+        Some(tid),
+        Some(project_id),
+        Some(channel_id),
+        None,
+        json!({ "channel_id": channel_id, "root_post_seq": root_post_seq, "task_id": tid, "imported_comments": imported }),
+        Recipients::FromChannel(channel_id),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({
+        "task_id": tid,
+        "channel_id": channel_id,
+        "root_post_seq": root_post_seq,
+        "imported_comments": imported,
+        "already_promoted": false,
+    }))
 }
 
 /// Read a channel's post backlog after `since_seq`, oldest first (a fresh joiner needs
@@ -4033,6 +4211,62 @@ mod tests {
         post_to_channel(&pool, pid, "concierge", "now out", None, None).await?;
         let ev = get_events(&pool, 0, 500).await?;
         assert_eq!(reflects(&ev, pid).len(), 1, "policy configurable after creation");
+        Ok(())
+    }
+
+    /// promote_thread (#151 §7): a channel thread imports into a task — root→description,
+    /// direct replies→comments preserving author/external-author + timestamps — and the
+    /// thread↔task link makes it idempotent.
+    #[tokio::test]
+    async fn promote_thread_imports_and_is_idempotent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "concierge", None, None, None, None, None).await?;
+        register_agent(&pool, "slack-bridge", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("concierge"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let ch = create_channel(&pool, "planning", None, Some("concierge"), None).await?;
+        let cid = ch["id"].as_i64().unwrap();
+
+        // A thread: root + two direct replies (one attributed to an external human) + an
+        // unrelated top-level post that must NOT be imported.
+        let root = post_to_channel(&pool, cid, "concierge", "Root topic\nmore detail", None, None).await?;
+        let root_seq = root["seq"].as_i64().unwrap();
+        let r1 = post_to_channel(&pool, cid, "slack-bridge", "reply from ada", Some(root_seq), Some("slack:U1")).await?;
+        let r1_seq = r1["seq"].as_i64().unwrap();
+        post_to_channel(&pool, cid, "concierge", "second reply", Some(root_seq), None).await?;
+        post_to_channel(&pool, cid, "concierge", "unrelated top-level", None, None).await?;
+
+        let res = promote_thread(&pool, cid, root_seq, pid, Some("concierge")).await?;
+        let tid = res["task_id"].as_i64().unwrap();
+        assert_eq!(res["imported_comments"], json!(2), "only the two direct replies import");
+        assert_eq!(res["already_promoted"], json!(false));
+
+        let task = get_task(&pool, tid).await?;
+        assert_eq!(task["title"], json!("Root topic"), "title = root's first line");
+        assert_eq!(task["description"], json!("Root topic\nmore detail"), "root body -> description");
+        let comments = task["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["body"], json!("reply from ada"));
+        assert_eq!(comments[0]["author"], json!("slack-bridge"), "ingester preserved");
+        assert_eq!(comments[0]["external_author"], json!("slack:U1"), "attribution preserved");
+        assert_eq!(comments[0]["origin_ref"], json!(r1_seq.to_string()), "origin id recorded for sync/dedup");
+        assert_eq!(comments[1]["body"], json!("second reply"));
+
+        // Timestamp fidelity: the imported comment carries the original reply's created_at.
+        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        let r1_created = posts.as_array().unwrap().iter()
+            .find(|p| p["seq"].as_i64() == Some(r1_seq)).unwrap()["created_at"].clone();
+        assert_eq!(comments[0]["created_at"], r1_created, "reply timestamp preserved");
+
+        // Idempotent: re-promoting returns the same task, no re-import, no duplicate comments.
+        let again = promote_thread(&pool, cid, root_seq, pid, Some("concierge")).await?;
+        assert_eq!(again["task_id"], json!(tid));
+        assert_eq!(again["already_promoted"], json!(true));
+        assert_eq!(get_task(&pool, tid).await?["comments"].as_array().unwrap().len(), 2, "no duplicate import");
+
+        // A missing root post is an error.
+        assert!(promote_thread(&pool, cid, 999999, pid, Some("concierge")).await.is_err());
         Ok(())
     }
 }

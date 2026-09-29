@@ -385,6 +385,19 @@ pub struct SetChannelPropsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PromoteThreadArgs {
+    pub channel_id: i64,
+    /// The seq of the thread's root post (its replies — posts with reply_to == this — are
+    /// imported as task comments).
+    pub root_post_seq: i64,
+    /// Project the new task is created in.
+    pub project_id: i64,
+    /// Who is promoting (task creator + subscriber). Defaults to your session identity.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InviteToChannelArgs {
     pub channel_id: i64,
     /// The agent to invite (auto-joined).
@@ -944,6 +957,20 @@ impl Board {
         Parameters(a): Parameters<SetChannelPropsArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::set_channel_props(&self.pool, a.channel_id, Value::Object(a.props))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Promote a channel thread into a task: the root post becomes the task description and each direct reply becomes a comment (preserving author / external-author attribution + timestamps). Installs a durable thread↔task link; idempotent — re-promoting the same thread returns the existing task, never a duplicate. Pass the root post's seq as root_post_seq."
+    )]
+    async fn promote_thread(
+        &self,
+        Parameters(a): Parameters<PromoteThreadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::promote_thread(&self.pool, a.channel_id, a.root_post_seq, a.project_id, actor.as_deref())
             .await
             .map_err(err)
             .and_then(ok)
