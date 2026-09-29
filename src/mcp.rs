@@ -211,6 +211,11 @@ pub struct CreateTaskArgs {
     /// Optional parent task (makes this a child/subtask). The parent must be in the same project.
     #[serde(default)]
     pub parent_id: Option<i64>,
+    /// Optional external reference for idempotent ingest (bridge adapters). If a task is already
+    /// linked on (source, external_id) it's returned with `created:false` instead of a duplicate;
+    /// otherwise the task is created and the link recorded atomically (`created:true`).
+    #[serde(default)]
+    pub external_link: Option<core::ExternalRef>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -306,6 +311,11 @@ pub struct CommentTaskArgs {
     /// ingested human. `author` stays the fleet agent (you) that performed the write.
     #[serde(default)]
     pub external_author: Option<String>,
+    /// Optional external reference for idempotent ingest (bridge adapters). If a comment is
+    /// already linked on (source, external_id) it's returned with `created:false` instead of a
+    /// duplicate; otherwise the comment is created and the link recorded atomically.
+    #[serde(default)]
+    pub external_link: Option<core::ExternalRef>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -848,6 +858,7 @@ impl Board {
             created_by.as_deref(),
             a.metadata.map(Value::Object),
             a.parent_id,
+            a.external_link,
         )
         .await
         .map_err(err)
@@ -939,7 +950,7 @@ impl Board {
         Parameters(a): Parameters<CommentTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let author = self.me_opt(s(&a.author));
-        core::comment_task(&self.pool, a.task_id, &a.body, author.as_deref(), s(&a.external_author))
+        core::comment_task(&self.pool, a.task_id, &a.body, author.as_deref(), s(&a.external_author), a.external_link)
             .await
             .map_err(err)
             .and_then(ok)

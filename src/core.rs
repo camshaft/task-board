@@ -625,6 +625,23 @@ pub async fn get_project(pool: &Pool, project_id: i64) -> anyhow::Result<Value> 
 
 // --- Tasks ---
 
+/// An external-system reference for idempotent ingest (task 270). A bridge adapter passes this
+/// when creating a task from an external item (or commenting from an external comment); the board
+/// dedups on `(source, external_id)` so the create/comment is exactly-once even if the adapter
+/// retries — collapsing the old create-then-link two-call race. `source` + `external_id` are the
+/// dedup key; `external_parent_id` records the external parent (e.g. the issue an ingested comment
+/// belongs to).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+pub struct ExternalRef {
+    /// External system, e.g. "github" or "slack".
+    pub source: String,
+    /// The external system's stable id for this item (issue key, comment id, ...). The dedup key.
+    pub external_id: String,
+    /// Optional external parent id (e.g. the issue an ingested comment belongs to).
+    #[serde(default)]
+    pub external_parent_id: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_task(
     pool: &Pool,
@@ -636,6 +653,7 @@ pub async fn create_task(
     created_by: Option<&str>,
     metadata: Option<Value>,
     parent_id: Option<i64>,
+    external_link: Option<ExternalRef>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -647,6 +665,30 @@ pub async fn create_task(
         .is_none()
     {
         anyhow::bail!("no project {project_id}");
+    }
+    // Idempotent ingest (task 270): if an external_link is given and a task is ALREADY linked on
+    // (source, external_id), return that existing task with `created:false` — no duplicate. The
+    // SELECT-then-INSERT is atomic under one tx (the pool serializes writers), so a retrying
+    // adapter can't race two tasks in. `created` is injected into the returned task object.
+    if let Some(ext) = &external_link {
+        if let Some(row) = sqlx::query(
+            "SELECT board_id FROM external_links WHERE source=? AND external_id=? AND board_kind='task'",
+        )
+        .bind(&ext.source)
+        .bind(&ext.external_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let existing: i64 = row.try_get("board_id")?;
+            let mut out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", existing)
+                .await?
+                .unwrap_or(Value::Null);
+            if let Value::Object(ref mut m) = out {
+                m.insert("created".into(), json!(false));
+            }
+            tx.commit().await?;
+            return Ok(out);
+        }
     }
     // A parent must exist and live in the SAME project (cross-project nesting is disallowed).
     if let Some(pid) = parent_id {
@@ -697,9 +739,28 @@ pub async fn create_task(
         Recipients::FromTask,
     )
     .await?;
-    let out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", tid)
+    // Record the external dedup link atomically with the create (task 270). Plain INSERT: within
+    // this tx a matching row was already ruled out above, and the pool serializes writers.
+    if let Some(ext) = &external_link {
+        sqlx::query(
+            "INSERT INTO external_links(source, external_id, external_parent_id, board_kind, board_id, metadata, created_at, updated_at) \
+             VALUES(?,?,?,'task',?,'{}',?,?)",
+        )
+        .bind(&ext.source)
+        .bind(&ext.external_id)
+        .bind(&ext.external_parent_id)
+        .bind(tid)
+        .bind(&ts)
+        .bind(&ts)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let mut out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", tid)
         .await?
         .unwrap_or(Value::Null);
+    if let Value::Object(ref mut m) = out {
+        m.insert("created".into(), json!(true));
+    }
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -1333,6 +1394,7 @@ pub async fn comment_task(
     body: &str,
     author: Option<&str>,
     external_author: Option<&str>,
+    external_link: Option<ExternalRef>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -1344,6 +1406,23 @@ pub async fn comment_task(
         .is_none()
     {
         anyhow::bail!("no task {task_id}");
+    }
+    // Idempotent ingest (task 270): if an external_link is given and a comment is ALREADY linked
+    // on (source, external_id), return it with `created:false` — no duplicate comment, no repeat
+    // fan-out/reflect. Same atomic SELECT-then-INSERT-under-one-tx guarantee as create_task.
+    if let Some(ext) = &external_link {
+        if let Some(row) = sqlx::query(
+            "SELECT board_id FROM external_links WHERE source=? AND external_id=? AND board_kind='comment'",
+        )
+        .bind(&ext.source)
+        .bind(&ext.external_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let existing: i64 = row.try_get("board_id")?;
+            tx.commit().await?;
+            return Ok(json!({ "comment_id": existing, "task_id": task_id, "created": false }));
+        }
     }
     // `author` is the fleet agent that wrote/ingested the comment (drives auto-subscribe +
     // notification actor); `external_author`, when set, is the external_identities id the
@@ -1432,9 +1511,26 @@ pub async fn comment_task(
     }
     // If this task mirrors a promoted channel thread, fan the comment back out as a thread reply.
     mirror_task_comment_to_thread(&mut tx, &mut hooks, task_id, cid, author, body, external_author).await?;
+    // Record the external dedup link (board_kind='comment', board_id=comment id) atomically with
+    // the insert (task 270), so a retrying adapter re-hits the short-circuit above instead of
+    // duplicating the comment.
+    if let Some(ext) = &external_link {
+        sqlx::query(
+            "INSERT INTO external_links(source, external_id, external_parent_id, board_kind, board_id, metadata, created_at, updated_at) \
+             VALUES(?,?,?,'comment',?,'{}',?,?)",
+        )
+        .bind(&ext.source)
+        .bind(&ext.external_id)
+        .bind(&ext.external_parent_id)
+        .bind(cid)
+        .bind(&ts)
+        .bind(&ts)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
-    Ok(json!({ "comment_id": cid, "task_id": task_id }))
+    Ok(json!({ "comment_id": cid, "task_id": task_id, "created": true }))
 }
 
 /// Merge arbitrary key/value properties into a task's metadata (JSON). Returns the
@@ -2581,7 +2677,7 @@ fn hydrate_external_identity(r: &SqliteRow) -> Value {
 // --- External links (bridged mappings: channel-map, issue↔task, thread↔task) ---
 
 /// The board entity kinds an external link may target.
-const EXTERNAL_LINK_KINDS: &[&str] = &["channel", "task", "thread"];
+const EXTERNAL_LINK_KINDS: &[&str] = &["channel", "task", "thread", "comment"];
 
 /// Create or update a mapping between a board entity and an external one — the generic link
 /// behind the Slack channel-map, the GitHub issue↔task bridge, and thread promotion. Idempotent
@@ -2606,11 +2702,11 @@ pub async fn upsert_external_link(
         anyhow::bail!("give an `external_id` for the external link (the external system's key)");
     }
     if !EXTERNAL_LINK_KINDS.contains(&board_kind) {
-        anyhow::bail!("give a `board_kind` of one of: channel, task, thread");
+        anyhow::bail!("give a `board_kind` of one of: channel, task, thread, comment");
     }
     let ts = now_iso();
     let mut tx = pool.begin().await?;
-    // A clean 404 for the two kinds backed by a real table (thread = a channel post seq, skipped).
+    // A clean 404 for the kinds backed by a real table (thread = a channel post seq, skipped).
     match board_kind {
         "channel" => {
             if sqlx::query("SELECT 1 FROM channels WHERE id=?").bind(board_id).fetch_optional(&mut *tx).await?.is_none() {
@@ -2620,6 +2716,11 @@ pub async fn upsert_external_link(
         "task" => {
             if sqlx::query("SELECT 1 FROM tasks WHERE id=?").bind(board_id).fetch_optional(&mut *tx).await?.is_none() {
                 anyhow::bail!("no task {board_id}");
+            }
+        }
+        "comment" => {
+            if sqlx::query("SELECT 1 FROM comments WHERE id=?").bind(board_id).fetch_optional(&mut *tx).await?.is_none() {
+                anyhow::bail!("no comment {board_id}");
             }
         }
         _ => {}
@@ -3867,11 +3968,11 @@ mod tests {
 
         let p = create_project(&pool, "Voron tuning", Some("dial in the printer"), Some("planner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None, None).await?;
+        let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         subscribe(&pool, "planner", Some(tid), None, None, None, false).await?; // (already auto-subscribed as creator)
-        comment_task(&pool, tid, "Start from PA=0.03", Some("planner"), None).await?;
+        comment_task(&pool, tid, "Start from PA=0.03", Some("planner"), None, None).await?;
         update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None, None, None).await?;
         update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None, None, None).await?;
         send_message(&pool, "fixer", "planner", "PA done, landed at 0.032").await?;
@@ -3913,9 +4014,9 @@ mod tests {
         // Activity by another actor, in projects the watcher never joined.
         let a = create_project(&pool, "A", None, Some("alice"), None).await?;
         let aid = a["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("alice"), None, None).await?;
+        let t = create_task(&pool, aid, "T", None, None, None, Some("alice"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
-        comment_task(&pool, tid, "hi", Some("alice"), None).await?;
+        comment_task(&pool, tid, "hi", Some("alice"), None, None).await?;
         create_project(&pool, "B", None, Some("alice"), None).await?;
 
         // The watcher hears all four: project.created (A, silent to others), task.created,
@@ -4117,23 +4218,23 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("owner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("owner"), None, None).await?;
+        let t = create_task(&pool, pid, "T", None, None, None, Some("owner"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Baseline: another agent's comment reaches the creator (they're in the fan-out).
-        comment_task(&pool, tid, "hello", Some("bob"), None).await?;
+        comment_task(&pool, tid, "hello", Some("bob"), None, None).await?;
         let n = check_notifications(&pool, "owner", true, 50, None).await?;
         assert_eq!(n["count"], json!(1), "creator hears the comment before muting");
 
         // Mute for the owner → subsequent task events no longer reach them.
         mute_task(&pool, "owner", tid).await?;
-        comment_task(&pool, tid, "hello again", Some("bob"), None).await?;
+        comment_task(&pool, tid, "hello again", Some("bob"), None, None).await?;
         let n = check_notifications(&pool, "owner", true, 50, None).await?;
         assert_eq!(n["count"], json!(0), "muted creator gets no fan-out for the task");
 
         // Unmute → back in the fan-out.
         unmute_task(&pool, "owner", tid).await?;
-        comment_task(&pool, tid, "third", Some("bob"), None).await?;
+        comment_task(&pool, tid, "third", Some("bob"), None, None).await?;
         let n = check_notifications(&pool, "owner", true, 50, None).await?;
         assert_eq!(n["count"], json!(1), "unmuted creator hears comments again");
 
@@ -4453,7 +4554,7 @@ mod tests {
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         // A task owned by alice, and a doc authored by bob.
-        let t = create_task(&pool, pid, "Build widget", None, Some("alice"), None, Some("alice"), None, None)
+        let t = create_task(&pool, pid, "Build widget", None, Some("alice"), None, Some("alice"), None, None, None)
             .await?;
         let tid = t["id"].as_i64().unwrap();
         let d = create_document(&pool, "Widget design", None, "bafy1", None, Some("bob"), None, None, None).await?;
@@ -4536,7 +4637,7 @@ mod tests {
         approve_document(&pool, cid, Some("op")).await?;
 
         // Attach A to a task.
-        let t = create_task(&pool, pid, "T", None, None, None, Some("u"), None, None).await?;
+        let t = create_task(&pool, pid, "T", None, None, None, Some("u"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
         attach_document(&pool, aid, tid, Some("u")).await?;
 
@@ -4584,17 +4685,17 @@ mod tests {
         };
 
         // An epic with two children.
-        let epic = create_task(&pool, pid, "Epic", None, None, None, Some("u"), None, None).await?;
+        let epic = create_task(&pool, pid, "Epic", None, None, None, Some("u"), None, None, None).await?;
         let eid = epic["id"].as_i64().unwrap();
-        let c1 = create_task(&pool, pid, "c1", None, None, None, Some("u"), None, Some(eid)).await?;
+        let c1 = create_task(&pool, pid, "c1", None, None, None, Some("u"), None, Some(eid), None).await?;
         let c1id = c1["id"].as_i64().unwrap();
-        let c2 = create_task(&pool, pid, "c2", None, None, None, Some("u"), None, Some(eid)).await?;
+        let c2 = create_task(&pool, pid, "c2", None, None, None, Some("u"), None, Some(eid), None).await?;
         let c2id = c2["id"].as_i64().unwrap();
 
         // Cross-project parent rejected at create.
-        assert!(create_task(&pool, pid2, "x", None, None, None, Some("u"), None, Some(eid)).await.is_err());
+        assert!(create_task(&pool, pid2, "x", None, None, None, Some("u"), None, Some(eid), None).await.is_err());
         // Non-existent parent rejected.
-        assert!(create_task(&pool, pid, "y", None, None, None, Some("u"), None, Some(99999)).await.is_err());
+        assert!(create_task(&pool, pid, "y", None, None, None, Some("u"), None, Some(99999), None).await.is_err());
 
         // get_task: children + roll-up.
         let e = get_task(&pool, eid).await?;
@@ -4646,9 +4747,9 @@ mod tests {
         let p2 = create_project(&pool, "Beta", None, Some("u"), None).await?;
         let pid2 = p2["id"].as_i64().unwrap();
 
-        create_task(&pool, pid1, "Fix the widget pipeline", Some("handles reflow"), None, None, Some("u"), None, None).await?;
-        create_task(&pool, pid1, "Unrelated chore", None, None, None, Some("u"), None, None).await?;
-        create_task(&pool, pid2, "Widget docs", Some("describe the WIDGET api"), Some("alice"), None, Some("u"), None, None).await?;
+        create_task(&pool, pid1, "Fix the widget pipeline", Some("handles reflow"), None, None, Some("u"), None, None, None).await?;
+        create_task(&pool, pid1, "Unrelated chore", None, None, None, Some("u"), None, None, None).await?;
+        create_task(&pool, pid2, "Widget docs", Some("describe the WIDGET api"), Some("alice"), None, Some("u"), None, None, None).await?;
 
         let titles = |v: &Value| -> Vec<String> {
             let mut t: Vec<String> =
@@ -4693,7 +4794,7 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, None, None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, None, Some(json!({"a": 1})), None).await?;
+        let t = create_task(&pool, pid, "T", None, None, None, None, Some(json!({"a": 1})), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         set_task_props(&pool, tid, json!({"b": 2})).await?;
@@ -4851,7 +4952,7 @@ mod tests {
                 .await?;
         }
         // ids: 1 = "Backend" (earlier), 2 = "backend" (later).
-        create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None, None).await?;
+        create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None, None, None).await?;
         // Same subscriber on both projects -> collision on repoint; both on dupe only too.
         subscribe(&pool, "alice", None, Some(1), None, None, false).await?;
         subscribe(&pool, "alice", None, Some(2), None, None, false).await?; // will collide with keep=1
@@ -4948,7 +5049,7 @@ mod tests {
         let b = create_project(&pool, "B", None, Some("u"), None).await?;
         let aid = a["id"].as_i64().unwrap();
         let bid = b["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None, None).await?;
+        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         let moved = move_task(&pool, tid, bid, Some("u")).await?;
@@ -4984,8 +5085,8 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        create_task(&pool, pid, "owned", None, Some("alice"), None, Some("u"), None, None).await?;
-        create_task(&pool, pid, "free", None, None, None, Some("u"), None, None).await?;
+        create_task(&pool, pid, "owned", None, Some("alice"), None, Some("u"), None, None, None).await?;
+        create_task(&pool, pid, "free", None, None, None, Some("u"), None, None, None).await?;
 
         // unassigned=true -> only the ownerless task.
         let un = list_tasks(&pool, Some(pid), None, None, true, None, false, None, None, None).await?;
@@ -5023,7 +5124,7 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, Some("alice"), None, Some("u"), None, None).await?;
+        let t = create_task(&pool, pid, "T", None, Some("alice"), None, Some("u"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Clear the owner.
@@ -5073,7 +5174,7 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let a = create_project(&pool, "A", None, Some("u"), None).await?;
         let aid = a["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None, None).await?;
+        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
         assert!(move_task(&pool, tid, 9999, Some("u")).await.is_err());
         Ok(())
@@ -5307,9 +5408,9 @@ mod tests {
         // A comment ingested by the bridge, attributed to the external human.
         let p = create_project(&pool, "P", None, Some("slack-bridge"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("slack-bridge"), None, None).await?;
+        let t = create_task(&pool, pid, "T", None, None, None, Some("slack-bridge"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
-        comment_task(&pool, tid, "hi from slack", Some("slack-bridge"), Some("slack:U123")).await?;
+        comment_task(&pool, tid, "hi from slack", Some("slack-bridge"), Some("slack:U123"), None).await?;
         let task = get_task(&pool, tid).await?;
         let c0 = &task["comments"][0];
         assert_eq!(c0["author"], json!("slack-bridge"), "author is the fleet ingester");
@@ -5442,7 +5543,7 @@ mod tests {
         };
 
         // A task linked to a GitHub issue, out-enabled with the default allowlist (concierge).
-        let task = create_task(&pool, pid, "t", None, None, None, Some("concierge"), None, None).await?;
+        let task = create_task(&pool, pid, "t", None, None, None, Some("concierge"), None, None, None).await?;
         let tid = task["id"].as_i64().unwrap();
         upsert_external_link(
             &pool, "github", "camshaft/task-board#42", Some("issue"), "task", tid,
@@ -5451,7 +5552,7 @@ mod tests {
         .await?;
 
         // Allowed author -> one reflect event carrying the comment + external target.
-        comment_task(&pool, tid, "reflect me", Some("concierge"), None).await?;
+        comment_task(&pool, tid, "reflect me", Some("concierge"), None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         let r = reflects(&ev, tid);
         assert_eq!(r.len(), 1, "allowed author reflects out");
@@ -5463,14 +5564,14 @@ mod tests {
         assert!(r[0]["data"]["comment_id"].as_i64().is_some());
 
         // Denied author (the ingesting bridge, not in outbound_authors) -> no echo back out.
-        comment_task(&pool, tid, "ingested from github", Some("gh-bridge"), Some("github:U9")).await?;
+        comment_task(&pool, tid, "ingested from github", Some("gh-bridge"), Some("github:U9"), None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(reflects(&ev, tid).len(), 1, "ingested comment stays board-internal (loop-safe)");
 
         // A task with no external link never reflects, even for an allowed author.
-        let plain = create_task(&pool, pid, "unlinked", None, None, None, Some("concierge"), None, None).await?;
+        let plain = create_task(&pool, pid, "unlinked", None, None, None, Some("concierge"), None, None, None).await?;
         let plain_id = plain["id"].as_i64().unwrap();
-        comment_task(&pool, plain_id, "hi", Some("concierge"), None).await?;
+        comment_task(&pool, plain_id, "hi", Some("concierge"), None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(reflects(&ev, plain_id).len(), 0, "unlinked task is board-internal");
 
@@ -5481,11 +5582,63 @@ mod tests {
             Some(json!({ "direction": "in" })),
         )
         .await?;
-        comment_task(&pool, tid, "second reflect", Some("concierge"), None).await?;
+        comment_task(&pool, tid, "second reflect", Some("concierge"), None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         let r = reflects(&ev, tid);
         assert_eq!(r.len(), 2, "only the out-enabled link fires; inbound link stays internal");
         assert!(r.iter().all(|e| e["data"]["source"] == json!("github")), "gitlab (in) never reflects");
+        Ok(())
+    }
+
+    /// Idempotent external ingest (task 270): create_task / comment_task with an `external_link`
+    /// dedup on (source, external_id), so a retrying bridge adapter is exactly-once — no duplicate
+    /// task or comment, and the existing entity is returned with `created:false`.
+    #[tokio::test]
+    async fn idempotent_ingest_dedups_on_external_link() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "gh", None, None, None, None, None).await?;
+        let pid = create_project(&pool, "P", None, Some("gh"), None).await?["id"].as_i64().unwrap();
+        let link = ExternalRef {
+            source: "github".into(),
+            external_id: "camshaft/x#1".into(),
+            external_parent_id: Some("issue".into()),
+        };
+
+        // First ingest: creates the task + link, created:true.
+        let a = create_task(&pool, pid, "issue 1", None, None, None, Some("gh"), None, None, Some(link.clone())).await?;
+        assert_eq!(a["created"], json!(true));
+        let tid = a["id"].as_i64().unwrap();
+
+        // Retry with the SAME (source, external_id): returns the SAME task, created:false, no dup —
+        // even though the retry passed a different title.
+        let b = create_task(&pool, pid, "issue 1 RETRY", None, None, None, Some("gh"), None, None, Some(link.clone())).await?;
+        assert_eq!(b["created"], json!(false));
+        assert_eq!(b["id"].as_i64().unwrap(), tid, "same task, not a duplicate");
+        assert_eq!(b["title"], json!("issue 1"), "existing task returned unchanged");
+        let tasks = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None).await?;
+        assert_eq!(tasks.as_array().unwrap().len(), 1, "exactly one task, no duplicate");
+
+        // Comment idempotency on the new board_kind='comment'.
+        let clink = ExternalRef {
+            source: "github".into(),
+            external_id: "camshaft/x#1-c9".into(),
+            external_parent_id: Some("camshaft/x#1".into()),
+        };
+        let c1 = comment_task(&pool, tid, "hi from github", Some("gh"), Some("github:U1"), Some(clink.clone())).await?;
+        assert_eq!(c1["created"], json!(true));
+        let cid = c1["comment_id"].as_i64().unwrap();
+        let c2 = comment_task(&pool, tid, "hi from github RETRY", Some("gh"), Some("github:U1"), Some(clink.clone())).await?;
+        assert_eq!(c2["created"], json!(false));
+        assert_eq!(c2["comment_id"].as_i64().unwrap(), cid, "same comment, not a duplicate");
+        let got = get_task(&pool, tid).await?;
+        assert_eq!(got["comments"].as_array().unwrap().len(), 1, "exactly one comment, no duplicate");
+
+        // A create/comment WITHOUT an external_link is unaffected and reports created:true.
+        let plain = create_task(&pool, pid, "manual", None, None, None, Some("gh"), None, None, None).await?;
+        assert_eq!(plain["created"], json!(true));
+        let pc = comment_task(&pool, tid, "manual comment", Some("gh"), None, None).await?;
+        assert_eq!(pc["created"], json!(true));
         Ok(())
     }
 
@@ -5555,7 +5708,7 @@ mod tests {
         let cid = ch["id"].as_i64().unwrap();
         let p = create_project(&pool, "P", None, Some("concierge"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("concierge"), None, None).await?;
+        let t = create_task(&pool, pid, "T", None, None, None, Some("concierge"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Channel-map link (board channel <-> Slack channel).
@@ -5620,7 +5773,7 @@ mod tests {
         assert_eq!(get_channel_posts(&pool, cid, 0, 100).await?.as_array().unwrap().len(), 2, "root + r1 only");
 
         // Direction 2: a new task comment -> a thread reply.
-        comment_task(&pool, tid, "reply from board", Some("worker"), None).await?;
+        comment_task(&pool, tid, "reply from board", Some("worker"), None, None).await?;
         let posts = get_channel_posts(&pool, cid, 0, 100).await?;
         let posts = posts.as_array().unwrap();
         assert_eq!(posts.len(), 3, "root + r1 + the mirrored comment");
@@ -5632,8 +5785,8 @@ mod tests {
         assert_eq!(get_task(&pool, tid).await?["comments"].as_array().unwrap().len(), 2, "no echo comment");
 
         // Safety: a comment on a NON-linked task posts nothing to the channel.
-        let solo = create_task(&pool, pid, "solo", None, None, None, Some("worker"), None, None).await?["id"].as_i64().unwrap();
-        comment_task(&pool, solo, "unrelated", Some("worker"), None).await?;
+        let solo = create_task(&pool, pid, "solo", None, None, None, Some("worker"), None, None, None).await?["id"].as_i64().unwrap();
+        comment_task(&pool, solo, "unrelated", Some("worker"), None, None).await?;
         assert_eq!(get_channel_posts(&pool, cid, 0, 100).await?.as_array().unwrap().len(), 3, "unlinked task doesn't post");
         Ok(())
     }
@@ -5652,11 +5805,11 @@ mod tests {
         register_agent(&pool, "op1", None, None, None, None, None).await?;
         let pid = create_project(&pool, "P", None, Some("creator"), None).await?["id"].as_i64().unwrap();
         // Task with NO assignee, so `watcher` is a PURE subscriber (not assignee/creator).
-        let tid = create_task(&pool, pid, "T", None, None, None, Some("creator"), None, None).await?["id"].as_i64().unwrap();
+        let tid = create_task(&pool, pid, "T", None, None, None, Some("creator"), None, None, None).await?["id"].as_i64().unwrap();
         subscribe(&pool, "watcher", Some(tid), None, None, None, false).await?;
 
         // op1 comments -> the pure subscriber hears it; the author (op1) does not hear its own.
-        comment_task(&pool, tid, "first", Some("op1"), None).await?;
+        comment_task(&pool, tid, "first", Some("op1"), None, None).await?;
         let w = check_notifications(&pool, "watcher", true, 50, None).await?;
         assert_eq!(w["count"].as_i64(), Some(1), "pure subscriber notified: {w}");
         assert_eq!(w["notifications"][0]["type"], json!("task.commented"));
@@ -5664,7 +5817,7 @@ mod tests {
         assert_eq!(check_notifications(&pool, "op1", true, 50, None).await?["count"].as_i64(), Some(0), "author not notified of own comment");
 
         // Commenting auto-subscribed op1, so it hears a subsequent comment by someone else.
-        comment_task(&pool, tid, "second", Some("watcher"), None).await?;
+        comment_task(&pool, tid, "second", Some("watcher"), None, None).await?;
         let o = check_notifications(&pool, "op1", true, 50, None).await?;
         assert_eq!(o["count"].as_i64(), Some(1), "commenter auto-subscribed, hears later comments: {o}");
         assert_eq!(o["notifications"][0]["type"], json!("task.commented"));
@@ -5686,8 +5839,8 @@ mod tests {
         register_agent(&pool, "a", None, None, None, None, None).await?;
         register_agent(&pool, "b", None, None, None, None, None).await?;
         let pid = create_project(&pool, "P", None, Some("a"), None).await?["id"].as_i64().unwrap();
-        let tid = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None).await?["id"].as_i64().unwrap();
-        comment_task(&pool, tid, "hi", Some("b"), None).await?;
+        let tid = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None, None).await?["id"].as_i64().unwrap();
+        comment_task(&pool, tid, "hi", Some("b"), None, None).await?;
 
         let all = get_events(&pool, 0, 500, None, false).await?;
         assert!(all.as_array().unwrap().len() >= 3, "project.created + task.created + task.commented");
@@ -5721,7 +5874,7 @@ mod tests {
         // Generate a run of events (project.created + one task.created per create_task).
         let mut tids = Vec::new();
         for i in 0..6 {
-            tids.push(create_task(&pool, pid, &format!("T{i}"), None, None, None, Some("a"), None, None).await?["id"].as_i64().unwrap());
+            tids.push(create_task(&pool, pid, &format!("T{i}"), None, None, None, Some("a"), None, None, None).await?["id"].as_i64().unwrap());
         }
 
         let seq_of = |v: &Value| v["seq"].as_i64().unwrap();
@@ -5741,7 +5894,7 @@ mod tests {
         assert!(!latest.iter().any(|e| e["type"] == json!("project.created")), "oldest event excluded from latest-N");
 
         // The feed advances: a new event becomes the new desc head.
-        comment_task(&pool, tids[0], "newest", Some("a"), None).await?;
+        comment_task(&pool, tids[0], "newest", Some("a"), None, None).await?;
         let latest2 = get_events(&pool, 0, 3, None, true).await?;
         let latest2 = latest2.as_array().unwrap();
         assert_eq!(latest2[0]["type"], json!("task.commented"), "the just-added event leads");
@@ -5799,9 +5952,9 @@ mod tests {
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         register_agent(&pool, "agent:rev", None, None, None, None, None).await?;
-        let t = create_task(&pool, pid, "Ship it", None, None, None, Some("alice"), None, None).await?;
+        let t = create_task(&pool, pid, "Ship it", None, None, None, Some("alice"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
-        let dep = create_task(&pool, pid, "Dependency", None, None, None, Some("bob"), None, None).await?;
+        let dep = create_task(&pool, pid, "Dependency", None, None, None, Some("bob"), None, None, None).await?;
         let dep_id = dep["id"].as_i64().unwrap();
 
         // Enforcement: blocked without a blocked_on is rejected (maps to 400 via the "give " prefix).
@@ -5876,9 +6029,9 @@ mod tests {
                 for r in 0..ROUNDS {
                     // A burst mixing the common write paths, incl. the read->write upgrade in
                     // check_notifications (subscribed to the task it just created).
-                    let t = create_task(&pool, pid, &format!("t{w}-{r}"), None, None, None, Some(&agent), None, None).await?;
+                    let t = create_task(&pool, pid, &format!("t{w}-{r}"), None, None, None, Some(&agent), None, None, None).await?;
                     let tid = t["id"].as_i64().unwrap();
-                    comment_task(&pool, tid, "working", Some(&agent), None).await?;
+                    comment_task(&pool, tid, "working", Some(&agent), None, None).await?;
                     update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some(&agent), None, None, None).await?;
                     check_notifications(&pool, &agent, true, 50, None).await?;
                 }
