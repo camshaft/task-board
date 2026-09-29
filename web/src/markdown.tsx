@@ -1,4 +1,4 @@
-import { createContext, useContext, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 
 // Minimal, dependency-free Markdown renderer. It emits a React element tree (never
@@ -155,6 +155,7 @@ function blocks(src: string, resolve: WikiResolver): ReactNode[] {
     const t = line.trim()
 
     if (t.startsWith('```')) {
+      const lang = t.slice(3).trim().toLowerCase()
       const buf: string[] = []
       i++
       while (i < lines.length && !lines[i].trim().startsWith('```')) {
@@ -162,13 +163,18 @@ function blocks(src: string, resolve: WikiResolver): ReactNode[] {
         i++
       }
       if (i < lines.length) i++ // consume closing fence
+      // A ```mermaid block renders as a diagram (lazy-loaded); anything else is a code block.
       out.push(
-        <pre
-          key={k++}
-          className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 font-mono text-xs"
-        >
-          <code>{buf.join('\n')}</code>
-        </pre>,
+        lang === 'mermaid' ? (
+          <Mermaid key={k++} code={buf.join('\n')} />
+        ) : (
+          <pre
+            key={k++}
+            className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 font-mono text-xs"
+          >
+            <code>{buf.join('\n')}</code>
+          </pre>
+        ),
       )
       continue
     }
@@ -251,4 +257,48 @@ function blocks(src: string, resolve: WikiResolver): ReactNode[] {
 export function Markdown({ source, className }: { source: string; className?: string }) {
   const resolve = useContext(WikiLinkContext)
   return <div className={`space-y-2 ${className ?? ''}`}>{blocks(source, resolve)}</div>
+}
+
+// A Mermaid diagram, rendered client-side to SVG. mermaid.js is a heavy dep, so it's loaded
+// lazily (dynamic import → its own chunk) only when a diagram actually appears — the base
+// bundle stays small. securityLevel 'strict' sanitizes labels and disables click handlers /
+// inline HTML (the source is agent-authored). Falls back to the raw source on any error.
+export function Mermaid({ code }: { code: string }) {
+  const [svg, setSvg] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    import('mermaid')
+      .then(async ({ default: mermaid }) => {
+        mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' })
+        const id = `mmd-${Math.random().toString(36).slice(2)}`
+        const { svg } = await mermaid.render(id, code)
+        if (!cancelled) setSvg(svg)
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [code])
+
+  if (failed) {
+    return (
+      <pre className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 font-mono text-xs">
+        <code>{code}</code>
+      </pre>
+    )
+  }
+  if (svg == null) {
+    return <div className="p-3 text-xs text-[var(--color-muted)]">Rendering diagram…</div>
+  }
+  // mermaid's SVG output (sanitized in strict mode); injected as markup since it's not JSX.
+  return (
+    <div
+      className="overflow-x-auto rounded-md border border-[var(--color-border)] bg-white/95 p-3"
+      // eslint-disable-next-line react-dom/no-dangerously-set-innerhtml
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  )
 }
