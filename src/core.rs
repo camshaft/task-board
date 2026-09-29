@@ -69,6 +69,27 @@ async fn auto_subscribe(
     Ok(())
 }
 
+/// Auto-subscribe an agent to a document (idempotent), so they hear about future versions and
+/// review activity. Mirrors auto_subscribe for tasks and auto-join-on-post for channels.
+async fn auto_subscribe_document(
+    tx: &mut Transaction<'_, Sqlite>,
+    subscriber: Option<&str>,
+    document_id: i64,
+) -> anyhow::Result<()> {
+    if let Some(sub) = subscriber {
+        sqlx::query(
+            "INSERT OR IGNORE INTO subscriptions(subscriber, target_type, target_id, created_at) \
+             VALUES(?,'document',?,?)",
+        )
+        .bind(sub)
+        .bind(document_id)
+        .bind(now_iso())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn fetch_one_json(
     tx: &mut Transaction<'_, Sqlite>,
     sql: &str,
@@ -358,6 +379,7 @@ pub async fn create_project(
         None,
         Some(pid),
         None,
+        None,
         json!({ "name": name }),
         Recipients::Explicit(BTreeSet::new()),
     )
@@ -491,6 +513,7 @@ pub async fn update_project(
         actor,
         None,
         Some(project_id),
+        None,
         None,
         json!({
             "name": name.unwrap_or(&old_name),
@@ -627,6 +650,7 @@ pub async fn create_task(
         Some(tid),
         Some(project_id),
         None,
+        None,
         json!({ "title": title, "assignee": assignee }),
         Recipients::FromTask,
     )
@@ -743,6 +767,7 @@ pub async fn update_task(
             Some(task_id),
             Some(old_project_id),
             None,
+            None,
             json!({ "from": old_status, "to": status, "title": old_title }),
             Recipients::FromTask,
         )
@@ -756,6 +781,7 @@ pub async fn update_task(
             actor,
             Some(task_id),
             Some(old_project_id),
+            None,
             None,
             json!({ "assignee": assignee, "title": old_title }),
             Recipients::FromTask,
@@ -772,6 +798,7 @@ pub async fn update_task(
             Some(task_id),
             Some(old_project_id),
             None,
+            None,
             json!({ "from": old_assignee, "title": old_title }),
             Recipients::FromTask,
         )
@@ -785,6 +812,7 @@ pub async fn update_task(
             actor,
             Some(task_id),
             Some(old_project_id),
+            None,
             None,
             json!({ "title": old_title }),
             Recipients::FromTask,
@@ -853,6 +881,7 @@ pub async fn move_task(
         actor,
         Some(task_id),
         Some(to_project_id),
+        None,
         None,
         json!({ "from_project_id": from_project_id, "to_project_id": to_project_id, "title": title }),
         Recipients::FromTask,
@@ -990,6 +1019,7 @@ pub async fn comment_task(
         Some(task_id),
         None,
         None,
+        None,
         json!({ "comment_id": cid, "body": body }),
         Recipients::FromTask,
     )
@@ -1038,9 +1068,10 @@ pub async fn subscribe(
     task_id: Option<i64>,
     project_id: Option<i64>,
     channel_id: Option<i64>,
+    document_id: Option<i64>,
     board: bool,
 ) -> anyhow::Result<Value> {
-    let (tt, tid) = target(task_id, project_id, channel_id, board)?;
+    let (tt, tid) = target(task_id, project_id, channel_id, document_id, board)?;
     sqlx::query(
         "INSERT OR IGNORE INTO subscriptions(subscriber, target_type, target_id, created_at) \
          VALUES(?,?,?,?)",
@@ -1060,9 +1091,10 @@ pub async fn unsubscribe(
     task_id: Option<i64>,
     project_id: Option<i64>,
     channel_id: Option<i64>,
+    document_id: Option<i64>,
     board: bool,
 ) -> anyhow::Result<Value> {
-    let (tt, tid) = target(task_id, project_id, channel_id, board)?;
+    let (tt, tid) = target(task_id, project_id, channel_id, document_id, board)?;
     let n = sqlx::query(
         "DELETE FROM subscriptions WHERE subscriber=? AND target_type=? AND target_id=?",
     )
@@ -1079,18 +1111,20 @@ fn target(
     task_id: Option<i64>,
     project_id: Option<i64>,
     channel_id: Option<i64>,
+    document_id: Option<i64>,
     board: bool,
 ) -> anyhow::Result<(&'static str, i64)> {
     // `board` is the whole-board firehose scope: a single subscription that receives every
-    // emitted event. It uses a fixed sentinel target_id (0 — real task/project/channel ids
-    // start at 1), so (subscriber, 'board', 0) stays unique for INSERT OR IGNORE dedup.
-    match (task_id, project_id, channel_id, board) {
-        (Some(t), _, _, _) => Ok(("task", t)),
-        (None, Some(p), _, _) => Ok(("project", p)),
-        (None, None, Some(c), _) => Ok(("channel", c)),
-        (None, None, None, true) => Ok(("board", 0)),
-        (None, None, None, false) => {
-            anyhow::bail!("give task_id, project_id, channel_id, or board=true")
+    // emitted event. It uses a fixed sentinel target_id (0 — real task/project/channel/document
+    // ids start at 1), so (subscriber, 'board', 0) stays unique for INSERT OR IGNORE dedup.
+    match (task_id, project_id, channel_id, document_id, board) {
+        (Some(t), ..) => Ok(("task", t)),
+        (None, Some(p), ..) => Ok(("project", p)),
+        (None, None, Some(c), ..) => Ok(("channel", c)),
+        (None, None, None, Some(d), _) => Ok(("document", d)),
+        (None, None, None, None, true) => Ok(("board", 0)),
+        (None, None, None, None, false) => {
+            anyhow::bail!("give task_id, project_id, channel_id, document_id, or board=true")
         }
     }
 }
@@ -1180,6 +1214,7 @@ pub async fn create_channel(
         None,
         None,
         Some(cid),
+        None,
         json!({ "name": name }),
         Recipients::Explicit(BTreeSet::new()),
     )
@@ -1324,6 +1359,7 @@ pub async fn post_to_channel(
         None,
         None,
         Some(channel_id),
+        None,
         data,
         Recipients::FromChannel(channel_id),
     )
@@ -1408,6 +1444,7 @@ pub async fn invite_to_channel(
         None,
         None,
         Some(channel_id),
+        None,
         json!({ "channel_id": channel_id, "name": name, "invited": agent_id, "invited_by": invited_by }),
         Recipients::Explicit(recips),
     )
@@ -1745,6 +1782,7 @@ pub async fn create_document(
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let meta_str = metadata.unwrap_or_else(|| json!({})).to_string();
     let slug = slugify(title);
     let did: i64 = sqlx::query(
@@ -1778,8 +1816,24 @@ pub async fn create_document(
         .bind(did)
         .execute(&mut *tx)
         .await?;
+    // The author subscribes so they hear about future versions and review activity.
+    auto_subscribe_document(&mut tx, created_by, did).await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.created",
+        created_by,
+        None,
+        project_id,
+        None,
+        Some(did),
+        json!({ "title": title, "slug": slug, "cid": cid, "version_no": 1 }),
+        Recipients::FromDocument(did),
+    )
+    .await?;
     let out = document_json(&mut tx, did).await?.unwrap_or(Value::Null);
     tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
 }
 
@@ -1795,7 +1849,8 @@ pub async fn publish_version(
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
-    let Some(doc) = sqlx::query("SELECT status FROM documents WHERE id=?")
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(doc) = sqlx::query("SELECT status, project_id FROM documents WHERE id=?")
         .bind(document_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -1803,6 +1858,7 @@ pub async fn publish_version(
         anyhow::bail!("no document {document_id}");
     };
     let status: String = doc.try_get("status")?;
+    let project_id: Option<i64> = doc.try_get("project_id")?;
     let next_no: i64 = sqlx::query(
         "SELECT COALESCE(MAX(version_no),0)+1 AS n FROM document_versions WHERE document_id=?",
     )
@@ -1835,8 +1891,24 @@ pub async fn publish_version(
         .bind(document_id)
         .execute(&mut *tx)
         .await?;
+    // The publisher subscribes (auto-join-on-post, like channels) so they hear about follow-ups.
+    auto_subscribe_document(&mut tx, created_by, document_id).await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.version_published",
+        created_by,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        json!({ "version_no": next_no, "cid": cid, "summary": summary, "status": new_status }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
     let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
     tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
 }
 
@@ -1917,7 +1989,7 @@ mod tests {
         let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None).await?;
         let tid = t["id"].as_i64().unwrap();
 
-        subscribe(&pool, "planner", Some(tid), None, None, false).await?; // (already auto-subscribed as creator)
+        subscribe(&pool, "planner", Some(tid), None, None, None, false).await?; // (already auto-subscribed as creator)
         comment_task(&pool, tid, "Start from PA=0.03", Some("planner")).await?;
         update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None).await?;
         update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None).await?;
@@ -1955,7 +2027,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
-        subscribe(&pool, "watcher", None, None, None, true).await?;
+        subscribe(&pool, "watcher", None, None, None, None, true).await?;
 
         // Activity by another actor, in projects the watcher never joined.
         let a = create_project(&pool, "A", None, Some("alice"), None).await?;
@@ -1985,7 +2057,7 @@ mod tests {
         assert_eq!(own["count"].as_i64(), Some(0), "actor excluded from its own events");
 
         // Unsubscribing stops the firehose.
-        unsubscribe(&pool, "watcher", None, None, None, true).await?;
+        unsubscribe(&pool, "watcher", None, None, None, None, true).await?;
         create_project(&pool, "D", None, Some("alice"), None).await?;
         let after = check_notifications(&pool, "watcher", true, 50, None).await?;
         assert_eq!(after["count"].as_i64(), Some(0), "no events after unsubscribe");
@@ -2057,6 +2129,54 @@ mod tests {
 
         // Missing document -> error.
         assert!(get_document(&pool, 424242).await.is_err());
+        Ok(())
+    }
+
+    /// Documents are subscribable: the author is auto-subscribed on create, an explicit
+    /// subscriber hears version publishes, the publishing actor is excluded from its own event,
+    /// and unsubscribing stops delivery. Rides the existing inbox machinery (Recipients::FromDocument).
+    #[tokio::test]
+    async fn documents_subscription_and_events() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // alice creates a doc (auto-subscribed as author).
+        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None).await?;
+        let did = d["id"].as_i64().unwrap();
+        // bob explicitly subscribes to the document.
+        subscribe(&pool, "bob", None, None, None, Some(did), false).await?;
+
+        // carol publishes v2 -> author (alice) + subscriber (bob) hear it; carol (actor) does not.
+        publish_version(&pool, did, "bafy2", Some("second"), Some("carol")).await?;
+
+        let alice = check_notifications(&pool, "alice", true, 50, None).await?;
+        let bob = check_notifications(&pool, "bob", true, 50, None).await?;
+        let carol = check_notifications(&pool, "carol", true, 50, None).await?;
+
+        // alice was subscribed as author (not notified of her own create), so she hears the publish.
+        let alice_types: BTreeSet<String> = alice["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            alice_types.contains("document.version_published"),
+            "author hears publishes: {alice}"
+        );
+        // bob (subscriber) hears exactly the publish, carrying the new version.
+        assert_eq!(bob["count"].as_i64(), Some(1), "bob: {bob}");
+        assert_eq!(bob["notifications"][0]["type"], json!("document.version_published"));
+        assert_eq!(bob["notifications"][0]["data"]["version_no"], json!(2));
+        // carol is the actor -> excluded from her own event.
+        assert_eq!(carol["count"].as_i64(), Some(0), "actor excluded: {carol}");
+
+        // Unsubscribing stops delivery.
+        unsubscribe(&pool, "bob", None, None, None, Some(did), false).await?;
+        publish_version(&pool, did, "bafy3", None, Some("alice")).await?;
+        let bob2 = check_notifications(&pool, "bob", true, 50, None).await?;
+        assert_eq!(bob2["count"].as_i64(), Some(0), "no events after unsubscribe");
+
         Ok(())
     }
 
@@ -2227,9 +2347,9 @@ mod tests {
         // ids: 1 = "Backend" (earlier), 2 = "backend" (later).
         create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None).await?;
         // Same subscriber on both projects -> collision on repoint; both on dupe only too.
-        subscribe(&pool, "alice", None, Some(1), None, false).await?;
-        subscribe(&pool, "alice", None, Some(2), None, false).await?; // will collide with keep=1
-        subscribe(&pool, "bob", None, Some(2), None, false).await?; // repoints cleanly onto 1
+        subscribe(&pool, "alice", None, Some(1), None, None, false).await?;
+        subscribe(&pool, "alice", None, Some(2), None, None, false).await?; // will collide with keep=1
+        subscribe(&pool, "bob", None, Some(2), None, None, false).await?; // repoints cleanly onto 1
 
         let report = merge_duplicate_projects(&pool).await?;
         assert_eq!(report["merged_groups"], json!(1));
@@ -2518,7 +2638,7 @@ mod tests {
         assert_eq!(members, ["alice", "bob"].iter().map(|s| s.to_string()).collect());
 
         // carol joins explicitly, then alice posts. bob + carol hear it; alice (poster) doesn't.
-        subscribe(&pool, "carol", None, None, Some(cid), false).await?;
+        subscribe(&pool, "carol", None, None, Some(cid), None, false).await?;
         let posted = post_to_channel(&pool, cid, "alice", "hello all", None).await?;
         let post_seq = posted["seq"].as_i64().unwrap();
 
@@ -2601,7 +2721,7 @@ mod tests {
         assert_eq!(bob["notifications"][0]["data"]["invited_by"], json!("alice"));
 
         // Leaving = unsubscribe from the channel.
-        unsubscribe(&pool, "bob", None, None, Some(cid), false).await?;
+        unsubscribe(&pool, "bob", None, None, Some(cid), None, false).await?;
         let after = get_channel(&pool, cid).await?;
         let members: Vec<&str> = after["members"]
             .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();

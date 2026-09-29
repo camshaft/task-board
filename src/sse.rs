@@ -43,6 +43,7 @@ pub struct StreamEvent {
     pub project_id: Option<i64>,
     pub task_id: Option<i64>,
     pub channel_id: Option<i64>,
+    pub document_id: Option<i64>,
 }
 
 /// Create the broadcast bus. The returned sender is cloned into app state (SSE handlers
@@ -147,7 +148,7 @@ fn resync_event() -> Event {
 /// Events with seq greater than `since`, oldest first, capped at `limit`.
 async fn fetch_since(pool: &Pool, since: i64, limit: i64) -> anyhow::Result<Vec<StreamEvent>> {
     let rows = sqlx::query(
-        "SELECT seq, type, project_id, task_id, channel_id FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
+        "SELECT seq, type, project_id, task_id, channel_id, document_id FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
     )
     .bind(since)
     .bind(limit)
@@ -161,6 +162,7 @@ async fn fetch_since(pool: &Pool, since: i64, limit: i64) -> anyhow::Result<Vec<
                 project_id: r.try_get("project_id")?,
                 task_id: r.try_get("task_id")?,
                 channel_id: r.try_get("channel_id")?,
+                document_id: r.try_get("document_id")?,
             })
         })
         .collect()
