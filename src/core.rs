@@ -3585,7 +3585,7 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let mk = |title: &'static str| {
             let pool = pool.clone();
-            async move { create_document(&pool, title, None, "bafy", None, Some("alice"), None, None).await }
+            async move { create_document(&pool, title, None, "bafy", None, Some("alice"), None, None, None).await }
         };
         let a = mk("A").await?["id"].as_i64().unwrap();
         let b = mk("B").await?["id"].as_i64().unwrap();
@@ -3624,6 +3624,68 @@ mod tests {
         set_document_path(&pool, c, "", None).await?; // clear -> unfiled
         assert!(get_document(&pool, c).await?["path"].is_null());
         assert_eq!(list_wiki(&pool, None).await?.as_array().unwrap().len(), 2);
+        Ok(())
+    }
+
+    /// Wiki links: [[target]] / [[path|label]] in a document's content become document_links
+    /// edges (embeds ![[..]] excluded), outbound_links resolve to whatever doc is filed at the
+    /// target path (dangling = null target), backlinks appear on the target, a new version WITH
+    /// content re-indexes the edges, and a CID-only publish leaves them untouched.
+    #[tokio::test]
+    async fn wiki_links_and_backlinks() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Source doc A links to two paths and embeds a third (the embed must NOT become a link).
+        let content = "See [[guide/setup]] and [[guide/advanced|Advanced Guide]].\n![[guide/diagram]]\nDup [[guide/setup]] again.";
+        let a = create_document(
+            &pool, "Intro", None, "bafyA", None, Some("alice"), None, None, Some(content),
+        )
+        .await?;
+        let aid = a["id"].as_i64().unwrap();
+        set_document_path(&pool, aid, "guide/intro", None).await?;
+
+        // outbound_links: guide/setup + guide/advanced, de-duped, embed excluded, ordered by path.
+        let a_doc = get_document(&pool, aid).await?;
+        let links = a_doc["outbound_links"].as_array().unwrap();
+        assert_eq!(links.len(), 2, "two distinct links, embed excluded, dup collapsed: {links:?}");
+        assert_eq!(links[0]["target_path"], json!("guide/advanced"));
+        assert_eq!(links[0]["label"], json!("Advanced Guide"));
+        assert!(links[0]["target_document_id"].is_null(), "advanced dangles (nothing filed there)");
+        assert_eq!(links[1]["target_path"], json!("guide/setup"));
+        assert!(links[1]["label"].is_null());
+        assert!(links[1]["target_document_id"].is_null(), "setup dangles until a doc is filed there");
+
+        // File a doc at guide/setup: A's link to it now resolves, and that doc sees the backlink.
+        let b = create_document(&pool, "Setup", None, "bafyB", None, Some("bob"), None, None, None).await?;
+        let bid = b["id"].as_i64().unwrap();
+        set_document_path(&pool, bid, "guide/setup", None).await?;
+
+        let a_doc = get_document(&pool, aid).await?;
+        let setup = a_doc["outbound_links"].as_array().unwrap().iter()
+            .find(|l| l["target_path"] == json!("guide/setup")).unwrap().clone();
+        assert_eq!(setup["target_document_id"], json!(bid), "link resolves to the doc filed at that path");
+        assert_eq!(setup["target_title"], json!("Setup"));
+
+        let b_doc = get_document(&pool, bid).await?;
+        let backlinks = b_doc["backlinks"].as_array().unwrap();
+        assert_eq!(backlinks.len(), 1, "A backlinks to Setup");
+        assert_eq!(backlinks[0]["id"], json!(aid));
+        assert_eq!(backlinks[0]["path"], json!("guide/intro"));
+
+        // A new version WITH content re-indexes edges (now only guide/setup).
+        publish_version(&pool, aid, "bafyA2", Some("trim"), Some("alice"), None, Some("only [[guide/setup]] now")).await?;
+        let a_doc = get_document(&pool, aid).await?;
+        assert_eq!(a_doc["outbound_links"].as_array().unwrap().len(), 1, "edges refreshed from new content");
+
+        // A CID-only publish (no content) leaves the edges as-is (board can't rescan a bare CID).
+        publish_version(&pool, aid, "bafyA3", None, Some("alice"), None, None).await?;
+        let a_doc = get_document(&pool, aid).await?;
+        assert_eq!(a_doc["outbound_links"].as_array().unwrap().len(), 1, "CID-only publish keeps prior edges");
+
+        // An unfiled doc (no path) has no backlinks even if others link to some path.
+        let c = create_document(&pool, "Orphan", None, "bafyC", None, Some("carol"), None, None, Some("x")).await?;
+        assert_eq!(get_document(&pool, c["id"].as_i64().unwrap()).await?["backlinks"].as_array().unwrap().len(), 0);
         Ok(())
     }
 
@@ -4996,7 +5058,7 @@ mod tests {
         assert_eq!(d["current_version"]["content_type"], json!("image/png"));
 
         // A later version can change the type; the authoritative type is per-version.
-        let d2 = publish_version(&pool, did, "bafypdf", Some("as pdf"), Some("alice"), Some("application/pdf")).await?;
+        let d2 = publish_version(&pool, did, "bafypdf", Some("as pdf"), Some("alice"), Some("application/pdf"), None).await?;
         assert_eq!(d2["current_version"]["content_type"], json!("application/pdf"));
 
         // Omitting content_type defaults to text/markdown (back-compat).
