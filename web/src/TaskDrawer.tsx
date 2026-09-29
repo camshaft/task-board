@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import { type TaskStatus } from './api'
 import { DocStatusChip } from './Documents'
@@ -19,6 +19,30 @@ import { AuthorLabel, relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './
 // Context handed down by the Board route (the parent <Outlet/>).
 interface DrawerContext {
   actor: string
+}
+
+// Track the *visual* viewport (the region not covered by an on-screen keyboard). A fixed
+// inset-0 overlay is sized to the layout viewport, so on mobile the keyboard shoves the whole
+// panel up and the comment footer ends up behind it. Sizing the overlay to visualViewport
+// instead keeps the footer pinned just above the keyboard — it "pops over" rather than pushing
+// the page. On desktop (and where the API is absent) this is just innerHeight at top 0.
+function useVisualViewport(): { top: number; height: number } {
+  const [vp, setVp] = useState(() => ({
+    top: window.visualViewport?.offsetTop ?? 0,
+    height: window.visualViewport?.height ?? window.innerHeight,
+  }))
+  useEffect(() => {
+    const v = window.visualViewport
+    if (!v) return
+    const onChange = () => setVp({ top: v.offsetTop, height: v.height })
+    v.addEventListener('resize', onChange)
+    v.addEventListener('scroll', onChange)
+    return () => {
+      v.removeEventListener('resize', onChange)
+      v.removeEventListener('scroll', onChange)
+    }
+  }, [])
+  return vp
 }
 
 // A slide-over panel showing one task (from the :taskId route param): fields, editable
@@ -42,6 +66,7 @@ export function TaskDrawer() {
   const [editMeta, setEditMeta] = useState<string | null>(null)
 
   const onClose = () => navigate(`/projects/${projectId}`)
+  const vp = useVisualViewport()
 
   async function setStatus(status: TaskStatus) {
     if (!task || status === task.status) return
@@ -195,7 +220,10 @@ export function TaskDrawer() {
   const shownError = error ?? loadError?.message ?? null
 
   return (
-    <div className="fixed inset-0 z-40 flex justify-end">
+    <div
+      className="fixed inset-x-0 z-40 flex justify-end"
+      style={{ top: vp.top, height: vp.height }}
+    >
       <div
         className="absolute inset-0 bg-black/50"
         onClick={onClose}
