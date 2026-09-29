@@ -23,6 +23,30 @@ pub fn row_to_json(row: &SqliteRow) -> Value {
     Value::Object(obj)
 }
 
+/// If `data` carries an `external_author` (an external_identities id, e.g. an ingested Slack
+/// user like `slack:U0…`), resolve that identity's registered `display_name` and add it as
+/// `external_author_name`, so a consumer can show the human's name while `external_author`
+/// stays the stable key. A no-op when there's no external_author, or the identity is
+/// unregistered / has no display_name (the consumer then falls back to the id). Must NOT be
+/// called while a transaction holds the single pooled connection — resolve after commit.
+async fn add_external_author_name(pool: &Pool, data: &mut Value) {
+    let Value::Object(m) = data else { return };
+    let Some(id) = m.get("external_author").and_then(|v| v.as_str()).map(str::to_string) else {
+        return;
+    };
+    let name: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT display_name FROM external_identities WHERE id=?")
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    if let Some(name) = name {
+        m.insert("external_author_name".into(), json!(name));
+    }
+}
+
 fn column_to_json(row: &SqliteRow, col: &SqliteColumn) -> Value {
     let raw = match row.try_get_raw(col.ordinal()) {
         Ok(r) => r,
@@ -1146,7 +1170,10 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
         m.insert("blocked_on".into(), blocked_on.unwrap_or(Value::Null));
 
         let comments = sqlx::query(
-            "SELECT id, author, body, created_at, external_author, origin_ref FROM comments WHERE task_id=? ORDER BY id",
+            "SELECT c.id, c.author, c.body, c.created_at, c.external_author, c.origin_ref, \
+             ei.display_name AS external_author_name \
+             FROM comments c LEFT JOIN external_identities ei ON ei.id = c.external_author \
+             WHERE c.task_id=? ORDER BY c.id",
         )
         .bind(task_id)
         .fetch_all(pool)
@@ -2116,11 +2143,12 @@ pub async fn get_channel_posts(
     for r in &rows {
         let mut d = row_to_json(r);
         if let Value::Object(ref mut m) = d {
-            let data: Value = m
+            let mut data: Value = m
                 .get("data")
                 .and_then(|v| v.as_str())
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_else(|| json!({}));
+            add_external_author_name(pool, &mut data).await;
             m.insert("data".into(), data);
         }
         out.push(d);
@@ -2277,6 +2305,15 @@ pub async fn check_notifications(
         .await?;
     tx.commit().await?;
 
+    // Resolve external_author -> display name AFTER commit (the single-connection pool is free
+    // again, so this can't deadlock), so a bridged post/comment in the inbox shows the human's
+    // name while external_author stays the stable key.
+    for item in &mut items {
+        if let Some(data) = item.get_mut("data") {
+            add_external_author_name(pool, data).await;
+        }
+    }
+
     Ok(json!({ "count": items.len(), "notifications": items }))
 }
 
@@ -2330,11 +2367,12 @@ pub async fn get_events(
     for r in &rows {
         let mut d = row_to_json(r);
         if let Value::Object(ref mut m) = d {
-            let data: Value = m
+            let mut data: Value = m
                 .get("data")
                 .and_then(|v| v.as_str())
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_else(|| json!({}));
+            add_external_author_name(pool, &mut data).await;
             m.insert("data".into(), data);
         }
         out.push(d);
@@ -3350,7 +3388,11 @@ pub async fn comment_document(
         Recipients::FromDocument(document_id),
     )
     .await?;
-    let out = sqlx::query("SELECT * FROM document_comments WHERE id=?")
+    let out = sqlx::query(
+        "SELECT dc.*, ei.display_name AS external_author_name \
+         FROM document_comments dc LEFT JOIN external_identities ei ON ei.id = dc.external_author \
+         WHERE dc.id=?",
+    )
         .bind(cid)
         .fetch_optional(&mut *tx)
         .await?
@@ -3391,7 +3433,11 @@ pub async fn resolve_comment(pool: &Pool, comment_id: i64, actor: Option<&str>) 
         Recipients::FromDocument(document_id),
     )
     .await?;
-    let out = sqlx::query("SELECT * FROM document_comments WHERE id=?")
+    let out = sqlx::query(
+        "SELECT dc.*, ei.display_name AS external_author_name \
+         FROM document_comments dc LEFT JOIN external_identities ei ON ei.id = dc.external_author \
+         WHERE dc.id=?",
+    )
         .bind(comment_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -3410,14 +3456,18 @@ pub async fn get_document_comments(
     version_id: Option<i64>,
     status: Option<&str>,
 ) -> anyhow::Result<Value> {
-    let mut q = String::from("SELECT * FROM document_comments WHERE document_id=?");
+    let mut q = String::from(
+        "SELECT dc.*, ei.display_name AS external_author_name \
+         FROM document_comments dc LEFT JOIN external_identities ei ON ei.id = dc.external_author \
+         WHERE dc.document_id=?",
+    );
     if version_id.is_some() {
-        q.push_str(" AND version_id=?");
+        q.push_str(" AND dc.version_id=?");
     }
     if status.is_some() {
-        q.push_str(" AND status=?");
+        q.push_str(" AND dc.status=?");
     }
-    q.push_str(" ORDER BY id");
+    q.push_str(" ORDER BY dc.id");
     let mut query = sqlx::query(&q).bind(document_id);
     if let Some(v) = version_id {
         query = query.bind(v);
@@ -5031,6 +5081,10 @@ mod tests {
         let c0 = &task["comments"][0];
         assert_eq!(c0["author"], json!("slack-bridge"), "author is the fleet ingester");
         assert_eq!(c0["external_author"], json!("slack:U123"), "attributed to the external human");
+        assert_eq!(
+            c0["external_author_name"], json!("Ada"),
+            "the identity's display_name is resolved on read (id stays the key)"
+        );
 
         // A channel post carries the same attribution on its event data.
         let ch = create_channel(&pool, "bridge", None, Some("slack-bridge"), None).await?;
@@ -5039,6 +5093,21 @@ mod tests {
         let posts = get_channel_posts(&pool, cid, 0, 100).await?;
         assert_eq!(posts[0]["data"]["from"], json!("slack-bridge"));
         assert_eq!(posts[0]["data"]["external_author"], json!("slack:U123"));
+        assert_eq!(
+            posts[0]["data"]["external_author_name"], json!("Ada"),
+            "channel-post attribution resolves the display name on read too"
+        );
+
+        // An identity with no registered display_name: external_author stays, name is absent
+        // (consumers fall back to the id — never a fabricated name).
+        post_to_channel(&pool, cid, "slack-bridge", "who am i", None, Some("slack:UNKNOWN")).await?;
+        let posts2 = get_channel_posts(&pool, cid, 0, 100).await?;
+        let last = posts2.as_array().unwrap().last().unwrap();
+        assert_eq!(last["data"]["external_author"], json!("slack:UNKNOWN"));
+        assert!(
+            last["data"].get("external_author_name").is_none(),
+            "no display_name registered -> no external_author_name (fall back to the id)"
+        );
 
         // Guardrails: empty id/source are client errors.
         assert!(upsert_external_identity(&pool, "  ", "slack", None, None).await.is_err());
