@@ -42,6 +42,9 @@ export default function DocumentView() {
   const contentRef = useRef<HTMLDivElement>(null)
   const [region, setRegion] = useState<RegionQuote | null>(null)
   const [contentNonce, setContentNonce] = useState(0)
+  // Long threads collapse older top-level comments behind a "show N earlier" button, keeping the
+  // latest few in view (their replies stay with them). Recent replies are what usually matter.
+  const [showAllComments, setShowAllComments] = useState(false)
 
   // Capture a text selection inside the rendered content as a text-quote region (exact + a little
   // prefix/suffix context, for disambiguation + highlight matching against the shown version).
@@ -503,39 +506,59 @@ export default function DocumentView() {
           <h2 className="mb-2 mt-6 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
             Comments ({comments.length})
           </h2>
-          <ul className="space-y-2">
-            {topLevel.map((c) => (
-              <li key={c.id}>
-                <CommentCard
-                  c={c}
-                  versionNo={versionNo(c.version_id)}
-                  busy={busy}
-                  resolveExternal={extName}
-                  onResolve={() => void act(() => resolveDocumentComment(id, c.id, { actor }))}
-                  onReply={() => setReplyTo(replyTo === c.id ? null : c.id)}
-                  replying={replyTo === c.id}
-                />
-                {repliesOf(c.id).length > 0 && (
-                  <ul className="mt-1.5 space-y-1.5 border-l border-[var(--color-border)] pl-4">
-                    {repliesOf(c.id).map((r) => (
-                      <li key={r.id}>
-                        <CommentCard
-                          c={r}
-                          versionNo={versionNo(r.version_id)}
-                          busy={busy}
-                          resolveExternal={extName}
-                          onResolve={() => void act(() => resolveDocumentComment(id, r.id, { actor }))}
-                        />
-                      </li>
-                    ))}
-                  </ul>
+          {(() => {
+            // Keep the latest few threads in view; collapse older top-level comments behind an
+            // expander once the thread is long enough to be worth hiding (chronological order kept).
+            const VISIBLE = 3
+            const hidden = topLevel.length - VISIBLE
+            const collapsed = !showAllComments && hidden >= 2
+            const shown = collapsed ? topLevel.slice(-VISIBLE) : topLevel
+            return (
+              <ul className="space-y-2">
+                {collapsed && (
+                  <li>
+                    <button
+                      onClick={() => setShowAllComments(true)}
+                      className="w-full rounded-md border border-dashed border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-300"
+                    >
+                      Show {hidden} earlier comment{hidden === 1 ? '' : 's'}
+                    </button>
+                  </li>
                 )}
-              </li>
-            ))}
-            {comments.length === 0 && (
-              <li className="text-sm text-[var(--color-muted)]">No comments yet.</li>
-            )}
-          </ul>
+                {shown.map((c) => (
+                  <li key={c.id}>
+                    <CommentCard
+                      c={c}
+                      versionNo={versionNo(c.version_id)}
+                      busy={busy}
+                      resolveExternal={extName}
+                      onResolve={() => void act(() => resolveDocumentComment(id, c.id, { actor }))}
+                      onReply={() => setReplyTo(replyTo === c.id ? null : c.id)}
+                      replying={replyTo === c.id}
+                    />
+                    {repliesOf(c.id).length > 0 && (
+                      <ul className="mt-1.5 space-y-1.5 border-l border-[var(--color-border)] pl-4">
+                        {repliesOf(c.id).map((r) => (
+                          <li key={r.id}>
+                            <CommentCard
+                              c={r}
+                              versionNo={versionNo(r.version_id)}
+                              busy={busy}
+                              resolveExternal={extName}
+                              onResolve={() => void act(() => resolveDocumentComment(id, r.id, { actor }))}
+                            />
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                ))}
+                {comments.length === 0 && (
+                  <li className="text-sm text-[var(--color-muted)]">No comments yet.</li>
+                )}
+              </ul>
+            )
+          })()}
 
           {/* Composer. Replies target the selected comment; a text selection over the content
               anchors a top-level comment to that region; otherwise a doc-level comment. */}
