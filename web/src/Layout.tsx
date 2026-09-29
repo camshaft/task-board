@@ -38,6 +38,10 @@ export default function Layout() {
   const { data: agents = [] } = useAgents()
   const { data: events = [] } = useEvents()
   const [showArchived, setShowArchived] = useState(false)
+  // The left sidebar is an off-canvas drawer on small screens (toggled from the header) and a
+  // static column on lg+. Navigating from a drawer link closes it so the content is visible.
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const closeSidebar = () => setSidebarOpen(false)
   const activeProjects = projects.filter((p) => p.status !== 'archived')
   const archivedProjects = projects.filter((p) => p.status === 'archived')
 
@@ -53,7 +57,19 @@ export default function Layout() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center gap-4 border-b border-[var(--color-border)] px-5 py-3">
+      <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[var(--color-border)] px-4 py-3 sm:px-5">
+        <button
+          onClick={() => setSidebarOpen((v) => !v)}
+          aria-label="Toggle sidebar"
+          aria-expanded={sidebarOpen}
+          className="-ml-1 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] lg:hidden"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
+        </button>
         <Link to="/" className="text-base font-semibold tracking-tight">
           <span className="text-sky-400">task</span>-board
         </Link>
@@ -109,9 +125,21 @@ export default function Layout() {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1">
-        {/* Sidebar: projects + agents */}
-        <aside className="flex w-64 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
+      <div className="relative flex min-h-0 flex-1">
+        {/* Backdrop behind the off-canvas sidebar on small screens. */}
+        {sidebarOpen && (
+          <div
+            className="absolute inset-0 z-30 bg-black/50 lg:hidden"
+            onClick={closeSidebar}
+            aria-hidden
+          />
+        )}
+        {/* Sidebar: projects + agents. Off-canvas drawer below lg, static column at lg+. */}
+        <aside
+          className={`absolute inset-y-0 left-0 z-40 flex w-64 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)] shadow-xl transition-transform duration-200 lg:static lg:z-auto lg:translate-x-0 lg:shadow-none ${
+            sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+          }`}
+        >
           <div className="flex items-center justify-between px-4 py-3">
             <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
               Projects
@@ -130,6 +158,7 @@ export default function Layout() {
                 <Link
                   key={p.id}
                   to={`projects/${p.id}`}
+                  onClick={closeSidebar}
                   className={`mb-1 flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm ${
                     p.id === selectedProject
                       ? 'bg-sky-500/15 text-sky-100'
@@ -162,6 +191,7 @@ export default function Layout() {
                     <Link
                       key={p.id}
                       to={`projects/${p.id}`}
+                      onClick={closeSidebar}
                       className={`mb-1 flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm ${
                         p.id === selectedProject
                           ? 'bg-sky-500/15 text-sky-100'
@@ -181,6 +211,7 @@ export default function Layout() {
             </span>
             <Link
               to="/agents"
+              onClick={closeSidebar}
               className="rounded px-1.5 text-xs text-sky-400 hover:bg-[var(--color-panel-2)]"
             >
               all →
@@ -191,6 +222,7 @@ export default function Layout() {
               <Link
                 key={a.id}
                 to={`/agents/${encodeURIComponent(a.id)}`}
+                onClick={closeSidebar}
                 className="block rounded-md px-3 py-1.5 text-sm hover:bg-[var(--color-panel-2)]"
                 title={a.charter ?? a.status_message ?? a.status}
               >
