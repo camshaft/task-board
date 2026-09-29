@@ -198,18 +198,23 @@ CREATE TABLE IF NOT EXISTS external_links (
     updated_at         TEXT NOT NULL,
     UNIQUE(source, external_id)
 );
--- Wiki links between documents: one row per distinct [[target]] a source document links to.
--- We store only the raw target_path (and optional |label), never a resolved target id -- the
--- target is resolved at read time by joining on documents.path, so links stay correct as docs
--- are filed, renamed, or unfiled (a link can also dangle, pointing at a path nothing occupies
--- yet). Links are recomputed from content whenever a version is published WITH raw content (the
--- board only sees a CID otherwise, so a CID-only publish leaves the prior edges untouched).
--- Embeds (the ![[target]] transclusion form) are NOT links and are excluded here.
+-- Edges between documents: one row per distinct target a source document points at, of two
+-- kinds. kind='link' is a [[wiki-link]] (a jump) and kind='embed' is a ![[transclusion]] that
+-- renders in place. We store only the raw target_path (and optional |label), never a resolved
+-- id -- the target is resolved at read time by joining on documents.path, so edges stay correct
+-- as docs are filed, renamed, or unfiled (an edge can also dangle, pointing at a path nothing
+-- occupies yet). Edges are recomputed from content whenever a version is published WITH raw
+-- content (the board only sees a CID otherwise, so a CID-only publish leaves prior edges as-is).
+-- For an embed, target_version_id pins it to an immutable version (NULL = floats to the target's
+-- current version) and region holds an optional raw fragment/selector for a partial embed.
 CREATE TABLE IF NOT EXISTS document_links (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     source_document_id INTEGER NOT NULL REFERENCES documents(id),
     target_path        TEXT NOT NULL,
     label              TEXT,
+    kind               TEXT NOT NULL DEFAULT 'link',
+    target_version_id  INTEGER REFERENCES document_versions(id),
+    region             TEXT,
     created_at         TEXT NOT NULL,
     UNIQUE(source_document_id, target_path)
 );
@@ -436,6 +441,28 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_path ON documents(path) WHERE path IS NOT NULL")
         .execute(&pool)
         .await?;
+
+    // Back-fill document_links.{kind,target_version_id,region} (transclusion/embeds). A DB whose
+    // document_links table was created before embeds existed keeps its rows as kind='link'. All
+    // three are nullable-or-defaulted, so no index/constraint over them goes in SCHEMA (the #63
+    // path-index crash-loop lesson: never index a back-filled column in the SCHEMA apply loop).
+    let doclinks_cols = sqlx::query("PRAGMA table_info(document_links)").fetch_all(&pool).await?;
+    let has = |c: &str| doclinks_cols.iter().any(|r| r.get::<String, _>("name") == c);
+    if !has("kind") {
+        sqlx::query("ALTER TABLE document_links ADD COLUMN kind TEXT NOT NULL DEFAULT 'link'")
+            .execute(&pool)
+            .await?;
+    }
+    if !has("target_version_id") {
+        sqlx::query("ALTER TABLE document_links ADD COLUMN target_version_id INTEGER")
+            .execute(&pool)
+            .await?;
+    }
+    if !has("region") {
+        sqlx::query("ALTER TABLE document_links ADD COLUMN region TEXT")
+            .execute(&pool)
+            .await?;
+    }
 
     Ok(pool)
 }
