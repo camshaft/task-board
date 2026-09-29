@@ -508,6 +508,10 @@ pub struct GetEventsArgs {
     /// Only events whose `actor` matches — a complete per-agent activity feed.
     #[serde(default)]
     pub actor: Option<String>,
+    /// `true` returns the LATEST `limit` events (newest-first) — a live activity feed. Default
+    /// `false` is oldest-first after `since_seq` — for incrementally tailing the log.
+    #[serde(default)]
+    pub desc: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1180,12 +1184,12 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Read the raw append-only event log after `since_seq` (the audit trail of everything).")]
+    #[tool(description = "Read the raw append-only event log (the audit trail of everything). Default oldest-first after `since_seq` (tail the log incrementally); pass desc=true for the LATEST N events newest-first (a live activity feed).")]
     async fn get_events(
         &self,
         Parameters(a): Parameters<GetEventsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_events(&self.pool, a.since_seq, a.limit, s(&a.actor)).await.map_err(err).and_then(ok)
+        core::get_events(&self.pool, a.since_seq, a.limit, s(&a.actor), a.desc).await.map_err(err).and_then(ok)
     }
 
     // --- Documents ---

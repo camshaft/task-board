@@ -198,7 +198,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/promote-thread", summary: "Promote a channel thread into a task (root→description, replies→comments); idempotent.", query: "", body: Some("PromoteThreadBody") },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
-    Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log (optionally filtered to one actor).", query: "since_seq=int&limit=int&actor=str", body: None },
+    Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log (optionally filtered to one actor). order=desc returns the latest N (newest-first) for a live feed; default asc is oldest-first for incremental pollers.", query: "since_seq=int&limit=int&actor=str&order=asc|desc", body: None },
     Endpoint { method: "GET", path: "/api/external-identities", summary: "List external (bridged) identities, optionally filtered by source.", query: "source=str", body: None },
     Endpoint { method: "POST", path: "/api/external-identities", summary: "Register/update an external identity (a bridged human/actor, e.g. slack:U123).", query: "", body: Some("UpsertExternalIdentityBody") },
     Endpoint { method: "GET", path: "/api/external-links", summary: "List bridged links (channel-map / issue↔task / thread↔task), filter by source/board_kind/board_id.", query: "source=str&board_kind=str&board_id=int", body: None },
@@ -1016,10 +1016,14 @@ struct EventsQuery {
     limit: i64,
     /// Only events whose `actor` matches — a complete per-agent activity feed.
     actor: Option<String>,
+    /// `asc` (default, oldest-first — incremental pollers) or `desc` (newest-first, so
+    /// `since_seq=0&limit=N` returns the LATEST N events — a live activity feed).
+    order: Option<String>,
 }
 
 async fn get_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) -> ApiResult {
-    Ok(Json(core::get_events(&st.pool, q.since_seq, q.limit, q.actor.as_deref()).await?))
+    let desc = q.order.as_deref() == Some("desc");
+    Ok(Json(core::get_events(&st.pool, q.since_seq, q.limit, q.actor.as_deref(), desc).await?))
 }
 
 // --- External identities (bridged actors) ---
