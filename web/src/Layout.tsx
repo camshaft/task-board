@@ -66,6 +66,12 @@ export default function Layout() {
         >
           Search
         </Link>
+        <Link
+          to="/documents"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        >
+          Docs
+        </Link>
         <a
           href={new URL('api', document.baseURI).href}
           target="_blank"

@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Route, Routes } from 'react-router-dom'
 import './index.css'
 import Board from './Board.tsx'
+import Documents from './Documents.tsx'
+import DocumentView from './DocumentView.tsx'
 import Home from './Home.tsx'
 import Layout from './Layout.tsx'
 import Search from './Search.tsx'
@@ -24,6 +26,8 @@ createRoot(document.getElementById('root')!).render(
         <Route element={<Layout />}>
           <Route index element={<Home />} />
           <Route path="search" element={<Search />} />
+          <Route path="documents" element={<Documents />} />
+          <Route path="documents/:documentId" element={<DocumentView />} />
           <Route path="projects/:projectId" element={<Board />}>
             <Route path="tasks/:taskId" element={<TaskDrawer />} />
           </Route>

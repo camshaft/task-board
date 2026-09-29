@@ -70,6 +70,40 @@ export interface Task {
   subscribers: string[]
 }
 
+export interface DocumentVersion {
+  id: number
+  document_id: number
+  version_no: number
+  cid: string
+  summary: string | null
+  created_by: string | null
+  created_at: string
+}
+
+// The row shape returned by listDocuments (no versions/metadata).
+export interface DocumentSummary {
+  id: number
+  title: string
+  slug: string | null
+  project_id: number | null
+  status: string
+  current_version_id: number | null
+  approved_version_id: number | null
+  created_by: string | null
+  updated_at: string
+}
+
+// A full document (getDocument): metadata + resolved current version + full version list +
+// the tasks it's attached to.
+export interface Document extends DocumentSummary {
+  metadata: Record<string, unknown>
+  approved_by: string | null
+  created_at: string
+  current_version: DocumentVersion | null
+  versions: DocumentVersion[]
+  attached_tasks: { id: number; title: string; status: TaskStatus }[]
+}
+
 export interface EventRow {
   seq: number
   type: string
@@ -206,4 +240,27 @@ export const api = {
 
   getEvents: (since_seq = 0, limit = 100) =>
     req<EventRow[]>('GET', `/events?since_seq=${since_seq}&limit=${limit}`),
+
+  listDocuments: (
+    q: { project_id?: number; status?: string; tag?: string; task_id?: number; author?: string } = {},
+  ) => {
+    const p = new URLSearchParams()
+    if (q.project_id != null) p.set('project_id', String(q.project_id))
+    if (q.status) p.set('status', q.status)
+    if (q.tag) p.set('tag', q.tag)
+    if (q.task_id != null) p.set('task_id', String(q.task_id))
+    if (q.author) p.set('author', q.author)
+    const qs = p.toString()
+    return req<DocumentSummary[]>('GET', `/documents${qs ? `?${qs}` : ''}`)
+  },
+  getDocument: (id: number) => req<Document>('GET', `/documents/${id}`),
+  getDocumentVersions: (id: number) =>
+    req<DocumentVersion[]>('GET', `/documents/${id}/versions`),
+}
+
+// Resolve a bare content id to a viewable URL via the deployment's IPFS gateway. The board
+// stores only the CID (location-independent); composing the path is the CLIENT's job. Resolved
+// against the page base so it's correct at the origin root or behind a sub-path proxy.
+export function ipfsUrl(cid: string): string {
+  return new URL(`ipfs/${cid}`, document.baseURI).href
 }
