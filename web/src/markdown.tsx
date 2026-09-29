@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from 'react'
 import { Link } from 'react-router-dom'
+import { api, ipfsUrl, type DocumentVersion } from './api'
 
 // Minimal, dependency-free Markdown renderer. It emits a React element tree (never
 // dangerouslySetInnerHTML), so all text is escaped by React and link hrefs are sanitized —
@@ -25,6 +26,16 @@ const SAFE_HREF = /^(https?:\/\/|mailto:|\/|#)/i
 // default resolves nothing, so a Markdown rendered outside the provider degrades gracefully.
 export type WikiResolver = (path: string) => { id: number; title: string } | null
 export const WikiLinkContext = createContext<WikiResolver>(() => null)
+
+// Transclusion recursion state: how deep we are and which paths are already on the embed chain,
+// so ![[a]] → ![[b]] → ![[a]] (or an over-deep nest) stops with a placeholder instead of looping.
+const MAX_EMBED_DEPTH = 4
+const EmbedContext = createContext<{ depth: number; chain: string[] }>({ depth: 0, chain: [] })
+
+// A block-level transclusion: ![[path]], ![[path@vN]] (pinned version), ![[path#region]], and an
+// optional |label. Matched only when it's the whole line (block construct, like an image embed).
+const EMBED_RE =
+  /^!\[\[\s*([^\]#@|]+?)\s*(?:@v(\d+))?\s*(?:#([^\]|]+?))?\s*(?:\|\s*([^\]]+?)\s*)?\]\]$/
 
 // Inline spans, in priority order: code (verbatim), wiki-links, links, bold, italic. Returns a
 // mix of strings (React escapes them) and elements. `gen` yields globally-unique keys;
@@ -138,6 +149,7 @@ function isBlockStart(line: string): boolean {
   const t = line.trim()
   return (
     t.startsWith('```') ||
+    EMBED_RE.test(t) ||
     /^#{1,6}\s/.test(line) ||
     /^>\s?/.test(line) ||
     /^\s*[-*+]\s+/.test(line) ||
@@ -161,6 +173,21 @@ function blocks(src: string, resolve: WikiResolver): ReactNode[] {
       continue
     }
     const t = line.trim()
+
+    const embed = EMBED_RE.exec(t)
+    if (embed) {
+      out.push(
+        <Embed
+          key={k++}
+          path={embed[1]}
+          versionNo={embed[2] ? Number(embed[2]) : null}
+          region={embed[3] ?? null}
+          label={embed[4] ?? null}
+        />,
+      )
+      i++
+      continue
+    }
 
     if (t.startsWith('```')) {
       const lang = t.slice(3).trim().toLowerCase()
@@ -370,5 +397,163 @@ export function VegaLite({ code }: { code: string }) {
       ref={ref}
       className="overflow-x-auto rounded-md border border-[var(--color-border)] bg-white/95 p-3"
     />
+  )
+}
+
+// Renderer family for an embedded version's content_type (a focused subset of the doc viewer's
+// dispatch — enough for transclusion).
+function embedKindOf(ct: string | null): 'markdown' | 'mermaid' | 'vega' | 'image' | 'text' | 'other' {
+  const t = (ct ?? 'text/markdown').toLowerCase().split(';')[0].trim()
+  if (t.startsWith('image/')) return 'image'
+  if (t === 'text/vnd.mermaid' || t === 'text/x-mermaid') return 'mermaid'
+  if (t === 'application/vnd.vegalite+json' || t === 'application/vnd.vega+json') return 'vega'
+  if (t === 'text/markdown' || t === 'text/x-markdown' || t === '') return 'markdown'
+  if (t.startsWith('text/') || t === 'application/json') return 'text'
+  return 'other'
+}
+
+type EmbedBody =
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'text'; kind: 'markdown' | 'mermaid' | 'vega' | 'text'; text: string }
+  | { status: 'url'; kind: 'image' | 'other'; url: string }
+
+// A block-level ![[transclusion]]: renders another document's content inline, dispatched by that
+// version's content_type, resolved through the same-origin gateway. Recurses through Markdown for
+// embedded markdown (so a doc can embed a doc), bounded by MAX_EMBED_DEPTH + a visited-path chain
+// to break cycles. Pinned (@vN) shows that immutable version; otherwise the current one.
+export function Embed({
+  path,
+  versionNo,
+  region,
+  label,
+}: {
+  path: string
+  versionNo: number | null
+  region: string | null
+  label: string | null
+}) {
+  const resolve = useContext(WikiLinkContext)
+  const { depth, chain } = useContext(EmbedContext)
+  const hit = resolve(path)
+  const blocked = !hit || chain.includes(path) || depth >= MAX_EMBED_DEPTH
+  const [body, setBody] = useState<EmbedBody>({ status: 'loading' })
+
+  useEffect(() => {
+    if (blocked || !hit) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const doc = await api.getDocument(hit.id)
+        const v: DocumentVersion | null =
+          versionNo != null
+            ? (doc.versions.find((x) => x.version_no === versionNo) ?? null)
+            : doc.current_version
+        if (!v) {
+          if (!cancelled) setBody({ status: 'error', message: `v${versionNo} not found` })
+          return
+        }
+        const kind = embedKindOf(v.content_type)
+        const url = ipfsUrl(v.cid, v.content_type)
+        if (kind === 'image' || kind === 'other') {
+          if (!cancelled) setBody({ status: 'url', kind, url })
+          return
+        }
+        const res = await fetch(url)
+        if (!res.ok) throw new Error(`gateway ${res.status}`)
+        const text = await res.text()
+        if (!cancelled) setBody({ status: 'text', kind, text })
+      } catch (e) {
+        if (!cancelled) setBody({ status: 'error', message: (e as Error).message })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [blocked, hit?.id, versionNo])
+
+  const title = label ?? hit?.title ?? path
+
+  // Dangling: nothing filed at this path — a transclusion "red link".
+  if (!hit) {
+    return (
+      <div className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-sm">
+        <span className="text-[var(--color-muted)]">⧉ embed </span>
+        <Link to="/wiki" className="text-rose-400/90 hover:text-rose-300" title={`No page filed at "${path}"`}>
+          {title}
+        </Link>
+        <span className="text-[var(--color-muted)]"> — no page filed</span>
+      </div>
+    )
+  }
+
+  const header = (
+    <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-muted)]">
+      <span>⧉ embedded</span>
+      <Link to={`/documents/${hit.id}`} className="text-sky-400 hover:text-sky-300">
+        {title}
+      </Link>
+      {versionNo != null && <span className="uppercase">· v{versionNo}</span>}
+      {region && <span className="font-mono">· #{region}</span>}
+    </div>
+  )
+
+  // Cycle or too deep: show the reference but not the content, so the page can't loop/hang.
+  if (chain.includes(path) || depth >= MAX_EMBED_DEPTH) {
+    return (
+      <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2">
+        {header}
+        <p className="text-xs text-[var(--color-muted)]">
+          content omitted — {chain.includes(path) ? 'embed cycle' : 'nested too deep'}
+        </p>
+      </div>
+    )
+  }
+
+  let content: ReactNode
+  if (body.status === 'loading') {
+    content = <p className="text-xs text-[var(--color-muted)]">Loading embedded content…</p>
+  } else if (body.status === 'error') {
+    content = (
+      <p className="text-xs text-[var(--color-muted)]">Couldn't load embedded content ({body.message}).</p>
+    )
+  } else if (body.status === 'url') {
+    content =
+      body.kind === 'image' ? (
+        <img src={body.url} alt={title} className="max-h-[50vh] rounded" />
+      ) : (
+        <a
+          href={body.url}
+          target="_blank"
+          rel="noreferrer"
+          className="text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        >
+          open embedded content
+        </a>
+      )
+  } else if (body.kind === 'markdown') {
+    // Recurse — deeper embeds see an incremented depth + this path on the chain.
+    content = (
+      <EmbedContext.Provider value={{ depth: depth + 1, chain: [...chain, path] }}>
+        <Markdown source={body.text} className="text-sm" />
+      </EmbedContext.Provider>
+    )
+  } else if (body.kind === 'mermaid') {
+    content = <Mermaid code={body.text} />
+  } else if (body.kind === 'vega') {
+    content = <VegaLite code={body.text} />
+  } else {
+    content = (
+      <pre className="overflow-x-auto rounded bg-[var(--color-panel-2)] p-2 font-mono text-xs">
+        <code>{body.text}</code>
+      </pre>
+    )
+  }
+
+  return (
+    <div className="rounded-md border border-[var(--color-border)] border-l-2 border-l-sky-500/40 bg-[var(--color-panel)] px-3 py-2">
+      {header}
+      {content}
+    </div>
   )
 }
