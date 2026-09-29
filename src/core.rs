@@ -1377,6 +1377,59 @@ pub async fn comment_task(
         Recipients::FromTask,
     )
     .await?;
+    // Outbound reflect-back for task comments (task 264): if this task is linked to one or more
+    // external systems (external_links, board_kind='task') whose per-link policy authorizes this
+    // comment's author OUT, emit a `task.outbound_reflect` per authorized link — the task-comment
+    // analogue of `channel.outbound_reflect` (#150), symmetric so both bridge adapters decode the
+    // same shape. Authz is keyed off the LINK's metadata (`direction` + `outbound_authors`, via
+    // reflects_out), so a task linked to several systems governs each independently. An INGESTED
+    // comment is authored by the bridge agent (not in outbound_authors), so it never echoes back
+    // out — no special-casing needed. Infra event: no inbox fan-out (firehose/SSE still see it).
+    if let Some(auth) = author {
+        let links = sqlx::query(
+            "SELECT source, external_id, external_parent_id, metadata FROM external_links WHERE board_kind='task' AND board_id=?",
+        )
+        .bind(task_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for link in links {
+            let meta: Value = link
+                .try_get::<Option<String>, _>("metadata")?
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| json!({}));
+            if !reflects_out(&meta, auth) {
+                continue;
+            }
+            let mut reflect = json!({
+                "task_id": task_id,
+                "comment_id": cid,
+                "author": auth,
+                "body": body,
+                "source": link.try_get::<String, _>("source")?,
+                "external_id": link.try_get::<String, _>("external_id")?,
+            });
+            if let Some(parent) = link.try_get::<Option<String>, _>("external_parent_id")? {
+                reflect["external_parent_id"] = json!(parent);
+            }
+            if let Some(ext) = external_author {
+                reflect["external_author"] = json!(ext);
+            }
+            emit(
+                &mut tx,
+                &mut hooks,
+                "task.outbound_reflect",
+                author,
+                Some(task_id),
+                None,
+                None,
+                None,
+                reflect,
+                Recipients::Explicit(std::collections::BTreeSet::new()),
+            )
+            .await?;
+        }
+    }
     // If this task mirrors a promoted channel thread, fan the comment back out as a thread reply.
     mirror_task_comment_to_thread(&mut tx, &mut hooks, task_id, cid, author, body, external_author).await?;
     tx.commit().await?;
@@ -1770,7 +1823,7 @@ pub async fn post_to_channel(
     // may leave the board for an external system. A `channel.outbound_reflect` event is emitted
     // ONLY when the channel's policy permits this author — a bridge adapter is a dumb executor
     // that acts solely on these authorized events. Other posts stay board-internal (no event).
-    if channel_reflects_out(&ch_meta, sender) {
+    if reflects_out(&ch_meta, sender) {
         let mut reflect = json!({
             "channel_id": channel_id,
             "post_seq": seq,
@@ -1815,13 +1868,14 @@ pub async fn post_to_channel(
     Ok(json!({ "channel_id": channel_id, "seq": seq }))
 }
 
-/// Outbound reflect-back policy (design #141 §5), read from a channel's `metadata`:
-/// `{ "outbound_authors": [..] (default ["concierge"]), "direction": "in"|"out"|"both" (default
-/// "in") }`. A post reflects OUT to an external system iff the channel's `direction` allows
-/// outbound (`out`/`both`) AND its `author` is in the `outbound_authors` allowlist. The safe
-/// default is board-internal: an unconfigured channel (direction defaults to "in") reflects
-/// nothing, so existing channels never start leaking to an external system.
-fn channel_reflects_out(metadata: &Value, author: &str) -> bool {
+/// Outbound reflect-back policy (design #141 §5), read from a policy-bearing `metadata` bag —
+/// a channel's `metadata` for channel posts, or an `external_links` row's `metadata` for task
+/// comments (task 264): `{ "outbound_authors": [..] (default ["concierge"]), "direction":
+/// "in"|"out"|"both" (default "in") }`. Content reflects OUT to an external system iff
+/// `direction` allows outbound (`out`/`both`) AND its `author` is in the `outbound_authors`
+/// allowlist. The safe default is board-internal: an unconfigured entity (direction defaults to
+/// "in") reflects nothing, so existing channels/links never start leaking to an external system.
+fn reflects_out(metadata: &Value, author: &str) -> bool {
     let direction = metadata.get("direction").and_then(|v| v.as_str()).unwrap_or("in");
     if direction != "out" && direction != "both" {
         return false;
@@ -5290,16 +5344,16 @@ mod tests {
     #[test]
     fn outbound_reflect_policy() {
         // Default (unconfigured) + explicit "in" never reflect out.
-        assert!(!channel_reflects_out(&json!({}), "concierge"));
-        assert!(!channel_reflects_out(&json!({ "direction": "in" }), "concierge"));
+        assert!(!reflects_out(&json!({}), "concierge"));
+        assert!(!reflects_out(&json!({ "direction": "in" }), "concierge"));
         // direction out/both with no allowlist -> the documented ["concierge"] default.
-        assert!(channel_reflects_out(&json!({ "direction": "out" }), "concierge"));
-        assert!(channel_reflects_out(&json!({ "direction": "both" }), "concierge"));
-        assert!(!channel_reflects_out(&json!({ "direction": "out" }), "worker"));
+        assert!(reflects_out(&json!({ "direction": "out" }), "concierge"));
+        assert!(reflects_out(&json!({ "direction": "both" }), "concierge"));
+        assert!(!reflects_out(&json!({ "direction": "out" }), "worker"));
         // An explicit allowlist replaces the default (and thus can EXCLUDE concierge).
         let p = json!({ "direction": "both", "outbound_authors": ["worker"] });
-        assert!(channel_reflects_out(&p, "worker"));
-        assert!(!channel_reflects_out(&p, "concierge"));
+        assert!(reflects_out(&p, "worker"));
+        assert!(!reflects_out(&p, "concierge"));
     }
 
     /// End-to-end (#150 gate): a post by an allowed author on an out-enabled channel emits a
@@ -5352,6 +5406,77 @@ mod tests {
         post_to_channel(&pool, pid, "concierge", "now out", None, None).await?;
         let ev = get_events(&pool, 0, 500, None).await?;
         assert_eq!(reflects(&ev, pid).len(), 1, "policy configurable after creation");
+        Ok(())
+    }
+
+    /// End-to-end (task 264 gate): a comment by an allowed author on a task linked OUT emits a
+    /// `task.outbound_reflect` carrying the link's external target; a denied author (e.g. the
+    /// ingesting bridge) emits none; an unlinked/unconfigured task never reflects; per-link authz
+    /// is independent (two links on one task, only the out-enabled one fires).
+    #[tokio::test]
+    async fn task_outbound_reflect_event_emission() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "concierge", None, None, None, None, None).await?;
+        register_agent(&pool, "gh-bridge", None, None, None, None, None).await?;
+        let proj = create_project(&pool, "p", None, Some("concierge"), None).await?;
+        let pid = proj["id"].as_i64().unwrap();
+
+        let reflects = |events: &Value, tid: i64| -> Vec<Value> {
+            events
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["type"] == json!("task.outbound_reflect") && e["data"]["task_id"] == json!(tid))
+                .cloned()
+                .collect()
+        };
+
+        // A task linked to a GitHub issue, out-enabled with the default allowlist (concierge).
+        let task = create_task(&pool, pid, "t", None, None, None, Some("concierge"), None, None).await?;
+        let tid = task["id"].as_i64().unwrap();
+        upsert_external_link(
+            &pool, "github", "camshaft/task-board#42", Some("issue"), "task", tid,
+            Some(json!({ "direction": "both" })),
+        )
+        .await?;
+
+        // Allowed author -> one reflect event carrying the comment + external target.
+        comment_task(&pool, tid, "reflect me", Some("concierge"), None).await?;
+        let ev = get_events(&pool, 0, 500, None).await?;
+        let r = reflects(&ev, tid);
+        assert_eq!(r.len(), 1, "allowed author reflects out");
+        assert_eq!(r[0]["data"]["author"], json!("concierge"));
+        assert_eq!(r[0]["data"]["body"], json!("reflect me"));
+        assert_eq!(r[0]["data"]["source"], json!("github"));
+        assert_eq!(r[0]["data"]["external_id"], json!("camshaft/task-board#42"));
+        assert_eq!(r[0]["data"]["external_parent_id"], json!("issue"));
+        assert!(r[0]["data"]["comment_id"].as_i64().is_some());
+
+        // Denied author (the ingesting bridge, not in outbound_authors) -> no echo back out.
+        comment_task(&pool, tid, "ingested from github", Some("gh-bridge"), Some("github:U9")).await?;
+        let ev = get_events(&pool, 0, 500, None).await?;
+        assert_eq!(reflects(&ev, tid).len(), 1, "ingested comment stays board-internal (loop-safe)");
+
+        // A task with no external link never reflects, even for an allowed author.
+        let plain = create_task(&pool, pid, "unlinked", None, None, None, Some("concierge"), None, None).await?;
+        let plain_id = plain["id"].as_i64().unwrap();
+        comment_task(&pool, plain_id, "hi", Some("concierge"), None).await?;
+        let ev = get_events(&pool, 0, 500, None).await?;
+        assert_eq!(reflects(&ev, plain_id).len(), 0, "unlinked task is board-internal");
+
+        // Per-link independence: add a SECOND link that is inbound-only; a comment fires only the
+        // out-enabled github link, not the inbound one.
+        upsert_external_link(
+            &pool, "gitlab", "grp/proj#7", None, "task", tid,
+            Some(json!({ "direction": "in" })),
+        )
+        .await?;
+        comment_task(&pool, tid, "second reflect", Some("concierge"), None).await?;
+        let ev = get_events(&pool, 0, 500, None).await?;
+        let r = reflects(&ev, tid);
+        assert_eq!(r.len(), 2, "only the out-enabled link fires; inbound link stays internal");
+        assert!(r.iter().all(|e| e["data"]["source"] == json!("github")), "gitlab (in) never reflects");
         Ok(())
     }
 

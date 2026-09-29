@@ -59,9 +59,16 @@ SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
     comments, attribution + timestamps preserved) with a durable link that keeps the two in
     sync **both ways** (a new reply mirrors to a comment, a new comment mirrors to a reply;
     loop-safe, deduped by origin id).
-  - **reflect-back policy** — a per-channel knob (`set_channel_props`: `outbound_authors` +
-    `direction`) decides which posts emit a `channel.outbound_reflect` event, so an adapter is a
-    dumb executor that only relays *authorized* content outward. The board is authoritative.
+  - **reflect-back policy** — a knob (`outbound_authors` + `direction`) decides which content may
+    leave the board for an external system, so an adapter is a dumb executor that only relays
+    *authorized* content outward. The board is authoritative. It applies on two surfaces with the
+    same semantics: a **channel** (`set_channel_props`) governs which posts emit a
+    `channel.outbound_reflect` event, and a **task↔external-item link** (`upsert_external_link`
+    metadata) governs which task comments emit a `task.outbound_reflect` event — one event per
+    authorized link, so a task bridged to several systems reflects each independently. In both
+    cases the safe default is board-internal (`direction` defaults to `in`), and an ingested
+    comment/post — authored by the bridge agent, which isn't in `outbound_authors` — never echoes
+    back out.
 
 > Why not live MCP push? The MCP spec supports server→client notifications, but today's
 > clients don't reliably wake an *idle* agent on them — so a polled inbox is the real
