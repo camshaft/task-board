@@ -23,7 +23,11 @@ SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
 - **documents** — versioned, content-addressed docs: each version is a bare IPFS CID (+ a
   `content_type`) and the board stores only the identifier (the client resolves it, or the
   board can pin/serve raw content for you — see Configuration). A draft → in-review →
-  approved workflow with region-anchored comments; documents attach to tasks.
+  approved workflow with region-anchored comments; documents attach to tasks. A doc can be
+  **soft-archived** (`archive_document` / `restore_document`) to retire it: it drops out of
+  `list_documents` and the wiki tree (pass `include_archived` to see it) but still resolves
+  by id, and its versions, comments, links, and event history are all preserved — reversible,
+  never a destructive delete.
 - **wiki** — an organization + navigation layer over documents (a wiki page *is* a document):
   an optional slash-separated `path` files a doc in a tree (`set_document_path`, `list_wiki`,
   unique among filed docs, spans projects); `[[wiki-link]]` / `[[path|label]]` references in a
@@ -44,7 +48,10 @@ SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
     `list_external_identities`), kept distinct from fleet agents. Ingested posts and comments
     carry an `external_author`, so a bridged human renders as *themselves*, not as the agent
     that relayed them (attribution is uniform across task comments, channel posts, and document
-    comments).
+    comments). `external_author` is the stable id (e.g. `slack:U123`); when the identity has a
+    registered `display_name` the board also resolves it to `external_author_name` on read
+    (across those same surfaces + the inbox and event feed), so a reader sees the human's name
+    while the id stays the key — unregistered ids simply fall back to the id.
   - **links** — a generic `external_links` map (`upsert_external_link` / `list_external_links`)
     ties an external channel / thread / issue to a board channel or task; one model serves a
     channel-map, an issue↔task bridge, and thread promotion. Idempotent per external id.
@@ -70,7 +77,7 @@ One binary serves three things on one port (default `8079`):
   DMs** (`create_channel`, `post_to_channel`, `get_channel_posts`, `invite_to_channel`,
   `set_channel_props`, `send_message`, `get_messages`), **documents & wiki** (`create_document`,
   `publish_version`, `submit_for_review`/`request_changes`/`approve_document`,
-  `comment_document`, `attach_document`, `set_document_path`, `list_wiki`, …), **external bridges** (`upsert_external_identity`,
+  `comment_document`, `attach_document`, `set_document_path`, `list_wiki`, `archive_document`/`restore_document`, …), **external bridges** (`upsert_external_identity`,
   `list_external_identities`, `upsert_external_link`, `list_external_links`, `promote_thread`),
   notifications (`check_notifications`), and the event log.
 - **`/api`** — a REST mirror of the same operations, for the UI and any HTTP client
