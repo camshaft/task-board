@@ -92,6 +92,22 @@ export function useExternalNameResolver(): (id: string) => string {
   return (id: string) => data?.find((e) => e.id === id)?.display_name ?? id
 }
 
+// The in-app deep-link for an activity-feed event → the underlying thing that happened, so the
+// operator can click through to details (task 275). Most specific target wins; null when there's
+// nothing linkable. Uses the bare `/tasks/:id` redirect route (it resolves the project itself),
+// and the `#comment-<id>` anchor for a comment. channel_id/document_id come straight off the
+// event row; comment_id lives in `data`.
+export function eventHref(e: EventRow): string | null {
+  const commentId = typeof e.data?.comment_id === 'number' ? e.data.comment_id : undefined
+  if (e.type.startsWith('document.') && e.document_id != null) return `/documents/${e.document_id}`
+  if (e.channel_id != null) return `/channels/${e.channel_id}`
+  if (e.task_id != null)
+    return `/tasks/${e.task_id}${e.type === 'task.commented' && commentId != null ? `#comment-${commentId}` : ''}`
+  if (e.document_id != null) return `/documents/${e.document_id}`
+  if (e.project_id != null) return `/projects/${e.project_id}`
+  return null
+}
+
 export function useEvents(limit = 30) {
   // order='desc' → the server returns the LATEST `limit` events, newest-first, so the feed
   // tracks recent activity (an SSE event invalidates this key, and the refetch surfaces the new

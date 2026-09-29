@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from 'react'
 import { Link, Outlet, useOutletContext, useParams } from 'react-router-dom'
 import { useLiveUpdates } from './live'
 import { WikiLinkContext, type WikiResolver } from './markdown'
-import { createProject, useAgents, useEvents, useProjects, useWiki } from './resources'
+import { createProject, eventHref, useAgents, useEvents, useProjects, useWiki } from './resources'
 import { AGENT_DOT, relTime } from './ui'
 
 // The only thing nested routes still need handed down is the current actor (per-user
@@ -277,20 +277,37 @@ export default function Layout() {
           </div>
           <div className="flex-1 overflow-y-auto px-3 pb-3">
             <ul className="space-y-2">
-              {events.map((e) => (
-                <li key={e.seq} className="text-xs">
-                  <div className="flex items-center gap-1.5">
-                    <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
-                      {e.type}
-                    </span>
-                    <span className="text-[var(--color-muted)]">{relTime(e.created_at)}</span>
-                  </div>
-                  <div className="mt-0.5 text-[var(--color-muted)]">
-                    {e.actor && <span className="font-mono">{e.actor}</span>}
-                    {typeof e.data?.title === 'string' && <> · {e.data.title as string}</>}
-                  </div>
-                </li>
-              ))}
+              {events.map((e) => {
+                const href = eventHref(e)
+                const body = (
+                  <>
+                    <div className="flex items-center gap-1.5">
+                      <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                        {e.type}
+                      </span>
+                      <span className="text-[var(--color-muted)]">{relTime(e.created_at)}</span>
+                    </div>
+                    <div className="mt-0.5 text-[var(--color-muted)]">
+                      {e.actor && <span className="font-mono">{e.actor}</span>}
+                      {typeof e.data?.title === 'string' && <> · {e.data.title as string}</>}
+                    </div>
+                  </>
+                )
+                return (
+                  <li key={e.seq} className="text-xs">
+                    {href ? (
+                      <Link
+                        to={href}
+                        className="-mx-1 block rounded px-1 hover:bg-[var(--color-panel-2)]"
+                      >
+                        {body}
+                      </Link>
+                    ) : (
+                      body
+                    )}
+                  </li>
+                )
+              })}
               {events.length === 0 && (
                 <li className="text-xs text-[var(--color-muted)]">No activity yet.</li>
               )}

@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom'
 import { useBoardContext } from './Layout'
-import { useAgents, useAgentTasks, useEvents, useProjects } from './resources'
+import { eventHref, useAgents, useAgentTasks, useEvents, useProjects } from './resources'
 import { AGENT_DOT, relTime, StatusChip, STATUS_CHIP, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // The index route (`/`): an at-a-glance fleet dashboard — cross-project task totals, the
@@ -157,15 +157,32 @@ export default function Home() {
           Recent activity
         </h2>
         <ul className="space-y-1">
-          {events.slice(0, 10).map((e) => (
-            <li key={e.seq} className="flex items-center gap-2 text-xs">
-              <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
-                {e.type}
-              </span>
-              {e.actor && <span className="font-mono text-[var(--color-muted)]">{e.actor}</span>}
-              <span className="ml-auto text-[var(--color-muted)]">{relTime(e.created_at)}</span>
-            </li>
-          ))}
+          {events.slice(0, 10).map((e) => {
+            const href = eventHref(e)
+            const body = (
+              <>
+                <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                  {e.type}
+                </span>
+                {e.actor && <span className="font-mono text-[var(--color-muted)]">{e.actor}</span>}
+                <span className="ml-auto text-[var(--color-muted)]">{relTime(e.created_at)}</span>
+              </>
+            )
+            return (
+              <li key={e.seq} className="text-xs">
+                {href ? (
+                  <Link
+                    to={href}
+                    className="-mx-1 flex items-center gap-2 rounded px-1 hover:bg-[var(--color-panel-2)]"
+                  >
+                    {body}
+                  </Link>
+                ) : (
+                  <div className="flex items-center gap-2">{body}</div>
+                )}
+              </li>
+            )
+          })}
           {events.length === 0 && <li className="text-sm text-[var(--color-muted)]">No activity yet.</li>}
         </ul>
       </section>
