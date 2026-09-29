@@ -48,6 +48,7 @@ impl IntoResponse for ApiError {
             || msg.starts_with("a task cannot be its own parent")
             || msg.starts_with("reparenting would create a cycle")
             || msg.contains("is in a different project")
+            || msg.starts_with("banned phrase")
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
@@ -111,6 +112,8 @@ pub fn router(state: AppState) -> Router {
         .route("/external-links", get(list_external_links).post(upsert_external_link))
         .route("/workspace-kinds", get(list_workspace_kinds).post(set_workspace_kind))
         .route("/workspace-kinds/{name}", get(get_workspace_kind).delete(delete_workspace_kind))
+        .route("/banned-phrases", get(list_banned_phrases).post(add_banned_phrase))
+        .route("/banned-phrases/{phrase}", axum::routing::delete(remove_banned_phrase))
         .route("/ipfs/add", post(ipfs_add))
         .route("/ipfs/{cid}", get(ipfs_cat))
         .route("/wiki", get(list_wiki))
@@ -211,6 +214,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/workspace-kinds", summary: "Define/update a workspace kind (setup_script + config an agent is configured with); idempotent on name, config merges.", query: "", body: Some("SetWorkspaceKindBody") },
     Endpoint { method: "GET", path: "/api/workspace-kinds/{name}", summary: "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize a workspace.", query: "", body: None },
     Endpoint { method: "DELETE", path: "/api/workspace-kinds/{name}", summary: "Retire a workspace kind by name.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list (what the pre-submit content lint checks docs and comments against).", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
+    Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author; archived hidden unless include_archived=true).", query: "project_id=int&status=str&tag=str&task_id=int&author=str&include_archived=bool", body: None },
@@ -272,6 +278,7 @@ fn body_schemas() -> Value {
         UpsertExternalLinkBody,
         PromoteThreadBody,
         SetWorkspaceKindBody,
+        AddBannedPhraseBody,
     )
 }
 
@@ -803,6 +810,8 @@ struct CommentBody {
     /// (source, external_id), the existing comment is returned (`created:false`) instead of a
     /// duplicate. Lets a bridge adapter mirror an external comment exactly-once.
     external_link: Option<core::ExternalRef>,
+    /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
+    acknowledge_banned: Option<bool>,
 }
 
 async fn comment_task(
@@ -810,6 +819,7 @@ async fn comment_task(
     Path(task_id): Path<i64>,
     Json(b): Json<CommentBody>,
 ) -> ApiResult {
+    core::check_banned_phrases(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
     Ok(Json(
         core::comment_task(&st.pool, task_id, &b.body, b.author.as_deref(), b.external_author.as_deref(), b.external_link).await?,
     ))
@@ -1140,6 +1150,29 @@ async fn delete_workspace_kind(State(st): State<AppState>, Path(name): Path<Stri
     Ok(Json(core::delete_workspace_kind(&st.pool, &name).await?))
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct AddBannedPhraseBody {
+    /// The phrase to ban (stored lowercased; matched case-insensitively, whole-phrase).
+    phrase: String,
+    /// Optional note: why it's banned, or what to write instead.
+    note: Option<String>,
+    created_by: Option<String>,
+}
+
+async fn add_banned_phrase(State(st): State<AppState>, Json(b): Json<AddBannedPhraseBody>) -> ApiResult {
+    Ok(Json(
+        core::add_banned_phrase(&st.pool, &b.phrase, b.note.as_deref(), b.created_by.as_deref()).await?,
+    ))
+}
+
+async fn list_banned_phrases(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_banned_phrases(&st.pool).await?))
+}
+
+async fn remove_banned_phrase(State(st): State<AppState>, Path(phrase): Path<String>) -> ApiResult {
+    Ok(Json(core::remove_banned_phrase(&st.pool, &phrase).await?))
+}
+
 #[derive(Deserialize)]
 struct ListExternalLinksQuery {
     source: Option<String>,
@@ -1324,9 +1357,17 @@ struct CreateDocumentBody {
     metadata: Option<Value>,
     /// MIME type of v1's bytes (default text/markdown). The board records only the label.
     content_type: Option<String>,
+    /// Submit even if the content contains a banned phrase (the pre-submit lint otherwise rejects
+    /// it). Text content is scanned; non-text content is not.
+    acknowledge_banned: Option<bool>,
 }
 
 async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumentBody>) -> ApiResult {
+    if let Some(c) = b.content.as_deref() {
+        if core::is_text_content_type(b.content_type.as_deref().unwrap_or("text/markdown")) {
+            core::check_banned_phrases(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
+        }
+    }
     let cid =
         ipfs::resolve_cid(b.cid.as_deref(), b.content.as_deref(), st.ipfs_api_url.as_deref()).await?;
     Ok(Json(
@@ -1389,6 +1430,9 @@ struct PublishVersionBody {
     created_by: Option<String>,
     /// MIME type of this version's bytes (default text/markdown). The board records only the label.
     content_type: Option<String>,
+    /// Submit even if the content contains a banned phrase (the pre-submit lint otherwise rejects
+    /// it). Text content is scanned; non-text content is not.
+    acknowledge_banned: Option<bool>,
 }
 
 async fn publish_version(
@@ -1396,6 +1440,11 @@ async fn publish_version(
     Path(document_id): Path<i64>,
     Json(b): Json<PublishVersionBody>,
 ) -> ApiResult {
+    if let Some(c) = b.content.as_deref() {
+        if core::is_text_content_type(b.content_type.as_deref().unwrap_or("text/markdown")) {
+            core::check_banned_phrases(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
+        }
+    }
     let cid =
         ipfs::resolve_cid(b.cid.as_deref(), b.content.as_deref(), st.ipfs_api_url.as_deref()).await?;
     Ok(Json(
@@ -1459,6 +1508,8 @@ struct CommentDocumentBody {
     /// Optional external identity id (e.g. "slack:U123") this comment is attributed to — for an
     /// ingested human author. `author` stays the fleet agent that performed the write.
     external_author: Option<String>,
+    /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
+    acknowledge_banned: Option<bool>,
 }
 
 async fn comment_document(
@@ -1466,6 +1517,7 @@ async fn comment_document(
     Path(document_id): Path<i64>,
     Json(b): Json<CommentDocumentBody>,
 ) -> ApiResult {
+    core::check_banned_phrases(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
     Ok(Json(
         core::comment_document(
             &st.pool,

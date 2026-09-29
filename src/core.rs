@@ -2803,6 +2803,126 @@ fn hydrate_workspace_kind(r: &SqliteRow) -> Value {
     v
 }
 
+// --- Banned phrases (data-driven pre-submit content lint for docs + comments) ---
+
+/// Add (or update the note on) a banned phrase. Stored trimmed + lowercased so matching is
+/// case-insensitive. Idempotent on the phrase. Returns the stored record.
+pub async fn add_banned_phrase(
+    pool: &Pool,
+    phrase: &str,
+    note: Option<&str>,
+    created_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let p = phrase.trim().to_lowercase();
+    if p.is_empty() {
+        anyhow::bail!("give a non-empty phrase to ban");
+    }
+    sqlx::query(
+        "INSERT INTO banned_phrases(phrase, note, created_by, created_at) VALUES(?,?,?,?) \
+         ON CONFLICT(phrase) DO UPDATE SET note=excluded.note",
+    )
+    .bind(&p)
+    .bind(note)
+    .bind(created_by)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(json!({ "phrase": p, "note": note, "created_by": created_by }))
+}
+
+/// The maintained banned-phrases list, alphabetical.
+pub async fn list_banned_phrases(pool: &Pool) -> anyhow::Result<Value> {
+    let rows = sqlx::query("SELECT * FROM banned_phrases ORDER BY phrase")
+        .fetch_all(pool)
+        .await?;
+    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
+/// Remove a banned phrase. Returns `{phrase, deleted}` (deleted=false if it wasn't listed).
+pub async fn remove_banned_phrase(pool: &Pool, phrase: &str) -> anyhow::Result<Value> {
+    let p = phrase.trim().to_lowercase();
+    let res = sqlx::query("DELETE FROM banned_phrases WHERE phrase=?")
+        .bind(&p)
+        .execute(pool)
+        .await?;
+    Ok(json!({ "phrase": p, "deleted": res.rows_affected() > 0 }))
+}
+
+/// Whether `needle` occurs in `haystack` as a whole phrase — bounded by a non-alphanumeric
+/// character (or the string ends) on each side, so "the floor" does not match inside "the
+/// floorboard". Both arguments must already be lowercased by the caller.
+fn contains_whole_phrase(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let idx = start + pos;
+        let end = idx + needle.len();
+        let before_ok = idx == 0
+            || !haystack[..idx]
+                .chars()
+                .next_back()
+                .map(|c| c.is_alphanumeric())
+                .unwrap_or(false);
+        let after_ok = end == haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .map(|c| c.is_alphanumeric())
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
+/// Scan `text` against the banned-phrases list. Returns the matched phrases (case-insensitive,
+/// whole-phrase), alphabetical. Empty when the list is empty or nothing matches.
+pub async fn scan_banned_phrases(pool: &Pool, text: &str) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query("SELECT phrase FROM banned_phrases ORDER BY phrase")
+        .fetch_all(pool)
+        .await?;
+    let hay = text.to_lowercase();
+    let mut hits = Vec::new();
+    for r in rows {
+        let phrase: String = r.try_get("phrase")?;
+        if contains_whole_phrase(&hay, &phrase) {
+            hits.push(phrase);
+        }
+    }
+    Ok(hits)
+}
+
+/// Pre-submit lint: bail with a clear, author-facing message if `text` contains any banned phrase
+/// and the author has not acknowledged. `acknowledge=true` is the soft-block escape hatch (submit
+/// anyway) — for intentional uses, e.g. content that quotes a banned phrase to discuss it. The
+/// error message starts with "banned phrase" so the REST layer maps it to 400.
+pub async fn check_banned_phrases(
+    pool: &Pool,
+    text: &str,
+    acknowledge: bool,
+) -> anyhow::Result<()> {
+    if acknowledge {
+        return Ok(());
+    }
+    let hits = scan_banned_phrases(pool, text).await?;
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let list = hits
+        .iter()
+        .map(|p| format!("\"{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "banned phrase(s) found: {list}. These are on the fleet banned-phrases list — that is not \
+         how we write here. Rewrite to remove them, or pass acknowledge_banned=true to submit anyway."
+    );
+}
+
 // --- External links (bridged mappings: channel-map, issue↔task, thread↔task) ---
 
 /// The board entity kinds an external link may target.
@@ -5436,6 +5556,46 @@ mod tests {
         assert_eq!(none.as_array().unwrap().len(), 0);
         let unfiltered = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), None).await?;
         assert_eq!(unfiltered.as_array().unwrap().len(), 4, "meta_key without meta_value is inert");
+        Ok(())
+    }
+
+    /// The banned-phrases list + scanner (task #308): add/list/remove round-trips, the scan is
+    /// case-insensitive and whole-phrase (not a substring of a larger word), and check_banned_phrases
+    /// bails on a hit unless acknowledged.
+    #[tokio::test]
+    async fn banned_phrases_list_and_scan() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Empty list: nothing matches, and check passes.
+        assert!(scan_banned_phrases(&pool, "anything at all").await?.is_empty());
+        check_banned_phrases(&pool, "anything at all", false).await?;
+
+        // Add two phrases (stored lowercased; idempotent + note-updating on re-add).
+        add_banned_phrase(&pool, "The Floor", Some("jargon"), Some("librarian")).await?;
+        add_banned_phrase(&pool, "floored", None, Some("librarian")).await?;
+        add_banned_phrase(&pool, "the floor", Some("still jargon"), Some("librarian")).await?; // dup -> update
+        let list = list_banned_phrases(&pool).await?;
+        assert_eq!(list.as_array().unwrap().len(), 2, "dup add did not grow the list: {list}");
+
+        // Case-insensitive, whole-phrase match; the term inside a larger word does NOT match.
+        assert_eq!(scan_banned_phrases(&pool, "we hit THE FLOOR today").await?, vec!["the floor"]);
+        assert_eq!(scan_banned_phrases(&pool, "I am floored.").await?, vec!["floored"]);
+        assert!(scan_banned_phrases(&pool, "the floorboard creaks").await?.is_empty(), "whole-word only");
+        assert!(scan_banned_phrases(&pool, "no jargon here").await?.is_empty());
+
+        // check bails on a hit, unless acknowledged.
+        let err = check_banned_phrases(&pool, "down to the floor", false).await.unwrap_err().to_string();
+        assert!(err.starts_with("banned phrase"), "got: {err}");
+        assert!(err.contains("the floor"), "names the phrase: {err}");
+        check_banned_phrases(&pool, "down to the floor", true).await?; // acknowledged -> passes
+
+        // Remove one; it stops matching and the list shrinks.
+        let r = remove_banned_phrase(&pool, "THE FLOOR").await?;
+        assert_eq!(r["deleted"], json!(true));
+        assert!(scan_banned_phrases(&pool, "we hit the floor").await?.is_empty());
+        assert_eq!(list_banned_phrases(&pool).await?.as_array().unwrap().len(), 1);
+        assert_eq!(remove_banned_phrase(&pool, "the floor").await?["deleted"], json!(false), "already gone");
         Ok(())
     }
 

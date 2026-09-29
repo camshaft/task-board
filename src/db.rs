@@ -267,6 +267,16 @@ CREATE TABLE IF NOT EXISTS workspace_kinds (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+-- A maintained list of BANNED PHRASES: jargon/idioms the fleet has agreed not to use in docs and
+-- comments. Data-driven so the list grows without a code change; the pre-submit scanner checks
+-- authored content against it (case-insensitive, whole-word). `phrase` is stored lowercased and is
+-- the key; `note` optionally explains why it's banned or what to write instead.
+CREATE TABLE IF NOT EXISTS banned_phrases (
+    phrase     TEXT PRIMARY KEY,
+    note       TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
