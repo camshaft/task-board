@@ -107,8 +107,10 @@ pub fn router(state: AppState) -> Router {
         .route("/external-identities", get(list_external_identities).post(upsert_external_identity))
         .route("/external-links", get(list_external_links).post(upsert_external_link))
         .route("/ipfs/add", post(ipfs_add))
+        .route("/wiki", get(list_wiki))
         .route("/documents", get(list_documents).post(create_document))
         .route("/documents/{document_id}", get(get_document))
+        .route("/documents/{document_id}/path", post(set_document_path))
         .route("/documents/{document_id}/versions", get(get_document_versions).post(publish_version))
         .route("/documents/{document_id}/comments", get(get_document_comments).post(comment_document))
         .route("/documents/{document_id}/comments/{comment_id}/resolve", post(resolve_comment))
@@ -197,7 +199,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author).", query: "project_id=int&status=str&tag=str&task_id=int&author=str", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
+    Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path.", query: "prefix=str", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/versions", summary: "Publish a new immutable version (bare CID).", query: "", body: Some("PublishVersionBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/comments", summary: "List a document's comments (filter by version_id/status).", query: "version_id=int&status=str", body: None },
@@ -237,6 +241,7 @@ fn body_schemas() -> Value {
         SendMessageBody,
         CreateDocumentBody,
         PublishVersionBody,
+        SetDocumentPathBody,
         CommentDocumentBody,
         ResolveCommentBody,
         DocumentActorBody,
@@ -1076,6 +1081,15 @@ struct ListDocumentsQuery {
     author: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct WikiQuery {
+    prefix: Option<String>,
+}
+
+async fn list_wiki(State(st): State<AppState>, Query(q): Query<WikiQuery>) -> ApiResult {
+    Ok(Json(core::list_wiki(&st.pool, q.prefix.as_deref()).await?))
+}
+
 async fn list_documents(
     State(st): State<AppState>,
     Query(q): Query<ListDocumentsQuery>,
@@ -1171,6 +1185,24 @@ async fn publish_version(
             b.content_type.as_deref(),
         )
         .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetDocumentPathBody {
+    /// The wiki path to file this document under (e.g. architecture/board/events). An empty
+    /// string clears the path (unfiles the doc). Must be unique among filed documents.
+    path: String,
+    actor: Option<String>,
+}
+
+async fn set_document_path(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<SetDocumentPathBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_document_path(&st.pool, document_id, &b.path, b.actor.as_deref()).await?,
     ))
 }
 

@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS documents (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     title               TEXT NOT NULL,
     slug                TEXT,
+    -- Optional wiki path (e.g. architecture/board/events). Nullable: a doc can exist unfiled.
+    -- Uniqueness among non-null paths is enforced by a partial unique index (see below).
+    path                TEXT,
     project_id          INTEGER REFERENCES projects(id),
     status              TEXT NOT NULL DEFAULT 'draft',
     current_version_id  INTEGER REFERENCES document_versions(id),
@@ -207,6 +210,7 @@ CREATE INDEX IF NOT EXISTS idx_doc_attach_doc  ON document_attachments(document_
 CREATE INDEX IF NOT EXISTS idx_ext_ident_source ON external_identities(source);
 CREATE INDEX IF NOT EXISTS idx_task_links_task ON task_links(task_id);
 CREATE INDEX IF NOT EXISTS idx_external_links_board ON external_links(board_kind, board_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_path ON documents(path) WHERE path IS NOT NULL;
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
@@ -394,6 +398,22 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
             .execute(&pool)
             .await?;
     }
+
+    // Back-fill documents.path (the wiki organization layer). Nullable; SQLite can't ALTER-ADD a
+    // UNIQUE column, so uniqueness among non-null paths is a partial unique index (created next).
+    let documents_have_path = sqlx::query("PRAGMA table_info(documents)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "path");
+    if !documents_have_path {
+        sqlx::query("ALTER TABLE documents ADD COLUMN path TEXT")
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_path ON documents(path) WHERE path IS NOT NULL")
+        .execute(&pool)
+        .await?;
 
     Ok(pool)
 }
