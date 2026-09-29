@@ -72,6 +72,12 @@ export default function Layout() {
         >
           Docs
         </Link>
+        <Link
+          to="/channels"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        >
+          Channels
+        </Link>
         <a
           href={new URL('api', document.baseURI).href}
           target="_blank"

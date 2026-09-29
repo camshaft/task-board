@@ -4,6 +4,8 @@ import { BrowserRouter, Route, Routes } from 'react-router-dom'
 import './index.css'
 import AgentView from './AgentView.tsx'
 import Board from './Board.tsx'
+import ChannelView from './ChannelView.tsx'
+import Channels from './Channels.tsx'
 import Documents from './Documents.tsx'
 import DocumentView from './DocumentView.tsx'
 import Home from './Home.tsx'
@@ -30,6 +32,8 @@ createRoot(document.getElementById('root')!).render(
           <Route path="documents" element={<Documents />} />
           <Route path="documents/:documentId" element={<DocumentView />} />
           <Route path="agents/:agentId" element={<AgentView />} />
+          <Route path="channels" element={<Channels />} />
+          <Route path="channels/:channelId" element={<ChannelView />} />
           <Route path="projects/:projectId" element={<Board />}>
             <Route path="tasks/:taskId" element={<TaskDrawer />} />
           </Route>
