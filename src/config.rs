@@ -38,6 +38,11 @@ pub struct Settings {
     /// A single `"*"` disables the check entirely — any `Host` is accepted (NOT recommended
     /// for public deployments; only for closed networks).
     pub mcp_allowed_hosts: Vec<String>,
+    /// Optional IPFS HTTP API base URL (e.g. "http://127.0.0.1:5001"). When set, the board
+    /// can content-address raw document `content` server-side (pin via `/api/v0/add` and
+    /// store the returned CID) — so a client with no local IPFS can still author a document.
+    /// When unset (the default), the board stays CID-only: callers supply a precomputed CID.
+    pub ipfs_api_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -48,6 +53,7 @@ impl Default for Settings {
             port: 8079,
             webhook_timeout_secs: 5.0,
             mcp_allowed_hosts: Vec::new(),
+            ipfs_api_url: None,
         }
     }
 }
@@ -66,6 +72,9 @@ pub struct Config {
     /// `Host` authorities accepted by the MCP endpoint. Empty == rmcp's loopback-only
     /// default; `["*"]` == accept any host. See `Settings::mcp_allowed_hosts`.
     pub mcp_allowed_hosts: Vec<String>,
+    /// Optional IPFS HTTP API base URL for server-side content-addressing. See
+    /// `Settings::ipfs_api_url`. `None` keeps the board CID-only.
+    pub ipfs_api_url: Option<String>,
 }
 
 impl Config {
@@ -93,6 +102,7 @@ impl Config {
             webhook_timeout: Duration::from_secs_f64(s.webhook_timeout_secs),
             web_dir: web_dir.filter(|s| !s.is_empty()),
             mcp_allowed_hosts: s.mcp_allowed_hosts,
+            ipfs_api_url: s.ipfs_api_url.filter(|s| !s.is_empty()),
         }
     }
 }

@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::core;
 use crate::db::Pool;
+use crate::ipfs;
 use crate::sse::{self, StreamEvent};
 use tokio::sync::broadcast;
 
@@ -22,6 +23,9 @@ pub struct AppState {
     pub pool: Pool,
     /// Live activity bus: the SSE tailer publishes here, `GET /api/stream` subscribes.
     pub events_tx: broadcast::Sender<StreamEvent>,
+    /// Optional IPFS HTTP API for server-side content-addressing of raw document `content`.
+    /// `None` keeps the board CID-only. See `crate::ipfs` and `config::Settings::ipfs_api_url`.
+    pub ipfs_api_url: Option<String>,
 }
 
 /// Map an anyhow error to a JSON HTTP response. "no project/task ..." -> 404/400.
@@ -924,7 +928,12 @@ async fn list_documents(
 struct CreateDocumentBody {
     title: String,
     /// Bare IPFS content id for version 1. Stored verbatim; the board never resolves it.
-    cid: String,
+    /// Optional if `content` is given (and the board has an IPFS backend configured).
+    cid: Option<String>,
+    /// Raw content for version 1, content-addressed server-side when no `cid` is given. Needs
+    /// a configured IPFS backend; lets a client with no local IPFS author a document. Supply
+    /// exactly one of `cid` / `content`.
+    content: Option<String>,
     project_id: Option<i64>,
     summary: Option<String>,
     created_by: Option<String>,
@@ -932,12 +941,14 @@ struct CreateDocumentBody {
 }
 
 async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumentBody>) -> ApiResult {
+    let cid =
+        ipfs::resolve_cid(b.cid.as_deref(), b.content.as_deref(), st.ipfs_api_url.as_deref()).await?;
     Ok(Json(
         core::create_document(
             &st.pool,
             &b.title,
             b.project_id,
-            &b.cid,
+            &cid,
             b.summary.as_deref(),
             b.created_by.as_deref(),
             b.metadata,
@@ -960,7 +971,11 @@ async fn get_document_versions(
 #[derive(Deserialize, JsonSchema)]
 struct PublishVersionBody {
     /// Bare IPFS content id for the new version. Stored verbatim; the board never resolves it.
-    cid: String,
+    /// Optional if `content` is given (and the board has an IPFS backend configured).
+    cid: Option<String>,
+    /// Raw content for the new version, content-addressed server-side when no `cid` is given.
+    /// Supply exactly one of `cid` / `content`.
+    content: Option<String>,
     summary: Option<String>,
     created_by: Option<String>,
 }
@@ -970,11 +985,13 @@ async fn publish_version(
     Path(document_id): Path<i64>,
     Json(b): Json<PublishVersionBody>,
 ) -> ApiResult {
+    let cid =
+        ipfs::resolve_cid(b.cid.as_deref(), b.content.as_deref(), st.ipfs_api_url.as_deref()).await?;
     Ok(Json(
         core::publish_version(
             &st.pool,
             document_id,
-            &b.cid,
+            &cid,
             b.summary.as_deref(),
             b.created_by.as_deref(),
         )
