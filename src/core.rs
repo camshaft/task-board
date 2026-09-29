@@ -2439,12 +2439,21 @@ pub async fn get_events(
     since_seq: i64,
     limit: i64,
     actor: Option<&str>,
+    desc: bool,
 ) -> anyhow::Result<Value> {
+    // Two read modes over the same `seq>since_seq [AND actor=?]` window:
+    // - ascending (desc=false, the default): oldest-first — what an incremental poller wants
+    //   (advance `since_seq` to the max seq it has seen and ask for the next page).
+    // - descending (desc=true): newest-first, so `since_seq=0, limit=N` yields the LATEST N events
+    //   overall — what a live activity feed wants (a plain `ORDER BY seq LIMIT N` returns the N
+    //   OLDEST and never advances). The `seq>since_seq` lower bound still applies, so a feed can
+    //   also ask for "the latest N above some floor".
     // Optional `actor` filter — a complete per-agent activity feed without over-fetching.
-    let sql = if actor.is_some() {
-        "SELECT * FROM events WHERE seq>? AND actor=? ORDER BY seq LIMIT ?"
-    } else {
-        "SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?"
+    let sql = match (actor.is_some(), desc) {
+        (true, false) => "SELECT * FROM events WHERE seq>? AND actor=? ORDER BY seq ASC LIMIT ?",
+        (true, true) => "SELECT * FROM events WHERE seq>? AND actor=? ORDER BY seq DESC LIMIT ?",
+        (false, false) => "SELECT * FROM events WHERE seq>? ORDER BY seq ASC LIMIT ?",
+        (false, true) => "SELECT * FROM events WHERE seq>? ORDER BY seq DESC LIMIT ?",
     };
     let mut q = sqlx::query(sql).bind(since_seq);
     if let Some(a) = actor {
@@ -4616,7 +4625,7 @@ mod tests {
         let r = update_task(&pool, c2id, None, None, None, None, None, Some("u"), None, Some(0), None).await?;
         assert!(r["parent_id"].is_null());
         assert_eq!(get_task(&pool, eid).await?["child_rollup"], json!({ "done": 1, "total": 1 }));
-        let evs = get_events(&pool, 0, 200, None).await?;
+        let evs = get_events(&pool, 0, 200, None, false).await?;
         assert!(evs.as_array().unwrap().iter().any(|e| e["type"] == json!("task.reparented")));
 
         // move_task guard: the epic still has a child -> cannot cross projects.
@@ -4949,7 +4958,7 @@ mod tests {
         assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false, None, None, None).await?.as_array().unwrap().len(), 1);
 
         // A task.moved event was recorded carrying both ends.
-        let events = get_events(&pool, 0, 100, None).await?;
+        let events = get_events(&pool, 0, 100, None, false).await?;
         let ev = events
             .as_array()
             .unwrap()
@@ -4960,9 +4969,9 @@ mod tests {
         assert_eq!(ev["data"]["to_project_id"], json!(bid));
 
         // Moving onto the current project is a no-op (no new event, still on B).
-        let before = get_events(&pool, 0, 100, None).await?.as_array().unwrap().len();
+        let before = get_events(&pool, 0, 100, None, false).await?.as_array().unwrap().len();
         move_task(&pool, tid, bid, Some("u")).await?;
-        let after = get_events(&pool, 0, 100, None).await?.as_array().unwrap().len();
+        let after = get_events(&pool, 0, 100, None, false).await?.as_array().unwrap().len();
         assert_eq!(before, after, "no-op move should not emit an event");
         Ok(())
     }
@@ -5022,7 +5031,7 @@ mod tests {
             update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None, None).await?;
         assert!(cleared["assignee"].is_null(), "assignee should be NULL after unassign");
 
-        let events = get_events(&pool, 0, 100, None).await?;
+        let events = get_events(&pool, 0, 100, None, false).await?;
         let un = events
             .as_array()
             .unwrap()
@@ -5033,7 +5042,7 @@ mod tests {
 
         // Clearing an already-unassigned task does NOT emit a second task.unassigned.
         update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None, None).await?;
-        let after = get_events(&pool, 0, 200, None).await?;
+        let after = get_events(&pool, 0, 200, None, false).await?;
         assert_eq!(
             after
                 .as_array()
@@ -5047,7 +5056,7 @@ mod tests {
 
         // Re-assigning to a real owner emits task.assigned.
         update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None, None, None).await?;
-        let evs = get_events(&pool, 0, 200, None).await?;
+        let evs = get_events(&pool, 0, 200, None, false).await?;
         assert!(
             evs.as_array().unwrap().iter().any(
                 |e| e["type"] == json!("task.assigned") && e["data"]["assignee"] == json!("bob")
@@ -5382,7 +5391,7 @@ mod tests {
 
         // Allowed author -> reflect event carrying the post details.
         post_to_channel(&pool, cid, "concierge", "to slack", None, None).await?;
-        let ev = get_events(&pool, 0, 500, None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
         let r = reflects(&ev, cid);
         assert_eq!(r.len(), 1, "allowed author reflects out");
         assert_eq!(r[0]["data"]["author"], json!("concierge"));
@@ -5391,20 +5400,20 @@ mod tests {
 
         // Denied author -> no new reflect event.
         post_to_channel(&pool, cid, "worker", "internal only", None, None).await?;
-        let ev = get_events(&pool, 0, 500, None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(reflects(&ev, cid).len(), 1, "denied author stays board-internal");
 
         // An unconfigured channel never reflects, even for concierge.
         let plain = create_channel(&pool, "plain", None, Some("concierge"), None).await?;
         let pid = plain["id"].as_i64().unwrap();
         post_to_channel(&pool, pid, "concierge", "hi", None, None).await?;
-        let ev = get_events(&pool, 0, 500, None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(reflects(&ev, pid).len(), 0, "default policy is board-internal");
 
         // set_channel_props turns reflect-back ON for the plain channel.
         set_channel_props(&pool, pid, json!({ "direction": "out" })).await?;
         post_to_channel(&pool, pid, "concierge", "now out", None, None).await?;
-        let ev = get_events(&pool, 0, 500, None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(reflects(&ev, pid).len(), 1, "policy configurable after creation");
         Ok(())
     }
@@ -5443,7 +5452,7 @@ mod tests {
 
         // Allowed author -> one reflect event carrying the comment + external target.
         comment_task(&pool, tid, "reflect me", Some("concierge"), None).await?;
-        let ev = get_events(&pool, 0, 500, None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
         let r = reflects(&ev, tid);
         assert_eq!(r.len(), 1, "allowed author reflects out");
         assert_eq!(r[0]["data"]["author"], json!("concierge"));
@@ -5455,14 +5464,14 @@ mod tests {
 
         // Denied author (the ingesting bridge, not in outbound_authors) -> no echo back out.
         comment_task(&pool, tid, "ingested from github", Some("gh-bridge"), Some("github:U9")).await?;
-        let ev = get_events(&pool, 0, 500, None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(reflects(&ev, tid).len(), 1, "ingested comment stays board-internal (loop-safe)");
 
         // A task with no external link never reflects, even for an allowed author.
         let plain = create_task(&pool, pid, "unlinked", None, None, None, Some("concierge"), None, None).await?;
         let plain_id = plain["id"].as_i64().unwrap();
         comment_task(&pool, plain_id, "hi", Some("concierge"), None).await?;
-        let ev = get_events(&pool, 0, 500, None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(reflects(&ev, plain_id).len(), 0, "unlinked task is board-internal");
 
         // Per-link independence: add a SECOND link that is inbound-only; a comment fires only the
@@ -5473,7 +5482,7 @@ mod tests {
         )
         .await?;
         comment_task(&pool, tid, "second reflect", Some("concierge"), None).await?;
-        let ev = get_events(&pool, 0, 500, None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
         let r = reflects(&ev, tid);
         assert_eq!(r.len(), 2, "only the out-enabled link fires; inbound link stays internal");
         assert!(r.iter().all(|e| e["data"]["source"] == json!("github")), "gitlab (in) never reflects");
@@ -5661,7 +5670,7 @@ mod tests {
         assert_eq!(o["notifications"][0]["type"], json!("task.commented"));
 
         // Every task.commented event carries task_id (the wake/webhook payload's routing key).
-        let events = get_events(&pool, 0, 500, None).await?;
+        let events = get_events(&pool, 0, 500, None, false).await?;
         let commented: Vec<&Value> = events.as_array().unwrap().iter().filter(|e| e["type"] == json!("task.commented")).collect();
         assert_eq!(commented.len(), 2);
         assert!(commented.iter().all(|e| e["task_id"] == json!(tid)));
@@ -5680,22 +5689,73 @@ mod tests {
         let tid = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None).await?["id"].as_i64().unwrap();
         comment_task(&pool, tid, "hi", Some("b"), None).await?;
 
-        let all = get_events(&pool, 0, 500, None).await?;
+        let all = get_events(&pool, 0, 500, None, false).await?;
         assert!(all.as_array().unwrap().len() >= 3, "project.created + task.created + task.commented");
 
-        let by_a = get_events(&pool, 0, 500, Some("a")).await?;
+        let by_a = get_events(&pool, 0, 500, Some("a"), false).await?;
         let by_a = by_a.as_array().unwrap();
         assert!(!by_a.is_empty());
         assert!(by_a.iter().all(|e| e["actor"] == json!("a")), "only actor a: {by_a:?}");
         assert!(by_a.iter().any(|e| e["type"] == json!("task.created")));
 
-        let by_b = get_events(&pool, 0, 500, Some("b")).await?;
+        let by_b = get_events(&pool, 0, 500, Some("b"), false).await?;
         let by_b = by_b.as_array().unwrap();
         assert_eq!(by_b.len(), 1, "b only authored the comment");
         assert_eq!(by_b[0]["type"], json!("task.commented"));
         assert_eq!(by_b[0]["actor"], json!("b"));
 
-        assert!(get_events(&pool, 0, 500, Some("nobody")).await?.as_array().unwrap().is_empty());
+        assert!(get_events(&pool, 0, 500, Some("nobody"), false).await?.as_array().unwrap().is_empty());
+        Ok(())
+    }
+
+    /// get_events(desc=true) returns the LATEST N events newest-first — the live-activity-feed
+    /// mode (task 266). A plain ORDER BY seq LIMIT N returns the N OLDEST and never advances; the
+    /// desc window must track the tail as new events arrive, and still honor the actor filter and
+    /// the `seq>since_seq` lower bound.
+    #[tokio::test]
+    async fn get_events_desc_returns_latest_newest_first() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "a", None, None, None, None, None).await?;
+        let pid = create_project(&pool, "P", None, Some("a"), None).await?["id"].as_i64().unwrap();
+        // Generate a run of events (project.created + one task.created per create_task).
+        let mut tids = Vec::new();
+        for i in 0..6 {
+            tids.push(create_task(&pool, pid, &format!("T{i}"), None, None, None, Some("a"), None, None).await?["id"].as_i64().unwrap());
+        }
+
+        let seq_of = |v: &Value| v["seq"].as_i64().unwrap();
+
+        // desc=true, limit 3 -> the 3 highest seqs, strictly newest-first.
+        let latest = get_events(&pool, 0, 3, None, true).await?;
+        let latest = latest.as_array().unwrap().clone();
+        assert_eq!(latest.len(), 3, "limit caps the window");
+        assert!(seq_of(&latest[0]) > seq_of(&latest[1]) && seq_of(&latest[1]) > seq_of(&latest[2]), "newest-first: {latest:?}");
+
+        // It is the TAIL, not the head: the newest desc seq == the max seq in the full asc log,
+        // and the oldest asc event (project.created) is NOT in the latest-3 window.
+        let asc = get_events(&pool, 0, 500, None, false).await?;
+        let asc = asc.as_array().unwrap();
+        let max_seq = asc.iter().map(seq_of).max().unwrap();
+        assert_eq!(seq_of(&latest[0]), max_seq, "desc head is the tail of history");
+        assert!(!latest.iter().any(|e| e["type"] == json!("project.created")), "oldest event excluded from latest-N");
+
+        // The feed advances: a new event becomes the new desc head.
+        comment_task(&pool, tids[0], "newest", Some("a"), None).await?;
+        let latest2 = get_events(&pool, 0, 3, None, true).await?;
+        let latest2 = latest2.as_array().unwrap();
+        assert_eq!(latest2[0]["type"], json!("task.commented"), "the just-added event leads");
+        assert!(seq_of(&latest2[0]) > max_seq, "advanced past the prior tail");
+
+        // `seq>since_seq` lower bound still applies in desc mode (latest N ABOVE a floor).
+        let above = get_events(&pool, max_seq, 50, None, true).await?;
+        let above = above.as_array().unwrap();
+        assert!(above.iter().all(|e| seq_of(e) > max_seq), "floor honored in desc: {above:?}");
+
+        // Actor filter composes with desc.
+        register_agent(&pool, "z", None, None, None, None, None).await?;
+        let by_z = get_events(&pool, 0, 10, Some("z"), true).await?;
+        assert!(by_z.as_array().unwrap().is_empty(), "actor filter still applies");
         Ok(())
     }
 
