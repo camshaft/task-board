@@ -158,7 +158,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") },
-    Endpoint { method: "GET", path: "/api/tasks", summary: "List tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool", body: None },
+    Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
@@ -598,18 +598,21 @@ struct ListTasksQuery {
     parent_id: Option<i64>,
     /// Only top-level tasks (no parent).
     top_level: Option<bool>,
+    /// Free-text search over title + description (across all projects when project_id omitted).
+    q: Option<String>,
 }
 
-async fn list_tasks(State(st): State<AppState>, Query(q): Query<ListTasksQuery>) -> ApiResult {
+async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQuery>) -> ApiResult {
     Ok(Json(
         core::list_tasks(
             &st.pool,
-            q.project_id,
-            q.status.as_deref(),
-            q.assignee.as_deref(),
-            q.unassigned.unwrap_or(false),
-            q.parent_id,
-            q.top_level.unwrap_or(false),
+            query.project_id,
+            query.status.as_deref(),
+            query.assignee.as_deref(),
+            query.unassigned.unwrap_or(false),
+            query.parent_id,
+            query.top_level.unwrap_or(false),
+            query.q.as_deref(),
         )
         .await?,
     ))

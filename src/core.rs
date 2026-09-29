@@ -1093,6 +1093,7 @@ pub async fn list_tasks(
     unassigned: bool,
     parent_id: Option<i64>,
     top_level: bool,
+    search: Option<&str>,
 ) -> anyhow::Result<Value> {
     let mut q = String::from(
         "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at FROM tasks",
@@ -1103,6 +1104,11 @@ pub async fn list_tasks(
     }
     if status.is_some() {
         conds.push("status=?");
+    }
+    // Free-text search over title + description (case-insensitive LIKE). Composable with the
+    // other filters and, with no project_id, spans every project.
+    if search.is_some() {
+        conds.push("(title LIKE ? OR description LIKE ?)");
     }
     // `unassigned` selects rows with no owner (assignee IS NULL); it takes precedence over an
     // `assignee=` equality filter (asking for both a specific owner and no owner is a
@@ -1131,6 +1137,10 @@ pub async fn list_tasks(
     }
     if let Some(s) = status {
         query = query.bind(s);
+    }
+    if let Some(needle) = search {
+        let like = format!("%{needle}%");
+        query = query.bind(like.clone()).bind(like);
     }
     if !unassigned {
         if let Some(a) = assignee {
@@ -3024,9 +3034,9 @@ mod tests {
         assert_eq!(c["parent_title"], json!("Epic"));
 
         // list_tasks top_level -> only the epic; parent_id -> the two children.
-        assert_eq!(ids(&list_tasks(&pool, Some(pid), None, None, false, None, true).await?), vec![eid]);
+        assert_eq!(ids(&list_tasks(&pool, Some(pid), None, None, false, None, true, None).await?), vec![eid]);
         assert_eq!(
-            ids(&list_tasks(&pool, Some(pid), None, None, false, Some(eid), false).await?),
+            ids(&list_tasks(&pool, Some(pid), None, None, false, Some(eid), false, None).await?),
             vec![c1id, c2id]
         );
 
@@ -3045,6 +3055,57 @@ mod tests {
         assert!(move_task(&pool, eid, pid2, Some("u")).await.is_err());
         // c2 is now top-level with no children -> it can move.
         assert_eq!(move_task(&pool, c2id, pid2, Some("u")).await?["project_id"], json!(pid2));
+        Ok(())
+    }
+
+    /// list_tasks free-text search spans projects (no project_id), matches title OR description
+    /// case-insensitively, and composes with assignee/project filters.
+    #[tokio::test]
+    async fn list_tasks_text_search() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p1 = create_project(&pool, "Alpha", None, Some("u"), None).await?;
+        let pid1 = p1["id"].as_i64().unwrap();
+        let p2 = create_project(&pool, "Beta", None, Some("u"), None).await?;
+        let pid2 = p2["id"].as_i64().unwrap();
+
+        create_task(&pool, pid1, "Fix the widget pipeline", Some("handles reflow"), None, None, Some("u"), None, None).await?;
+        create_task(&pool, pid1, "Unrelated chore", None, None, None, Some("u"), None, None).await?;
+        create_task(&pool, pid2, "Widget docs", Some("describe the WIDGET api"), Some("alice"), None, Some("u"), None, None).await?;
+
+        let titles = |v: &Value| -> Vec<String> {
+            let mut t: Vec<String> =
+                v.as_array().unwrap().iter().map(|x| x["title"].as_str().unwrap().to_string()).collect();
+            t.sort();
+            t
+        };
+
+        // "widget" across ALL projects (case-insensitive) -> the two widget tasks, not the chore.
+        assert_eq!(
+            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("widget")).await?),
+            vec!["Fix the widget pipeline".to_string(), "Widget docs".to_string()]
+        );
+        // Matches description too.
+        assert_eq!(
+            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("reflow")).await?),
+            vec!["Fix the widget pipeline".to_string()]
+        );
+        // Composable with assignee: widget + alice -> only the Beta doc task.
+        assert_eq!(
+            titles(&list_tasks(&pool, None, None, Some("alice"), false, None, false, Some("widget")).await?),
+            vec!["Widget docs".to_string()]
+        );
+        // Composable with project scope: widget in Alpha -> only the pipeline task.
+        assert_eq!(
+            titles(&list_tasks(&pool, Some(pid1), None, None, false, None, false, Some("widget")).await?),
+            vec!["Fix the widget pipeline".to_string()]
+        );
+        // No match -> empty.
+        assert!(list_tasks(&pool, None, None, None, false, None, false, Some("zzznope"))
+            .await?
+            .as_array()
+            .unwrap()
+            .is_empty());
         Ok(())
     }
 
@@ -3230,7 +3291,7 @@ mod tests {
         assert_eq!(arr[0]["id"], json!(1));
 
         // The task moved onto the surviving project.
-        let tasks = list_tasks(&pool, Some(1), None, None, false, None, false).await?;
+        let tasks = list_tasks(&pool, Some(1), None, None, false, None, false, None).await?;
         assert_eq!(tasks.as_array().unwrap().len(), 1);
 
         // Subscriptions: alice (deduped to one), bob (repointed) both on project 1.
@@ -3316,8 +3377,8 @@ mod tests {
         let moved = move_task(&pool, tid, bid, Some("u")).await?;
         assert_eq!(moved["project_id"], json!(bid));
         // It now lists under B, not A.
-        assert_eq!(list_tasks(&pool, Some(aid), None, None, false, None, false).await?.as_array().unwrap().len(), 0);
-        assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_tasks(&pool, Some(aid), None, None, false, None, false, None).await?.as_array().unwrap().len(), 0);
+        assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false, None).await?.as_array().unwrap().len(), 1);
 
         // A task.moved event was recorded carrying both ends.
         let events = get_events(&pool, 0, 100).await?;
@@ -3350,27 +3411,27 @@ mod tests {
         create_task(&pool, pid, "free", None, None, None, Some("u"), None, None).await?;
 
         // unassigned=true -> only the ownerless task.
-        let un = list_tasks(&pool, Some(pid), None, None, true, None, false).await?;
+        let un = list_tasks(&pool, Some(pid), None, None, true, None, false, None).await?;
         let un = un.as_array().unwrap();
         assert_eq!(un.len(), 1);
         assert_eq!(un[0]["title"], json!("free"));
         assert!(un[0]["assignee"].is_null());
 
         // assignee equality still works when unassigned is false.
-        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false, None, false).await?;
+        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false, None, false, None).await?;
         let mine = mine.as_array().unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0]["title"], json!("owned"));
 
         // unassigned=true wins over a contradictory assignee= filter (no owner beats owner=alice).
-        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true, None, false).await?;
+        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true, None, false, None).await?;
         let both = both.as_array().unwrap();
         assert_eq!(both.len(), 1);
         assert_eq!(both[0]["title"], json!("free"));
 
         // No filter returns both.
         assert_eq!(
-            list_tasks(&pool, Some(pid), None, None, false, None, false).await?.as_array().unwrap().len(),
+            list_tasks(&pool, Some(pid), None, None, false, None, false, None).await?.as_array().unwrap().len(),
             2
         );
         Ok(())

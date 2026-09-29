@@ -156,13 +156,24 @@ export const api = {
   ) => req<Project>('PATCH', `/projects/${id}`, b),
 
   listTasks: (
-    q: { project_id?: number; status?: string; assignee?: string; unassigned?: boolean } = {},
+    q: {
+      project_id?: number
+      status?: string
+      assignee?: string
+      unassigned?: boolean
+      parent_id?: number
+      top_level?: boolean
+      q?: string
+    } = {},
   ) => {
     const p = new URLSearchParams()
     if (q.project_id != null) p.set('project_id', String(q.project_id))
     if (q.status) p.set('status', q.status)
     if (q.assignee) p.set('assignee', q.assignee)
     if (q.unassigned) p.set('unassigned', 'true')
+    if (q.parent_id != null) p.set('parent_id', String(q.parent_id))
+    if (q.top_level) p.set('top_level', 'true')
+    if (q.q) p.set('q', q.q)
     const qs = p.toString()
     return req<TaskSummary[]>('GET', `/tasks${qs ? `?${qs}` : ''}`)
   },

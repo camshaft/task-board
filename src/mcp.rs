@@ -230,6 +230,10 @@ pub struct ListTasksArgs {
     /// Only top-level tasks (no parent) — epics + loose tasks, the default board view.
     #[serde(default)]
     pub top_level: Option<bool>,
+    /// Free-text search over task title + description (case-insensitive substring). With no
+    /// project_id it searches across every project.
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -689,12 +693,12 @@ impl Board {
         core::get_task(&self.pool, a.task_id).await.map_err(err).and_then(ok)
     }
 
-    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view).")]
+    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted).")]
     async fn list_tasks(
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false))
+        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false), s(&a.q))
             .await
             .map_err(err)
             .and_then(ok)
