@@ -45,6 +45,8 @@ export default function DocumentView() {
   // Long threads collapse older top-level comments behind a "show N earlier" button, keeping the
   // latest few in view (their replies stay with them). Recent replies are what usually matter.
   const [showAllComments, setShowAllComments] = useState(false)
+  // Version diff panel (what changed between two versions), toggled under the version list.
+  const [showDiff, setShowDiff] = useState(false)
 
   // Capture a text selection inside the rendered content as a text-quote region (exact + a little
   // prefix/suffix context, for disambiguation + highlight matching against the shown version).
@@ -365,6 +367,19 @@ export default function DocumentView() {
               )
             })}
           </ul>
+
+          {/* Diff mode: compare any two versions to see what changed (fetched + diffed client-side). */}
+          {doc.versions.length >= 2 && (
+            <div className="mt-2">
+              <button
+                onClick={() => setShowDiff((s) => !s)}
+                className="text-xs text-sky-400 hover:text-sky-300"
+              >
+                {showDiff ? 'Hide diff' : 'Compare versions →'}
+              </button>
+              {showDiff && <DocDiff versions={doc.versions} currentId={doc.current_version_id} />}
+            </div>
+          )}
 
           {/* Wiki link graph: pages THIS doc links to ([[path]] in its content) and pages that
               link back to it. Outbound targets that aren't filed yet render as dangling red-links.
@@ -874,4 +889,147 @@ function findQuoteRange(container: HTMLElement, exact: string, prefix?: string):
     return null
   }
   return range
+}
+
+type DiffLine = { type: 'ctx' | 'add' | 'del'; text: string }
+
+// Line-level diff via a longest-common-subsequence table. O(n·m) — fine for documents (hundreds
+// of lines). Lines present in both are context; lines only in `a` are deletions, only in `b`
+// additions. Not a minimal Myers diff, but stable and dependency-free.
+function lineDiff(a: string[], b: string[]): DiffLine[] {
+  const n = a.length
+  const m = b.length
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0))
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+    }
+  }
+  const out: DiffLine[] = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      out.push({ type: 'ctx', text: a[i] })
+      i++
+      j++
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push({ type: 'del', text: a[i++] })
+    } else {
+      out.push({ type: 'add', text: b[j++] })
+    }
+  }
+  while (i < n) out.push({ type: 'del', text: a[i++] })
+  while (j < m) out.push({ type: 'add', text: b[j++] })
+  return out
+}
+
+// Compare two document versions: pick a base + a compare version (default previous → current),
+// fetch both through the IPFS gateway, and render an added/removed/context line diff client-side.
+function DocDiff({
+  versions,
+  currentId,
+}: {
+  versions: DocumentVersion[]
+  currentId: number | null
+}) {
+  const sorted = [...versions].sort((a, b) => a.version_no - b.version_no)
+  const current = sorted.find((v) => v.id === currentId) ?? sorted[sorted.length - 1]
+  const curIdx = sorted.indexOf(current)
+  const prev = sorted[curIdx - 1] ?? sorted[0]
+  const [baseId, setBaseId] = useState<number>(prev.id)
+  const [cmpId, setCmpId] = useState<number>(current.id)
+  const key = `${baseId}:${cmpId}`
+  // Keyed so `loading` is derived (result.key !== key) rather than set synchronously in the effect.
+  const [result, setResult] = useState<{ key: string; lines?: DiffLine[]; error?: string }>({
+    key: '',
+  })
+  useEffect(() => {
+    let cancelled = false
+    const bv = versions.find((v) => v.id === baseId)
+    const cv = versions.find((v) => v.id === cmpId)
+    if (!bv || !cv) return
+    const grab = (v: DocumentVersion) =>
+      fetch(ipfsUrl(v.cid, v.content_type)).then((r) =>
+        r.ok ? r.text() : Promise.reject(new Error(`gateway ${r.status}`)),
+      )
+    Promise.all([grab(bv), grab(cv)])
+      .then(([a, b]) => {
+        if (!cancelled) setResult({ key, lines: lineDiff(a.split('\n'), b.split('\n')) })
+      })
+      .catch((e) => {
+        if (!cancelled) setResult({ key, error: (e as Error).message })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [key, baseId, cmpId, versions])
+
+  const loading = result.key !== key
+  const adds = result.lines?.filter((l) => l.type === 'add').length ?? 0
+  const dels = result.lines?.filter((l) => l.type === 'del').length ?? 0
+
+  return (
+    <div className="mt-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-3">
+      <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-[var(--color-muted)]">
+        <span>Compare</span>
+        <select
+          value={baseId}
+          onChange={(e) => setBaseId(Number(e.target.value))}
+          className="rounded border border-[var(--color-border)] bg-[var(--color-panel-2)] px-1.5 py-1 text-xs"
+        >
+          {sorted.map((v) => (
+            <option key={v.id} value={v.id}>
+              v{v.version_no}
+            </option>
+          ))}
+        </select>
+        <span>→</span>
+        <select
+          value={cmpId}
+          onChange={(e) => setCmpId(Number(e.target.value))}
+          className="rounded border border-[var(--color-border)] bg-[var(--color-panel-2)] px-1.5 py-1 text-xs"
+        >
+          {sorted.map((v) => (
+            <option key={v.id} value={v.id}>
+              v{v.version_no}
+            </option>
+          ))}
+        </select>
+        {!loading && !result.error && (
+          <span className="ml-auto font-mono">
+            <span className="text-emerald-300">+{adds}</span>{' '}
+            <span className="text-red-300">−{dels}</span>
+          </span>
+        )}
+      </div>
+      {loading ? (
+        <p className="text-xs text-[var(--color-muted)]">Computing diff…</p>
+      ) : result.error ? (
+        <p className="text-xs text-[var(--color-muted)]">Couldn't load versions: {result.error}</p>
+      ) : baseId === cmpId ? (
+        <p className="text-xs text-[var(--color-muted)]">Pick two different versions to compare.</p>
+      ) : (
+        <pre className="max-h-[60vh] overflow-auto rounded bg-[var(--color-panel-2)] p-2 text-xs leading-relaxed">
+          {result.lines!.map((l, idx) => (
+            <div
+              key={idx}
+              className={
+                l.type === 'add'
+                  ? 'bg-emerald-500/10 text-emerald-300'
+                  : l.type === 'del'
+                    ? 'bg-red-500/10 text-red-300'
+                    : 'text-[var(--color-muted)]'
+              }
+            >
+              <span className="select-none opacity-60">
+                {l.type === 'add' ? '+ ' : l.type === 'del' ? '− ' : '  '}
+              </span>
+              {l.text || ' '}
+            </div>
+          ))}
+        </pre>
+      )}
+    </div>
+  )
 }
