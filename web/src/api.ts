@@ -144,6 +144,29 @@ export interface Backlink {
   label: string | null
 }
 
+// An outbound transclusion (![[path]] / ![[path@vN]] / ![[path#region]]) from a document.
+// target_version_id set = pinned to that immutable version; null = floats to current. region is
+// a raw fragment for a partial embed. target_* are null when the embed dangles.
+export interface Embed {
+  target_path: string
+  label: string | null
+  target_version_id: number | null
+  region: string | null
+  target_document_id: number | null
+  target_title: string | null
+  target_status: string | null
+}
+
+// A document that transcludes THIS document ("what embeds this" — the dependents view).
+export interface EmbeddedBy {
+  id: number
+  title: string
+  path: string | null
+  status: string
+  label: string | null
+  region: string | null
+}
+
 // A full document (getDocument): metadata + resolved current version + full version list +
 // the tasks it's attached to + its wiki link graph (outbound links + backlinks).
 export interface Document extends DocumentSummary {
@@ -155,6 +178,8 @@ export interface Document extends DocumentSummary {
   attached_tasks: { id: number; title: string; status: TaskStatus; project_id: number | null }[]
   outbound_links: OutboundLink[]
   backlinks: Backlink[]
+  embeds: Embed[]
+  embedded_by: EmbeddedBy[]
 }
 
 export interface DocumentComment {
