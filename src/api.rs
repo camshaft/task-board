@@ -30,7 +30,7 @@ struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let msg = self.0.to_string();
-        let code = if msg.starts_with("no project") || msg.starts_with("no task") || msg.starts_with("no agent") {
+        let code = if msg.starts_with("no project") || msg.starts_with("no task") || msg.starts_with("no agent") || msg.starts_with("no document") {
             StatusCode::NOT_FOUND
         } else if msg.starts_with("give ") {
             StatusCode::BAD_REQUEST
@@ -82,6 +82,9 @@ pub fn router(state: AppState) -> Router {
         .route("/channels/{channel_id}/invites", post(invite_to_channel))
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
+        .route("/documents", get(list_documents).post(create_document))
+        .route("/documents/{document_id}", get(get_document))
+        .route("/documents/{document_id}/versions", get(get_document_versions).post(publish_version))
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
@@ -153,6 +156,11 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/documents", summary: "List documents, optionally filtered by project/status.", query: "project_id=int&status=str", body: None },
+    Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
+    Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/versions", summary: "Publish a new immutable version (bare CID).", query: "", body: Some("PublishVersionBody") },
     Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
 ];
 
@@ -180,6 +188,8 @@ fn body_schemas() -> Value {
         PostToChannelBody,
         InviteChannelBody,
         SendMessageBody,
+        CreateDocumentBody,
+        PublishVersionBody,
     )
 }
 
@@ -829,6 +839,85 @@ struct EventsQuery {
 
 async fn get_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) -> ApiResult {
     Ok(Json(core::get_events(&st.pool, q.since_seq, q.limit).await?))
+}
+
+// --- Documents ---
+
+#[derive(Deserialize)]
+struct ListDocumentsQuery {
+    project_id: Option<i64>,
+    status: Option<String>,
+}
+
+async fn list_documents(
+    State(st): State<AppState>,
+    Query(q): Query<ListDocumentsQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_documents(&st.pool, q.project_id, q.status.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CreateDocumentBody {
+    title: String,
+    /// Bare IPFS content id for version 1. Stored verbatim; the board never resolves it.
+    cid: String,
+    project_id: Option<i64>,
+    summary: Option<String>,
+    created_by: Option<String>,
+    metadata: Option<Value>,
+}
+
+async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumentBody>) -> ApiResult {
+    Ok(Json(
+        core::create_document(
+            &st.pool,
+            &b.title,
+            b.project_id,
+            &b.cid,
+            b.summary.as_deref(),
+            b.created_by.as_deref(),
+            b.metadata,
+        )
+        .await?,
+    ))
+}
+
+async fn get_document(State(st): State<AppState>, Path(document_id): Path<i64>) -> ApiResult {
+    Ok(Json(core::get_document(&st.pool, document_id).await?))
+}
+
+async fn get_document_versions(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+) -> ApiResult {
+    Ok(Json(core::get_document_versions(&st.pool, document_id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PublishVersionBody {
+    /// Bare IPFS content id for the new version. Stored verbatim; the board never resolves it.
+    cid: String,
+    summary: Option<String>,
+    created_by: Option<String>,
+}
+
+async fn publish_version(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<PublishVersionBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::publish_version(
+            &st.pool,
+            document_id,
+            &b.cid,
+            b.summary.as_deref(),
+            b.created_by.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]

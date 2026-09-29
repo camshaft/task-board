@@ -1672,6 +1672,230 @@ fn webhook_timeout(_pool: &Pool) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(5))
 }
 
+// --- Documents ---
+//
+// A document is publishable, versioned content addressed by a CID. The board stores only the
+// identifier (a bare CID) + metadata; the bytes live on IPFS and the *client* resolves the CID
+// — the board never runs `ipfs add` nor composes a gateway URL, so the identifier stays
+// location-independent. Each publish appends an immutable `document_versions` row and advances
+// `current_version_id`. Event wiring (document.created / document.version_published, a document
+// subscription scope, and Recipients::FromDocument) lands in the follow-on "events" task.
+
+/// Derive a URL-friendly slug from a title: lowercase, runs of non-alphanumerics collapsed to a
+/// single '-', ends trimmed. Non-unique — documents may share a title.
+fn slugify(title: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Fetch a document as JSON (metadata parsed) plus its resolved `current_version` and full
+/// `versions` list (newest first). Returns None if the document doesn't exist.
+async fn document_json(
+    tx: &mut Transaction<'_, Sqlite>,
+    document_id: i64,
+) -> anyhow::Result<Option<Value>> {
+    let Some(mut d) =
+        fetch_one_json(tx, "SELECT * FROM documents WHERE id=?", document_id).await?
+    else {
+        return Ok(None);
+    };
+    let vrows = sqlx::query(
+        "SELECT * FROM document_versions WHERE document_id=? ORDER BY version_no DESC",
+    )
+    .bind(document_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let versions: Vec<Value> = vrows.iter().map(row_to_json).collect();
+    if let Value::Object(ref mut m) = d {
+        let meta: Value = m
+            .get("metadata")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        m.insert("metadata".into(), meta);
+        let cur_id = m.get("current_version_id").and_then(|v| v.as_i64());
+        let current =
+            cur_id.and_then(|cid| versions.iter().find(|v| v["id"].as_i64() == Some(cid)).cloned());
+        m.insert("current_version".into(), current.unwrap_or(Value::Null));
+        m.insert("versions".into(), Value::Array(versions));
+    }
+    Ok(Some(d))
+}
+
+/// Create a document with its first version. The `cid` is stored verbatim (the board does not
+/// resolve or validate it). Returns the document JSON with its current version + version list.
+pub async fn create_document(
+    pool: &Pool,
+    title: &str,
+    project_id: Option<i64>,
+    cid: &str,
+    summary: Option<&str>,
+    created_by: Option<&str>,
+    metadata: Option<Value>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let meta_str = metadata.unwrap_or_else(|| json!({})).to_string();
+    let slug = slugify(title);
+    let did: i64 = sqlx::query(
+        "INSERT INTO documents(title, slug, project_id, metadata, created_by, created_at, updated_at) \
+         VALUES(?,?,?,?,?,?,?) RETURNING id",
+    )
+    .bind(title)
+    .bind(&slug)
+    .bind(project_id)
+    .bind(&meta_str)
+    .bind(created_by)
+    .bind(&ts)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    let vid: i64 = sqlx::query(
+        "INSERT INTO document_versions(document_id, version_no, cid, summary, created_by, created_at) \
+         VALUES(?,1,?,?,?,?) RETURNING id",
+    )
+    .bind(did)
+    .bind(cid)
+    .bind(summary)
+    .bind(created_by)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    sqlx::query("UPDATE documents SET current_version_id=? WHERE id=?")
+        .bind(vid)
+        .bind(did)
+        .execute(&mut *tx)
+        .await?;
+    let out = document_json(&mut tx, did).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Append a new immutable version and advance the document's current pointer. A new version
+/// supersedes any prior approval: an `approved` / `changes_requested` document drops back to
+/// `in_review` (the review workflow itself lands in a follow-on task).
+pub async fn publish_version(
+    pool: &Pool,
+    document_id: i64,
+    cid: &str,
+    summary: Option<&str>,
+    created_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let Some(doc) = sqlx::query("SELECT status FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let status: String = doc.try_get("status")?;
+    let next_no: i64 = sqlx::query(
+        "SELECT COALESCE(MAX(version_no),0)+1 AS n FROM document_versions WHERE document_id=?",
+    )
+    .bind(document_id)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("n")?;
+    let vid: i64 = sqlx::query(
+        "INSERT INTO document_versions(document_id, version_no, cid, summary, created_by, created_at) \
+         VALUES(?,?,?,?,?,?) RETURNING id",
+    )
+    .bind(document_id)
+    .bind(next_no)
+    .bind(cid)
+    .bind(summary)
+    .bind(created_by)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    let new_status = if status == "approved" || status == "changes_requested" {
+        "in_review"
+    } else {
+        status.as_str()
+    };
+    sqlx::query("UPDATE documents SET current_version_id=?, status=?, updated_at=? WHERE id=?")
+        .bind(vid)
+        .bind(new_status)
+        .bind(&ts)
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Fetch one document with its current version + version list.
+pub async fn get_document(pool: &Pool, document_id: i64) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let out = document_json(&mut tx, document_id).await?;
+    tx.commit().await?;
+    match out {
+        Some(v) => Ok(v),
+        None => anyhow::bail!("no document {document_id}"),
+    }
+}
+
+/// List a document's versions (immutable), newest first.
+pub async fn get_document_versions(pool: &Pool, document_id: i64) -> anyhow::Result<Value> {
+    let rows = sqlx::query(
+        "SELECT * FROM document_versions WHERE document_id=? ORDER BY version_no DESC",
+    )
+    .bind(document_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
+/// List documents, optionally filtered by project and/or status. (Tag/author discovery filters
+/// land in a follow-on task.)
+pub async fn list_documents(
+    pool: &Pool,
+    project_id: Option<i64>,
+    status: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut q = String::from(
+        "SELECT id, title, slug, project_id, status, current_version_id, approved_version_id, \
+         created_by, updated_at FROM documents",
+    );
+    let mut conds: Vec<&str> = Vec::new();
+    if project_id.is_some() {
+        conds.push("project_id=?");
+    }
+    if status.is_some() {
+        conds.push("status=?");
+    }
+    if !conds.is_empty() {
+        q.push_str(" WHERE ");
+        q.push_str(&conds.join(" AND "));
+    }
+    q.push_str(" ORDER BY id");
+    let mut query = sqlx::query(&q);
+    if let Some(p) = project_id {
+        query = query.bind(p);
+    }
+    if let Some(s) = status {
+        query = query.bind(s);
+    }
+    let rows = query.fetch_all(pool).await?;
+    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1766,6 +1990,73 @@ mod tests {
         let after = check_notifications(&pool, "watcher", true, 50, None).await?;
         assert_eq!(after["count"].as_i64(), Some(0), "no events after unsubscribe");
 
+        Ok(())
+    }
+
+    /// Documents: create makes version 1 and points current at it; publish appends immutable
+    /// versions and advances the pointer; get/list/versions read back; a new version supersedes
+    /// a prior approval.
+    #[tokio::test]
+    async fn documents_versioning_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Docs", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+
+        let d = create_document(
+            &pool,
+            "Design: Widgets",
+            Some(pid),
+            "bafyv1",
+            Some("first draft"),
+            Some("alice"),
+            Some(json!({ "tags": ["design"] })),
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        assert_eq!(d["title"], json!("Design: Widgets"));
+        assert_eq!(d["slug"], json!("design-widgets"));
+        assert_eq!(d["status"], json!("draft"));
+        assert_eq!(d["metadata"]["tags"][0], json!("design"));
+        assert_eq!(d["current_version"]["version_no"], json!(1));
+        assert_eq!(d["current_version"]["cid"], json!("bafyv1"));
+        assert_eq!(d["versions"].as_array().unwrap().len(), 1);
+
+        // Publish version 2 -> current advances, immutable history grows.
+        let d2 = publish_version(&pool, did, "bafyv2", Some("revise"), Some("alice")).await?;
+        assert_eq!(d2["current_version"]["version_no"], json!(2));
+        assert_eq!(d2["current_version"]["cid"], json!("bafyv2"));
+        assert_eq!(d2["versions"].as_array().unwrap().len(), 2);
+
+        // get_document_versions -> newest first.
+        let vers = get_document_versions(&pool, did).await?;
+        let vers = vers.as_array().unwrap();
+        assert_eq!(vers.len(), 2);
+        assert_eq!(vers[0]["version_no"], json!(2));
+        assert_eq!(vers[1]["version_no"], json!(1));
+
+        // list_documents by project + status.
+        assert_eq!(list_documents(&pool, Some(pid), None).await?.as_array().unwrap().len(), 1);
+        assert_eq!(
+            list_documents(&pool, Some(pid), Some("draft")).await?.as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            list_documents(&pool, Some(pid), Some("approved")).await?.as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(list_documents(&pool, Some(99999), None).await?.as_array().unwrap().len(), 0);
+
+        // A new version resets an approved doc back to in_review.
+        sqlx::query("UPDATE documents SET status='approved' WHERE id=?")
+            .bind(did)
+            .execute(&pool)
+            .await?;
+        let d3 = publish_version(&pool, did, "bafyv3", None, Some("alice")).await?;
+        assert_eq!(d3["status"], json!("in_review"), "new version supersedes approval");
+
+        // Missing document -> error.
+        assert!(get_document(&pool, 424242).await.is_err());
         Ok(())
     }
 

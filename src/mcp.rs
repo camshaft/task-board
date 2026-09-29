@@ -333,6 +333,48 @@ pub struct GetEventsArgs {
     pub limit: i64,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateDocumentArgs {
+    pub title: String,
+    /// Bare IPFS content id for version 1. Stored verbatim; the board never resolves it.
+    pub cid: String,
+    /// Optionally attach the document to a project.
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    /// Short note describing this version.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// Arbitrary props (tags, etc). MERGED is not applicable on create — set the initial bag.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PublishVersionArgs {
+    pub document_id: i64,
+    /// Bare IPFS content id for the new version. Stored verbatim; the board never resolves it.
+    pub cid: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetDocumentArgs {
+    pub document_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListDocumentsArgs {
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -722,6 +764,65 @@ impl Board {
         Parameters(a): Parameters<GetEventsArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_events(&self.pool, a.since_seq, a.limit).await.map_err(err).and_then(ok)
+    }
+
+    // --- Documents ---
+    #[tool(
+        description = "Create a versioned document. Content lives on IPFS: pass `cid` (a bare content id) — the board stores the identifier only and NEVER resolves it or composes a URL (the client does). Optionally attach it to a `project_id` and set `metadata` (tags, etc). Creates version 1. Returns the document with its current version + version list."
+    )]
+    async fn create_document(
+        &self,
+        Parameters(a): Parameters<CreateDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::create_document(
+            &self.pool,
+            &a.title,
+            a.project_id,
+            &a.cid,
+            s(&a.summary),
+            s(&a.created_by),
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Publish a new immutable version of a document from a `cid` (bare content id; the board does not resolve it). Appends the version, advances the current pointer, and returns the updated document. A new version drops an approved/changes_requested doc back to in_review."
+    )]
+    async fn publish_version(
+        &self,
+        Parameters(a): Parameters<PublishVersionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::publish_version(&self.pool, a.document_id, &a.cid, s(&a.summary), s(&a.created_by))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Get one document with its current version and full version list (each version is a bare CID + summary).")]
+    async fn get_document(
+        &self,
+        Parameters(a): Parameters<GetDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_document(&self.pool, a.document_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "List a document's versions (immutable), newest first.")]
+    async fn get_document_versions(
+        &self,
+        Parameters(a): Parameters<GetDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_document_versions(&self.pool, a.document_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "List documents, optionally filtered by project and/or status (draft / in_review / approved / changes_requested).")]
+    async fn list_documents(
+        &self,
+        Parameters(a): Parameters<ListDocumentsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_documents(&self.pool, a.project_id, s(&a.status)).await.map_err(err).and_then(ok)
     }
 }
 
