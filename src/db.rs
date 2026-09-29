@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS events (
     project_id INTEGER,
     task_id    INTEGER,
     channel_id INTEGER,
+    document_id INTEGER,
     data       TEXT,
     created_at TEXT NOT NULL
 );
@@ -224,6 +225,22 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     // Index for channel-post backlog reads. Created after the column exists (an old DB adds
     // it via the ALTER just above; a fresh DB via CREATE TABLE), so it's safe either way.
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_channel ON events(channel_id, seq)")
+        .execute(&pool)
+        .await?;
+
+    // Back-fill events.document_id (added when documents became subscribable). Nullable, like
+    // channel_id above. Document events set it so a subscriber can trace a doc's activity.
+    let events_have_document = sqlx::query("PRAGMA table_info(events)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "document_id");
+    if !events_have_document {
+        sqlx::query("ALTER TABLE events ADD COLUMN document_id INTEGER")
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_document ON events(document_id, seq)")
         .execute(&pool)
         .await?;
 
