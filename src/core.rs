@@ -3171,13 +3171,18 @@ pub async fn list_documents(
     tag: Option<&str>,
     task_id: Option<i64>,
     author: Option<&str>,
+    include_archived: bool,
 ) -> anyhow::Result<Value> {
     let mut q = String::from(
         "SELECT id, title, slug, path, project_id, status, current_version_id, approved_version_id, \
-         created_by, updated_at FROM documents",
+         created_by, updated_at, archived_at FROM documents",
     );
-    // conds and the binds below MUST stay in the same order.
+    // conds and the binds below MUST stay in the same order. (A cond that binds no value — like
+    // the archived filter — can go anywhere without disturbing that order.)
     let mut conds: Vec<&str> = Vec::new();
+    if !include_archived {
+        conds.push("archived_at IS NULL");
+    }
     if project_id.is_some() {
         conds.push("project_id=?");
     }
@@ -3284,25 +3289,30 @@ pub async fn set_document_path(
 /// List filed (path-bearing) documents for the wiki tree, optionally restricted to a path
 /// `prefix` — the prefix itself plus everything nested under `prefix/`. Ordered by path, so a
 /// client can render the tree directly. Returns doc summaries (incl. `path`).
-pub async fn list_wiki(pool: &Pool, prefix: Option<&str>) -> anyhow::Result<Value> {
+pub async fn list_wiki(
+    pool: &Pool,
+    prefix: Option<&str>,
+    include_archived: bool,
+) -> anyhow::Result<Value> {
+    // Archived docs are hidden from the tree by default (reversible; the doc still resolves by id).
+    let arch = if include_archived { "" } else { " AND archived_at IS NULL" };
+    let cols = "id, title, slug, path, project_id, status, current_version_id, \
+                approved_version_id, created_by, updated_at, archived_at";
     let rows = match prefix.map(|p| p.trim().trim_matches('/')).filter(|p| !p.is_empty()) {
         Some(p) => {
-            sqlx::query(
-                "SELECT id, title, slug, path, project_id, status, current_version_id, \
-                 approved_version_id, created_by, updated_at FROM documents \
-                 WHERE path IS NOT NULL AND (path=? OR path LIKE ? || '/%') ORDER BY path",
-            )
+            sqlx::query(&format!(
+                "SELECT {cols} FROM documents \
+                 WHERE path IS NOT NULL AND (path=? OR path LIKE ? || '/%'){arch} ORDER BY path",
+            ))
             .bind(p)
             .bind(p)
             .fetch_all(pool)
             .await?
         }
         None => {
-            sqlx::query(
-                "SELECT id, title, slug, path, project_id, status, current_version_id, \
-                 approved_version_id, created_by, updated_at FROM documents \
-                 WHERE path IS NOT NULL ORDER BY path",
-            )
+            sqlx::query(&format!(
+                "SELECT {cols} FROM documents WHERE path IS NOT NULL{arch} ORDER BY path",
+            ))
             .fetch_all(pool)
             .await?
         }
@@ -3604,6 +3614,56 @@ pub async fn approve_document(
     .await
 }
 
+/// Soft-archive (retire) a document, or restore it. Archiving stamps `archived_at` so the doc is
+/// hidden from list_documents / list_wiki by default, but keeps its versions, comments, links, and
+/// the append-only event log intact — reversible, and consistent with the board's audit model
+/// (nothing is destroyed). Restoring clears the stamp. `archived_at` is orthogonal to the review
+/// status. Emits document.archived / document.restored to the doc's subscribers. Idempotent
+/// (re-archiving refreshes the stamp). Returns the updated document.
+pub async fn set_document_archived(
+    pool: &Pool,
+    document_id: i64,
+    archived: bool,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT project_id FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let project_id: Option<i64> = row.try_get("project_id")?;
+    let stamp = archived.then(|| ts.clone());
+    sqlx::query("UPDATE documents SET archived_at=?, updated_at=? WHERE id=?")
+        .bind(stamp.as_deref())
+        .bind(&ts)
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    let event_type = if archived { "document.archived" } else { "document.restored" };
+    emit(
+        &mut tx,
+        &mut hooks,
+        event_type,
+        actor,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        json!({ "archived": archived }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
 /// Attach a document to a task (many-to-many, idempotent). Emits document.attached to both the
 /// document's and the task's subscribers, so either side learns of the link.
 pub async fn attach_document(
@@ -3834,16 +3894,16 @@ mod tests {
         assert_eq!(vers[1]["version_no"], json!(1));
 
         // list_documents by project + status.
-        assert_eq!(list_documents(&pool, Some(pid), None, None, None, None).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_documents(&pool, Some(pid), None, None, None, None, false).await?.as_array().unwrap().len(), 1);
         assert_eq!(
-            list_documents(&pool, Some(pid), Some("draft"), None, None, None).await?.as_array().unwrap().len(),
+            list_documents(&pool, Some(pid), Some("draft"), None, None, None, false).await?.as_array().unwrap().len(),
             1
         );
         assert_eq!(
-            list_documents(&pool, Some(pid), Some("approved"), None, None, None).await?.as_array().unwrap().len(),
+            list_documents(&pool, Some(pid), Some("approved"), None, None, None, false).await?.as_array().unwrap().len(),
             0
         );
-        assert_eq!(list_documents(&pool, Some(99999), None, None, None, None).await?.as_array().unwrap().len(), 0);
+        assert_eq!(list_documents(&pool, Some(99999), None, None, None, None, false).await?.as_array().unwrap().len(), 0);
 
         // A new version resets an approved doc back to in_review.
         sqlx::query("UPDATE documents SET status='approved' WHERE id=?")
@@ -3887,7 +3947,7 @@ mod tests {
         set_document_path(&pool, c, "runbooks/deploy", None).await?;
 
         // Whole wiki: all three, ordered by path (architecture/* before runbooks/*).
-        let all = list_wiki(&pool, None).await?;
+        let all = list_wiki(&pool, None, false).await?;
         let all = all.as_array().unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0]["path"], json!("architecture/board/events"));
@@ -3895,17 +3955,59 @@ mod tests {
         assert_eq!(all[2]["path"], json!("runbooks/deploy"));
 
         // Prefix filter: only the architecture subtree.
-        let arch = list_wiki(&pool, Some("architecture")).await?;
+        let arch = list_wiki(&pool, Some("architecture"), false).await?;
         assert_eq!(arch.as_array().unwrap().len(), 2);
         // A prefix must not match a sibling that merely shares a string head.
-        assert_eq!(list_wiki(&pool, Some("runbooks")).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_wiki(&pool, Some("runbooks"), false).await?.as_array().unwrap().len(), 1);
 
         // Rename frees the old path (b can now take it) and clearing unfiles a doc.
         set_document_path(&pool, a, "architecture/board/events-v2", None).await?;
         set_document_path(&pool, b, "architecture/board/events", None).await?; // no longer a collision
         set_document_path(&pool, c, "", None).await?; // clear -> unfiled
         assert!(get_document(&pool, c).await?["path"].is_null());
-        assert_eq!(list_wiki(&pool, None).await?.as_array().unwrap().len(), 2);
+        assert_eq!(list_wiki(&pool, None, false).await?.as_array().unwrap().len(), 2);
+        Ok(())
+    }
+
+    /// Soft-archive: archiving a doc hides it from list_documents and the wiki tree by default
+    /// (but include_archived=true still shows it), the doc still resolves by id with archived_at
+    /// set, and restore brings it back. Reversible; nothing is destroyed.
+    #[tokio::test]
+    async fn document_archive_hides_and_restores() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let mk = |title: &'static str| {
+            let pool = pool.clone();
+            async move { create_document(&pool, title, None, "bafy", None, Some("alice"), None, None, None).await }
+        };
+        let keep = mk("Keep").await?["id"].as_i64().unwrap();
+        let probe = mk("Probe").await?["id"].as_i64().unwrap();
+        set_document_path(&pool, keep, "docs/keep", None).await?;
+        set_document_path(&pool, probe, "docs/probe", None).await?;
+
+        // Both visible before archiving.
+        assert_eq!(list_documents(&pool, None, None, None, None, None, false).await?.as_array().unwrap().len(), 2);
+        assert_eq!(list_wiki(&pool, None, false).await?.as_array().unwrap().len(), 2);
+
+        // Archive the probe: hidden from list_documents and the wiki tree by default.
+        let archived = set_document_archived(&pool, probe, true, Some("concierge")).await?;
+        assert!(archived["archived_at"].is_string(), "archived_at is stamped");
+        assert_eq!(list_documents(&pool, None, None, None, None, None, false).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_wiki(&pool, None, false).await?.as_array().unwrap().len(), 1);
+
+        // include_archived=true still surfaces it, and it always resolves by id (nothing destroyed).
+        assert_eq!(list_documents(&pool, None, None, None, None, None, true).await?.as_array().unwrap().len(), 2);
+        assert_eq!(list_wiki(&pool, None, true).await?.as_array().unwrap().len(), 2);
+        assert!(get_document(&pool, probe).await?["archived_at"].is_string());
+
+        // Restore: back in the listings, stamp cleared.
+        let restored = set_document_archived(&pool, probe, false, Some("concierge")).await?;
+        assert!(restored["archived_at"].is_null(), "restore clears the stamp");
+        assert_eq!(list_documents(&pool, None, None, None, None, None, false).await?.as_array().unwrap().len(), 2);
+        assert_eq!(list_wiki(&pool, None, false).await?.as_array().unwrap().len(), 2);
+
+        // Archiving a missing document is an error.
+        assert!(set_document_archived(&pool, 999_999, true, None).await.is_err());
         Ok(())
     }
 
@@ -4312,25 +4414,25 @@ mod tests {
         };
 
         // author
-        assert_eq!(ids(&list_documents(&pool, None, None, None, None, Some("alice")).await?), vec![aid, cid]);
-        assert_eq!(ids(&list_documents(&pool, None, None, None, None, Some("bob")).await?), vec![bid]);
+        assert_eq!(ids(&list_documents(&pool, None, None, None, None, Some("alice"), false).await?), vec![aid, cid]);
+        assert_eq!(ids(&list_documents(&pool, None, None, None, None, Some("bob"), false).await?), vec![bid]);
         // tag
-        assert_eq!(ids(&list_documents(&pool, None, None, Some("design"), None, None).await?), vec![aid]);
-        assert_eq!(ids(&list_documents(&pool, None, None, Some("ops"), None, None).await?), vec![bid]);
-        assert!(list_documents(&pool, None, None, Some("nope"), None, None).await?.as_array().unwrap().is_empty());
+        assert_eq!(ids(&list_documents(&pool, None, None, Some("design"), None, None, false).await?), vec![aid]);
+        assert_eq!(ids(&list_documents(&pool, None, None, Some("ops"), None, None, false).await?), vec![bid]);
+        assert!(list_documents(&pool, None, None, Some("nope"), None, None, false).await?.as_array().unwrap().is_empty());
         // task attachment
-        assert_eq!(ids(&list_documents(&pool, None, None, None, Some(tid), None).await?), vec![aid]);
+        assert_eq!(ids(&list_documents(&pool, None, None, None, Some(tid), None, false).await?), vec![aid]);
         // project
-        assert_eq!(ids(&list_documents(&pool, Some(pid), None, None, None, None).await?), vec![aid, cid]);
+        assert_eq!(ids(&list_documents(&pool, Some(pid), None, None, None, None, false).await?), vec![aid, cid]);
         // status
-        assert_eq!(ids(&list_documents(&pool, None, Some("approved"), None, None, None).await?), vec![cid]);
+        assert_eq!(ids(&list_documents(&pool, None, Some("approved"), None, None, None, false).await?), vec![cid]);
         // combined AND: project + tag rfc + author alice -> only A
         assert_eq!(
-            ids(&list_documents(&pool, Some(pid), None, Some("rfc"), None, Some("alice")).await?),
+            ids(&list_documents(&pool, Some(pid), None, Some("rfc"), None, Some("alice"), false).await?),
             vec![aid]
         );
         // contradictory combo -> empty
-        assert!(list_documents(&pool, None, None, Some("ops"), None, Some("alice")).await?.as_array().unwrap().is_empty());
+        assert!(list_documents(&pool, None, None, Some("ops"), None, Some("alice"), false).await?.as_array().unwrap().is_empty());
         Ok(())
     }
 

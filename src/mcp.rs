@@ -564,6 +564,9 @@ pub struct ListWikiArgs {
     /// everything beneath it). Omit for the whole wiki tree. Results are ordered by path.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Include archived (retired) documents in the tree. Hidden by default.
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -586,6 +589,9 @@ pub struct ListDocumentsArgs {
     /// Only documents created by this author (created_by).
     #[serde(default)]
     pub author: Option<String>,
+    /// Include archived (retired) documents. Hidden by default.
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1238,10 +1244,10 @@ impl Board {
         &self,
         Parameters(a): Parameters<ListWikiArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_wiki(&self.pool, s(&a.prefix)).await.map_err(err).and_then(ok)
+        core::list_wiki(&self.pool, s(&a.prefix), a.include_archived).await.map_err(err).and_then(ok)
     }
 
-    #[tool(description = "List documents for discovery, filtered by any combination of project, status (draft / in_review / approved / changes_requested), tag (a value in metadata.tags), task_id (docs attached to that task), and author. Filters AND together.")]
+    #[tool(description = "List documents for discovery, filtered by any combination of project, status (draft / in_review / approved / changes_requested), tag (a value in metadata.tags), task_id (docs attached to that task), and author. Filters AND together. Archived (retired) documents are hidden unless include_archived=true.")]
     async fn list_documents(
         &self,
         Parameters(a): Parameters<ListDocumentsArgs>,
@@ -1253,6 +1259,7 @@ impl Board {
             s(&a.tag),
             a.task_id,
             s(&a.author),
+            a.include_archived,
         )
         .await
         .map_err(err)
@@ -1325,6 +1332,28 @@ impl Board {
         Parameters(a): Parameters<DocumentActorArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::approve_document(&self.pool, a.document_id, s(&a.actor)).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Soft-archive (retire) a document: it's hidden from list_documents and the wiki tree by default, but its versions, comments, links, and history are preserved and it still resolves by id. Reversible with restore_document. Use for throwaway or superseded docs. Notifies subscribers.")]
+    async fn archive_document(
+        &self,
+        Parameters(a): Parameters<DocumentActorArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::set_document_archived(&self.pool, a.document_id, true, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Restore a previously archived document (clears the archive stamp so it reappears in listings). Notifies subscribers.")]
+    async fn restore_document(
+        &self,
+        Parameters(a): Parameters<DocumentActorArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::set_document_archived(&self.pool, a.document_id, false, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(description = "Attach a document to a task (many-to-many). Notifies both the document's and the task's subscribers, so a task watcher learns a design doc landed. Idempotent.")]
