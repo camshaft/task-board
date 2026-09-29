@@ -299,6 +299,13 @@ pub struct ListTasksArgs {
     /// Filter by blocked_on ref (a blocking task id or agent id) — e.g. what is blocked on you.
     #[serde(default)]
     pub blocked_on_ref: Option<String>,
+    /// Filter to tasks whose metadata has this key (a JSON path under `$.`, e.g. "observes").
+    /// Pair with `meta_value`; both must be set for the filter to apply.
+    #[serde(default)]
+    pub meta_key: Option<String>,
+    /// The value `meta_key` must equal (matched against `json_extract(metadata, '$.'||key)`).
+    #[serde(default)]
+    pub meta_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -961,7 +968,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false), s(&a.q), s(&a.blocked_on_kind), s(&a.blocked_on_ref))
+        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false), s(&a.q), s(&a.blocked_on_kind), s(&a.blocked_on_ref), s(&a.meta_key), s(&a.meta_value))
             .await
             .map_err(err)
             .and_then(ok)
@@ -1582,7 +1589,7 @@ mod tests {
                 .as_i64()
                 .unwrap()
         };
-        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None).await?;
+        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None).await?;
         let got = core::get_task(&pool, find(&tasks, "T")).await?;
         assert_eq!(got["created_by"], serde_json::json!("agent:x"));
 
@@ -1593,7 +1600,7 @@ mod tests {
             )?))
             .await
             .map_err(mkfail)?;
-        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None).await?;
+        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None).await?;
         let got2 = core::get_task(&pool, find(&tasks, "T2")).await?;
         assert_eq!(got2["created_by"], serde_json::json!("other"));
 
