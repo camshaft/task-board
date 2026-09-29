@@ -3,7 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import { type DocumentComment, type DocumentVersion, ipfsUrl } from './api'
 import { DocStatusChip } from './Documents'
 import { useBoardContext } from './Layout'
-import { Markdown, Mermaid } from './markdown'
+import { Markdown, Mermaid, VegaLite } from './markdown'
 import {
   approveDocument,
   commentDocument,
@@ -444,12 +444,13 @@ export default function DocumentView() {
 
 // Which renderer a MIME type maps to. Absent/unknown text defaults to markdown (the board's
 // own default), so a plain doc still renders richly.
-type DocKind = 'markdown' | 'mermaid' | 'image' | 'pdf' | 'json' | 'text' | 'other'
+type DocKind = 'markdown' | 'mermaid' | 'vega' | 'image' | 'pdf' | 'json' | 'text' | 'other'
 function kindOf(contentType: string | null): DocKind {
   const t = (contentType ?? 'text/markdown').toLowerCase().split(';')[0].trim()
   if (t.startsWith('image/')) return 'image'
   if (t === 'application/pdf') return 'pdf'
   if (t === 'text/vnd.mermaid' || t === 'text/x-mermaid') return 'mermaid'
+  if (t === 'application/vnd.vegalite+json' || t === 'application/vnd.vega+json') return 'vega'
   if (t === 'text/markdown' || t === 'text/x-markdown' || t === '') return 'markdown'
   if (t === 'application/json') return 'json'
   if (t.startsWith('text/')) return 'text'
@@ -462,7 +463,8 @@ function kindOf(contentType: string | null): DocKind {
 // gateway is unreachable or the type is unknown — a missing gateway never breaks the view.
 function DocContent({ version }: { version: DocumentVersion }) {
   const kind = kindOf(version.content_type)
-  const needsText = kind === 'markdown' || kind === 'json' || kind === 'text' || kind === 'mermaid'
+  const needsText =
+    kind === 'markdown' || kind === 'json' || kind === 'text' || kind === 'mermaid' || kind === 'vega'
   const url = ipfsUrl(version.cid)
   const [text, setText] = useState<string | null>(null)
   const [status, setStatus] = useState<'idle' | 'loading' | 'error'>(needsText ? 'loading' : 'idle')
@@ -540,6 +542,9 @@ function DocContent({ version }: { version: DocumentVersion }) {
   }
   if (kind === 'mermaid') {
     return <Mermaid code={text} />
+  }
+  if (kind === 'vega') {
+    return <VegaLite code={text} />
   }
   if (kind === 'markdown') {
     return (
