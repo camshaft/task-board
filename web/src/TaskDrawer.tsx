@@ -12,6 +12,7 @@ import {
   useTask,
   useTasks,
 } from './resources'
+import { Markdown } from './markdown'
 import { relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // Context handed down by the Board route (the parent <Outlet/>).
@@ -373,7 +374,7 @@ export function TaskDrawer() {
                 </div>
                 {editDesc === null ? (
                   task.description ? (
-                    <p className="whitespace-pre-wrap text-sm">{task.description}</p>
+                    <Markdown source={task.description} className="text-sm" />
                   ) : (
                     <p className="text-sm text-[var(--color-muted)]">— none —</p>
                   )
@@ -537,7 +538,7 @@ export function TaskDrawer() {
                         <span className="font-mono">{c.author ?? 'anon'}</span>
                         <span>{relTime(c.created_at)}</span>
                       </div>
-                      <p className="whitespace-pre-wrap text-sm">{c.body}</p>
+                      <Markdown source={c.body} className="text-sm" />
                     </li>
                   ))}
                   {task.comments.length === 0 && (
