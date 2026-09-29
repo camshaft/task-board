@@ -1517,7 +1517,7 @@ pub async fn post_to_channel(
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
 
-    let ch = sqlx::query("SELECT dm_key FROM channels WHERE id=?")
+    let ch = sqlx::query("SELECT dm_key, metadata FROM channels WHERE id=?")
         .bind(channel_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -1526,6 +1526,11 @@ pub async fn post_to_channel(
     };
     let is_dm: Option<String> = ch.try_get("dm_key")?;
     let evtype = if is_dm.is_some() { "message.direct" } else { "channel.post" };
+    let ch_meta: Value = ch
+        .try_get::<Option<String>, _>("metadata")?
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
 
     join_channel(&mut tx, channel_id, sender).await?;
 
@@ -1552,6 +1557,41 @@ pub async fn post_to_channel(
         Recipients::FromChannel(channel_id),
     )
     .await?;
+
+    // Outbound reflect-back authz (design #141 §5): the board is authoritative on which posts
+    // may leave the board for an external system. A `channel.outbound_reflect` event is emitted
+    // ONLY when the channel's policy permits this author — a bridge adapter is a dumb executor
+    // that acts solely on these authorized events. Other posts stay board-internal (no event).
+    if channel_reflects_out(&ch_meta, sender) {
+        let mut reflect = json!({
+            "channel_id": channel_id,
+            "post_seq": seq,
+            "author": sender,
+            "body": body,
+        });
+        if let Some(parent) = reply_to {
+            reflect["reply_to"] = json!(parent);
+        }
+        if let Some(ext) = external_author {
+            reflect["external_author"] = json!(ext);
+        }
+        // Infra event: no inbox fan-out (a whole-board firehose subscriber / the SSE feed still
+        // sees it — that's how the adapter picks it up).
+        emit(
+            &mut tx,
+            &mut hooks,
+            "channel.outbound_reflect",
+            Some(sender),
+            None,
+            None,
+            Some(channel_id),
+            None,
+            reflect,
+            Recipients::Explicit(std::collections::BTreeSet::new()),
+        )
+        .await?;
+    }
+
     sqlx::query("UPDATE channels SET updated_at=? WHERE id=?")
         .bind(now_iso())
         .bind(channel_id)
@@ -1560,6 +1600,56 @@ pub async fn post_to_channel(
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(json!({ "channel_id": channel_id, "seq": seq }))
+}
+
+/// Outbound reflect-back policy (design #141 §5), read from a channel's `metadata`:
+/// `{ "outbound_authors": [..] (default ["concierge"]), "direction": "in"|"out"|"both" (default
+/// "in") }`. A post reflects OUT to an external system iff the channel's `direction` allows
+/// outbound (`out`/`both`) AND its `author` is in the `outbound_authors` allowlist. The safe
+/// default is board-internal: an unconfigured channel (direction defaults to "in") reflects
+/// nothing, so existing channels never start leaking to an external system.
+fn channel_reflects_out(metadata: &Value, author: &str) -> bool {
+    let direction = metadata.get("direction").and_then(|v| v.as_str()).unwrap_or("in");
+    if direction != "out" && direction != "both" {
+        return false;
+    }
+    match metadata.get("outbound_authors").and_then(|v| v.as_array()) {
+        Some(authors) => authors.iter().any(|a| a.as_str() == Some(author)),
+        // direction allows out but no explicit allowlist -> the documented default.
+        None => author == "concierge",
+    }
+}
+
+/// Merge arbitrary key/value properties into a channel's metadata (JSON), returning the merged
+/// bag — mirrors `set_task_props`. This is how a channel's outbound reflect-back policy
+/// (`outbound_authors` / `direction`, see `channel_reflects_out`) is configured after creation.
+pub async fn set_channel_props(pool: &Pool, channel_id: i64, props: Value) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query("SELECT metadata FROM channels WHERE id=?")
+        .bind(channel_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(row) = row else {
+        anyhow::bail!("no channel {channel_id}");
+    };
+    let existing: Option<String> = row.try_get("metadata")?;
+    let mut meta: Map<String, Value> =
+        serde_json::from_str(existing.as_deref().unwrap_or("{}")).unwrap_or_default();
+    if let Value::Object(m) = props {
+        for (k, v) in m {
+            meta.insert(k, v);
+        }
+    }
+    let meta_val = Value::Object(meta);
+    sqlx::query("UPDATE channels SET metadata=?, updated_at=? WHERE id=?")
+        .bind(meta_val.to_string())
+        .bind(&ts)
+        .bind(channel_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(json!({ "channel_id": channel_id, "metadata": meta_val }))
 }
 
 /// Read a channel's post backlog after `since_seq`, oldest first (a fresh joiner needs
@@ -3873,6 +3963,76 @@ mod tests {
         // Guardrails: empty id/source are client errors.
         assert!(upsert_external_identity(&pool, "  ", "slack", None, None).await.is_err());
         assert!(upsert_external_identity(&pool, "slack:U9", "  ", None, None).await.is_err());
+        Ok(())
+    }
+
+    /// The pure outbound reflect-back policy (#150 §5): default is board-internal; only
+    /// direction out/both + an allowed author reflects out.
+    #[test]
+    fn outbound_reflect_policy() {
+        // Default (unconfigured) + explicit "in" never reflect out.
+        assert!(!channel_reflects_out(&json!({}), "concierge"));
+        assert!(!channel_reflects_out(&json!({ "direction": "in" }), "concierge"));
+        // direction out/both with no allowlist -> the documented ["concierge"] default.
+        assert!(channel_reflects_out(&json!({ "direction": "out" }), "concierge"));
+        assert!(channel_reflects_out(&json!({ "direction": "both" }), "concierge"));
+        assert!(!channel_reflects_out(&json!({ "direction": "out" }), "worker"));
+        // An explicit allowlist replaces the default (and thus can EXCLUDE concierge).
+        let p = json!({ "direction": "both", "outbound_authors": ["worker"] });
+        assert!(channel_reflects_out(&p, "worker"));
+        assert!(!channel_reflects_out(&p, "concierge"));
+    }
+
+    /// End-to-end (#150 gate): a post by an allowed author on an out-enabled channel emits a
+    /// `channel.outbound_reflect` event; a denied author's post emits none. set_channel_props
+    /// configures the policy on an existing channel.
+    #[tokio::test]
+    async fn outbound_reflect_event_emission() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "concierge", None, None, None, None, None).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+
+        let reflects = |events: &Value, cid: i64| -> Vec<Value> {
+            events
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["type"] == json!("channel.outbound_reflect") && e["data"]["channel_id"] == json!(cid))
+                .cloned()
+                .collect()
+        };
+
+        // An out-enabled channel with the default allowlist (concierge).
+        let ch = create_channel(&pool, "bridge-out", None, Some("concierge"), Some(json!({"direction":"both"}))).await?;
+        let cid = ch["id"].as_i64().unwrap();
+
+        // Allowed author -> reflect event carrying the post details.
+        post_to_channel(&pool, cid, "concierge", "to slack", None, None).await?;
+        let ev = get_events(&pool, 0, 500).await?;
+        let r = reflects(&ev, cid);
+        assert_eq!(r.len(), 1, "allowed author reflects out");
+        assert_eq!(r[0]["data"]["author"], json!("concierge"));
+        assert_eq!(r[0]["data"]["body"], json!("to slack"));
+        assert!(r[0]["data"]["post_seq"].as_i64().is_some());
+
+        // Denied author -> no new reflect event.
+        post_to_channel(&pool, cid, "worker", "internal only", None, None).await?;
+        let ev = get_events(&pool, 0, 500).await?;
+        assert_eq!(reflects(&ev, cid).len(), 1, "denied author stays board-internal");
+
+        // An unconfigured channel never reflects, even for concierge.
+        let plain = create_channel(&pool, "plain", None, Some("concierge"), None).await?;
+        let pid = plain["id"].as_i64().unwrap();
+        post_to_channel(&pool, pid, "concierge", "hi", None, None).await?;
+        let ev = get_events(&pool, 0, 500).await?;
+        assert_eq!(reflects(&ev, pid).len(), 0, "default policy is board-internal");
+
+        // set_channel_props turns reflect-back ON for the plain channel.
+        set_channel_props(&pool, pid, json!({ "direction": "out" })).await?;
+        post_to_channel(&pool, pid, "concierge", "now out", None, None).await?;
+        let ev = get_events(&pool, 0, 500).await?;
+        assert_eq!(reflects(&ev, pid).len(), 1, "policy configurable after creation");
         Ok(())
     }
 }

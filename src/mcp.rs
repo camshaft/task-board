@@ -377,6 +377,14 @@ pub struct ListExternalIdentitiesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetChannelPropsArgs {
+    pub channel_id: i64,
+    /// Key/value properties to merge into the channel's metadata — e.g. the outbound
+    /// reflect-back policy `{"direction":"both","outbound_authors":["concierge"]}`.
+    pub props: JsonObject,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InviteToChannelArgs {
     pub channel_id: i64,
     /// The agent to invite (auto-joined).
@@ -928,6 +936,19 @@ impl Board {
         core::list_external_identities(&self.pool, s(&a.source)).await.map_err(err).and_then(ok)
     }
 
+    #[tool(
+        description = "Merge key/value props into a channel's metadata. Used to set the outbound reflect-back policy: `direction` ('in' | 'out' | 'both', default 'in') and `outbound_authors` (allowlist, default ['concierge']). A channel.outbound_reflect event fires for a post only when direction allows out AND its author is allowed — how 'only the concierge posts OUT to an external system' is enforced."
+    )]
+    async fn set_channel_props(
+        &self,
+        Parameters(a): Parameters<SetChannelPropsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::set_channel_props(&self.pool, a.channel_id, Value::Object(a.props))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
     #[tool(description = "Invite another agent into a channel: they're auto-joined and get a channel.invite in their inbox (no accept step). They can unsubscribe to leave.")]
     async fn invite_to_channel(
         &self,
@@ -1301,8 +1322,10 @@ mod tests {
     #[test]
     fn free_form_json_args_have_object_schemas() {
         prop_type_is_object(serde_json::to_value(schema_for!(SetTaskPropsArgs)).unwrap(), "props");
+        prop_type_is_object(serde_json::to_value(schema_for!(SetChannelPropsArgs)).unwrap(), "props");
         prop_type_is_object(serde_json::to_value(schema_for!(CreateTaskArgs)).unwrap(), "metadata");
         prop_type_is_object(serde_json::to_value(schema_for!(UpdateTaskArgs)).unwrap(), "metadata");
         prop_type_is_object(serde_json::to_value(schema_for!(CreateChannelArgs)).unwrap(), "metadata");
+        prop_type_is_object(serde_json::to_value(schema_for!(UpsertExternalIdentityArgs)).unwrap(), "metadata");
     }
 }

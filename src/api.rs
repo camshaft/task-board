@@ -99,6 +99,7 @@ pub fn router(state: AppState) -> Router {
         .route("/channels", get(list_channels).post(create_channel))
         .route("/channels/{channel_id}", get(get_channel))
         .route("/channels/{channel_id}/posts", get(get_channel_posts).post(post_to_channel))
+        .route("/channels/{channel_id}/props", patch(set_channel_props))
         .route("/channels/{channel_id}/invites", post(invite_to_channel))
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
@@ -182,6 +183,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/channels/{channel_id}/posts", summary: "Read a channel's post history.", query: "since_seq=int&limit=int", body: None },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/posts", summary: "Post a message to a channel.", query: "", body: Some("PostToChannelBody") },
+    Endpoint { method: "PATCH", path: "/api/channels/{channel_id}/props", summary: "Merge props into a channel's metadata (e.g. the outbound reflect-back policy).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
@@ -868,6 +870,14 @@ async fn post_to_channel(
     Ok(Json(
         core::post_to_channel(&st.pool, channel_id, &b.sender, &b.body, b.reply_to, b.external_author.as_deref()).await?,
     ))
+}
+
+async fn set_channel_props(
+    State(st): State<AppState>,
+    Path(channel_id): Path<i64>,
+    Json(props): Json<Value>,
+) -> ApiResult {
+    Ok(Json(core::set_channel_props(&st.pool, channel_id, props).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]
