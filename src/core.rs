@@ -611,6 +611,7 @@ pub async fn create_task(
     priority: Option<&str>,
     created_by: Option<&str>,
     metadata: Option<Value>,
+    parent_id: Option<i64>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -623,16 +624,33 @@ pub async fn create_task(
     {
         anyhow::bail!("no project {project_id}");
     }
+    // A parent must exist and live in the SAME project (cross-project nesting is disallowed).
+    if let Some(pid) = parent_id {
+        let parent_proj: Option<i64> = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+            .bind(pid)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| r.try_get("project_id"))
+            .transpose()?;
+        match parent_proj {
+            None => anyhow::bail!("no parent task {pid}"),
+            Some(pp) if pp != project_id => {
+                anyhow::bail!("parent task {pid} is in a different project")
+            }
+            _ => {}
+        }
+    }
     let meta_str = metadata.unwrap_or_else(|| json!({})).to_string();
     let tid: i64 = sqlx::query(
-        "INSERT INTO tasks(project_id, title, description, assignee, priority, created_by, \
-         metadata, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?, 'todo', ?, ?) RETURNING id",
+        "INSERT INTO tasks(project_id, title, description, assignee, priority, parent_id, created_by, \
+         metadata, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?, 'todo', ?, ?) RETURNING id",
     )
     .bind(project_id)
     .bind(title)
     .bind(description)
     .bind(assignee)
     .bind(priority)
+    .bind(parent_id)
     .bind(created_by)
     .bind(&meta_str)
     .bind(&ts)
@@ -674,6 +692,7 @@ pub async fn update_task(
     priority: Option<&str>,
     actor: Option<&str>,
     metadata: Option<Value>,
+    parent_id: Option<i64>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -689,6 +708,7 @@ pub async fn update_task(
     let old_assignee: Option<String> = old.try_get("assignee")?;
     let old_title: Option<String> = old.try_get("title")?;
     let old_project_id: i64 = old.try_get("project_id")?;
+    let old_parent_id: Option<i64> = old.try_get("parent_id")?;
     let old_metadata: Option<String> = old.try_get("metadata")?;
 
     // Build a dynamic UPDATE from the provided fields, preserving column order.
@@ -741,6 +761,56 @@ pub async fn update_task(
         }
         q = q.bind(&ts).bind(task_id);
         q.execute(&mut *tx).await?;
+    }
+
+    // Reparenting. parent_id semantics: None = leave unchanged; Some(0) = clear (make top-level);
+    // Some(pid) = set a parent. A parent must exist, be in the SAME project, not be the task
+    // itself, and not be a descendant (no cycles).
+    let mut reparented = false;
+    let mut reparent_to: Option<i64> = None;
+    if let Some(new_parent) = parent_id {
+        let target: Option<i64> = if new_parent == 0 { None } else { Some(new_parent) };
+        if target != old_parent_id {
+            if let Some(np) = target {
+                if np == task_id {
+                    anyhow::bail!("a task cannot be its own parent");
+                }
+                let pp: Option<i64> = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+                    .bind(np)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| r.try_get("project_id"))
+                    .transpose()?;
+                match pp {
+                    None => anyhow::bail!("no parent task {np}"),
+                    Some(proj) if proj != old_project_id => {
+                        anyhow::bail!("parent task {np} is in a different project")
+                    }
+                    _ => {}
+                }
+                // Walk the prospective parent's ancestor chain; reaching task_id = a cycle.
+                let mut cur = Some(np);
+                while let Some(c) = cur {
+                    if c == task_id {
+                        anyhow::bail!("reparenting would create a cycle");
+                    }
+                    cur = sqlx::query("SELECT parent_id FROM tasks WHERE id=?")
+                        .bind(c)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .and_then(|r| r.try_get::<Option<i64>, _>("parent_id").ok())
+                        .flatten();
+                }
+            }
+            sqlx::query("UPDATE tasks SET parent_id=?, updated_at=? WHERE id=?")
+                .bind(target)
+                .bind(&ts)
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+            reparented = true;
+            reparent_to = target;
+        }
     }
 
     // An empty-string assignee means "unassign" (clear to NULL) rather than a new owner to
@@ -804,6 +874,21 @@ pub async fn update_task(
         )
         .await?;
     }
+    if reparented {
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.reparented",
+            actor,
+            Some(task_id),
+            Some(old_project_id),
+            None,
+            None,
+            json!({ "from_parent_id": old_parent_id, "to_parent_id": reparent_to, "title": old_title }),
+            Recipients::FromTask,
+        )
+        .await?;
+    }
     if has_fields && !status_changed && !reassigned && !unassigned {
         emit(
             &mut tx,
@@ -841,7 +926,7 @@ pub async fn move_task(
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
 
-    let old = sqlx::query("SELECT project_id, title FROM tasks WHERE id=?")
+    let old = sqlx::query("SELECT project_id, title, parent_id FROM tasks WHERE id=?")
         .bind(task_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -866,6 +951,26 @@ pub async fn move_task(
             .unwrap_or(Value::Null);
         tx.commit().await?;
         return Ok(out);
+    }
+
+    // Nesting is per-project, so a task tangled in a parent/child relationship can't cross
+    // projects — reject with guidance to unlink first (clear the parent / move children).
+    let parent: Option<i64> = old.try_get("parent_id")?;
+    if parent.is_some() {
+        anyhow::bail!(
+            "cannot move task {task_id} to another project while it has a parent — clear its parent (parent_id=0) first"
+        );
+    }
+    let child_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS n FROM tasks WHERE parent_id=?")
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("n")?;
+    if child_count > 0 {
+        anyhow::bail!(
+            "cannot move task {task_id} to another project while it has {child_count} child task(s) — reparent them first"
+        );
     }
 
     sqlx::query("UPDATE tasks SET project_id=?, updated_at=? WHERE id=?")
@@ -946,19 +1051,52 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
             "attached_documents".into(),
             Value::Array(docs.iter().map(row_to_json).collect()),
         );
+
+        // Epic nesting: children (id/title/status), a done/total roll-up, and the parent title.
+        let children = sqlx::query(
+            "SELECT id, title, status FROM tasks WHERE parent_id=? ORDER BY id",
+        )
+        .bind(task_id)
+        .fetch_all(pool)
+        .await?;
+        let total = children.len() as i64;
+        let done = children
+            .iter()
+            .filter(|r| r.try_get::<String, _>("status").map(|s| s == "done").unwrap_or(false))
+            .count() as i64;
+        m.insert("children".into(), Value::Array(children.iter().map(row_to_json).collect()));
+        m.insert("child_rollup".into(), json!({ "done": done, "total": total }));
+
+        let parent_id = m.get("parent_id").and_then(|v| v.as_i64());
+        let parent_title = if let Some(pid) = parent_id {
+            sqlx::query("SELECT title FROM tasks WHERE id=?")
+                .bind(pid)
+                .fetch_optional(pool)
+                .await?
+                .and_then(|r| r.try_get::<Option<String>, _>("title").ok().flatten())
+                .map(Value::String)
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        m.insert("parent_title".into(), parent_title);
     }
     Ok(d)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn list_tasks(
     pool: &Pool,
     project_id: Option<i64>,
     status: Option<&str>,
     assignee: Option<&str>,
     unassigned: bool,
+    parent_id: Option<i64>,
+    top_level: bool,
 ) -> anyhow::Result<Value> {
-    let mut q =
-        String::from("SELECT id, project_id, title, status, assignee, priority, updated_at FROM tasks");
+    let mut q = String::from(
+        "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at FROM tasks",
+    );
     let mut conds: Vec<&str> = Vec::new();
     if project_id.is_some() {
         conds.push("project_id=?");
@@ -973,6 +1111,13 @@ pub async fn list_tasks(
         conds.push("assignee IS NULL");
     } else if assignee.is_some() {
         conds.push("assignee=?");
+    }
+    // Nesting filters: `parent_id` lists the direct children of an epic; `top_level` lists only
+    // unparented tasks (the default board view = epics + loose tasks). parent_id wins if both.
+    if parent_id.is_some() {
+        conds.push("parent_id=?");
+    } else if top_level {
+        conds.push("parent_id IS NULL");
     }
     if !conds.is_empty() {
         q.push_str(" WHERE ");
@@ -991,6 +1136,9 @@ pub async fn list_tasks(
         if let Some(a) = assignee {
             query = query.bind(a);
         }
+    }
+    if let Some(pp) = parent_id {
+        query = query.bind(pp);
     }
     let rows = query.fetch_all(pool).await?;
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
@@ -2395,13 +2543,13 @@ mod tests {
 
         let p = create_project(&pool, "Voron tuning", Some("dial in the printer"), Some("planner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None).await?;
+        let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         subscribe(&pool, "planner", Some(tid), None, None, None, false).await?; // (already auto-subscribed as creator)
         comment_task(&pool, tid, "Start from PA=0.03", Some("planner")).await?;
-        update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None).await?;
-        update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None).await?;
+        update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None, None).await?;
+        update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None, None).await?;
         send_message(&pool, "fixer", "planner", "PA done, landed at 0.032").await?;
 
         // planner should hear: 2 status changes (by fixer) + 1 DM = 3; NOT its own comment.
@@ -2441,7 +2589,7 @@ mod tests {
         // Activity by another actor, in projects the watcher never joined.
         let a = create_project(&pool, "A", None, Some("alice"), None).await?;
         let aid = a["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("alice"), None).await?;
+        let t = create_task(&pool, aid, "T", None, None, None, Some("alice"), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
         comment_task(&pool, tid, "hi", Some("alice")).await?;
         create_project(&pool, "B", None, Some("alice"), None).await?;
@@ -2723,7 +2871,7 @@ mod tests {
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         // A task owned by alice, and a doc authored by bob.
-        let t = create_task(&pool, pid, "Build widget", None, Some("alice"), None, Some("alice"), None)
+        let t = create_task(&pool, pid, "Build widget", None, Some("alice"), None, Some("alice"), None, None)
             .await?;
         let tid = t["id"].as_i64().unwrap();
         let d = create_document(&pool, "Widget design", None, "bafy1", None, Some("bob"), None).await?;
@@ -2801,7 +2949,7 @@ mod tests {
         approve_document(&pool, cid, Some("op")).await?;
 
         // Attach A to a task.
-        let t = create_task(&pool, pid, "T", None, None, None, Some("u"), None).await?;
+        let t = create_task(&pool, pid, "T", None, None, None, Some("u"), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
         attach_document(&pool, aid, tid, Some("u")).await?;
 
@@ -2832,6 +2980,74 @@ mod tests {
         Ok(())
     }
 
+    /// Task nesting/epics: parent_id on create + update, same-project + self + cycle guards,
+    /// get_task children/roll-up/parent, list_tasks top_level + parent_id filters, clear-parent,
+    /// and the move_task cross-project guard for entangled tasks.
+    #[tokio::test]
+    async fn task_parent_epic_nesting() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let p2 = create_project(&pool, "P2", None, Some("u"), None).await?;
+        let pid2 = p2["id"].as_i64().unwrap();
+
+        let ids = |v: &Value| -> Vec<i64> {
+            v.as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect()
+        };
+
+        // An epic with two children.
+        let epic = create_task(&pool, pid, "Epic", None, None, None, Some("u"), None, None).await?;
+        let eid = epic["id"].as_i64().unwrap();
+        let c1 = create_task(&pool, pid, "c1", None, None, None, Some("u"), None, Some(eid)).await?;
+        let c1id = c1["id"].as_i64().unwrap();
+        let c2 = create_task(&pool, pid, "c2", None, None, None, Some("u"), None, Some(eid)).await?;
+        let c2id = c2["id"].as_i64().unwrap();
+
+        // Cross-project parent rejected at create.
+        assert!(create_task(&pool, pid2, "x", None, None, None, Some("u"), None, Some(eid)).await.is_err());
+        // Non-existent parent rejected.
+        assert!(create_task(&pool, pid, "y", None, None, None, Some("u"), None, Some(99999)).await.is_err());
+
+        // get_task: children + roll-up.
+        let e = get_task(&pool, eid).await?;
+        assert_eq!(ids(&e["children"]), vec![c1id, c2id]);
+        assert_eq!(e["child_rollup"], json!({ "done": 0, "total": 2 }));
+
+        // Mark c1 done -> roll-up 1/2.
+        update_task(&pool, c1id, Some("done"), None, None, None, None, Some("u"), None, None).await?;
+        assert_eq!(get_task(&pool, eid).await?["child_rollup"], json!({ "done": 1, "total": 2 }));
+
+        // Child surfaces parent_id + parent_title.
+        let c = get_task(&pool, c1id).await?;
+        assert_eq!(c["parent_id"], json!(eid));
+        assert_eq!(c["parent_title"], json!("Epic"));
+
+        // list_tasks top_level -> only the epic; parent_id -> the two children.
+        assert_eq!(ids(&list_tasks(&pool, Some(pid), None, None, false, None, true).await?), vec![eid]);
+        assert_eq!(
+            ids(&list_tasks(&pool, Some(pid), None, None, false, Some(eid), false).await?),
+            vec![c1id, c2id]
+        );
+
+        // Guards: self-parent + cycle rejected.
+        assert!(update_task(&pool, eid, None, None, None, None, None, Some("u"), None, Some(eid)).await.is_err());
+        assert!(update_task(&pool, eid, None, None, None, None, None, Some("u"), None, Some(c1id)).await.is_err());
+
+        // Clear c2's parent (parent_id=0) -> top-level; emits task.reparented; roll-up shrinks.
+        let r = update_task(&pool, c2id, None, None, None, None, None, Some("u"), None, Some(0)).await?;
+        assert!(r["parent_id"].is_null());
+        assert_eq!(get_task(&pool, eid).await?["child_rollup"], json!({ "done": 1, "total": 1 }));
+        let evs = get_events(&pool, 0, 200).await?;
+        assert!(evs.as_array().unwrap().iter().any(|e| e["type"] == json!("task.reparented")));
+
+        // move_task guard: the epic still has a child -> cannot cross projects.
+        assert!(move_task(&pool, eid, pid2, Some("u")).await.is_err());
+        // c2 is now top-level with no children -> it can move.
+        assert_eq!(move_task(&pool, c2id, pid2, Some("u")).await?["project_id"], json!(pid2));
+        Ok(())
+    }
+
     /// metadata is merged (not overwritten) on update_task and set_task_props.
     #[tokio::test]
     async fn metadata_merges() -> anyhow::Result<()> {
@@ -2839,11 +3055,11 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, None, None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, None, Some(json!({"a": 1}))).await?;
+        let t = create_task(&pool, pid, "T", None, None, None, None, Some(json!({"a": 1})), None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         set_task_props(&pool, tid, json!({"b": 2})).await?;
-        update_task(&pool, tid, None, None, None, None, None, None, Some(json!({"c": 3}))).await?;
+        update_task(&pool, tid, None, None, None, None, None, None, Some(json!({"c": 3})), None).await?;
 
         let task = get_task(&pool, tid).await?;
         assert_eq!(task["metadata"], json!({"a": 1, "b": 2, "c": 3}));
@@ -2997,7 +3213,7 @@ mod tests {
                 .await?;
         }
         // ids: 1 = "Backend" (earlier), 2 = "backend" (later).
-        create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None).await?;
+        create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None, None).await?;
         // Same subscriber on both projects -> collision on repoint; both on dupe only too.
         subscribe(&pool, "alice", None, Some(1), None, None, false).await?;
         subscribe(&pool, "alice", None, Some(2), None, None, false).await?; // will collide with keep=1
@@ -3014,7 +3230,7 @@ mod tests {
         assert_eq!(arr[0]["id"], json!(1));
 
         // The task moved onto the surviving project.
-        let tasks = list_tasks(&pool, Some(1), None, None, false).await?;
+        let tasks = list_tasks(&pool, Some(1), None, None, false, None, false).await?;
         assert_eq!(tasks.as_array().unwrap().len(), 1);
 
         // Subscriptions: alice (deduped to one), bob (repointed) both on project 1.
@@ -3094,14 +3310,14 @@ mod tests {
         let b = create_project(&pool, "B", None, Some("u"), None).await?;
         let aid = a["id"].as_i64().unwrap();
         let bid = b["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None).await?;
+        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         let moved = move_task(&pool, tid, bid, Some("u")).await?;
         assert_eq!(moved["project_id"], json!(bid));
         // It now lists under B, not A.
-        assert_eq!(list_tasks(&pool, Some(aid), None, None, false).await?.as_array().unwrap().len(), 0);
-        assert_eq!(list_tasks(&pool, Some(bid), None, None, false).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_tasks(&pool, Some(aid), None, None, false, None, false).await?.as_array().unwrap().len(), 0);
+        assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false).await?.as_array().unwrap().len(), 1);
 
         // A task.moved event was recorded carrying both ends.
         let events = get_events(&pool, 0, 100).await?;
@@ -3130,31 +3346,31 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        create_task(&pool, pid, "owned", None, Some("alice"), None, Some("u"), None).await?;
-        create_task(&pool, pid, "free", None, None, None, Some("u"), None).await?;
+        create_task(&pool, pid, "owned", None, Some("alice"), None, Some("u"), None, None).await?;
+        create_task(&pool, pid, "free", None, None, None, Some("u"), None, None).await?;
 
         // unassigned=true -> only the ownerless task.
-        let un = list_tasks(&pool, Some(pid), None, None, true).await?;
+        let un = list_tasks(&pool, Some(pid), None, None, true, None, false).await?;
         let un = un.as_array().unwrap();
         assert_eq!(un.len(), 1);
         assert_eq!(un[0]["title"], json!("free"));
         assert!(un[0]["assignee"].is_null());
 
         // assignee equality still works when unassigned is false.
-        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false).await?;
+        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false, None, false).await?;
         let mine = mine.as_array().unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0]["title"], json!("owned"));
 
         // unassigned=true wins over a contradictory assignee= filter (no owner beats owner=alice).
-        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true).await?;
+        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true, None, false).await?;
         let both = both.as_array().unwrap();
         assert_eq!(both.len(), 1);
         assert_eq!(both[0]["title"], json!("free"));
 
         // No filter returns both.
         assert_eq!(
-            list_tasks(&pool, Some(pid), None, None, false).await?.as_array().unwrap().len(),
+            list_tasks(&pool, Some(pid), None, None, false, None, false).await?.as_array().unwrap().len(),
             2
         );
         Ok(())
@@ -3169,12 +3385,12 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, Some("alice"), None, Some("u"), None).await?;
+        let t = create_task(&pool, pid, "T", None, Some("alice"), None, Some("u"), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Clear the owner.
         let cleared =
-            update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None).await?;
+            update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None).await?;
         assert!(cleared["assignee"].is_null(), "assignee should be NULL after unassign");
 
         let events = get_events(&pool, 0, 100).await?;
@@ -3187,7 +3403,7 @@ mod tests {
         assert_eq!(un["data"]["from"], json!("alice"), "carries the prior owner");
 
         // Clearing an already-unassigned task does NOT emit a second task.unassigned.
-        update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None).await?;
+        update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None).await?;
         let after = get_events(&pool, 0, 200).await?;
         assert_eq!(
             after
@@ -3201,7 +3417,7 @@ mod tests {
         );
 
         // Re-assigning to a real owner emits task.assigned.
-        update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None).await?;
+        update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None, None).await?;
         let evs = get_events(&pool, 0, 200).await?;
         assert!(
             evs.as_array().unwrap().iter().any(
@@ -3219,7 +3435,7 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let a = create_project(&pool, "A", None, Some("u"), None).await?;
         let aid = a["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None).await?;
+        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None, None).await?;
         let tid = t["id"].as_i64().unwrap();
         assert!(move_task(&pool, tid, 9999, Some("u")).await.is_err());
         Ok(())

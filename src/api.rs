@@ -30,9 +30,21 @@ struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let msg = self.0.to_string();
-        let code = if msg.starts_with("no project") || msg.starts_with("no task") || msg.starts_with("no agent") || msg.starts_with("no document") || msg.starts_with("no comment") {
+        let code = if msg.starts_with("no project")
+            || msg.starts_with("no task")
+            || msg.starts_with("no agent")
+            || msg.starts_with("no document")
+            || msg.starts_with("no comment")
+            || msg.starts_with("no parent task")
+        {
             StatusCode::NOT_FOUND
-        } else if msg.starts_with("give ") {
+        } else if msg.starts_with("give ")
+            || msg.starts_with("cannot move task")
+            || msg.starts_with("a task cannot be its own parent")
+            || msg.starts_with("reparenting would create a cycle")
+            || msg.contains("is in a different project")
+        {
+            // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -146,7 +158,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") },
-    Endpoint { method: "GET", path: "/api/tasks", summary: "List tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str&unassigned=bool", body: None },
+    Endpoint { method: "GET", path: "/api/tasks", summary: "List tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
@@ -582,6 +594,10 @@ struct ListTasksQuery {
     assignee: Option<String>,
     /// Only tasks with no assignee (assignee IS NULL). Takes precedence over `assignee`.
     unassigned: Option<bool>,
+    /// Only the direct children of this task. Takes precedence over `top_level`.
+    parent_id: Option<i64>,
+    /// Only top-level tasks (no parent).
+    top_level: Option<bool>,
 }
 
 async fn list_tasks(State(st): State<AppState>, Query(q): Query<ListTasksQuery>) -> ApiResult {
@@ -592,6 +608,8 @@ async fn list_tasks(State(st): State<AppState>, Query(q): Query<ListTasksQuery>)
             q.status.as_deref(),
             q.assignee.as_deref(),
             q.unassigned.unwrap_or(false),
+            q.parent_id,
+            q.top_level.unwrap_or(false),
         )
         .await?,
     ))
@@ -606,6 +624,8 @@ struct CreateTaskBody {
     priority: Option<String>,
     created_by: Option<String>,
     metadata: Option<Value>,
+    /// Optional parent task (makes this a child/subtask). Must be in the same project.
+    parent_id: Option<i64>,
 }
 
 async fn create_task(State(st): State<AppState>, Json(b): Json<CreateTaskBody>) -> ApiResult {
@@ -619,6 +639,7 @@ async fn create_task(State(st): State<AppState>, Json(b): Json<CreateTaskBody>) 
             b.priority.as_deref(),
             b.created_by.as_deref(),
             b.metadata,
+            b.parent_id,
         )
         .await?,
     ))
@@ -638,6 +659,8 @@ struct UpdateTaskBody {
     priority: Option<String>,
     actor: Option<String>,
     metadata: Option<Value>,
+    /// Reparent: a parent task id (same project), or 0 to clear the parent (make top-level).
+    parent_id: Option<i64>,
 }
 
 async fn update_task(
@@ -656,6 +679,7 @@ async fn update_task(
             b.priority.as_deref(),
             b.actor.as_deref(),
             b.metadata,
+            b.parent_id,
         )
         .await?,
     ))
