@@ -278,7 +278,7 @@ export default function DocumentView() {
                     </span>
                   )}
                   <a
-                    href={ipfsUrl(v.cid)}
+                    href={ipfsUrl(v.cid, v.content_type)}
                     target="_blank"
                     rel="noreferrer"
                     className="min-w-0 flex-1 truncate font-mono text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
@@ -532,7 +532,7 @@ function DocContent({ version }: { version: DocumentVersion }) {
   const kind = kindOf(version.content_type)
   const needsText =
     kind === 'markdown' || kind === 'json' || kind === 'text' || kind === 'mermaid' || kind === 'vega'
-  const url = ipfsUrl(version.cid)
+  const url = ipfsUrl(version.cid, version.content_type)
   const [text, setText] = useState<string | null>(null)
   const [status, setStatus] = useState<'idle' | 'loading' | 'error'>(needsText ? 'loading' : 'idle')
 

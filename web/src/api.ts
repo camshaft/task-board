@@ -444,9 +444,13 @@ export const api = {
     ),
 }
 
-// Resolve a bare content id to a viewable URL via the deployment's IPFS gateway. The board
-// stores only the CID (location-independent); composing the path is the CLIENT's job. Resolved
-// against the page base so it's correct at the origin root or behind a sub-path proxy.
-export function ipfsUrl(cid: string): string {
-  return new URL(`ipfs/${cid}`, document.baseURI).href
+// Resolve a bare content id to a same-origin URL served by the board's scoped read-through
+// gateway (GET /api/ipfs/:cid — reads the bytes from the board's IPFS backend and streams them
+// back; 503 when no backend is configured). Pass the version's content_type so the response is
+// labeled for the browser/renderer (the board doesn't sniff bytes). Resolved against the page
+// base so it's correct at the origin root or behind a sub-path proxy.
+export function ipfsUrl(cid: string, contentType?: string | null): string {
+  const u = new URL(`api/ipfs/${encodeURIComponent(cid)}`, document.baseURI)
+  if (contentType) u.searchParams.set('content_type', contentType)
+  return u.href
 }
