@@ -26,6 +26,9 @@ const keys = {
   documents: 'documents',
   document: (documentId: number) => `document:${documentId}`,
   documentComments: (documentId: number) => `documentComments:${documentId}`,
+  agent: (id: string) => `agent:${id}`,
+  // Keyed under the `tasks:` prefix so touched()'s task-list invalidation refreshes it too.
+  agentTasks: (id: string) => `tasks:agent:${id}`,
 }
 
 export function useProjects() {
@@ -34,6 +37,15 @@ export function useProjects() {
 
 export function useAgents() {
   return useResource<Agent[]>(keys.agents, () => api.listAgents())
+}
+
+export function useAgent(id: string) {
+  return useResource<Agent>(keys.agent(id), () => api.getAgent(id))
+}
+
+// An agent's assigned tasks across every project (assignee filter, no project_id).
+export function useAgentTasks(id: string) {
+  return useResource<TaskSummary[]>(keys.agentTasks(id), () => api.listTasks({ assignee: id }))
 }
 
 export function useEvents(limit = 30) {
