@@ -9,7 +9,10 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
-use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::service::NotificationContext;
+use rmcp::{
+    schemars, tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -1382,7 +1385,12 @@ impl Board {
 #[tool_handler]
 impl ServerHandler for Board {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
@@ -1396,12 +1404,37 @@ impl ServerHandler for Board {
                     .to_string(),
             )
     }
+
+    /// Nudge a freshly-connected client to refetch `tools/list`. An MCP client fetches the tool
+    /// list once at connect and caches it; when this board redeploys with a new tool/param, a
+    /// reconnecting session would otherwise keep the stale schema — so a self-hosting owner
+    /// couldn't call surface it just shipped without a full respawn. Emitting
+    /// `notifications/tools/list_changed` right after `initialized` prompts a compliant client to
+    /// refetch, so the current tool set is always in effect. Best-effort: log and move on if the
+    /// peer is already gone.
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        if let Err(e) = context.peer.notify_tool_list_changed().await {
+            tracing::warn!("failed to send tools/list_changed on initialize: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rmcp::schemars::schema_for;
+
+    // The board advertises tools/list_changed so a client refetches its tool list after a
+    // redeploy adds/changes a tool (see on_initialized).
+    #[tokio::test]
+    async fn advertises_tool_list_changed_capability() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool, None);
+        let tools = board.get_info().capabilities.tools.expect("tools capability present");
+        assert_eq!(tools.list_changed, Some(true));
+        Ok(())
+    }
 
     // register_agent binds the session identity; identity params then default to it when
     // omitted, an explicit value still wins, and a session with no identity errors clearly.
