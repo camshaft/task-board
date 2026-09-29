@@ -370,6 +370,73 @@ export default function DocumentView() {
             </div>
           )}
 
+          {/* Transclusion graph: docs THIS one embeds (![[path]]) and docs that embed it (the
+              "dependents before you change it" view). Inline embed COMPOSITION is a later slice
+              (needs the content gateway); this is the reference view. */}
+          {(doc.embeds.length > 0 || doc.embedded_by.length > 0) && (
+            <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Embeds ({doc.embeds.length})
+                </h2>
+                <ul className="space-y-1">
+                  {doc.embeds.map((e, i) => (
+                    <li key={i} className="text-sm">
+                      {e.target_document_id != null ? (
+                        <Link
+                          to={`/documents/${e.target_document_id}`}
+                          className="text-sky-400 hover:text-sky-300"
+                          title={e.target_path}
+                        >
+                          {e.label ?? e.target_title ?? e.target_path}
+                        </Link>
+                      ) : (
+                        <Link
+                          to="/wiki"
+                          className="text-rose-400/90 hover:text-rose-300"
+                          title={`No page filed at "${e.target_path}" yet`}
+                        >
+                          {e.label ?? e.target_path}
+                        </Link>
+                      )}
+                      {e.target_version_id != null && (
+                        <span className="ml-1 text-[10px] uppercase text-[var(--color-muted)]">pinned</span>
+                      )}
+                      {e.region && (
+                        <span className="ml-1 font-mono text-[11px] text-[var(--color-muted)]">
+                          #{e.region}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div>
+                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Embedded by ({doc.embedded_by.length})
+                </h2>
+                <ul className="space-y-1">
+                  {doc.embedded_by.map((e) => (
+                    <li key={e.id} className="flex items-center gap-2 text-sm">
+                      <DocStatusChip status={e.status} />
+                      <Link
+                        to={`/documents/${e.id}`}
+                        className="min-w-0 flex-1 truncate hover:text-sky-300"
+                      >
+                        {e.title}
+                      </Link>
+                      {e.path && (
+                        <span className="font-mono text-[11px] text-[var(--color-muted)]">
+                          {e.path}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          )}
+
           {/* Review comments: threaded (top-level + one-level replies), each open comment
               resolvable. Region-anchored comments show the version they target. */}
           <h2 className="mb-2 mt-6 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
