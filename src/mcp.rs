@@ -328,6 +328,10 @@ pub struct CommentTaskArgs {
     /// duplicate; otherwise the comment is created and the link recorded atomically.
     #[serde(default)]
     pub external_link: Option<core::ExternalRef>,
+    /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
+    /// Use only for an intentional occurrence, e.g. quoting a banned phrase to discuss it.
+    #[serde(default)]
+    pub acknowledge_banned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -452,6 +456,24 @@ pub struct SetWorkspaceKindArgs {
 pub struct WorkspaceKindNameArgs {
     /// The workspace kind's name.
     pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AddBannedPhraseArgs {
+    /// The phrase to ban. Stored lowercased; matched case-insensitively and whole-phrase, so
+    /// "the floor" does not match inside "the floorboard".
+    pub phrase: String,
+    /// Optional note: why it's banned, or what to write instead.
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BannedPhraseArgs {
+    /// The phrase to remove from the banned list.
+    pub phrase: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -586,6 +608,10 @@ pub struct CreateDocumentArgs {
     /// text/vnd.mermaid. The board records only the label; rendering is the client's job.
     #[serde(default)]
     pub content_type: Option<String>,
+    /// Submit even if the content contains a banned phrase (the pre-submit lint otherwise rejects
+    /// it). Text content is scanned; non-text content is not.
+    #[serde(default)]
+    pub acknowledge_banned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -606,6 +632,10 @@ pub struct PublishVersionArgs {
     /// MIME type of this version's bytes (default text/markdown). The board records only the label.
     #[serde(default)]
     pub content_type: Option<String>,
+    /// Submit even if the content contains a banned phrase (the pre-submit lint otherwise rejects
+    /// it). Text content is scanned; non-text content is not.
+    #[serde(default)]
+    pub acknowledge_banned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -682,6 +712,9 @@ pub struct CommentDocumentArgs {
     /// ingested human. `author` stays the fleet agent (you) that performed the write.
     #[serde(default)]
     pub external_author: Option<String>,
+    /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
+    #[serde(default)]
+    pub acknowledge_banned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1000,6 +1033,9 @@ impl Board {
         Parameters(a): Parameters<CommentTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let author = self.me_opt(s(&a.author));
+        core::check_banned_phrases(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
+            .await
+            .map_err(err)?;
         core::comment_task(&self.pool, a.task_id, &a.body, author.as_deref(), s(&a.external_author), a.external_link)
             .await
             .map_err(err)
@@ -1175,6 +1211,34 @@ impl Board {
         core::delete_workspace_kind(&self.pool, &a.name).await.map_err(err).and_then(ok)
     }
 
+    // --- Banned phrases (pre-submit content lint for docs + comments) ---
+    #[tool(
+        description = "Add a phrase to the fleet banned-phrases list (jargon/idioms we've agreed not to use in docs and comments). The pre-submit lint on create_document / publish_version / comment_task / comment_document then rejects authored content containing it (case-insensitive, whole-phrase), unless the author passes acknowledge_banned. Idempotent on the phrase; pass an optional note for why or what to write instead."
+    )]
+    async fn add_banned_phrase(
+        &self,
+        Parameters(a): Parameters<AddBannedPhraseArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let creator = self.me_opt(s(&a.created_by));
+        core::add_banned_phrase(&self.pool, &a.phrase, s(&a.note), creator.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "List the fleet banned-phrases list (the phrases the pre-submit content lint checks docs and comments against).")]
+    async fn list_banned_phrases(&self) -> Result<CallToolResult, McpError> {
+        core::list_banned_phrases(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Remove a phrase from the fleet banned-phrases list.")]
+    async fn remove_banned_phrase(
+        &self,
+        Parameters(a): Parameters<BannedPhraseArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::remove_banned_phrase(&self.pool, &a.phrase).await.map_err(err).and_then(ok)
+    }
+
     #[tool(
         description = "Map a board entity to an entity in a bridged external system (the generic link behind the Slack channel-map, GitHub issue↔task, and thread↔task). `board_kind` is channel|task|thread, `board_id` the board-side id; `source`+`external_id` identify the external side. Idempotent on (source, external_id). This is how a bridge adapter resolves e.g. a board channel to its Slack channel."
     )]
@@ -1303,6 +1367,13 @@ impl Board {
         &self,
         Parameters(a): Parameters<CreateDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(c) = a.content.as_deref() {
+            if core::is_text_content_type(a.content_type.as_deref().unwrap_or("text/markdown")) {
+                core::check_banned_phrases(&self.pool, c, a.acknowledge_banned.unwrap_or(false))
+                    .await
+                    .map_err(err)?;
+            }
+        }
         let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
             .await
             .map_err(err)?;
@@ -1329,6 +1400,13 @@ impl Board {
         &self,
         Parameters(a): Parameters<PublishVersionArgs>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(c) = a.content.as_deref() {
+            if core::is_text_content_type(a.content_type.as_deref().unwrap_or("text/markdown")) {
+                core::check_banned_phrases(&self.pool, c, a.acknowledge_banned.unwrap_or(false))
+                    .await
+                    .map_err(err)?;
+            }
+        }
         let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
             .await
             .map_err(err)?;
@@ -1416,6 +1494,9 @@ impl Board {
         &self,
         Parameters(a): Parameters<CommentDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
+        core::check_banned_phrases(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
+            .await
+            .map_err(err)?;
         core::comment_document(
             &self.pool,
             a.document_id,
