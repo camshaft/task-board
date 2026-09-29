@@ -91,10 +91,40 @@ CREATE TABLE IF NOT EXISTS inbox (
     created_at TEXT NOT NULL,
     read_at    TEXT
 );
+-- Documents: publishable, versioned content. The board stores only the content IDENTIFIER
+-- (a bare CID) plus metadata. The bytes live on IPFS and the CID is resolved by the client,
+-- never the board (content addressing keeps the identifier location-independent). Each
+-- version is an immutable row.
+CREATE TABLE IF NOT EXISTS documents (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    title               TEXT NOT NULL,
+    slug                TEXT,
+    project_id          INTEGER REFERENCES projects(id),
+    status              TEXT NOT NULL DEFAULT 'draft',
+    current_version_id  INTEGER REFERENCES document_versions(id),
+    approved_version_id INTEGER REFERENCES document_versions(id),
+    approved_by         TEXT,
+    metadata            TEXT NOT NULL DEFAULT '{}',
+    created_by          TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS document_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id),
+    version_no  INTEGER NOT NULL,
+    cid         TEXT NOT NULL,
+    summary     TEXT,
+    created_by  TEXT,
+    created_at  TEXT NOT NULL,
+    UNIQUE(document_id, version_no)
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
 CREATE INDEX IF NOT EXISTS idx_subs_target   ON subscriptions(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_docs_project  ON documents(project_id);
+CREATE INDEX IF NOT EXISTS idx_docversions   ON document_versions(document_id, version_no);
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
