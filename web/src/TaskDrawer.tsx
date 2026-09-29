@@ -71,6 +71,9 @@ export function TaskDrawer() {
   const [editTitle, setEditTitle] = useState<string | null>(null)
   const [editDesc, setEditDesc] = useState<string | null>(null)
   const [editMeta, setEditMeta] = useState<string | null>(null)
+  // Long comment threads collapse the older ones behind a "show N earlier" button, keeping the
+  // latest few (and the compose box) in view — the operator usually only cares about recent replies.
+  const [showAllComments, setShowAllComments] = useState(false)
 
   const onClose = () => navigate(`/projects/${projectId}`)
   const vp = useVisualViewport()
@@ -86,6 +89,8 @@ export function TaskDrawer() {
   useEffect(() => {
     const m = /^#comment-(\d+)$/.exec(location.hash)
     if (!m || !task || flashedHash.current === location.hash) return
+    // A deep-linked comment that would otherwise be collapsed is force-shown during render (see
+    // the comments list below), so by the time this runs the element exists.
     const el = document.getElementById(`comment-${m[1]}`)
     if (el) {
       el.scrollIntoView({ block: 'center' })
@@ -597,28 +602,54 @@ export function TaskDrawer() {
                 <div className="mb-2 text-xs text-[var(--color-muted)]">
                   Comments ({task.comments.length})
                 </div>
-                <ul className="space-y-3">
-                  {task.comments.map((c) => (
-                    <li
-                      key={c.id}
-                      id={`comment-${c.id}`}
-                      className="scroll-mt-4 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3"
-                    >
-                      <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
-                        <AuthorLabel
-                          author={c.author}
-                          externalAuthor={c.external_author}
-                          resolveExternal={extName}
-                        />
-                        <span>{relTime(c.created_at)}</span>
-                      </div>
-                      <Markdown source={c.body} className="text-sm" />
-                    </li>
-                  ))}
-                  {task.comments.length === 0 && (
-                    <li className="text-sm text-[var(--color-muted)]">No comments yet.</li>
-                  )}
-                </ul>
+                {(() => {
+                  // Keep the latest few in view; collapse older ones behind an expander once the
+                  // thread is long enough that hiding is worthwhile (chronological order is kept).
+                  const VISIBLE = 3
+                  const hidden = task.comments.length - VISIBLE
+                  // Force-expand when a #comment-<id> deep-link targets one of the older (hidden)
+                  // comments, so the link lands (derived here rather than via setState in an effect).
+                  const targetId = /^#comment-(\d+)$/.exec(location.hash)?.[1]
+                  const targetHidden =
+                    targetId != null &&
+                    task.comments.slice(0, Math.max(0, hidden)).some((c) => String(c.id) === targetId)
+                  const collapsed = !showAllComments && hidden >= 2 && !targetHidden
+                  const shown = collapsed ? task.comments.slice(-VISIBLE) : task.comments
+                  return (
+                    <ul className="space-y-3">
+                      {collapsed && (
+                        <li>
+                          <button
+                            onClick={() => setShowAllComments(true)}
+                            className="w-full rounded-md border border-dashed border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-300"
+                          >
+                            Show {hidden} earlier comment{hidden === 1 ? '' : 's'}
+                          </button>
+                        </li>
+                      )}
+                      {shown.map((c) => (
+                        <li
+                          key={c.id}
+                          id={`comment-${c.id}`}
+                          className="scroll-mt-4 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3"
+                        >
+                          <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
+                            <AuthorLabel
+                              author={c.author}
+                              externalAuthor={c.external_author}
+                              resolveExternal={extName}
+                            />
+                            <span>{relTime(c.created_at)}</span>
+                          </div>
+                          <Markdown source={c.body} className="text-sm" />
+                        </li>
+                      ))}
+                      {task.comments.length === 0 && (
+                        <li className="text-sm text-[var(--color-muted)]">No comments yet.</li>
+                      )}
+                    </ul>
+                  )
+                })()}
               </div>
             </div>
 
