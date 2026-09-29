@@ -1,5 +1,12 @@
-import { useEffect, useState } from 'react'
-import { Link, useNavigate, useOutletContext, useParams } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import {
+  Link,
+  Navigate,
+  useLocation,
+  useNavigate,
+  useOutletContext,
+  useParams,
+} from 'react-router-dom'
 import { type TaskStatus } from './api'
 import { DocStatusChip } from './Documents'
 import {
@@ -67,6 +74,32 @@ export function TaskDrawer() {
 
   const onClose = () => navigate(`/projects/${projectId}`)
   const vp = useVisualViewport()
+  const location = useLocation()
+
+  // Deep-link to a specific comment: /tasks/:id#comment-<id> scrolls it into view and briefly
+  // flashes a ring. The comment list renders async (after the task loads), so the browser's own
+  // fragment scroll misses it — we scroll once the element exists. We can't use the :target CSS
+  // pseudo because the id-only route redirects via the History API (which doesn't update :target),
+  // so the flash is a transient Web Animations API ring that reverts on its own (no lingering
+  // state). A ref guards against re-running on later background task refreshes.
+  const flashedHash = useRef<string | null>(null)
+  useEffect(() => {
+    const m = /^#comment-(\d+)$/.exec(location.hash)
+    if (!m || !task || flashedHash.current === location.hash) return
+    const el = document.getElementById(`comment-${m[1]}`)
+    if (el) {
+      el.scrollIntoView({ block: 'center' })
+      el.animate(
+        [
+          { boxShadow: '0 0 0 2px rgba(56, 189, 248, 0.7)' },
+          { boxShadow: '0 0 0 2px rgba(56, 189, 248, 0.7)', offset: 0.6 },
+          { boxShadow: '0 0 0 2px rgba(56, 189, 248, 0)' },
+        ],
+        { duration: 2200, easing: 'ease-out' },
+      )
+      flashedHash.current = location.hash
+    }
+  }, [location.hash, task])
 
   async function setStatus(status: TaskStatus) {
     if (!task || status === task.status) return
@@ -568,7 +601,8 @@ export function TaskDrawer() {
                   {task.comments.map((c) => (
                     <li
                       key={c.id}
-                      className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3"
+                      id={`comment-${c.id}`}
+                      className="scroll-mt-4 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3"
                     >
                       <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
                         <AuthorLabel
@@ -611,4 +645,20 @@ export function TaskDrawer() {
       </aside>
     </div>
   )
+}
+
+// Bare /tasks/:taskId deep-link: the task drawer lives under a project route, so a link that
+// only knows the task id resolves the task, then redirects to the canonical nested URL —
+// preserving any #comment-<id> fragment. Lets an id-only link (e.g. /board/tasks/42) just work.
+export function TaskRedirect() {
+  const { taskId } = useParams()
+  const location = useLocation()
+  const { data: task, error } = useTask(Number(taskId))
+  if (error) {
+    return <div className="p-6 text-[var(--color-muted)]">Error: {error.message}</div>
+  }
+  if (!task) {
+    return <div className="p-6 text-[var(--color-muted)]">Loading…</div>
+  }
+  return <Navigate to={`/projects/${task.project_id}/tasks/${task.id}${location.hash}`} replace />
 }
