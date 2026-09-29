@@ -3476,6 +3476,99 @@ pub async fn get_document(pool: &Pool, document_id: i64) -> anyhow::Result<Value
     }
 }
 
+/// Cap on a from-session document-body read, matching the REST IPFS gateway cap.
+pub const DOCUMENT_READ_CAP_BYTES: usize = 25 * 1024 * 1024;
+
+/// Whether a content_type is text-shaped, i.e. safe to return as a UTF-8 string from the read
+/// path. Binary types (image/pdf/...) are not inlined; the caller fetches their bytes by CID.
+pub fn is_text_content_type(ct: &str) -> bool {
+    let t = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    t.is_empty()
+        || t.starts_with("text/")
+        || t == "application/json"
+        || t == "application/xml"
+        || t == "application/javascript"
+        || t.ends_with("+json")
+        || t.ends_with("+xml")
+}
+
+/// Resolve a document version's stored (version_no, cid, content_type) — the current version when
+/// `version_no` is None, or the named version otherwise.
+pub async fn resolve_document_version(
+    pool: &Pool,
+    document_id: i64,
+    version_no: Option<i64>,
+) -> anyhow::Result<(i64, String, String)> {
+    let row = match version_no {
+        Some(n) => {
+            sqlx::query(
+                "SELECT version_no, cid, content_type FROM document_versions \
+                 WHERE document_id=? AND version_no=?",
+            )
+            .bind(document_id)
+            .bind(n)
+            .fetch_optional(pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "SELECT dv.version_no, dv.cid, dv.content_type FROM documents d \
+                 JOIN document_versions dv ON dv.id = d.current_version_id WHERE d.id=?",
+            )
+            .bind(document_id)
+            .fetch_optional(pool)
+            .await?
+        }
+    };
+    let Some(row) = row else {
+        match version_no {
+            Some(n) => anyhow::bail!("no version {n} for document {document_id}"),
+            None => anyhow::bail!("no document {document_id}"),
+        }
+    };
+    let vn: i64 = row.try_get("version_no")?;
+    let cid: String = row.try_get("cid")?;
+    let ct: Option<String> = row.try_get("content_type")?;
+    Ok((vn, cid, ct.unwrap_or_else(|| "text/markdown".to_string())))
+}
+
+/// Read a document's body content from-session: resolve the version's CID and return the text,
+/// fetched through the board's own IPFS backend server-side. This lets an agent on the board
+/// client read a document body without local IPFS or a separate gateway. Text-shaped content is
+/// returned inline as `content`; binary content (image/pdf/...) returns a null `content` + the CID
+/// so the caller can fetch the raw bytes via the REST gateway instead. Requires `ipfs_api_url`.
+pub async fn read_document_content(
+    pool: &Pool,
+    ipfs_api_url: Option<&str>,
+    document_id: i64,
+    version_no: Option<i64>,
+) -> anyhow::Result<Value> {
+    let (vn, cid, ct) = resolve_document_version(pool, document_id, version_no).await?;
+    let Some(url) = ipfs_api_url else {
+        anyhow::bail!(
+            "no IPFS backend configured (set ipfs_api_url); this board can't read content by CID"
+        );
+    };
+    let mut out = json!({
+        "document_id": document_id,
+        "version_no": vn,
+        "cid": cid,
+        "content_type": ct,
+    });
+    if is_text_content_type(&ct) {
+        let bytes = crate::ipfs::cat(url, &cid, DOCUMENT_READ_CAP_BYTES).await?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("document {document_id} v{vn} content is not valid UTF-8"))?;
+        out["content"] = json!(text);
+    } else {
+        out["content"] = Value::Null;
+        out["note"] = json!(format!(
+            "binary content ({ct}); fetch the raw bytes via GET /api/ipfs/{cid}"
+        ));
+    }
+    Ok(out)
+}
+
 /// List a document's versions (immutable), newest first.
 pub async fn get_document_versions(pool: &Pool, document_id: i64) -> anyhow::Result<Value> {
     let rows = sqlx::query(
@@ -4492,6 +4585,39 @@ mod tests {
         // BOTH backlinks AND embedded_by (previously the embed was silently dropped).
         assert!(emb_by.iter().any(|e| e["id"] == json!(sid)), "Page embeds Widget (same path it also links)");
         assert!(t_doc["backlinks"].as_array().unwrap().iter().any(|b| b["id"] == json!(sid)), "Page links Widget");
+        Ok(())
+    }
+
+    /// The from-session content read path (task #303): resolve_document_version picks the current
+    /// or a named version's (version_no, cid, content_type), read_document_content requires an IPFS
+    /// backend (so REST maps to 503 without one), and is_text_content_type classifies text vs binary.
+    #[tokio::test]
+    async fn read_document_content_resolves_version_and_needs_backend() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(&pool, "Spec", None, "bafycurrent", None, Some("alice"), None, Some("text/markdown"), None).await?;
+        let did = d["id"].as_i64().unwrap();
+        publish_version(&pool, did, "bafyv2", Some("s"), Some("alice"), Some("application/pdf"), None).await?;
+
+        // The current version resolves to v2 + its cid/content_type; a named older version resolves too.
+        let (vn, cid, ct) = resolve_document_version(&pool, did, None).await?;
+        assert_eq!((vn, cid.as_str(), ct.as_str()), (2, "bafyv2", "application/pdf"));
+        let (vn1, cid1, ct1) = resolve_document_version(&pool, did, Some(1)).await?;
+        assert_eq!((vn1, cid1.as_str(), ct1.as_str()), (1, "bafycurrent", "text/markdown"));
+        // A missing version or document errors.
+        assert!(resolve_document_version(&pool, did, Some(99)).await.is_err());
+        assert!(resolve_document_version(&pool, 9999, None).await.is_err());
+
+        // With no IPFS backend, the read path errors with the backend-required message (REST -> 503).
+        let err = read_document_content(&pool, None, did, None).await.unwrap_err().to_string();
+        assert!(err.contains("no IPFS backend"), "got: {err}");
+
+        assert!(is_text_content_type("text/markdown"));
+        assert!(is_text_content_type("application/json"));
+        assert!(is_text_content_type("application/vnd.foo+json"));
+        assert!(is_text_content_type(""));
+        assert!(!is_text_content_type("image/png"));
+        assert!(!is_text_content_type("application/pdf"));
         Ok(())
     }
 

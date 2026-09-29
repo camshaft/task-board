@@ -116,6 +116,7 @@ pub fn router(state: AppState) -> Router {
         .route("/wiki", get(list_wiki))
         .route("/documents", get(list_documents).post(create_document))
         .route("/documents/{document_id}", get(get_document))
+        .route("/documents/{document_id}/content", get(read_document_content))
         .route("/documents/{document_id}/path", post(set_document_path))
         .route("/documents/{document_id}/versions", get(get_document_versions).post(publish_version))
         .route("/documents/{document_id}/comments", get(get_document_comments).post(comment_document))
@@ -216,6 +217,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
     Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version. Requires ipfs_api_url.", query: "version_no=int", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/versions", summary: "Publish a new immutable version (bare CID).", query: "", body: Some("PublishVersionBody") },
@@ -1345,6 +1347,27 @@ async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumen
 
 async fn get_document(State(st): State<AppState>, Path(document_id): Path<i64>) -> ApiResult {
     Ok(Json(core::get_document(&st.pool, document_id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DocumentContentQuery {
+    /// Which version's body to read. Omit for the current version.
+    version_no: Option<i64>,
+}
+
+/// `GET /api/documents/{id}/content` — read a document's body inline (resolves the version's CID
+/// through the board's IPFS backend server-side). The agent-usable read path: no local IPFS or
+/// separate gateway. Text content comes back as `content`; binary content returns a null `content`
+/// + the CID to fetch via `/api/ipfs/{cid}`. Requires `ipfs_api_url` (503 without one).
+async fn read_document_content(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Query(q): Query<DocumentContentQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::read_document_content(&st.pool, st.ipfs_api_url.as_deref(), document_id, q.version_no)
+            .await?,
+    ))
 }
 
 async fn get_document_versions(
