@@ -161,7 +161,7 @@ pub async fn emit(
     .await?
     .try_get("seq")?;
 
-    let recips = match recipients {
+    let mut recips = match recipients {
         Recipients::Explicit(set) => set,
         Recipients::FromTask => match task_id {
             Some(tid) => recipients_for_task(tx, tid, actor).await?,
@@ -170,6 +170,20 @@ pub async fn emit(
         Recipients::FromProject(pid) => recipients_for_project(tx, pid, actor).await?,
         Recipients::FromChannel(cid) => recipients_for_channel(tx, cid, actor).await?,
     };
+
+    // Whole-board firehose: anyone subscribed with target_type='board' receives EVERY event,
+    // regardless of the per-event recipient set above (even otherwise-silent Explicit events).
+    // Minus the actor, so an agent isn't notified of its own action.
+    let board_subs =
+        sqlx::query("SELECT subscriber FROM subscriptions WHERE target_type='board'")
+            .fetch_all(&mut **tx)
+            .await?;
+    for s in board_subs {
+        let sub: String = s.try_get("subscriber")?;
+        if Some(sub.as_str()) != actor {
+            recips.insert(sub);
+        }
+    }
 
     for r in &recips {
         sqlx::query("INSERT INTO inbox(recipient, event_seq, created_at) VALUES(?,?,?)")

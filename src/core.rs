@@ -1038,8 +1038,9 @@ pub async fn subscribe(
     task_id: Option<i64>,
     project_id: Option<i64>,
     channel_id: Option<i64>,
+    board: bool,
 ) -> anyhow::Result<Value> {
-    let (tt, tid) = target(task_id, project_id, channel_id)?;
+    let (tt, tid) = target(task_id, project_id, channel_id, board)?;
     sqlx::query(
         "INSERT OR IGNORE INTO subscriptions(subscriber, target_type, target_id, created_at) \
          VALUES(?,?,?,?)",
@@ -1059,8 +1060,9 @@ pub async fn unsubscribe(
     task_id: Option<i64>,
     project_id: Option<i64>,
     channel_id: Option<i64>,
+    board: bool,
 ) -> anyhow::Result<Value> {
-    let (tt, tid) = target(task_id, project_id, channel_id)?;
+    let (tt, tid) = target(task_id, project_id, channel_id, board)?;
     let n = sqlx::query(
         "DELETE FROM subscriptions WHERE subscriber=? AND target_type=? AND target_id=?",
     )
@@ -1077,12 +1079,19 @@ fn target(
     task_id: Option<i64>,
     project_id: Option<i64>,
     channel_id: Option<i64>,
+    board: bool,
 ) -> anyhow::Result<(&'static str, i64)> {
-    match (task_id, project_id, channel_id) {
-        (Some(t), _, _) => Ok(("task", t)),
-        (None, Some(p), _) => Ok(("project", p)),
-        (None, None, Some(c)) => Ok(("channel", c)),
-        (None, None, None) => anyhow::bail!("give task_id, project_id, or channel_id"),
+    // `board` is the whole-board firehose scope: a single subscription that receives every
+    // emitted event. It uses a fixed sentinel target_id (0 — real task/project/channel ids
+    // start at 1), so (subscriber, 'board', 0) stays unique for INSERT OR IGNORE dedup.
+    match (task_id, project_id, channel_id, board) {
+        (Some(t), _, _, _) => Ok(("task", t)),
+        (None, Some(p), _, _) => Ok(("project", p)),
+        (None, None, Some(c), _) => Ok(("channel", c)),
+        (None, None, None, true) => Ok(("board", 0)),
+        (None, None, None, false) => {
+            anyhow::bail!("give task_id, project_id, channel_id, or board=true")
+        }
     }
 }
 
@@ -1684,7 +1693,7 @@ mod tests {
         let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None).await?;
         let tid = t["id"].as_i64().unwrap();
 
-        subscribe(&pool, "planner", Some(tid), None, None).await?; // (already auto-subscribed as creator)
+        subscribe(&pool, "planner", Some(tid), None, None, false).await?; // (already auto-subscribed as creator)
         comment_task(&pool, tid, "Start from PA=0.03", Some("planner")).await?;
         update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None).await?;
         update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None).await?;
@@ -1710,6 +1719,52 @@ mod tests {
         // Draining a second time yields nothing (marked read).
         let again = check_notifications(&pool, "planner", true, 50, None).await?;
         assert_eq!(again["count"].as_i64(), Some(0), "should be drained");
+
+        Ok(())
+    }
+
+    /// A board-scope subscription is a firehose: it receives every event — including events in
+    /// projects the subscriber never joined and otherwise-silent ones — minus its own actions,
+    /// and stops when unsubscribed.
+    #[tokio::test]
+    async fn board_subscription_is_a_firehose() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        subscribe(&pool, "watcher", None, None, None, true).await?;
+
+        // Activity by another actor, in projects the watcher never joined.
+        let a = create_project(&pool, "A", None, Some("alice"), None).await?;
+        let aid = a["id"].as_i64().unwrap();
+        let t = create_task(&pool, aid, "T", None, None, None, Some("alice"), None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        comment_task(&pool, tid, "hi", Some("alice")).await?;
+        create_project(&pool, "B", None, Some("alice"), None).await?;
+
+        // The watcher hears all four: project.created (A, silent to others), task.created,
+        // task.commented, project.created (B) — despite subscribing to nothing specific.
+        let watcher = check_notifications(&pool, "watcher", true, 50, None).await?;
+        assert_eq!(watcher["count"].as_i64(), Some(4), "firehose: {watcher}");
+        let types: BTreeSet<String> = watcher["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap().to_string())
+            .collect();
+        for want in ["project.created", "task.created", "task.commented"] {
+            assert!(types.contains(want), "firehose should carry {want}: {types:?}");
+        }
+
+        // The watcher's OWN action does not notify itself (actor excluded).
+        create_project(&pool, "C", None, Some("watcher"), None).await?;
+        let own = check_notifications(&pool, "watcher", true, 50, None).await?;
+        assert_eq!(own["count"].as_i64(), Some(0), "actor excluded from its own events");
+
+        // Unsubscribing stops the firehose.
+        unsubscribe(&pool, "watcher", None, None, None, true).await?;
+        create_project(&pool, "D", None, Some("alice"), None).await?;
+        let after = check_notifications(&pool, "watcher", true, 50, None).await?;
+        assert_eq!(after["count"].as_i64(), Some(0), "no events after unsubscribe");
 
         Ok(())
     }
@@ -1881,9 +1936,9 @@ mod tests {
         // ids: 1 = "Backend" (earlier), 2 = "backend" (later).
         create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None).await?;
         // Same subscriber on both projects -> collision on repoint; both on dupe only too.
-        subscribe(&pool, "alice", None, Some(1), None).await?;
-        subscribe(&pool, "alice", None, Some(2), None).await?; // will collide with keep=1
-        subscribe(&pool, "bob", None, Some(2), None).await?; // repoints cleanly onto 1
+        subscribe(&pool, "alice", None, Some(1), None, false).await?;
+        subscribe(&pool, "alice", None, Some(2), None, false).await?; // will collide with keep=1
+        subscribe(&pool, "bob", None, Some(2), None, false).await?; // repoints cleanly onto 1
 
         let report = merge_duplicate_projects(&pool).await?;
         assert_eq!(report["merged_groups"], json!(1));
@@ -2172,7 +2227,7 @@ mod tests {
         assert_eq!(members, ["alice", "bob"].iter().map(|s| s.to_string()).collect());
 
         // carol joins explicitly, then alice posts. bob + carol hear it; alice (poster) doesn't.
-        subscribe(&pool, "carol", None, None, Some(cid)).await?;
+        subscribe(&pool, "carol", None, None, Some(cid), false).await?;
         let posted = post_to_channel(&pool, cid, "alice", "hello all", None).await?;
         let post_seq = posted["seq"].as_i64().unwrap();
 
@@ -2255,7 +2310,7 @@ mod tests {
         assert_eq!(bob["notifications"][0]["data"]["invited_by"], json!("alice"));
 
         // Leaving = unsubscribe from the channel.
-        unsubscribe(&pool, "bob", None, None, Some(cid)).await?;
+        unsubscribe(&pool, "bob", None, None, Some(cid), false).await?;
         let after = get_channel(&pool, cid).await?;
         let members: Vec<&str> = after["members"]
             .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();

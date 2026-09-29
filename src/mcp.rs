@@ -235,9 +235,13 @@ pub struct SubscribeArgs {
     pub task_id: Option<i64>,
     #[serde(default)]
     pub project_id: Option<i64>,
-    /// Subscribe to a channel (join it). Give exactly one of task_id / project_id / channel_id.
+    /// Subscribe to a channel (join it). Give exactly one of task_id / project_id / channel_id,
+    /// or set `board: true`.
     #[serde(default)]
     pub channel_id: Option<i64>,
+    /// Whole-board firehose: subscribe to EVERY event on the board (for a coordinator/auto-assigner).
+    #[serde(default)]
+    pub board: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -581,23 +585,23 @@ impl Board {
     }
 
     // --- Subscriptions ---
-    #[tool(description = "Subscribe an agent to a task, a project, OR a channel so it's notified of activity there. Give exactly one of task_id / project_id / channel_id. Subscribing to a channel joins it.")]
+    #[tool(description = "Subscribe an agent to a task, a project, a channel, OR the whole board so it's notified of activity there. Give exactly one of task_id / project_id / channel_id, or set `board: true` for the whole-board firehose (every event — for a coordinator/auto-assigner). Subscribing to a channel joins it.")]
     async fn subscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::subscribe(&self.pool, &a.subscriber, a.task_id, a.project_id, a.channel_id)
+        core::subscribe(&self.pool, &a.subscriber, a.task_id, a.project_id, a.channel_id, a.board.unwrap_or(false))
             .await
             .map_err(err)
             .and_then(ok)
     }
 
-    #[tool(description = "Stop notifying an agent about a task, project, or channel (leaving a channel).")]
+    #[tool(description = "Stop notifying an agent about a task, project, channel (leaving a channel), or the whole board (board: true).")]
     async fn unsubscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::unsubscribe(&self.pool, &a.subscriber, a.task_id, a.project_id, a.channel_id)
+        core::unsubscribe(&self.pool, &a.subscriber, a.task_id, a.project_id, a.channel_id, a.board.unwrap_or(false))
             .await
             .map_err(err)
             .and_then(ok)
