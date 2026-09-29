@@ -120,6 +120,8 @@ pub fn router(state: AppState) -> Router {
         .route("/documents/{document_id}/approve", post(approve_document))
         .route("/documents/{document_id}/attach", post(attach_document))
         .route("/documents/{document_id}/detach", post(detach_document))
+        .route("/documents/{document_id}/archive", post(archive_document))
+        .route("/documents/{document_id}/restore", post(restore_document))
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
@@ -199,9 +201,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/external-links", summary: "Map a board entity (channel|task|thread) to an external one; idempotent on (source, external_id).", query: "", body: Some("UpsertExternalLinkBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
-    Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author).", query: "project_id=int&status=str&tag=str&task_id=int&author=str", body: None },
+    Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author; archived hidden unless include_archived=true).", query: "project_id=int&status=str&tag=str&task_id=int&author=str&include_archived=bool", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
-    Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path.", query: "prefix=str", body: None },
+    Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
@@ -214,6 +216,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents/{document_id}/approve", summary: "Approve a document (stamps the current version, status -> approved).", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/attach", summary: "Attach a document to a task (notifies both sides).", query: "", body: Some("AttachDocumentBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/detach", summary: "Detach a document from a task.", query: "", body: Some("AttachDocumentBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/archive", summary: "Soft-archive (retire) a document: hidden from listings by default, reversible, history preserved.", query: "", body: Some("DocumentActorBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/restore", summary: "Restore a previously archived document (clears the archive stamp).", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
 ];
 
@@ -1157,15 +1161,23 @@ struct ListDocumentsQuery {
     tag: Option<String>,
     task_id: Option<i64>,
     author: Option<String>,
+    /// Include archived (retired) documents; hidden by default.
+    #[serde(default)]
+    include_archived: bool,
 }
 
 #[derive(Deserialize)]
 struct WikiQuery {
     prefix: Option<String>,
+    /// Include archived (retired) documents in the tree; hidden by default.
+    #[serde(default)]
+    include_archived: bool,
 }
 
 async fn list_wiki(State(st): State<AppState>, Query(q): Query<WikiQuery>) -> ApiResult {
-    Ok(Json(core::list_wiki(&st.pool, q.prefix.as_deref()).await?))
+    Ok(Json(
+        core::list_wiki(&st.pool, q.prefix.as_deref(), q.include_archived).await?,
+    ))
 }
 
 async fn list_documents(
@@ -1180,6 +1192,7 @@ async fn list_documents(
             q.tag.as_deref(),
             q.task_id,
             q.author.as_deref(),
+            q.include_archived,
         )
         .await?,
     ))
@@ -1391,6 +1404,26 @@ async fn approve_document(
 ) -> ApiResult {
     Ok(Json(
         core::approve_document(&st.pool, document_id, b.actor.as_deref()).await?,
+    ))
+}
+
+async fn archive_document(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<DocumentActorBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_document_archived(&st.pool, document_id, true, b.actor.as_deref()).await?,
+    ))
+}
+
+async fn restore_document(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<DocumentActorBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_document_archived(&st.pool, document_id, false, b.actor.as_deref()).await?,
     ))
 }
 

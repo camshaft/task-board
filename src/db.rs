@@ -117,6 +117,9 @@ CREATE TABLE IF NOT EXISTS documents (
     approved_version_id INTEGER REFERENCES document_versions(id),
     approved_by         TEXT,
     metadata            TEXT NOT NULL DEFAULT '{}',
+    -- Soft-archive stamp. NULL = live; a timestamp = retired (hidden from listings by default,
+    -- reversible, and the append-only event log is preserved). Orthogonal to the review status.
+    archived_at         TEXT,
     created_by          TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
@@ -520,6 +523,18 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_path ON documents(path) WHERE path IS NOT NULL")
         .execute(&pool)
         .await?;
+
+    // Back-fill documents.archived_at (the soft-archive/retire path). Nullable; NULL = live.
+    let documents_have_archived_at = sqlx::query("PRAGMA table_info(documents)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "archived_at");
+    if !documents_have_archived_at {
+        sqlx::query("ALTER TABLE documents ADD COLUMN archived_at TEXT")
+            .execute(&pool)
+            .await?;
+    }
 
     // Back-fill document_links.{kind,target_version_id,region} (transclusion/embeds). A DB whose
     // document_links table was created before embeds existed keeps its rows as kind='link'. All
