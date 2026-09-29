@@ -885,6 +885,7 @@ pub async fn list_tasks(
     project_id: Option<i64>,
     status: Option<&str>,
     assignee: Option<&str>,
+    unassigned: bool,
 ) -> anyhow::Result<Value> {
     let mut q =
         String::from("SELECT id, project_id, title, status, assignee, priority, updated_at FROM tasks");
@@ -895,7 +896,12 @@ pub async fn list_tasks(
     if status.is_some() {
         conds.push("status=?");
     }
-    if assignee.is_some() {
+    // `unassigned` selects rows with no owner (assignee IS NULL); it takes precedence over an
+    // `assignee=` equality filter (asking for both a specific owner and no owner is a
+    // contradiction, so we honor the more specific "no owner" intent).
+    if unassigned {
+        conds.push("assignee IS NULL");
+    } else if assignee.is_some() {
         conds.push("assignee=?");
     }
     if !conds.is_empty() {
@@ -911,8 +917,10 @@ pub async fn list_tasks(
     if let Some(s) = status {
         query = query.bind(s);
     }
-    if let Some(a) = assignee {
-        query = query.bind(a);
+    if !unassigned {
+        if let Some(a) = assignee {
+            query = query.bind(a);
+        }
     }
     let rows = query.fetch_all(pool).await?;
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
@@ -1860,7 +1868,7 @@ mod tests {
         assert_eq!(arr[0]["id"], json!(1));
 
         // The task moved onto the surviving project.
-        let tasks = list_tasks(&pool, Some(1), None, None).await?;
+        let tasks = list_tasks(&pool, Some(1), None, None, false).await?;
         assert_eq!(tasks.as_array().unwrap().len(), 1);
 
         // Subscriptions: alice (deduped to one), bob (repointed) both on project 1.
@@ -1946,8 +1954,8 @@ mod tests {
         let moved = move_task(&pool, tid, bid, Some("u")).await?;
         assert_eq!(moved["project_id"], json!(bid));
         // It now lists under B, not A.
-        assert_eq!(list_tasks(&pool, Some(aid), None, None).await?.as_array().unwrap().len(), 0);
-        assert_eq!(list_tasks(&pool, Some(bid), None, None).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_tasks(&pool, Some(aid), None, None, false).await?.as_array().unwrap().len(), 0);
+        assert_eq!(list_tasks(&pool, Some(bid), None, None, false).await?.as_array().unwrap().len(), 1);
 
         // A task.moved event was recorded carrying both ends.
         let events = get_events(&pool, 0, 100).await?;
@@ -1965,6 +1973,44 @@ mod tests {
         move_task(&pool, tid, bid, Some("u")).await?;
         let after = get_events(&pool, 0, 100).await?.as_array().unwrap().len();
         assert_eq!(before, after, "no-op move should not emit an event");
+        Ok(())
+    }
+
+    /// list_tasks(unassigned=true) returns only tasks with no assignee, and that intent takes
+    /// precedence over a contradictory assignee= equality filter.
+    #[tokio::test]
+    async fn list_tasks_unassigned_filter() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        create_task(&pool, pid, "owned", None, Some("alice"), None, Some("u"), None).await?;
+        create_task(&pool, pid, "free", None, None, None, Some("u"), None).await?;
+
+        // unassigned=true -> only the ownerless task.
+        let un = list_tasks(&pool, Some(pid), None, None, true).await?;
+        let un = un.as_array().unwrap();
+        assert_eq!(un.len(), 1);
+        assert_eq!(un[0]["title"], json!("free"));
+        assert!(un[0]["assignee"].is_null());
+
+        // assignee equality still works when unassigned is false.
+        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false).await?;
+        let mine = mine.as_array().unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0]["title"], json!("owned"));
+
+        // unassigned=true wins over a contradictory assignee= filter (no owner beats owner=alice).
+        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true).await?;
+        let both = both.as_array().unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0]["title"], json!("free"));
+
+        // No filter returns both.
+        assert_eq!(
+            list_tasks(&pool, Some(pid), None, None, false).await?.as_array().unwrap().len(),
+            2
+        );
         Ok(())
     }
 

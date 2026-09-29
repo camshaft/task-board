@@ -136,7 +136,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") },
-    Endpoint { method: "GET", path: "/api/tasks", summary: "List tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str", body: None },
+    Endpoint { method: "GET", path: "/api/tasks", summary: "List tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str&unassigned=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
@@ -550,11 +550,20 @@ struct ListTasksQuery {
     project_id: Option<i64>,
     status: Option<String>,
     assignee: Option<String>,
+    /// Only tasks with no assignee (assignee IS NULL). Takes precedence over `assignee`.
+    unassigned: Option<bool>,
 }
 
 async fn list_tasks(State(st): State<AppState>, Query(q): Query<ListTasksQuery>) -> ApiResult {
     Ok(Json(
-        core::list_tasks(&st.pool, q.project_id, q.status.as_deref(), q.assignee.as_deref()).await?,
+        core::list_tasks(
+            &st.pool,
+            q.project_id,
+            q.status.as_deref(),
+            q.assignee.as_deref(),
+            q.unassigned.unwrap_or(false),
+        )
+        .await?,
     ))
 }
 
