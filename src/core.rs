@@ -1957,23 +1957,39 @@ pub async fn get_document_versions(pool: &Pool, document_id: i64) -> anyhow::Res
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
-/// List documents, optionally filtered by project and/or status. (Tag/author discovery filters
-/// land in a follow-on task.)
+/// List documents for discovery, filtered by any combination of: project, status, tag (a value
+/// in the document's `metadata.tags` array), task_id (documents attached to that task), and
+/// author (created_by). All filters AND together.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_documents(
     pool: &Pool,
     project_id: Option<i64>,
     status: Option<&str>,
+    tag: Option<&str>,
+    task_id: Option<i64>,
+    author: Option<&str>,
 ) -> anyhow::Result<Value> {
     let mut q = String::from(
         "SELECT id, title, slug, project_id, status, current_version_id, approved_version_id, \
          created_by, updated_at FROM documents",
     );
+    // conds and the binds below MUST stay in the same order.
     let mut conds: Vec<&str> = Vec::new();
     if project_id.is_some() {
         conds.push("project_id=?");
     }
     if status.is_some() {
         conds.push("status=?");
+    }
+    if author.is_some() {
+        conds.push("created_by=?");
+    }
+    if task_id.is_some() {
+        conds.push("id IN (SELECT document_id FROM document_attachments WHERE task_id=?)");
+    }
+    if tag.is_some() {
+        // A value in the metadata.tags JSON array. json_each yields no rows when tags is absent.
+        conds.push("EXISTS (SELECT 1 FROM json_each(documents.metadata, '$.tags') WHERE value=?)");
     }
     if !conds.is_empty() {
         q.push_str(" WHERE ");
@@ -1986,6 +2002,15 @@ pub async fn list_documents(
     }
     if let Some(s) = status {
         query = query.bind(s);
+    }
+    if let Some(a) = author {
+        query = query.bind(a);
+    }
+    if let Some(t) = task_id {
+        query = query.bind(t);
+    }
+    if let Some(tg) = tag {
+        query = query.bind(tg);
     }
     let rows = query.fetch_all(pool).await?;
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
@@ -2492,16 +2517,16 @@ mod tests {
         assert_eq!(vers[1]["version_no"], json!(1));
 
         // list_documents by project + status.
-        assert_eq!(list_documents(&pool, Some(pid), None).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_documents(&pool, Some(pid), None, None, None, None).await?.as_array().unwrap().len(), 1);
         assert_eq!(
-            list_documents(&pool, Some(pid), Some("draft")).await?.as_array().unwrap().len(),
+            list_documents(&pool, Some(pid), Some("draft"), None, None, None).await?.as_array().unwrap().len(),
             1
         );
         assert_eq!(
-            list_documents(&pool, Some(pid), Some("approved")).await?.as_array().unwrap().len(),
+            list_documents(&pool, Some(pid), Some("approved"), None, None, None).await?.as_array().unwrap().len(),
             0
         );
-        assert_eq!(list_documents(&pool, Some(99999), None).await?.as_array().unwrap().len(), 0);
+        assert_eq!(list_documents(&pool, Some(99999), None, None, None, None).await?.as_array().unwrap().len(), 0);
 
         // A new version resets an approved doc back to in_review.
         sqlx::query("UPDATE documents SET status='approved' WHERE id=?")
@@ -2750,6 +2775,60 @@ mod tests {
         // Attaching to a missing task or doc errors.
         assert!(attach_document(&pool, did, 9999, Some("carol")).await.is_err());
         assert!(attach_document(&pool, 9999, tid, Some("carol")).await.is_err());
+        Ok(())
+    }
+
+    /// list_documents discovery filters: project, status, tag (metadata.tags), task_id
+    /// (attachment), author — each alone and combined (AND).
+    #[tokio::test]
+    async fn list_documents_discovery_filters() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+
+        let a = create_document(
+            &pool, "A", Some(pid), "bafyA", None, Some("alice"),
+            Some(json!({ "tags": ["design", "rfc"] })),
+        ).await?;
+        let aid = a["id"].as_i64().unwrap();
+        let b = create_document(
+            &pool, "B", None, "bafyB", None, Some("bob"), Some(json!({ "tags": ["ops"] })),
+        ).await?;
+        let bid = b["id"].as_i64().unwrap();
+        let c = create_document(&pool, "C", Some(pid), "bafyC", None, Some("alice"), None).await?;
+        let cid = c["id"].as_i64().unwrap();
+        approve_document(&pool, cid, Some("op")).await?;
+
+        // Attach A to a task.
+        let t = create_task(&pool, pid, "T", None, None, None, Some("u"), None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        attach_document(&pool, aid, tid, Some("u")).await?;
+
+        let ids = |v: &Value| -> Vec<i64> {
+            v.as_array().unwrap().iter().map(|d| d["id"].as_i64().unwrap()).collect()
+        };
+
+        // author
+        assert_eq!(ids(&list_documents(&pool, None, None, None, None, Some("alice")).await?), vec![aid, cid]);
+        assert_eq!(ids(&list_documents(&pool, None, None, None, None, Some("bob")).await?), vec![bid]);
+        // tag
+        assert_eq!(ids(&list_documents(&pool, None, None, Some("design"), None, None).await?), vec![aid]);
+        assert_eq!(ids(&list_documents(&pool, None, None, Some("ops"), None, None).await?), vec![bid]);
+        assert!(list_documents(&pool, None, None, Some("nope"), None, None).await?.as_array().unwrap().is_empty());
+        // task attachment
+        assert_eq!(ids(&list_documents(&pool, None, None, None, Some(tid), None).await?), vec![aid]);
+        // project
+        assert_eq!(ids(&list_documents(&pool, Some(pid), None, None, None, None).await?), vec![aid, cid]);
+        // status
+        assert_eq!(ids(&list_documents(&pool, None, Some("approved"), None, None, None).await?), vec![cid]);
+        // combined AND: project + tag rfc + author alice -> only A
+        assert_eq!(
+            ids(&list_documents(&pool, Some(pid), None, Some("rfc"), None, Some("alice")).await?),
+            vec![aid]
+        );
+        // contradictory combo -> empty
+        assert!(list_documents(&pool, None, None, Some("ops"), None, Some("alice")).await?.as_array().unwrap().is_empty());
         Ok(())
     }
 

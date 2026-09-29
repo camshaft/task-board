@@ -163,7 +163,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
-    Endpoint { method: "GET", path: "/api/documents", summary: "List documents, optionally filtered by project/status.", query: "project_id=int&status=str", body: None },
+    Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author).", query: "project_id=int&status=str&tag=str&task_id=int&author=str", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
@@ -871,6 +871,9 @@ async fn get_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) ->
 struct ListDocumentsQuery {
     project_id: Option<i64>,
     status: Option<String>,
+    tag: Option<String>,
+    task_id: Option<i64>,
+    author: Option<String>,
 }
 
 async fn list_documents(
@@ -878,7 +881,15 @@ async fn list_documents(
     Query(q): Query<ListDocumentsQuery>,
 ) -> ApiResult {
     Ok(Json(
-        core::list_documents(&st.pool, q.project_id, q.status.as_deref()).await?,
+        core::list_documents(
+            &st.pool,
+            q.project_id,
+            q.status.as_deref(),
+            q.tag.as_deref(),
+            q.task_id,
+            q.author.as_deref(),
+        )
+        .await?,
     ))
 }
 

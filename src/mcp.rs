@@ -376,6 +376,15 @@ pub struct ListDocumentsArgs {
     pub project_id: Option<i64>,
     #[serde(default)]
     pub status: Option<String>,
+    /// A value in the document's metadata.tags array.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Only documents attached to this task.
+    #[serde(default)]
+    pub task_id: Option<i64>,
+    /// Only documents created by this author (created_by).
+    #[serde(default)]
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -879,12 +888,22 @@ impl Board {
         core::get_document_versions(&self.pool, a.document_id).await.map_err(err).and_then(ok)
     }
 
-    #[tool(description = "List documents, optionally filtered by project and/or status (draft / in_review / approved / changes_requested).")]
+    #[tool(description = "List documents for discovery, filtered by any combination of project, status (draft / in_review / approved / changes_requested), tag (a value in metadata.tags), task_id (docs attached to that task), and author. Filters AND together.")]
     async fn list_documents(
         &self,
         Parameters(a): Parameters<ListDocumentsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_documents(&self.pool, a.project_id, s(&a.status)).await.map_err(err).and_then(ok)
+        core::list_documents(
+            &self.pool,
+            a.project_id,
+            s(&a.status),
+            s(&a.tag),
+            a.task_id,
+            s(&a.author),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(
