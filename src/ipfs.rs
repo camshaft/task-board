@@ -54,6 +54,49 @@ pub async fn add(api_url: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
     Ok(parsed.hash)
 }
 
+/// A permissive sanity check that `cid` looks like a bare content id, so the read gateway
+/// never forwards junk (or a path-traversal attempt) to the IPFS node. Real CIDs are a single
+/// token of base32/base58/base36 characters — so we require a non-empty string of ASCII
+/// alphanumerics only. This is a guardrail, not a full multibase/multihash validation (the
+/// IPFS node is the real authority and rejects a malformed CID itself).
+pub fn is_probable_cid(cid: &str) -> bool {
+    !cid.is_empty() && cid.len() <= 256 && cid.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Read the content behind `cid` back through the configured IPFS API (`/api/v0/cat`) and
+/// return the raw bytes. This is the READ half of the CID-only exception (see `add`): it lets
+/// the same-origin web app fetch a document's content to render it, without a separate gateway.
+/// Deliberately scoped — it only cats content by CID; it never exposes the node's RPC (pin
+/// management, config, ...). Caps the response at `max_bytes` so the board never buffers a
+/// runaway blob. The caller supplies the content-type (the board doesn't sniff bytes).
+pub async fn cat(api_url: &str, cid: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let url = format!("{}/api/v0/cat", api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("building ipfs http client")?;
+    // Kubo's cat is a POST with the CID as the `arg` query param (reqwest url-encodes it).
+    let resp = client
+        .post(&url)
+        .query(&[("arg", cid)])
+        .send()
+        .await
+        .context("posting to ipfs /api/v0/cat")?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("ipfs cat returned {code}: {body}");
+    }
+    let bytes = resp.bytes().await.context("reading ipfs cat response")?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!(
+            "content behind {cid} is {} bytes, over the {max_bytes}-byte read-gateway cap",
+            bytes.len()
+        );
+    }
+    Ok(bytes.to_vec())
+}
+
 /// Resolve the CID to store for a document version. Prefer an explicit precomputed `cid`;
 /// otherwise content-address raw `content` server-side (which requires a configured backend).
 /// The error messages start with "give " so the REST layer maps them to 400 (client input),
@@ -96,6 +139,16 @@ mod tests {
         // Content but no configured backend: a 400-mapped "give a `cid`" error, no network.
         let err = resolve_cid(None, Some("hello"), None).await.unwrap_err().to_string();
         assert!(err.starts_with("give a `cid`"), "got: {err}");
+    }
+
+    #[test]
+    fn is_probable_cid_guards_junk() {
+        assert!(is_probable_cid("QmVnKtNdzF7NEr7wQVjy8oUjRs9co9DbURhB5y1Q6ByEve")); // base58 v0
+        assert!(is_probable_cid("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")); // base32 v1
+        assert!(!is_probable_cid("")); // empty
+        assert!(!is_probable_cid("../../etc/passwd")); // path traversal
+        assert!(!is_probable_cid("bafy with space"));
+        assert!(!is_probable_cid("bafy/sub")); // no slashes
     }
 
     #[tokio::test]

@@ -107,6 +107,7 @@ pub fn router(state: AppState) -> Router {
         .route("/external-identities", get(list_external_identities).post(upsert_external_identity))
         .route("/external-links", get(list_external_links).post(upsert_external_link))
         .route("/ipfs/add", post(ipfs_add))
+        .route("/ipfs/{cid}", get(ipfs_cat))
         .route("/wiki", get(list_wiki))
         .route("/documents", get(list_documents).post(create_document))
         .route("/documents/{document_id}", get(get_document))
@@ -197,6 +198,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/external-links", summary: "List bridged links (channel-map / issue↔task / thread↔task), filter by source/board_kind/board_id.", query: "source=str&board_kind=str&board_id=int", body: None },
     Endpoint { method: "POST", path: "/api/external-links", summary: "Map a board entity (channel|task|thread) to an external one; idempotent on (source, external_id).", query: "", body: Some("UpsertExternalLinkBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
+    Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author).", query: "project_id=int&status=str&tag=str&task_id=int&author=str", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
     Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path.", query: "prefix=str", body: None },
@@ -1102,6 +1104,50 @@ async fn ipfs_add(State(st): State<AppState>, Json(b): Json<IpfsAddBody>) -> Api
     Ok(Json(json!({ "cid": cid })))
 }
 
+#[derive(Deserialize)]
+struct IpfsCatQuery {
+    /// Content-Type to label the response with — the board never sniffs bytes; the client
+    /// knows the type from the document version's `content_type`. Default application/octet-stream.
+    content_type: Option<String>,
+}
+
+/// Cap on a single read-gateway response, so the board never buffers a runaway blob.
+const IPFS_READ_CAP_BYTES: usize = 25 * 1024 * 1024;
+
+/// `GET /api/ipfs/{cid}` — read content back by CID through the configured IPFS backend. The
+/// READ half of the scoped CID-only exception (see `ipfs_add`): it lets the same-origin web app
+/// fetch a document's bytes to render them, with no separate IPFS gateway or CORS. Deliberately
+/// scoped to `cat` by CID — it never proxies the node's RPC. 503 without a backend, 400 on a
+/// junk CID. CIDs are immutable, so the response is aggressively cacheable. The caller passes the
+/// content-type it already knows via `?content_type=` (the board does not sniff bytes).
+async fn ipfs_cat(
+    State(st): State<AppState>,
+    Path(cid): Path<String>,
+    Query(q): Query<IpfsCatQuery>,
+) -> Result<Response, ApiError> {
+    let Some(url) = st.ipfs_api_url.as_deref() else {
+        return Err(ApiError(anyhow::anyhow!(
+            "no IPFS backend configured (set ipfs_api_url); this board can't read content by CID"
+        )));
+    };
+    if !ipfs::is_probable_cid(&cid) {
+        return Err(ApiError(anyhow::anyhow!("give a valid `cid` (a bare content id)")));
+    }
+    let bytes = ipfs::cat(url, &cid, IPFS_READ_CAP_BYTES).await?;
+    let ct = q
+        .content_type
+        .as_deref()
+        .and_then(|s| axum::http::HeaderValue::from_str(s).ok())
+        .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/octet-stream"));
+    let mut resp = Response::new(axum::body::Body::from(bytes));
+    resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, ct);
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    Ok(resp)
+}
+
 // --- Documents ---
 
 #[derive(Deserialize)]
@@ -1414,6 +1460,18 @@ fn default_events_limit() -> i64 {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The router must actually build — guards against an axum route-overlap panic (e.g. the
+    /// static `/ipfs/add` vs the param `/ipfs/{cid}`), which would otherwise only surface when
+    /// the server boots. Building it here fails the test instead.
+    #[tokio::test]
+    async fn router_builds_without_route_conflicts() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let (events_tx, _rx) = broadcast::channel(16);
+        let _app = router(AppState { pool, events_tx, ipfs_api_url: None });
+        Ok(())
+    }
 
     /// Every request-body struct named in `ENDPOINTS` must have a generated schema.
     #[test]
