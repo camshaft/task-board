@@ -173,7 +173,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") },
-    Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str", body: None },
+    Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
@@ -629,6 +629,10 @@ struct ListTasksQuery {
     top_level: Option<bool>,
     /// Free-text search over title + description (across all projects when project_id omitted).
     q: Option<String>,
+    /// What blocked tasks are waiting on: filter by blocked_on kind (task|agent|operator).
+    blocked_on_kind: Option<String>,
+    /// Filter by blocked_on ref (a blocking task id or agent id) — e.g. "what is blocked on me".
+    blocked_on_ref: Option<String>,
 }
 
 async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQuery>) -> ApiResult {
@@ -642,6 +646,8 @@ async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQue
             query.parent_id,
             query.top_level.unwrap_or(false),
             query.q.as_deref(),
+            query.blocked_on_kind.as_deref(),
+            query.blocked_on_ref.as_deref(),
         )
         .await?,
     ))
@@ -681,6 +687,28 @@ async fn get_task(State(st): State<AppState>, Path(task_id): Path<i64>) -> ApiRe
     found(core::get_task(&st.pool, task_id).await?)
 }
 
+/// What a blocked task is waiting on. `kind` is task | agent | operator (or "none"/"" to clear).
+/// `target` is the blocking task id or agent id (ignored for operator). A blocked task must
+/// carry one.
+#[derive(Deserialize, JsonSchema)]
+struct BlockedOnBody {
+    kind: String,
+    target: Option<String>,
+    note: Option<String>,
+}
+
+/// Map an optional blocked_on body into the value core expects: None = leave unchanged,
+/// Value::Null = clear, an object = set.
+fn blocked_on_value(b: Option<BlockedOnBody>) -> Option<Value> {
+    b.map(|bo| {
+        if bo.kind.is_empty() || bo.kind == "none" || bo.kind == "clear" {
+            Value::Null
+        } else {
+            json!({ "kind": bo.kind, "target": bo.target, "note": bo.note })
+        }
+    })
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct UpdateTaskBody {
     status: Option<String>,
@@ -693,6 +721,9 @@ struct UpdateTaskBody {
     metadata: Option<Value>,
     /// Reparent: a parent task id (same project), or 0 to clear the parent (make top-level).
     parent_id: Option<i64>,
+    /// What this task is blocked on (required when setting status=blocked). Omit to leave
+    /// unchanged; pass kind="none" to clear.
+    blocked_on: Option<BlockedOnBody>,
 }
 
 async fn update_task(
@@ -712,6 +743,7 @@ async fn update_task(
             b.actor.as_deref(),
             b.metadata,
             b.parent_id,
+            blocked_on_value(b.blocked_on),
         )
         .await?,
     ))

@@ -234,6 +234,22 @@ pub struct UpdateTaskArgs {
     /// Reparent: set a parent task id (same project), or 0 to clear the parent (make top-level).
     #[serde(default)]
     pub parent_id: Option<i64>,
+    /// What this task is blocked on. REQUIRED when setting status=blocked — a blocked task must
+    /// record what it is waiting on. Omit to leave unchanged; pass kind="none" to clear.
+    #[serde(default)]
+    pub blocked_on: Option<BlockedOnArgs>,
+}
+
+/// What a blocked task is waiting on: kind is task | agent | operator (or "none" to clear),
+/// target is the blocking task id or agent id (ignored for operator). When kind=agent, that
+/// agent is notified they are blocking.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BlockedOnArgs {
+    pub kind: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -269,6 +285,12 @@ pub struct ListTasksArgs {
     /// project_id it searches across every project.
     #[serde(default)]
     pub q: Option<String>,
+    /// "What is waiting on X" views: filter blocked tasks by blocked_on kind (task|agent|operator).
+    #[serde(default)]
+    pub blocked_on_kind: Option<String>,
+    /// Filter by blocked_on ref (a blocking task id or agent id) — e.g. what is blocked on you.
+    #[serde(default)]
+    pub blocked_on_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -812,13 +834,20 @@ impl Board {
     }
 
     #[tool(
-        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. Set `assignee` to \"\" (empty string) to unassign (clear the owner) — this emits task.unassigned; setting a non-empty owner emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent."
+        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. Set `assignee` to \"\" (empty string) to unassign (clear the owner) — this emits task.unassigned; setting a non-empty owner emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent. When you set status=blocked you MUST pass `blocked_on` (kind: task, agent, or operator) recording what it waits on — kind=agent notifies that agent they are blocking; blocked_on auto-clears when the task leaves the blocked state."
     )]
     async fn update_task(
         &self,
         Parameters(a): Parameters<UpdateTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.me_opt(s(&a.actor));
+        let blocked_on = a.blocked_on.map(|bo| {
+            if bo.kind.is_empty() || bo.kind == "none" || bo.kind == "clear" {
+                Value::Null
+            } else {
+                serde_json::json!({ "kind": bo.kind, "target": bo.target, "note": bo.note })
+            }
+        });
         core::update_task(
             &self.pool,
             a.task_id,
@@ -830,6 +859,7 @@ impl Board {
             actor.as_deref(),
             a.metadata.map(Value::Object),
             a.parent_id,
+            blocked_on,
         )
         .await
         .map_err(err)
@@ -871,12 +901,12 @@ impl Board {
         core::get_task(&self.pool, a.task_id).await.map_err(err).and_then(ok)
     }
 
-    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted).")]
+    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, or blocked_on_ref=<agent> for what is blocked on that agent.")]
     async fn list_tasks(
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false), s(&a.q))
+        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false), s(&a.q), s(&a.blocked_on_kind), s(&a.blocked_on_ref))
             .await
             .map_err(err)
             .and_then(ok)
@@ -1390,7 +1420,7 @@ mod tests {
                 .as_i64()
                 .unwrap()
         };
-        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None).await?;
+        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None).await?;
         let got = core::get_task(&pool, find(&tasks, "T")).await?;
         assert_eq!(got["created_by"], serde_json::json!("agent:x"));
 
@@ -1401,7 +1431,7 @@ mod tests {
             )?))
             .await
             .map_err(mkfail)?;
-        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None).await?;
+        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None).await?;
         let got2 = core::get_task(&pool, find(&tasks, "T2")).await?;
         assert_eq!(got2["created_by"], serde_json::json!("other"));
 
