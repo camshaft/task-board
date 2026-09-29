@@ -143,8 +143,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
-    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, or channel.", query: "", body: Some("SubscribeBody") },
-    Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, or channel.", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, or the whole board (board=true).", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, channel, or the whole board (board=true).", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None },
     Endpoint { method: "POST", path: "/api/channels", summary: "Create (or get) a named channel.", query: "", body: Some("CreateChannelBody") },
     Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members.", query: "", body: None },
@@ -678,19 +678,38 @@ struct SubscribeBody {
     subscriber: String,
     task_id: Option<i64>,
     project_id: Option<i64>,
-    /// Subscribe to a channel (join it). Give exactly one of task_id / project_id / channel_id.
+    /// Subscribe to a channel (join it). Give exactly one of task_id / project_id / channel_id,
+    /// or set `board: true`.
     channel_id: Option<i64>,
+    /// Whole-board firehose: subscribe to EVERY event on the board (for a coordinator/auto-assigner).
+    board: Option<bool>,
 }
 
 async fn subscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
     Ok(Json(
-        core::subscribe(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id).await?,
+        core::subscribe(
+            &st.pool,
+            &b.subscriber,
+            b.task_id,
+            b.project_id,
+            b.channel_id,
+            b.board.unwrap_or(false),
+        )
+        .await?,
     ))
 }
 
 async fn unsubscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
     Ok(Json(
-        core::unsubscribe(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id).await?,
+        core::unsubscribe(
+            &st.pool,
+            &b.subscriber,
+            b.task_id,
+            b.project_id,
+            b.channel_id,
+            b.board.unwrap_or(false),
+        )
+        .await?,
     ))
 }
 
