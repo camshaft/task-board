@@ -111,6 +111,18 @@ export interface Document extends DocumentSummary {
   attached_tasks: { id: number; title: string; status: TaskStatus; project_id: number | null }[]
 }
 
+export interface DocumentComment {
+  id: number
+  document_id: number
+  version_id: number | null
+  author: string | null
+  body: string
+  region: unknown
+  status: string
+  reply_to: number | null
+  created_at: string
+}
+
 export interface EventRow {
   seq: number
   type: string
@@ -263,6 +275,26 @@ export const api = {
   getDocument: (id: number) => req<Document>('GET', `/documents/${id}`),
   getDocumentVersions: (id: number) =>
     req<DocumentVersion[]>('GET', `/documents/${id}/versions`),
+
+  getDocumentComments: (id: number, q: { version_id?: number; status?: string } = {}) => {
+    const p = new URLSearchParams()
+    if (q.version_id != null) p.set('version_id', String(q.version_id))
+    if (q.status) p.set('status', q.status)
+    const qs = p.toString()
+    return req<DocumentComment[]>('GET', `/documents/${id}/comments${qs ? `?${qs}` : ''}`)
+  },
+  commentDocument: (
+    id: number,
+    b: { body: string; version_id?: number; author?: string; region?: unknown; reply_to?: number },
+  ) => req<DocumentComment>('POST', `/documents/${id}/comments`, b),
+  resolveComment: (id: number, commentId: number, b: { actor?: string } = {}) =>
+    req<DocumentComment>('POST', `/documents/${id}/comments/${commentId}/resolve`, b),
+  submitDocumentForReview: (id: number, b: { actor?: string } = {}) =>
+    req<Document>('POST', `/documents/${id}/submit-review`, b),
+  requestDocumentChanges: (id: number, b: { actor?: string; note?: string } = {}) =>
+    req<Document>('POST', `/documents/${id}/request-changes`, b),
+  approveDocument: (id: number, b: { actor?: string } = {}) =>
+    req<Document>('POST', `/documents/${id}/approve`, b),
 }
 
 // Resolve a bare content id to a viewable URL via the deployment's IPFS gateway. The board
