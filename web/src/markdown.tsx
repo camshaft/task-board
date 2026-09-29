@@ -17,10 +17,6 @@ import { api, ipfsUrl, type DocumentVersion } from './api'
 // ordered / unordered lists, horizontal rules, and paragraphs. Not a full CommonMark
 // implementation; anything it doesn't recognize degrades to plain text.
 
-// Only these href schemes render as links; anything else (javascript:, data:, …) falls back
-// to plain text so a crafted link can't execute.
-const SAFE_HREF = /^(https?:\/\/|mailto:|\/|#)/i
-
 // Resolves a [[wiki-path]] to the document filed there, or null when nothing is (a dangling
 // link, rendered as a wiki "red link"). Provided app-wide from the live wiki listing; the
 // default resolves nothing, so a Markdown rendered outside the provider degrades gracefully.
@@ -84,20 +80,37 @@ function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNo
     ],
     [
       /\[([^\]]+)\]\(([^)\s]+)\)/,
-      (m) =>
-        SAFE_HREF.test(m[2]) ? (
-          <a
-            key={gen()}
-            href={m[2]}
-            target="_blank"
-            rel="noreferrer"
-            className="text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
-          >
-            {inline(m[1], gen, resolve)}
-          </a>
-        ) : (
-          <span key={gen()}>{m[0]}</span>
-        ),
+      (m) => {
+        const href = m[2]
+        const cls =
+          'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
+        // External links open in a new tab; an in-app path navigates client-side via <Link> so
+        // the router basename (e.g. a /board sub-path) is preserved and it stays in the same tab
+        // — an <a href="/documents/2"> would drop the prefix and open a broken new tab (#185).
+        if (/^(https?:\/\/|mailto:)/i.test(href)) {
+          return (
+            <a key={gen()} href={href} target="_blank" rel="noreferrer" className={cls}>
+              {inline(m[1], gen, resolve)}
+            </a>
+          )
+        }
+        if (href.startsWith('/') && !href.startsWith('//')) {
+          return (
+            <Link key={gen()} to={href} className={cls}>
+              {inline(m[1], gen, resolve)}
+            </Link>
+          )
+        }
+        if (href.startsWith('#')) {
+          return (
+            <a key={gen()} href={href} className={cls}>
+              {inline(m[1], gen, resolve)}
+            </a>
+          )
+        }
+        // Relative / unsafe scheme (javascript:, data:, protocol-relative //) → inert text.
+        return <span key={gen()}>{m[0]}</span>
+      },
     ],
     [/\*\*([^*]+)\*\*/, (m) => <strong key={gen()}>{inline(m[1], gen, resolve)}</strong>],
     [
