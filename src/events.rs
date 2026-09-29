@@ -152,6 +152,15 @@ async fn recipients_for_task(
                 recips.insert(s.try_get::<String, _>("subscriber")?);
             }
         }
+        // Muted agents detach from this task's fan-out even though they're the
+        // creator/assignee/subscriber (a stood-down owner opting out of FYI wakes).
+        let muted = sqlx::query("SELECT agent FROM task_mutes WHERE task_id=?")
+            .bind(task_id)
+            .fetch_all(&mut **tx)
+            .await?;
+        for m in muted {
+            recips.remove(&m.try_get::<String, _>("agent")?);
+        }
     }
     if let Some(actor) = actor {
         recips.remove(actor);

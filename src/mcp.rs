@@ -330,6 +330,14 @@ pub struct SubscribeArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MuteTaskArgs {
+    pub task_id: i64,
+    /// The agent to mute/unmute the task for. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateChannelArgs {
     /// Channel name (unique case-insensitively; e.g. 'general', 'planning').
     pub name: String,
@@ -956,6 +964,18 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(description = "Mute a task for yourself: detach from its event fan-out so comments / status changes on it stop notifying (and waking) you — even on a task you created or are assigned (unsubscribe can't do that, since the creator is always in the fan-out). Use it to stand down cleanly from a task you opened. Direct messages still reach you; restore with unmute_task.")]
+    async fn mute_task(&self, Parameters(a): Parameters<MuteTaskArgs>) -> Result<CallToolResult, McpError> {
+        let who = self.me_req(a.agent.as_deref())?;
+        core::mute_task(&self.pool, &who, a.task_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Unmute a task for yourself (reverses mute_task): rejoin its event fan-out.")]
+    async fn unmute_task(&self, Parameters(a): Parameters<MuteTaskArgs>) -> Result<CallToolResult, McpError> {
+        let who = self.me_req(a.agent.as_deref())?;
+        core::unmute_task(&self.pool, &who, a.task_id).await.map_err(err).and_then(ok)
     }
 
     // --- Channels ---
