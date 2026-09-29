@@ -178,6 +178,7 @@ pub struct UpdateTaskArgs {
     /// todo / in_progress / blocked / done / cancelled
     #[serde(default)]
     pub status: Option<String>,
+    /// New owner's agent id. Pass "" (empty string) to unassign (clear the owner).
     #[serde(default)]
     pub assignee: Option<String>,
     #[serde(default)]
@@ -501,7 +502,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage)."
+        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. Set `assignee` to \"\" (empty string) to unassign (clear the owner) — this emits task.unassigned; setting a non-empty owner emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage)."
     )]
     async fn update_task(
         &self,

@@ -702,9 +702,14 @@ pub async fn update_task(
             set_clauses.join(", ")
         );
         let mut q = sqlx::query(&sql);
-        for (_, val) in fields.iter() {
+        for (col, val) in fields.iter() {
             if let Some(v) = val {
-                q = q.bind(*v);
+                // An empty-string assignee is the "unassign" sentinel: store NULL, not "".
+                if *col == "assignee" && v.is_empty() {
+                    q = q.bind(None::<&str>);
+                } else {
+                    q = q.bind(*v);
+                }
             }
         }
         if let Some(ref m) = merged_meta {
@@ -714,12 +719,20 @@ pub async fn update_task(
         q.execute(&mut *tx).await?;
     }
 
-    if let Some(a) = assignee {
-        auto_subscribe(&mut tx, Some(a), task_id).await?;
+    // An empty-string assignee means "unassign" (clear to NULL) rather than a new owner to
+    // subscribe. Only auto-subscribe a real, non-empty owner.
+    let clearing = assignee == Some("");
+    if !clearing {
+        if let Some(a) = assignee {
+            auto_subscribe(&mut tx, Some(a), task_id).await?;
+        }
     }
 
     let status_changed = status.is_some() && status != Some(old_status.as_str());
-    let assignee_changed = assignee.is_some() && assignee != old_assignee.as_deref();
+    // A real (re)assignment to a non-empty owner that differs from the current one.
+    let reassigned = assignee.is_some() && !clearing && assignee != old_assignee.as_deref();
+    // Unassignment: the owner was cleared, and there was an owner to remove.
+    let unassigned = clearing && old_assignee.is_some();
 
     if status_changed {
         emit(
@@ -735,7 +748,7 @@ pub async fn update_task(
         )
         .await?;
     }
-    if assignee_changed {
+    if reassigned {
         emit(
             &mut tx,
             &mut hooks,
@@ -749,7 +762,22 @@ pub async fn update_task(
         )
         .await?;
     }
-    if has_fields && !status_changed && !assignee_changed {
+    if unassigned {
+        // Carry the prior owner so a subscription-only auto-assigner knows who dropped it.
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.unassigned",
+            actor,
+            Some(task_id),
+            Some(old_project_id),
+            None,
+            json!({ "from": old_assignee, "title": old_title }),
+            Recipients::FromTask,
+        )
+        .await?;
+    }
+    if has_fields && !status_changed && !reassigned && !unassigned {
         emit(
             &mut tx,
             &mut hooks,
@@ -2010,6 +2038,58 @@ mod tests {
         assert_eq!(
             list_tasks(&pool, Some(pid), None, None, false).await?.as_array().unwrap().len(),
             2
+        );
+        Ok(())
+    }
+
+    /// Clearing an assignee (assignee="") unsets the owner and emits task.unassigned carrying the
+    /// prior owner; setting an owner emits task.assigned; clearing an already-unowned task is a
+    /// no-op for the event.
+    #[tokio::test]
+    async fn update_task_unassign_emits_task_unassigned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, Some("alice"), None, Some("u"), None).await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Clear the owner.
+        let cleared =
+            update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None).await?;
+        assert!(cleared["assignee"].is_null(), "assignee should be NULL after unassign");
+
+        let events = get_events(&pool, 0, 100).await?;
+        let un = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == json!("task.unassigned"))
+            .expect("task.unassigned emitted");
+        assert_eq!(un["data"]["from"], json!("alice"), "carries the prior owner");
+
+        // Clearing an already-unassigned task does NOT emit a second task.unassigned.
+        update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None).await?;
+        let after = get_events(&pool, 0, 200).await?;
+        assert_eq!(
+            after
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["type"] == json!("task.unassigned"))
+                .count(),
+            1,
+            "no second task.unassigned for a no-op clear"
+        );
+
+        // Re-assigning to a real owner emits task.assigned.
+        update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None).await?;
+        let evs = get_events(&pool, 0, 200).await?;
+        assert!(
+            evs.as_array().unwrap().iter().any(
+                |e| e["type"] == json!("task.assigned") && e["data"]["assignee"] == json!("bob")
+            ),
+            "task.assigned emitted for the new owner"
         );
         Ok(())
     }
