@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { useAgent, useAgentTasks, useEvents, useProjects, updateAgent } from './resources'
+import { useAgent, useAgentActivity, useAgentTasks, useProjects, updateAgent } from './resources'
 import { AGENT_DOT, relTime, StatusChip } from './ui'
 
 // Per-agent page (/agents/:agentId): identity + presence, charter, registry metadata (repos),
@@ -13,10 +13,8 @@ export default function AgentView() {
   const { data: agent, error, loading } = useAgent(id)
   const { data: tasks = [] } = useAgentTasks(id)
   const { data: projects = [] } = useProjects()
-  // A wide window of the activity log, filtered to this agent's own actions. Client-side for
-  // now; a server-side ?actor= filter (v-task-board) would make the feed complete past 200.
-  const { data: recentEvents = [] } = useEvents(200)
-  const activity = recentEvents.filter((e) => e.actor === id)
+  // This agent's own actions, server-filtered by actor (complete, not window-truncated).
+  const { data: activity = [] } = useAgentActivity(id)
   const projectName = (pid: number | null | undefined) =>
     pid == null ? '' : (projects.find((p) => p.id === pid)?.name ?? `#${pid}`)
 

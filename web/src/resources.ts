@@ -26,6 +26,9 @@ const keys = {
   // Keyed by window size so a wide per-agent feed (AgentView) and the compact chrome feed
   // (Layout/Home) don't share one cache entry and clobber each other's limit.
   events: (limit: number) => `events:${limit}`,
+  // Per-agent activity: the server-filtered events for one actor. Shares the `events:` prefix
+  // so touched()'s activity invalidation refreshes it too.
+  agentActivity: (id: string) => `events:actor:${id}`,
   tasks: (projectId: number) => `tasks:${projectId}`,
   task: (taskId: number) => `task:${taskId}`,
   documents: 'documents',
@@ -89,6 +92,14 @@ export function useExternalNameResolver(): (id: string) => string {
 export function useEvents(limit = 30) {
   return useResource<EventRow[]>(keys.events(limit), () =>
     api.getEvents(0, limit).then((es) => es.reverse()),
+  )
+}
+
+// One agent's own activity, server-filtered by actor so the feed is complete (not truncated to
+// a client-side window). Newest first, matching useEvents.
+export function useAgentActivity(agentId: string, limit = 100) {
+  return useResource<EventRow[]>(keys.agentActivity(agentId), () =>
+    api.getEvents(0, limit, agentId).then((es) => es.reverse()),
   )
 }
 

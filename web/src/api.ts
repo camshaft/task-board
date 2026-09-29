@@ -307,8 +307,11 @@ export const api = {
   moveTask: (id: number, b: { to_project_id: number; actor?: string }) =>
     req<Task>('POST', `/tasks/${id}/move`, b),
 
-  getEvents: (since_seq = 0, limit = 100) =>
-    req<EventRow[]>('GET', `/events?since_seq=${since_seq}&limit=${limit}`),
+  getEvents: (since_seq = 0, limit = 100, actor?: string) =>
+    req<EventRow[]>(
+      'GET',
+      `/events?since_seq=${since_seq}&limit=${limit}${actor ? `&actor=${encodeURIComponent(actor)}` : ''}`,
+    ),
 
   listDocuments: (
     q: { project_id?: number; status?: string; tag?: string; task_id?: number; author?: string } = {},
