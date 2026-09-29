@@ -1,12 +1,10 @@
-import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api, type DocumentSummary } from './api'
-import { useProjects } from './resources'
+import { useDocuments, useProjects } from './resources'
 import { relTime } from './ui'
 
-// Documents live-update wiring, in-app markdown rendering, and review actions land in later
-// slices; this read-only list surfaces every document with its status + project, linking to the
-// viewer. Fetched on demand (like Search) rather than through the resource store for now.
+// The documents list: every document with its status + project, linking to the viewer. Backed
+// by the reference-counted resource store, so it live-updates as documents are created, get
+// new versions, or change review status (the SSE feed funnels document.* through touched()).
 
 const DOC_STATUS_CHIP: Record<string, string> = {
   draft: 'bg-slate-500/15 text-slate-300 ring-slate-500/30',
@@ -31,21 +29,7 @@ export default function Documents() {
   const projectName = (id: number | null) =>
     id == null ? '' : (projects.find((p) => p.id === id)?.name ?? `#${id}`)
 
-  const [docs, setDocs] = useState<DocumentSummary[] | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    let alive = true
-    api
-      .listDocuments()
-      .then((d) => alive && setDocs(d))
-      .catch((e) => alive && setError((e as Error).message))
-      .finally(() => alive && setLoading(false))
-    return () => {
-      alive = false
-    }
-  }, [])
+  const { data: docs, error, loading } = useDocuments()
 
   return (
     <main className="flex min-w-0 flex-1 flex-col">
@@ -56,9 +40,9 @@ export default function Documents() {
         </p>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
-        {error && <p className="text-sm text-rose-300">{error}</p>}
-        {loading && <p className="text-sm text-[var(--color-muted)]">Loading…</p>}
-        {!loading && docs && docs.length === 0 && (
+        {error && <p className="text-sm text-rose-300">{error.message}</p>}
+        {loading && !docs && <p className="text-sm text-[var(--color-muted)]">Loading…</p>}
+        {docs && docs.length === 0 && (
           <p className="text-sm text-[var(--color-muted)]">No documents yet.</p>
         )}
         <ul className="space-y-1.5">

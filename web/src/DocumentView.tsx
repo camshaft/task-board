@@ -1,55 +1,46 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { api, type Document, type DocumentComment, ipfsUrl } from './api'
+import { type DocumentComment, ipfsUrl } from './api'
 import { DocStatusChip } from './Documents'
 import { useBoardContext } from './Layout'
+import {
+  approveDocument,
+  commentDocument,
+  requestDocumentChanges,
+  resolveDocumentComment,
+  submitDocumentForReview,
+  useDocument,
+  useDocumentComments,
+} from './resources'
 import { relTime } from './ui'
 
 // Read-only document viewer plus the review surface: metadata, the tasks it backs, its
 // immutable version history (each CID resolved through the IPFS gateway client-side), review
 // actions (submit-for-review / approve / request-changes) driven by the current status, and a
-// threaded comment panel with resolve + one-level replies. In-app markdown rendering of the
-// current version's content is a follow-up slice (needs a markdown dep + a reachable gateway).
+// threaded comment panel with resolve + one-level replies. Backed by the resource store, so it
+// live-updates as review actions / comments land from any client (document.* SSE → touched()).
+// In-app markdown rendering of the current version is a follow-up slice (needs a markdown dep).
 export default function DocumentView() {
   const { documentId } = useParams()
   const { actor } = useBoardContext()
   const id = Number(documentId)
-  const [doc, setDoc] = useState<Document | null>(null)
-  const [comments, setComments] = useState<DocumentComment[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const { data: doc, error: docError, loading } = useDocument(id)
+  const { data: comments = [] } = useDocumentComments(id)
+  const [actionError, setActionError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [draft, setDraft] = useState('')
   const [replyTo, setReplyTo] = useState<number | null>(null)
 
-  // Reload both the document (its status/versions can change under a review action) and its
-  // comments. Called on mount and after every mutation so the UI reflects the server.
-  const reload = useCallback(async () => {
-    const [d, c] = await Promise.all([api.getDocument(id), api.getDocumentComments(id)])
-    setDoc(d)
-    setComments(c)
-  }, [id])
-
-  useEffect(() => {
-    let alive = true
-    setLoading(true)
-    reload()
-      .catch((e) => alive && setError((e as Error).message))
-      .finally(() => alive && setLoading(false))
-    return () => {
-      alive = false
-    }
-  }, [reload])
-
-  // Run a mutation, surface its error, then reload. Keeps every action button uniform.
+  // Run a mutation and surface its error. The wrappers invalidate the document + its comments
+  // through touched(), so the subscribed hooks refetch and this component re-renders — no
+  // manual reload needed.
   async function act(fn: () => Promise<unknown>) {
     setBusy(true)
-    setError(null)
+    setActionError(null)
     try {
       await fn()
-      await reload()
     } catch (e) {
-      setError((e as Error).message)
+      setActionError((e as Error).message)
     } finally {
       setBusy(false)
     }
@@ -59,7 +50,7 @@ export default function DocumentView() {
     const body = draft.trim()
     if (!body) return
     await act(() =>
-      api.commentDocument(id, { body, author: actor, reply_to: replyTo ?? undefined }),
+      commentDocument(id, { body, author: actor, reply_to: replyTo ?? undefined }),
     )
     setDraft('')
     setReplyTo(null)
@@ -67,9 +58,10 @@ export default function DocumentView() {
 
   function requestChanges() {
     const note = window.prompt('What needs to change? (optional note)') ?? undefined
-    void act(() => api.requestDocumentChanges(id, { actor, note: note || undefined }))
+    void act(() => requestDocumentChanges(id, { actor, note: note || undefined }))
   }
 
+  const error = actionError ?? docError?.message ?? null
   const tags = Array.isArray(doc?.metadata?.tags) ? (doc!.metadata.tags as unknown[]) : []
 
   // Available review actions depend on status: a draft (or one with changes requested) can be
@@ -98,7 +90,7 @@ export default function DocumentView() {
             {canSubmit && (
               <button
                 disabled={busy}
-                onClick={() => void act(() => api.submitDocumentForReview(id, { actor }))}
+                onClick={() => void act(() => submitDocumentForReview(id, { actor }))}
                 className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
               >
                 Submit for review
@@ -108,7 +100,7 @@ export default function DocumentView() {
               <>
                 <button
                   disabled={busy}
-                  onClick={() => void act(() => api.approveDocument(id, { actor }))}
+                  onClick={() => void act(() => approveDocument(id, { actor }))}
                   className="rounded-md bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
                 >
                   Approve
@@ -131,7 +123,7 @@ export default function DocumentView() {
           {error}
         </div>
       )}
-      {loading && <p className="px-5 py-3 text-sm text-[var(--color-muted)]">Loading…</p>}
+      {loading && !doc && <p className="px-5 py-3 text-sm text-[var(--color-muted)]">Loading…</p>}
 
       {doc && (
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
@@ -237,7 +229,7 @@ export default function DocumentView() {
                   c={c}
                   versionNo={versionNo(c.version_id)}
                   busy={busy}
-                  onResolve={() => void act(() => api.resolveComment(id, c.id, { actor }))}
+                  onResolve={() => void act(() => resolveDocumentComment(id, c.id, { actor }))}
                   onReply={() => setReplyTo(replyTo === c.id ? null : c.id)}
                   replying={replyTo === c.id}
                 />
@@ -249,7 +241,7 @@ export default function DocumentView() {
                           c={r}
                           versionNo={versionNo(r.version_id)}
                           busy={busy}
-                          onResolve={() => void act(() => api.resolveComment(id, r.id, { actor }))}
+                          onResolve={() => void act(() => resolveDocumentComment(id, r.id, { actor }))}
                         />
                       </li>
                     ))}
