@@ -357,6 +357,7 @@ pub async fn create_project(
         created_by,
         None,
         Some(pid),
+        None,
         json!({ "name": name }),
         Recipients::Explicit(BTreeSet::new()),
     )
@@ -490,6 +491,7 @@ pub async fn update_project(
         actor,
         None,
         Some(project_id),
+        None,
         json!({
             "name": name.unwrap_or(&old_name),
             "status": status,
@@ -624,6 +626,7 @@ pub async fn create_task(
         created_by,
         Some(tid),
         Some(project_id),
+        None,
         json!({ "title": title, "assignee": assignee }),
         Recipients::FromTask,
     )
@@ -726,6 +729,7 @@ pub async fn update_task(
             actor,
             Some(task_id),
             Some(old_project_id),
+            None,
             json!({ "from": old_status, "to": status, "title": old_title }),
             Recipients::FromTask,
         )
@@ -739,6 +743,7 @@ pub async fn update_task(
             actor,
             Some(task_id),
             Some(old_project_id),
+            None,
             json!({ "assignee": assignee, "title": old_title }),
             Recipients::FromTask,
         )
@@ -752,6 +757,7 @@ pub async fn update_task(
             actor,
             Some(task_id),
             Some(old_project_id),
+            None,
             json!({ "title": old_title }),
             Recipients::FromTask,
         )
@@ -819,6 +825,7 @@ pub async fn move_task(
         actor,
         Some(task_id),
         Some(to_project_id),
+        None,
         json!({ "from_project_id": from_project_id, "to_project_id": to_project_id, "title": title }),
         Recipients::FromTask,
     )
@@ -946,6 +953,7 @@ pub async fn comment_task(
         author,
         Some(task_id),
         None,
+        None,
         json!({ "comment_id": cid, "body": body }),
         Recipients::FromTask,
     )
@@ -993,8 +1001,9 @@ pub async fn subscribe(
     subscriber: &str,
     task_id: Option<i64>,
     project_id: Option<i64>,
+    channel_id: Option<i64>,
 ) -> anyhow::Result<Value> {
-    let (tt, tid) = target(task_id, project_id)?;
+    let (tt, tid) = target(task_id, project_id, channel_id)?;
     sqlx::query(
         "INSERT OR IGNORE INTO subscriptions(subscriber, target_type, target_id, created_at) \
          VALUES(?,?,?,?)",
@@ -1013,8 +1022,9 @@ pub async fn unsubscribe(
     subscriber: &str,
     task_id: Option<i64>,
     project_id: Option<i64>,
+    channel_id: Option<i64>,
 ) -> anyhow::Result<Value> {
-    let (tt, tid) = target(task_id, project_id)?;
+    let (tt, tid) = target(task_id, project_id, channel_id)?;
     let n = sqlx::query(
         "DELETE FROM subscriptions WHERE subscriber=? AND target_type=? AND target_id=?",
     )
@@ -1027,12 +1037,383 @@ pub async fn unsubscribe(
     Ok(json!({ "removed": n }))
 }
 
-fn target(task_id: Option<i64>, project_id: Option<i64>) -> anyhow::Result<(&'static str, i64)> {
-    match (task_id, project_id) {
-        (Some(t), _) => Ok(("task", t)),
-        (None, Some(p)) => Ok(("project", p)),
-        (None, None) => anyhow::bail!("give task_id or project_id"),
+fn target(
+    task_id: Option<i64>,
+    project_id: Option<i64>,
+    channel_id: Option<i64>,
+) -> anyhow::Result<(&'static str, i64)> {
+    match (task_id, project_id, channel_id) {
+        (Some(t), _, _) => Ok(("task", t)),
+        (None, Some(p), _) => Ok(("project", p)),
+        (None, None, Some(c)) => Ok(("channel", c)),
+        (None, None, None) => anyhow::bail!("give task_id, project_id, or channel_id"),
     }
+}
+
+// --- Channels ---
+//
+// A channel is a named discussion container agents post to and subscribe to. It reuses the
+// existing machinery wholesale: membership IS a `channel` subscription row, a post IS an
+// event (carrying channel_id) fanned out via Recipients::FromChannel, and the inbox / SSE
+// tailer / webhooks carry channel posts for free. Direct messages are just a *private 1:1*
+// channel (keyed by dm_key), so there is a single data model — see dm_channel().
+
+/// Turn a channel row into JSON with `metadata` parsed from its TEXT column and `private`
+/// surfaced as a bool (SQLite stores it as 0/1). Mirrors project_json/agent_json.
+fn channel_json(row: &SqliteRow) -> Value {
+    let mut obj = match row_to_json(row) {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let meta = obj
+        .get("metadata")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| json!({}));
+    obj.insert("metadata".into(), meta);
+    if let Some(p) = obj.get("private").and_then(|v| v.as_i64()) {
+        obj.insert("private".into(), Value::Bool(p != 0));
+    }
+    Value::Object(obj)
+}
+
+/// Create a named channel (get-or-create by case-insensitive name, like projects), auto-
+/// subscribing the creator as its first member. Returns the channel. Named channels are
+/// never private — DMs are created via send_message/dm_channel, not here.
+pub async fn create_channel(
+    pool: &Pool,
+    name: &str,
+    topic: Option<&str>,
+    created_by: Option<&str>,
+    metadata: Option<Value>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+
+    // Get-or-create by case-insensitive name among non-DM channels (dm_key IS NULL), so
+    // opening "#general" twice returns the same channel rather than a duplicate.
+    if let Some(row) = sqlx::query(
+        "SELECT id FROM channels WHERE dm_key IS NULL AND name = ? COLLATE NOCASE",
+    )
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let existing_id: i64 = row.try_get("id")?;
+        if let Some(sub) = created_by {
+            join_channel(&mut tx, existing_id, sub).await?;
+        }
+        let out = channel_row_json(&mut tx, existing_id).await?.unwrap_or(Value::Null);
+        tx.commit().await?;
+        return Ok(out);
+    }
+
+    let meta_str = metadata.unwrap_or_else(|| json!({})).to_string();
+    let cid: i64 = sqlx::query(
+        "INSERT INTO channels(name, topic, private, metadata, created_by, created_at, updated_at) \
+         VALUES(?,?,0,?,?,?,?) RETURNING id",
+    )
+    .bind(name)
+    .bind(topic)
+    .bind(&meta_str)
+    .bind(created_by)
+    .bind(&ts)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    if let Some(sub) = created_by {
+        join_channel(&mut tx, cid, sub).await?;
+    }
+    // A silent creation event (no recipients) so it lands in the audit log + SSE tail.
+    emit(
+        &mut tx,
+        &mut hooks,
+        "channel.created",
+        created_by,
+        None,
+        None,
+        Some(cid),
+        json!({ "name": name }),
+        Recipients::Explicit(BTreeSet::new()),
+    )
+    .await?;
+    let out = channel_row_json(&mut tx, cid).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Fetch one channel row as JSON (with member ids), or None if it doesn't exist.
+async fn channel_row_json(
+    tx: &mut Transaction<'_, Sqlite>,
+    channel_id: i64,
+) -> anyhow::Result<Option<Value>> {
+    let Some(row) = sqlx::query("SELECT * FROM channels WHERE id=?")
+        .bind(channel_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut d = channel_json(&row);
+    let members = sqlx::query(
+        "SELECT subscriber FROM subscriptions WHERE target_type='channel' AND target_id=? ORDER BY subscriber",
+    )
+    .bind(channel_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if let Value::Object(ref mut m) = d {
+        let ids: Vec<Value> = members
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("subscriber").ok().map(Value::String))
+            .collect();
+        m.insert("members".into(), Value::Array(ids));
+    }
+    Ok(Some(d))
+}
+
+/// Subscribe an agent to a channel (idempotent). Membership IS subscription.
+async fn join_channel(
+    tx: &mut Transaction<'_, Sqlite>,
+    channel_id: i64,
+    subscriber: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO subscriptions(subscriber, target_type, target_id, created_at) \
+         VALUES(?,'channel',?,?)",
+    )
+    .bind(subscriber)
+    .bind(channel_id)
+    .bind(now_iso())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// List channels. Private channels (incl. DMs) are shown only to their members; named public
+/// channels are always listed. `member` optionally scopes to channels a given agent belongs to.
+pub async fn list_channels(pool: &Pool, member: Option<&str>) -> anyhow::Result<Value> {
+    // A channel is visible if it's public (private=0) OR the viewer is a member. When `member`
+    // is given we also restrict to that agent's channels regardless of visibility.
+    let rows = match member {
+        Some(m) => {
+            sqlx::query(
+                "SELECT c.* FROM channels c \
+                 JOIN subscriptions s ON s.target_type='channel' AND s.target_id=c.id \
+                 WHERE s.subscriber=? ORDER BY c.id",
+            )
+            .bind(m)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query("SELECT * FROM channels WHERE private=0 ORDER BY id")
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        let cid: i64 = r.try_get("id")?;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subscriptions WHERE target_type='channel' AND target_id=?",
+        )
+        .bind(cid)
+        .fetch_one(pool)
+        .await?;
+        let mut d = channel_json(r);
+        if let Value::Object(ref mut m) = d {
+            m.insert("member_count".into(), json!(n));
+        }
+        out.push(d);
+    }
+    Ok(Value::Array(out))
+}
+
+/// Fetch one channel with its member list.
+pub async fn get_channel(pool: &Pool, channel_id: i64) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let out = channel_row_json(&mut tx, channel_id).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Post a message to a channel. The poster is auto-joined (so posting implies membership),
+/// then the post is emitted to every member's inbox. `reply_to` optionally threads under a
+/// parent post's event seq (one level only — a reply carries the parent seq in its data).
+/// The event type is `channel.post` for named channels and `message.direct` for DM channels,
+/// so DMs keep flowing through get_messages/the inbox exactly as before.
+pub async fn post_to_channel(
+    pool: &Pool,
+    channel_id: i64,
+    sender: &str,
+    body: &str,
+    reply_to: Option<i64>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+
+    let ch = sqlx::query("SELECT dm_key FROM channels WHERE id=?")
+        .bind(channel_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(ch) = ch else {
+        anyhow::bail!("no channel {channel_id}");
+    };
+    let is_dm: Option<String> = ch.try_get("dm_key")?;
+    let evtype = if is_dm.is_some() { "message.direct" } else { "channel.post" };
+
+    join_channel(&mut tx, channel_id, sender).await?;
+
+    let mut data = json!({ "body": body, "from": sender });
+    if let Some(parent) = reply_to {
+        data["reply_to"] = json!(parent);
+    }
+    let seq = emit(
+        &mut tx,
+        &mut hooks,
+        evtype,
+        Some(sender),
+        None,
+        None,
+        Some(channel_id),
+        data,
+        Recipients::FromChannel(channel_id),
+    )
+    .await?;
+    sqlx::query("UPDATE channels SET updated_at=? WHERE id=?")
+        .bind(now_iso())
+        .bind(channel_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "channel_id": channel_id, "seq": seq }))
+}
+
+/// Read a channel's post backlog after `since_seq`, oldest first (a fresh joiner needs
+/// history the inbox doesn't hold). Returns channel.post AND message.direct events for the
+/// channel so DM channels read uniformly.
+pub async fn get_channel_posts(
+    pool: &Pool,
+    channel_id: i64,
+    since_seq: i64,
+    limit: i64,
+) -> anyhow::Result<Value> {
+    // Only post events — a channel's event stream also carries channel.created / channel.invite
+    // which aren't messages. DM channels post as message.direct, named ones as channel.post.
+    let rows = sqlx::query(
+        "SELECT seq, type, actor, channel_id, data, created_at FROM events \
+         WHERE channel_id=? AND seq>? AND type IN ('channel.post','message.direct') \
+         ORDER BY seq LIMIT ?",
+    )
+    .bind(channel_id)
+    .bind(since_seq)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for r in &rows {
+        let mut d = row_to_json(r);
+        if let Value::Object(ref mut m) = d {
+            let data: Value = m
+                .get("data")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| json!({}));
+            m.insert("data".into(), data);
+        }
+        out.push(d);
+    }
+    Ok(Value::Array(out))
+}
+
+/// Invite an agent into a channel: auto-join + notify (no accept/decline — LAN trust). The
+/// invitee gets a `channel.invite` in their inbox and can unsubscribe to leave. Idempotent.
+pub async fn invite_to_channel(
+    pool: &Pool,
+    channel_id: i64,
+    agent_id: &str,
+    invited_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+
+    let ch = sqlx::query("SELECT name FROM channels WHERE id=?")
+        .bind(channel_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(ch) = ch else {
+        anyhow::bail!("no channel {channel_id}");
+    };
+    let name: Option<String> = ch.try_get("name")?;
+
+    join_channel(&mut tx, channel_id, agent_id).await?;
+    // Deliver the invite explicitly to the invitee (they may not have been a member to hear
+    // a FromChannel fan-out for their own join).
+    let mut recips = BTreeSet::new();
+    recips.insert(agent_id.to_string());
+    emit(
+        &mut tx,
+        &mut hooks,
+        "channel.invite",
+        invited_by,
+        None,
+        None,
+        Some(channel_id),
+        json!({ "channel_id": channel_id, "name": name, "invited": agent_id, "invited_by": invited_by }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let out = channel_row_json(&mut tx, channel_id).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Get-or-create the private 1:1 DM channel for an unordered pair of agents. The pair is
+/// keyed by `dm_key` (both ids sorted, NUL-joined) so A→B and B→A resolve to one channel.
+/// Both agents are auto-joined. This is what lets DMs reuse the channel data model.
+async fn dm_channel(
+    tx: &mut Transaction<'_, Sqlite>,
+    a: &str,
+    b: &str,
+) -> anyhow::Result<i64> {
+    let mut pair = [a, b];
+    pair.sort_unstable();
+    let dm_key = format!("{}\u{0}{}", pair[0], pair[1]);
+
+    if let Some(row) = sqlx::query("SELECT id FROM channels WHERE dm_key=?")
+        .bind(&dm_key)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        let id: i64 = row.try_get("id")?;
+        // Ensure both are members (an id could have been removed; keep the invariant).
+        join_channel(tx, id, a).await?;
+        join_channel(tx, id, b).await?;
+        return Ok(id);
+    }
+
+    let ts = now_iso();
+    let name = format!("dm:{}\u{2194}{}", pair[0], pair[1]);
+    let cid: i64 = sqlx::query(
+        "INSERT INTO channels(name, topic, private, dm_key, metadata, created_by, created_at, updated_at) \
+         VALUES(?,NULL,1,?,'{}',?,?,?) RETURNING id",
+    )
+    .bind(&name)
+    .bind(&dm_key)
+    .bind(a)
+    .bind(&ts)
+    .bind(&ts)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get("id")?;
+    join_channel(tx, cid, a).await?;
+    join_channel(tx, cid, b).await?;
+    Ok(cid)
 }
 
 // --- Notifications / direct messages ---
@@ -1100,6 +1481,11 @@ pub async fn check_notifications(
     Ok(json!({ "count": items.len(), "notifications": items }))
 }
 
+/// Send a direct message. A DM is just a post to the private 1:1 channel for the pair, so
+/// there's one data model — but the wire behavior is unchanged: the post is emitted as a
+/// `message.direct` event (post_to_channel derives that type for DM channels) delivered to
+/// the recipient's inbox, and get_messages still reads it. The event now also carries the
+/// pair's channel_id, so the conversation has a durable home a client can page through.
 pub async fn send_message(
     pool: &Pool,
     from_agent: &str,
@@ -1107,23 +1493,12 @@ pub async fn send_message(
     body: &str,
 ) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
-    let mut hooks: Vec<WebhookDelivery> = Vec::new();
-    let mut recips = BTreeSet::new();
-    recips.insert(to_agent.to_string());
-    emit(
-        &mut tx,
-        &mut hooks,
-        "message.direct",
-        Some(from_agent),
-        None,
-        None,
-        json!({ "to": to_agent, "body": body }),
-        Recipients::Explicit(recips),
-    )
-    .await?;
+    let cid = dm_channel(&mut tx, from_agent, to_agent).await?;
     tx.commit().await?;
-    fire_webhooks(hooks, webhook_timeout(pool));
-    Ok(json!({ "to": to_agent, "delivered": true }))
+    // post_to_channel opens its own transaction; the DM channel is committed above so it's
+    // visible. Emits message.direct to the recipient (FromChannel minus the sender).
+    post_to_channel(pool, cid, from_agent, body, None).await?;
+    Ok(json!({ "to": to_agent, "channel_id": cid, "delivered": true }))
 }
 
 pub async fn get_messages(
@@ -1273,7 +1648,7 @@ mod tests {
         let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None).await?;
         let tid = t["id"].as_i64().unwrap();
 
-        subscribe(&pool, "planner", Some(tid), None).await?; // (already auto-subscribed as creator)
+        subscribe(&pool, "planner", Some(tid), None, None).await?; // (already auto-subscribed as creator)
         comment_task(&pool, tid, "Start from PA=0.03", Some("planner")).await?;
         update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None).await?;
         update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None).await?;
@@ -1470,9 +1845,9 @@ mod tests {
         // ids: 1 = "Backend" (earlier), 2 = "backend" (later).
         create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None).await?;
         // Same subscriber on both projects -> collision on repoint; both on dupe only too.
-        subscribe(&pool, "alice", None, Some(1)).await?;
-        subscribe(&pool, "alice", None, Some(2)).await?; // will collide with keep=1
-        subscribe(&pool, "bob", None, Some(2)).await?; // repoints cleanly onto 1
+        subscribe(&pool, "alice", None, Some(1), None).await?;
+        subscribe(&pool, "alice", None, Some(2), None).await?; // will collide with keep=1
+        subscribe(&pool, "bob", None, Some(2), None).await?; // repoints cleanly onto 1
 
         let report = merge_duplicate_projects(&pool).await?;
         assert_eq!(report["merged_groups"], json!(1));
@@ -1648,6 +2023,162 @@ mod tests {
         update_project(&pool, 1, None, None, None, Some(json!({"repo": "r"})), Some("u")).await?;
         let after = get_project(&pool, 1).await?;
         assert_eq!(after["metadata"], json!({"repo": "r"}));
+        Ok(())
+    }
+
+    /// A channel post fans out to every member's inbox except the poster, a fresh joiner can
+    /// read the backlog via get_channel_posts, and create_channel is a case-insensitive
+    /// get-or-create that auto-joins the creator.
+    #[tokio::test]
+    async fn channel_post_fans_out_to_members() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Creator auto-joins; a case-variant name returns the same channel (no duplicate).
+        let c = create_channel(&pool, "General", Some("chat"), Some("alice"), None).await?;
+        let cid = c["id"].as_i64().unwrap();
+        assert_eq!(c["members"], json!(["alice"]));
+        let again = create_channel(&pool, "general", None, Some("bob"), None).await?;
+        assert_eq!(again["id"].as_i64(), Some(cid), "get-or-create by name");
+        // bob joined via the get-or-create call.
+        let members: BTreeSet<String> = again["members"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert_eq!(members, ["alice", "bob"].iter().map(|s| s.to_string()).collect());
+
+        // carol joins explicitly, then alice posts. bob + carol hear it; alice (poster) doesn't.
+        subscribe(&pool, "carol", None, None, Some(cid)).await?;
+        let posted = post_to_channel(&pool, cid, "alice", "hello all", None).await?;
+        let post_seq = posted["seq"].as_i64().unwrap();
+
+        let bob = check_notifications(&pool, "bob", true, 50, None).await?;
+        let carol = check_notifications(&pool, "carol", true, 50, None).await?;
+        let alice = check_notifications(&pool, "alice", true, 50, None).await?;
+        assert_eq!(bob["count"].as_i64(), Some(1), "bob hears the post: {bob}");
+        assert_eq!(carol["count"].as_i64(), Some(1), "carol hears the post: {carol}");
+        assert_eq!(alice["count"].as_i64(), Some(0), "poster isn't self-notified: {alice}");
+        assert_eq!(bob["notifications"][0]["type"], json!("channel.post"));
+
+        // A fresh joiner reads history from the backlog (inbox only holds post-join events).
+        let backlog = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts = backlog.as_array().unwrap();
+        assert_eq!(posts.len(), 1, "one post in history");
+        assert_eq!(posts[0]["data"]["body"], json!("hello all"));
+
+        // A threaded reply carries the parent seq.
+        post_to_channel(&pool, cid, "bob", "hi alice", Some(post_seq)).await?;
+        let backlog = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts = backlog.as_array().unwrap();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[1]["data"]["reply_to"].as_i64(), Some(post_seq));
+        Ok(())
+    }
+
+    /// A DM is a private 1:1 channel: send_message resolves the pair channel (same channel
+    /// A→B and B→A), the recipient gets a message.direct in their inbox (unchanged wire
+    /// behavior), the sender doesn't, and the private channel is hidden from the public list.
+    #[tokio::test]
+    async fn dm_is_a_private_channel() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        let m1 = send_message(&pool, "alice", "bob", "hey bob").await?;
+        let cid = m1["channel_id"].as_i64().unwrap();
+        // Reverse direction resolves to the SAME channel (canonical dm_key).
+        let m2 = send_message(&pool, "bob", "alice", "hey alice").await?;
+        assert_eq!(m2["channel_id"].as_i64(), Some(cid), "A->B and B->A share a channel");
+
+        // bob hears alice's message (1st DM), alice hears bob's (2nd) — each as message.direct,
+        // never their own.
+        let bob = check_notifications(&pool, "bob", true, 50, Some("message.direct")).await?;
+        assert_eq!(bob["count"].as_i64(), Some(1), "bob: {bob}");
+        assert_eq!(bob["notifications"][0]["data"]["body"], json!("hey bob"));
+        let alice = get_messages(&pool, "alice", true, 50).await?;
+        assert_eq!(alice["count"].as_i64(), Some(1), "alice: {alice}");
+        assert_eq!(alice["notifications"][0]["data"]["body"], json!("hey alice"));
+
+        // The DM channel is private: not in the public list, but visible to a member.
+        let public = list_channels(&pool, None).await?;
+        assert_eq!(public.as_array().unwrap().len(), 0, "DM hidden from public list");
+        let alices = list_channels(&pool, Some("alice")).await?;
+        assert_eq!(alices.as_array().unwrap().len(), 1, "member sees their DM channel");
+        assert_eq!(alices[0]["private"], json!(true));
+
+        // Full conversation is readable as a backlog on the shared channel.
+        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        assert_eq!(posts.as_array().unwrap().len(), 2);
+        Ok(())
+    }
+
+    /// invite_to_channel auto-joins the invitee and drops a channel.invite in their inbox
+    /// (no accept step); they can unsubscribe to leave.
+    #[tokio::test]
+    async fn invite_auto_joins_and_notifies() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        let c = create_channel(&pool, "planning", None, Some("alice"), None).await?;
+        let cid = c["id"].as_i64().unwrap();
+
+        let after = invite_to_channel(&pool, cid, "bob", Some("alice")).await?;
+        let members: BTreeSet<String> = after["members"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(members.contains("bob"), "invitee auto-joined");
+
+        let bob = check_notifications(&pool, "bob", true, 50, Some("channel.invite")).await?;
+        assert_eq!(bob["count"].as_i64(), Some(1), "bob got the invite: {bob}");
+        assert_eq!(bob["notifications"][0]["data"]["invited_by"], json!("alice"));
+
+        // Leaving = unsubscribe from the channel.
+        unsubscribe(&pool, "bob", None, None, Some(cid)).await?;
+        let after = get_channel(&pool, cid).await?;
+        let members: Vec<&str> = after["members"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(!members.contains(&"bob"), "unsubscribe leaves the channel");
+        Ok(())
+    }
+
+    /// The channels feature opens a pre-channels DB in place: the events table gains a
+    /// channel_id column and the channels table is created, so posting works on a legacy DB.
+    #[tokio::test]
+    async fn opens_legacy_db_without_channels() -> anyhow::Result<()> {
+        use sqlx::Row;
+        use std::str::FromStr;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("legacy.db");
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+
+        // A pre-channels events table (no channel_id column) with an existing row.
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
+            let legacy = sqlx::SqlitePool::connect_with(opts).await?;
+            sqlx::query(
+                "CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, \
+                 actor TEXT, project_id INTEGER, task_id INTEGER, data TEXT, created_at TEXT NOT NULL)",
+            )
+            .execute(&legacy)
+            .await?;
+            sqlx::query("INSERT INTO events(type, created_at) VALUES('legacy.event','t')")
+                .execute(&legacy)
+                .await?;
+            legacy.close().await;
+        }
+
+        // Real init adds events.channel_id and creates the channels table.
+        let pool = crate::db::init(path.to_str().unwrap()).await?;
+        let has_channel_col = sqlx::query("PRAGMA table_info(events)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "channel_id");
+        assert!(has_channel_col, "migration should have added events.channel_id");
+
+        // Channels work on the migrated DB: create, post, read back.
+        let c = create_channel(&pool, "general", None, Some("alice"), None).await?;
+        let cid = c["id"].as_i64().unwrap();
+        post_to_channel(&pool, cid, "alice", "first post", None).await?;
+        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        assert_eq!(posts.as_array().unwrap().len(), 1);
+        assert_eq!(posts[0]["data"]["body"], json!("first post"));
         Ok(())
     }
 }

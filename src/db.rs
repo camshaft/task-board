@@ -50,6 +50,22 @@ CREATE TABLE IF NOT EXISTS comments (
     body       TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS channels (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    topic       TEXT,
+    status      TEXT NOT NULL DEFAULT 'active',
+    -- private channels (incl. DMs) are hidden from list_channels for non-members.
+    private     INTEGER NOT NULL DEFAULT 0,
+    -- Canonical key for a 1:1 direct-message channel (the two agent ids, sorted, joined by a
+    -- NUL). NULL for ordinary named channels. UNIQUE so a DM pair resolves to one channel
+    -- regardless of who opens it first. This is how DMs reuse the channel data model.
+    dm_key      TEXT UNIQUE,
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    created_by  TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS subscriptions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     subscriber  TEXT NOT NULL,
@@ -64,6 +80,7 @@ CREATE TABLE IF NOT EXISTS events (
     actor      TEXT,
     project_id INTEGER,
     task_id    INTEGER,
+    channel_id INTEGER,
     data       TEXT,
     created_at TEXT NOT NULL
 );
@@ -158,6 +175,26 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
             .execute(&pool)
             .await?;
     }
+
+    // Back-fill events.channel_id (added when channels landed). Nullable; pre-existing task/
+    // project events simply have no channel. Channel posts set it so get_channel_posts can
+    // read a channel's backlog directly. `channels` itself is created by CREATE TABLE above,
+    // so only the events column needs an explicit ALTER on an old DB.
+    let events_have_channel = sqlx::query("PRAGMA table_info(events)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "channel_id");
+    if !events_have_channel {
+        sqlx::query("ALTER TABLE events ADD COLUMN channel_id INTEGER")
+            .execute(&pool)
+            .await?;
+    }
+    // Index for channel-post backlog reads. Created after the column exists (an old DB adds
+    // it via the ALTER just above; a fresh DB via CREATE TABLE), so it's safe either way.
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_channel ON events(channel_id, seq)")
+        .execute(&pool)
+        .await?;
 
     Ok(pool)
 }

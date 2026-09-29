@@ -230,6 +230,65 @@ pub struct SubscribeArgs {
     pub task_id: Option<i64>,
     #[serde(default)]
     pub project_id: Option<i64>,
+    /// Subscribe to a channel (join it). Give exactly one of task_id / project_id / channel_id.
+    #[serde(default)]
+    pub channel_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateChannelArgs {
+    /// Channel name (unique case-insensitively; e.g. 'general', 'planning').
+    pub name: String,
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// Your agent id — auto-joined as the first member.
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// Arbitrary channel properties.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListChannelsArgs {
+    /// If set, list channels this agent belongs to (incl. private/DM). Omit for public only.
+    #[serde(default)]
+    pub member: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetChannelArgs {
+    pub channel_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PostToChannelArgs {
+    pub channel_id: i64,
+    /// Your agent id (the poster).
+    pub sender: String,
+    pub body: String,
+    /// Optional parent post seq to reply under (one-level threading).
+    #[serde(default)]
+    pub reply_to: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetChannelPostsArgs {
+    pub channel_id: i64,
+    #[serde(default)]
+    pub since_seq: i64,
+    #[serde(default = "default_events_limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InviteToChannelArgs {
+    pub channel_id: i64,
+    /// The agent to invite (auto-joined).
+    pub agent_id: String,
+    /// Your agent id (the inviter).
+    #[serde(default)]
+    pub invited_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -517,23 +576,94 @@ impl Board {
     }
 
     // --- Subscriptions ---
-    #[tool(description = "Subscribe an agent to a task OR a project so it's notified of changes there.")]
+    #[tool(description = "Subscribe an agent to a task, a project, OR a channel so it's notified of activity there. Give exactly one of task_id / project_id / channel_id. Subscribing to a channel joins it.")]
     async fn subscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::subscribe(&self.pool, &a.subscriber, a.task_id, a.project_id)
+        core::subscribe(&self.pool, &a.subscriber, a.task_id, a.project_id, a.channel_id)
             .await
             .map_err(err)
             .and_then(ok)
     }
 
-    #[tool(description = "Stop notifying an agent about a task or project.")]
+    #[tool(description = "Stop notifying an agent about a task, project, or channel (leaving a channel).")]
     async fn unsubscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::unsubscribe(&self.pool, &a.subscriber, a.task_id, a.project_id)
+        core::unsubscribe(&self.pool, &a.subscriber, a.task_id, a.project_id, a.channel_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    // --- Channels ---
+    #[tool(
+        description = "Create (or get) a named channel: a discussion topic agents post to and subscribe to. The creator auto-joins. `topic` is a free-form description; `metadata` an optional props dict. Returns the channel incl. its id and members."
+    )]
+    async fn create_channel(
+        &self,
+        Parameters(a): Parameters<CreateChannelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::create_channel(
+            &self.pool,
+            &a.name,
+            s(&a.topic),
+            s(&a.created_by),
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(description = "List channels. Public channels are always shown; private channels (incl. DMs) only when `member` is set to an agent that belongs to them. Set `member` to your id to list just the channels you're in.")]
+    async fn list_channels(
+        &self,
+        Parameters(a): Parameters<ListChannelsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_channels(&self.pool, s(&a.member)).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Get one channel with its member list.")]
+    async fn get_channel(
+        &self,
+        Parameters(a): Parameters<GetChannelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_channel(&self.pool, a.channel_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(
+        description = "Post a message to a channel. You're auto-joined on posting. Every member's inbox gets it (drain with check_notifications). `reply_to` optionally threads under a parent post's seq (one level)."
+    )]
+    async fn post_to_channel(
+        &self,
+        Parameters(a): Parameters<PostToChannelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::post_to_channel(&self.pool, a.channel_id, &a.sender, &a.body, a.reply_to)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Read a channel's post history after `since_seq` (oldest first). Use this to catch up on a channel you just joined — the inbox only holds what arrived after you joined.")]
+    async fn get_channel_posts(
+        &self,
+        Parameters(a): Parameters<GetChannelPostsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_channel_posts(&self.pool, a.channel_id, a.since_seq, a.limit)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Invite another agent into a channel: they're auto-joined and get a channel.invite in their inbox (no accept step). They can unsubscribe to leave.")]
+    async fn invite_to_channel(
+        &self,
+        Parameters(a): Parameters<InviteToChannelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::invite_to_channel(&self.pool, a.channel_id, &a.agent_id, s(&a.invited_by))
             .await
             .map_err(err)
             .and_then(ok)
@@ -627,5 +757,6 @@ mod tests {
         prop_type_is_object(serde_json::to_value(schema_for!(SetTaskPropsArgs)).unwrap(), "props");
         prop_type_is_object(serde_json::to_value(schema_for!(CreateTaskArgs)).unwrap(), "metadata");
         prop_type_is_object(serde_json::to_value(schema_for!(UpdateTaskArgs)).unwrap(), "metadata");
+        prop_type_is_object(serde_json::to_value(schema_for!(CreateChannelArgs)).unwrap(), "metadata");
     }
 }
