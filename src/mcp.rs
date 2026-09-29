@@ -385,6 +385,34 @@ pub struct SetChannelPropsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpsertExternalLinkArgs {
+    /// Originating system, e.g. "slack" or "github".
+    pub source: String,
+    /// The external system's canonical key (e.g. a Slack channel id, a thread ts, an issue url).
+    pub external_id: String,
+    /// Optional external container (e.g. the Slack channel of a thread).
+    #[serde(default)]
+    pub external_parent_id: Option<String>,
+    /// Board entity kind: "channel", "task", or "thread".
+    pub board_kind: String,
+    /// Board-side id (channel id / task id / thread root post seq).
+    pub board_id: i64,
+    /// Arbitrary props (external names, urls, ...). MERGED into any existing bag.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListExternalLinksArgs {
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub board_kind: Option<String>,
+    #[serde(default)]
+    pub board_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PromoteThreadArgs {
     pub channel_id: i64,
     /// The seq of the thread's root post (its replies — posts with reply_to == this — are
@@ -954,6 +982,38 @@ impl Board {
     }
 
     #[tool(
+        description = "Map a board entity to an entity in a bridged external system (the generic link behind the Slack channel-map, GitHub issue↔task, and thread↔task). `board_kind` is channel|task|thread, `board_id` the board-side id; `source`+`external_id` identify the external side. Idempotent on (source, external_id). This is how a bridge adapter resolves e.g. a board channel to its Slack channel."
+    )]
+    async fn upsert_external_link(
+        &self,
+        Parameters(a): Parameters<UpsertExternalLinkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::upsert_external_link(
+            &self.pool,
+            &a.source,
+            &a.external_id,
+            s(&a.external_parent_id),
+            &a.board_kind,
+            a.board_id,
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(description = "List external links (bridged mappings), filtered by any of `source`, `board_kind`, `board_id`. The read path a bridge adapter uses to resolve a board entity to its external counterpart (or vice-versa).")]
+    async fn list_external_links(
+        &self,
+        Parameters(a): Parameters<ListExternalLinksArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_external_links(&self.pool, s(&a.source), s(&a.board_kind), a.board_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
         description = "Merge key/value props into a channel's metadata. Used to set the outbound reflect-back policy: `direction` ('in' | 'out' | 'both', default 'in') and `outbound_authors` (allowlist, default ['concierge']). A channel.outbound_reflect event fires for a post only when direction allows out AND its author is allowed — how 'only the concierge posts OUT to an external system' is enforced."
     )]
     async fn set_channel_props(
@@ -1359,5 +1419,6 @@ mod tests {
         prop_type_is_object(serde_json::to_value(schema_for!(UpdateTaskArgs)).unwrap(), "metadata");
         prop_type_is_object(serde_json::to_value(schema_for!(CreateChannelArgs)).unwrap(), "metadata");
         prop_type_is_object(serde_json::to_value(schema_for!(UpsertExternalIdentityArgs)).unwrap(), "metadata");
+        prop_type_is_object(serde_json::to_value(schema_for!(UpsertExternalLinkArgs)).unwrap(), "metadata");
     }
 }
