@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useAgent, useAgentActivity, useAgentTasks, useProjects, updateAgent } from './resources'
+import { Markdown } from './markdown'
 import { AGENT_DOT, relTime, StatusChip } from './ui'
 
 // Per-agent page (/agents/:agentId): identity + presence, charter, registry metadata (repos),
@@ -119,7 +120,7 @@ export default function AgentView() {
           {agent.charter && (
             <div className="mb-5">
               <div className="mb-1 text-xs text-[var(--color-muted)]">Charter</div>
-              <p className="whitespace-pre-wrap text-sm">{agent.charter}</p>
+              <Markdown source={agent.charter} className="text-sm" />
             </div>
           )}
 
