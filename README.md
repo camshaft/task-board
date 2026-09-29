@@ -91,6 +91,12 @@ omit keeps its default. The settings are `db_path`, `host`, `port`,
 server-side — pinning it and storing the returned CID — so a client with no local IPFS can
 author a document. Left unset, the board stays strictly CID-only (callers supply a CID).
 
+With a backend configured, the board also exposes `POST /api/ipfs/add` (`{ "content": "…" }`
+→ `{ "cid": "…" }`): a deliberately **scoped, add-only** capability that pins bytes and hands
+back the CID. It never proxies the raw IPFS node RPC (pin-management / config / shutdown), so
+a client can mint a CID once and reuse it across `create_document` / `publish_version`. Unset
+`ipfs_api_url` and the endpoint returns 503.
+
 The one thing *not* in the config file is `--web-dir` (the directory of built UI assets
 to serve at `/`) — that's a packaging detail, baked into the binary by `nix build` and
 overridable via the flag or the `TB_WEB_DIR` env var in dev.
