@@ -33,6 +33,10 @@ export function TaskDrawer() {
   const [error, setError] = useState<string | null>(null)
   const [comment, setComment] = useState('')
   const [busy, setBusy] = useState(false)
+  // Inline edit drafts: null = not editing that field, string = editing with this draft.
+  const [editTitle, setEditTitle] = useState<string | null>(null)
+  const [editDesc, setEditDesc] = useState<string | null>(null)
+  const [editMeta, setEditMeta] = useState<string | null>(null)
 
   const onClose = () => navigate(`/projects/${projectId}`)
 
@@ -163,6 +167,42 @@ export function TaskDrawer() {
     }
   }
 
+  // Apply a field edit through the same updateTask choke point the rest of the drawer uses.
+  async function save(patch: Parameters<typeof updateTask>[1]) {
+    if (!task) return
+    setBusy(true)
+    try {
+      await updateTask(task.id, { ...patch, actor })
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function commitTitle() {
+    const v = (editTitle ?? '').trim()
+    setEditTitle(null)
+    if (task && v && v !== task.title) void save({ title: v })
+  }
+
+  async function saveMeta() {
+    if (editMeta === null) return
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(editMeta)
+    } catch {
+      setError('Metadata must be valid JSON.')
+      return
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      setError('Metadata must be a JSON object.')
+      return
+    }
+    setEditMeta(null)
+    await save({ metadata: parsed as Record<string, unknown> })
+  }
+
   const shownError = error ?? loadError?.message ?? null
 
   return (
@@ -184,7 +224,28 @@ export function TaskDrawer() {
                 <div className="mb-1 text-xs text-[var(--color-muted)]">
                   task #{task.id}
                 </div>
-                <h2 className="text-lg font-semibold leading-snug">{task.title}</h2>
+                {editTitle === null ? (
+                  <h2
+                    onClick={() => setEditTitle(task.title)}
+                    title="click to edit"
+                    className="cursor-text text-lg font-semibold leading-snug hover:text-sky-200"
+                  >
+                    {task.title}
+                  </h2>
+                ) : (
+                  <input
+                    autoFocus
+                    value={editTitle}
+                    disabled={busy}
+                    onChange={(e) => setEditTitle(e.target.value)}
+                    onBlur={commitTitle}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitTitle()
+                      else if (e.key === 'Escape') setEditTitle(null)
+                    }}
+                    className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-lg font-semibold outline-none focus:border-sky-500/50"
+                  />
+                )}
               </div>
               <button
                 onClick={onClose}
@@ -273,7 +334,22 @@ export function TaskDrawer() {
                   )}
                 </dd>
                 <dt className="text-[var(--color-muted)]">Priority</dt>
-                <dd className="col-span-2">{task.priority ?? '—'}</dd>
+                <dd className="col-span-2">
+                  <select
+                    value={task.priority ?? ''}
+                    disabled={busy}
+                    onChange={(e) => void save({ priority: e.target.value })}
+                    className="rounded border border-[var(--color-border)] bg-[var(--color-panel-2)] px-1.5 py-0.5 text-xs outline-none focus:border-sky-500/50"
+                  >
+                    <option value="">—</option>
+                    <option value="low">low</option>
+                    <option value="normal">normal</option>
+                    <option value="high">high</option>
+                    {task.priority && !['low', 'normal', 'high'].includes(task.priority) && (
+                      <option value={task.priority}>{task.priority}</option>
+                    )}
+                  </select>
+                </dd>
                 <dt className="text-[var(--color-muted)]">Created by</dt>
                 <dd className="col-span-2 font-mono text-xs">{task.created_by ?? '—'}</dd>
                 <dt className="text-[var(--color-muted)]">Subscribers</dt>
@@ -282,12 +358,56 @@ export function TaskDrawer() {
                 </dd>
               </dl>
 
-              {task.description && (
-                <div className="mb-5">
-                  <div className="mb-1 text-xs text-[var(--color-muted)]">Description</div>
-                  <p className="whitespace-pre-wrap text-sm">{task.description}</p>
+              <div className="mb-5">
+                <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
+                  <span>Description</span>
+                  {editDesc === null && (
+                    <button
+                      onClick={() => setEditDesc(task.description ?? '')}
+                      disabled={busy}
+                      className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)]"
+                    >
+                      edit
+                    </button>
+                  )}
                 </div>
-              )}
+                {editDesc === null ? (
+                  task.description ? (
+                    <p className="whitespace-pre-wrap text-sm">{task.description}</p>
+                  ) : (
+                    <p className="text-sm text-[var(--color-muted)]">— none —</p>
+                  )
+                ) : (
+                  <div className="space-y-2">
+                    <textarea
+                      autoFocus
+                      value={editDesc}
+                      rows={6}
+                      onChange={(e) => setEditDesc(e.target.value)}
+                      className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        disabled={busy}
+                        onClick={async () => {
+                          const v = editDesc
+                          setEditDesc(null)
+                          await save({ description: v })
+                        }}
+                        className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+                      >
+                        Save
+                      </button>
+                      <button
+                        onClick={() => setEditDesc(null)}
+                        className="rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
 
               {/* Subtasks (one level of nesting in the UI). Offered on top-level tasks so an
                   epic can gather children; a task that already has a parent stays a leaf here. */}
@@ -350,14 +470,58 @@ export function TaskDrawer() {
                 </div>
               )}
 
-              {Object.keys(task.metadata ?? {}).length > 0 && (
-                <div className="mb-5">
-                  <div className="mb-1 text-xs text-[var(--color-muted)]">Metadata</div>
-                  <pre className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 text-xs">
-                    {JSON.stringify(task.metadata, null, 2)}
-                  </pre>
+              <div className="mb-5">
+                <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
+                  <span>Metadata</span>
+                  {editMeta === null && (
+                    <button
+                      onClick={() => setEditMeta(JSON.stringify(task.metadata ?? {}, null, 2))}
+                      disabled={busy}
+                      className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)]"
+                    >
+                      edit
+                    </button>
+                  )}
                 </div>
-              )}
+                {editMeta === null ? (
+                  Object.keys(task.metadata ?? {}).length > 0 ? (
+                    <pre className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 text-xs">
+                      {JSON.stringify(task.metadata, null, 2)}
+                    </pre>
+                  ) : (
+                    <p className="text-sm text-[var(--color-muted)]">— none —</p>
+                  )
+                ) : (
+                  <div className="space-y-2">
+                    <textarea
+                      autoFocus
+                      value={editMeta}
+                      rows={6}
+                      onChange={(e) => setEditMeta(e.target.value)}
+                      className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-2 font-mono text-xs outline-none focus:border-sky-500/50"
+                    />
+                    <p className="text-[11px] text-[var(--color-muted)]">
+                      Keys are merged into the task's existing metadata server-side; this can't
+                      remove a key.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        disabled={busy}
+                        onClick={saveMeta}
+                        className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+                      >
+                        Save
+                      </button>
+                      <button
+                        onClick={() => setEditMeta(null)}
+                        className="rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
 
               <div>
                 <div className="mb-2 text-xs text-[var(--color-muted)]">
