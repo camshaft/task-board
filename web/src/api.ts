@@ -69,6 +69,10 @@ export interface Task {
   updated_at: string
   comments: Comment[]
   subscribers: string[]
+  parent_id?: number | null
+  parent_title?: string | null
+  children?: { id: number; title: string; status: TaskStatus }[]
+  child_rollup?: { done: number; total: number }
   attached_documents?: {
     id: number
     title: string
@@ -239,6 +243,7 @@ export const api = {
     assignee?: string
     priority?: string
     created_by?: string
+    parent_id?: number
     metadata?: Record<string, unknown>
   }) => req<Task>('POST', '/tasks', b),
   updateTask: (
@@ -250,6 +255,9 @@ export const api = {
       description?: string
       priority?: string
       actor?: string
+      // Reparent: a task id nests under that epic, 0 clears the parent (back to top-level),
+      // omitted leaves it unchanged. Same-project / self / cycle guards are enforced server-side.
+      parent_id?: number
       metadata?: Record<string, unknown>
     },
   ) => req<Task>('PATCH', `/tasks/${id}`, b),
