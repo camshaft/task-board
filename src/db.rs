@@ -255,11 +255,20 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         }
     }
 
+    // Concurrency posture (see task 191, "database is locked" under fleet load). WAL lets many
+    // readers run alongside a single writer. busy_timeout makes a writer WAIT for the lock
+    // instead of erroring immediately on contention -- a generous 30s absorbs bursty fleet
+    // writes and WAL checkpoints. synchronous=NORMAL is the recommended WAL pairing: it fsyncs
+    // far less than FULL (so the write lock is held briefly, shrinking the contention window)
+    // while staying durable across an app crash (only an OS/power crash can lose the last commit,
+    // acceptable for a coordination board). Transactions here are short (a few statements, and
+    // webhooks fire AFTER commit), so writers release the lock quickly.
     let opts = SqliteConnectOptions::from_str(&format!("sqlite://{db_path}"))?
         .create_if_missing(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
         .foreign_keys(true)
-        .busy_timeout(std::time::Duration::from_secs(5));
+        .busy_timeout(std::time::Duration::from_secs(30));
 
     let pool = SqlitePoolOptions::new().max_connections(8).connect_with(opts).await?;
 
