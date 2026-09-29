@@ -12,6 +12,7 @@ use rmcp::model::{
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 
 use crate::core;
 use crate::db::Pool;
@@ -29,9 +30,38 @@ pub struct Board {
     /// Optional IPFS HTTP API for server-side content-addressing of raw document `content`.
     /// `None` keeps the board CID-only. See `crate::ipfs`.
     ipfs_api_url: Option<String>,
+    /// Per-session identity: the agent this MCP session registered as. The streamable-HTTP
+    /// transport creates one Board per session (via the service factory), so this binds an
+    /// `Mcp-Session-Id` to an agent id without a separate map. register_agent sets it; other
+    /// tools default `created_by`/`assignee`/`author`/`agent_id` from it when omitted. A
+    /// reconnect/restart mints a fresh session (identity gone) — recover by re-registering.
+    identity: Arc<Mutex<Option<String>>>,
     // Populated and consumed by the #[tool_router]/#[tool_handler] macros.
     #[allow(dead_code)]
     tool_router: ToolRouter<Board>,
+}
+
+impl Board {
+    /// Resolve an identity param: an explicit non-empty value wins; otherwise fall back to the
+    /// agent this session registered as. `None` if neither is available.
+    fn me_opt(&self, explicit: Option<&str>) -> Option<String> {
+        match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(x) => Some(x.to_string()),
+            None => self.identity.lock().unwrap().clone(),
+        }
+    }
+
+    /// Like `me_opt`, but required: a clear error when there's no explicit value and no session
+    /// identity, rather than acting as nobody.
+    fn me_req(&self, explicit: Option<&str>) -> Result<String, McpError> {
+        self.me_opt(explicit).ok_or_else(|| {
+            McpError::invalid_params(
+                "no identity for this session; call register_agent first, or pass the id explicitly"
+                    .to_string(),
+                None,
+            )
+        })
+    }
 }
 
 /// Pretty-print like the Python `_j` (indent=2, default=str).
@@ -99,7 +129,9 @@ pub struct UpdateAgentArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetStatusArgs {
-    pub agent_id: String,
+    /// Defaults to the agent this session registered as; pass to act for another.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     /// online / busy / away / offline
     pub status: String,
     #[serde(default)]
@@ -249,7 +281,9 @@ pub struct CommentTaskArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SubscribeArgs {
-    pub subscriber: String,
+    /// The agent to (un)subscribe. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub subscriber: Option<String>,
     #[serde(default)]
     pub task_id: Option<i64>,
     #[serde(default)]
@@ -295,8 +329,9 @@ pub struct GetChannelArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PostToChannelArgs {
     pub channel_id: i64,
-    /// Your agent id (the poster).
-    pub sender: String,
+    /// The poster. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub sender: Option<String>,
     pub body: String,
     /// Optional parent post seq to reply under (one-level threading).
     #[serde(default)]
@@ -324,7 +359,9 @@ pub struct InviteToChannelArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CheckNotificationsArgs {
-    pub agent_id: String,
+    /// Whose inbox to drain. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     #[serde(default = "default_true")]
     pub mark_read: bool,
     #[serde(default = "default_limit")]
@@ -333,14 +370,18 @@ pub struct CheckNotificationsArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SendMessageArgs {
-    pub from_agent: String,
+    /// Sender. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub from_agent: Option<String>,
     pub to_agent: String,
     pub body: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetMessagesArgs {
-    pub agent_id: String,
+    /// Whose messages. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     #[serde(default = "default_true")]
     pub mark_read: bool,
     #[serde(default = "default_limit")]
@@ -498,6 +539,7 @@ impl Board {
         Self {
             pool,
             ipfs_api_url,
+            identity: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
@@ -510,7 +552,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<RegisterAgentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::register_agent(
+        let out = core::register_agent(
             &self.pool,
             &a.agent_id,
             s(&a.display_name),
@@ -521,7 +563,11 @@ impl Board {
         )
         .await
         .map_err(err)
-        .and_then(ok)
+        .and_then(ok)?;
+        // Bind this session to the registered agent (idempotent: re-registering just refreshes
+        // it). Other tools then default their identity params from this when omitted.
+        *self.identity.lock().unwrap() = Some(a.agent_id);
+        Ok(out)
     }
 
     #[tool(description = "Set your presence: online / busy / away / offline (+ an optional note).")]
@@ -529,7 +575,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<SetStatusArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::set_status(&self.pool, &a.agent_id, &a.status, s(&a.status_message))
+        let me = self.me_req(a.agent_id.as_deref())?;
+        core::set_status(&self.pool, &me, &a.status, s(&a.status_message))
             .await
             .map_err(err)
             .and_then(ok)
@@ -579,11 +626,12 @@ impl Board {
         &self,
         Parameters(a): Parameters<CreateProjectArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let created_by = self.me_opt(s(&a.created_by));
         core::create_project(
             &self.pool,
             &a.name,
             s(&a.description),
-            s(&a.created_by),
+            created_by.as_deref(),
             a.metadata.map(Value::Object),
         )
         .await
@@ -636,6 +684,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<CreateTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let created_by = self.me_opt(s(&a.created_by));
         core::create_task(
             &self.pool,
             a.project_id,
@@ -643,7 +692,7 @@ impl Board {
             s(&a.description),
             s(&a.assignee),
             s(&a.priority),
-            s(&a.created_by),
+            created_by.as_deref(),
             a.metadata.map(Value::Object),
             a.parent_id,
         )
@@ -659,6 +708,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<UpdateTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
         core::update_task(
             &self.pool,
             a.task_id,
@@ -667,7 +717,7 @@ impl Board {
             s(&a.title),
             s(&a.description),
             s(&a.priority),
-            s(&a.actor),
+            actor.as_deref(),
             a.metadata.map(Value::Object),
             a.parent_id,
         )
@@ -696,7 +746,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<MoveTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::move_task(&self.pool, a.task_id, a.to_project_id, s(&a.actor))
+        let actor = self.me_opt(s(&a.actor));
+        core::move_task(&self.pool, a.task_id, a.to_project_id, actor.as_deref())
             .await
             .map_err(err)
             .and_then(ok)
@@ -726,7 +777,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<CommentTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::comment_task(&self.pool, a.task_id, &a.body, s(&a.author))
+        let author = self.me_opt(s(&a.author));
+        core::comment_task(&self.pool, a.task_id, &a.body, author.as_deref())
             .await
             .map_err(err)
             .and_then(ok)
@@ -738,7 +790,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::subscribe(&self.pool, &a.subscriber, a.task_id, a.project_id, a.channel_id, a.document_id, a.board.unwrap_or(false))
+        let sub = self.me_req(a.subscriber.as_deref())?;
+        core::subscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, a.board.unwrap_or(false))
             .await
             .map_err(err)
             .and_then(ok)
@@ -749,7 +802,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::unsubscribe(&self.pool, &a.subscriber, a.task_id, a.project_id, a.channel_id, a.document_id, a.board.unwrap_or(false))
+        let sub = self.me_req(a.subscriber.as_deref())?;
+        core::unsubscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, a.board.unwrap_or(false))
             .await
             .map_err(err)
             .and_then(ok)
@@ -763,11 +817,12 @@ impl Board {
         &self,
         Parameters(a): Parameters<CreateChannelArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let created_by = self.me_opt(s(&a.created_by));
         core::create_channel(
             &self.pool,
             &a.name,
             s(&a.topic),
-            s(&a.created_by),
+            created_by.as_deref(),
             a.metadata.map(Value::Object),
         )
         .await
@@ -798,7 +853,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<PostToChannelArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::post_to_channel(&self.pool, a.channel_id, &a.sender, &a.body, a.reply_to)
+        let sender = self.me_req(a.sender.as_deref())?;
+        core::post_to_channel(&self.pool, a.channel_id, &sender, &a.body, a.reply_to)
             .await
             .map_err(err)
             .and_then(ok)
@@ -820,7 +876,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<InviteToChannelArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::invite_to_channel(&self.pool, a.channel_id, &a.agent_id, s(&a.invited_by))
+        let invited_by = self.me_opt(s(&a.invited_by));
+        core::invite_to_channel(&self.pool, a.channel_id, &a.agent_id, invited_by.as_deref())
             .await
             .map_err(err)
             .and_then(ok)
@@ -834,7 +891,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<CheckNotificationsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::check_notifications(&self.pool, &a.agent_id, a.mark_read, a.limit, None)
+        let me = self.me_req(a.agent_id.as_deref())?;
+        core::check_notifications(&self.pool, &me, a.mark_read, a.limit, None)
             .await
             .map_err(err)
             .and_then(ok)
@@ -847,7 +905,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<SendMessageArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::send_message(&self.pool, &a.from_agent, &a.to_agent, &a.body)
+        let from = self.me_req(a.from_agent.as_deref())?;
+        core::send_message(&self.pool, &from, &a.to_agent, &a.body)
             .await
             .map_err(err)
             .and_then(ok)
@@ -858,7 +917,8 @@ impl Board {
         &self,
         Parameters(a): Parameters<GetMessagesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_messages(&self.pool, &a.agent_id, a.mark_read, a.limit)
+        let me = self.me_req(a.agent_id.as_deref())?;
+        core::get_messages(&self.pool, &me, a.mark_read, a.limit)
             .await
             .map_err(err)
             .and_then(ok)
@@ -1044,7 +1104,11 @@ impl ServerHandler for Board {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
-                "Task-board: a coordination board for agents. Register yourself, create \
+                "Task-board: a coordination board for agents. Call register_agent first — it \
+                 binds this session to your agent id, so you can then omit created_by / \
+                 assignee / author / agent_id on later calls and they default to you (pass one \
+                 explicitly to act for another agent). If a call returns a 'no identity for \
+                 this session' error, call register_agent again and retry. Create \
                  projects/tasks, comment, subscribe, and drain your inbox with \
                  check_notifications."
                     .to_string(),
@@ -1056,6 +1120,85 @@ impl ServerHandler for Board {
 mod tests {
     use super::*;
     use rmcp::schemars::schema_for;
+
+    // register_agent binds the session identity; identity params then default to it when
+    // omitted, an explicit value still wins, and a session with no identity errors clearly.
+    #[tokio::test]
+    async fn session_identity_defaults_and_requires() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool.clone(), None);
+        let mkfail = |e: McpError| anyhow::anyhow!("{e:?}");
+
+        let p = core::create_project(&pool, "P", None, None, None).await?;
+        let pid = p["id"].as_i64().unwrap();
+
+        // No identity + no explicit id -> a clear error, not acting as nobody.
+        assert!(
+            board
+                .check_notifications(Parameters(serde_json::from_value(serde_json::json!({}))?))
+                .await
+                .is_err(),
+            "check_notifications with neither session identity nor agent_id must error"
+        );
+
+        // register_agent binds this session.
+        board
+            .register_agent(Parameters(serde_json::from_value(
+                serde_json::json!({"agent_id":"agent:x"}),
+            )?))
+            .await
+            .map_err(mkfail)?;
+
+        // create_task with no created_by defaults to the session identity.
+        board
+            .create_task(Parameters(serde_json::from_value(
+                serde_json::json!({"project_id": pid, "title": "T"}),
+            )?))
+            .await
+            .map_err(mkfail)?;
+        let find = |tasks: &Value, title: &str| -> i64 {
+            tasks
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["title"] == title)
+                .unwrap()["id"]
+                .as_i64()
+                .unwrap()
+        };
+        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None).await?;
+        let got = core::get_task(&pool, find(&tasks, "T")).await?;
+        assert_eq!(got["created_by"], serde_json::json!("agent:x"));
+
+        // An explicit created_by still wins over the session identity.
+        board
+            .create_task(Parameters(serde_json::from_value(
+                serde_json::json!({"project_id": pid, "title": "T2", "created_by": "other"}),
+            )?))
+            .await
+            .map_err(mkfail)?;
+        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None).await?;
+        let got2 = core::get_task(&pool, find(&tasks, "T2")).await?;
+        assert_eq!(got2["created_by"], serde_json::json!("other"));
+
+        // check_notifications now works with no agent_id (defaults to the bound identity).
+        board
+            .check_notifications(Parameters(serde_json::from_value(serde_json::json!({}))?))
+            .await
+            .map_err(mkfail)?;
+
+        // A fresh session (new Board) starts with no identity again.
+        let board2 = Board::new(pool.clone(), None);
+        assert!(
+            board2
+                .check_notifications(Parameters(serde_json::from_value(serde_json::json!({}))?))
+                .await
+                .is_err(),
+            "a new session has no identity until it registers"
+        );
+        Ok(())
+    }
 
     // A free-form JSON object property must generate a concrete `{"type":"object"}` schema.
     // A bare `serde_json::Value` instead yields a boolean/empty schema, which strict MCP
