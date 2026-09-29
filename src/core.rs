@@ -5400,4 +5400,45 @@ mod tests {
         assert!(get_task(&pool, tid).await?["blocked_on"].is_null(), "unblocking clears blocked_on");
         Ok(())
     }
+
+    /// Concurrency guard for task 191 ("database is locked"). Many agents hammer the board's
+    /// write paths at once — notably check_notifications, which reads then writes (mark-read +
+    /// last_seen) in one transaction, the classic read->write upgrade that can deadlock under
+    /// WAL. This spins up several workers sharing one pool (as the live server does) and asserts
+    /// NONE of their writes surface a lock error. It's both the regression guard for the busy_
+    /// timeout/synchronous mitigation and the measurement harness the operator asked for: if this
+    /// ever fails with "database is locked", that's the signal to add BEGIN IMMEDIATE / retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_do_not_lock() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Load", None, Some("op"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+
+        const WORKERS: usize = 12;
+        const ROUNDS: usize = 6;
+        let mut handles = Vec::new();
+        for w in 0..WORKERS {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                let agent = format!("agent:w{w}");
+                register_agent(&pool, &agent, None, None, None, None, None).await?;
+                for r in 0..ROUNDS {
+                    // A burst mixing the common write paths, incl. the read->write upgrade in
+                    // check_notifications (subscribed to the task it just created).
+                    let t = create_task(&pool, pid, &format!("t{w}-{r}"), None, None, None, Some(&agent), None, None).await?;
+                    let tid = t["id"].as_i64().unwrap();
+                    comment_task(&pool, tid, "working", Some(&agent), None).await?;
+                    update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some(&agent), None, None, None).await?;
+                    check_notifications(&pool, &agent, true, 50, None).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        for h in handles {
+            // A panic or an Err (e.g. "database is locked") fails the test with the message.
+            h.await.expect("worker task did not panic")?;
+        }
+        Ok(())
+    }
 }
