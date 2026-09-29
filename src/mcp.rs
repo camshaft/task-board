@@ -635,6 +635,14 @@ pub struct GetDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadDocumentArgs {
+    pub document_id: i64,
+    /// Which version's body to read. Omit for the current version.
+    #[serde(default)]
+    pub version_no: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListDocumentsArgs {
     #[serde(default)]
     pub project_id: Option<i64>,
@@ -1336,6 +1344,19 @@ impl Board {
         Parameters(a): Parameters<GetDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_document(&self.pool, a.document_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(
+        description = "Read a document's body content from-session: resolves the version's CID and returns the text (the current version, or pass version_no). The board fetches it through its own IPFS backend, so you don't need local IPFS or a gateway. Binary content (image/pdf/...) returns a null content + the CID to fetch via the REST gateway instead."
+    )]
+    async fn read_document(
+        &self,
+        Parameters(a): Parameters<ReadDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::read_document_content(&self.pool, self.ipfs_api_url.as_deref(), a.document_id, a.version_no)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(description = "List a document's versions (immutable), newest first.")]
