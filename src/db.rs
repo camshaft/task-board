@@ -210,7 +210,11 @@ CREATE INDEX IF NOT EXISTS idx_doc_attach_doc  ON document_attachments(document_
 CREATE INDEX IF NOT EXISTS idx_ext_ident_source ON external_identities(source);
 CREATE INDEX IF NOT EXISTS idx_task_links_task ON task_links(task_id);
 CREATE INDEX IF NOT EXISTS idx_external_links_board ON external_links(board_kind, board_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_path ON documents(path) WHERE path IS NOT NULL;
+-- NOTE: the unique index on documents(path) is intentionally NOT here. path is a back-filled
+-- column (added by an ALTER in init after this SCHEMA runs), so on a pre-path DB an index over
+-- documents(path) in the SCHEMA apply loop fails with "no such column: path" and crash-loops the
+-- process. It is created after the back-fill instead (see init), which is correct for fresh and
+-- existing DBs alike. Any future index/constraint on a back-filled column must follow the same rule.
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
@@ -416,4 +420,86 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .await?;
 
     Ok(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the #63 crash-loop: a DB whose `documents` table predates the `path`
+    /// column must migrate cleanly. `path` is back-filled by an ALTER after the SCHEMA apply
+    /// loop, so any index over `documents(path)` inside SCHEMA fails there with
+    /// "no such column: path" and wedges the process. A fresh-DB test can't catch this — the
+    /// legacy table must be seeded WITHOUT `path` first.
+    #[tokio::test]
+    async fn init_migrates_pre_path_documents_db() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("legacy.db");
+        let dbp = db_path.to_str().unwrap();
+
+        // Seed a pre-#63 documents table: no `path` column.
+        {
+            let opts = SqliteConnectOptions::from_str(&format!("sqlite://{dbp}"))?
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
+            sqlx::query(
+                "CREATE TABLE documents (\
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                    title TEXT NOT NULL, \
+                    slug TEXT, \
+                    project_id INTEGER, \
+                    status TEXT NOT NULL DEFAULT 'draft', \
+                    current_version_id INTEGER, \
+                    approved_version_id INTEGER, \
+                    approved_by TEXT, \
+                    metadata TEXT NOT NULL DEFAULT '{}', \
+                    created_by TEXT, \
+                    created_at TEXT NOT NULL, \
+                    updated_at TEXT NOT NULL)",
+            )
+            .execute(&pool)
+            .await?;
+            pool.close().await;
+        }
+
+        // init() must succeed (this is the crash-loop that #63 introduced).
+        let pool = init(dbp).await?;
+
+        // The back-fill added documents.path...
+        let has_path = sqlx::query("PRAGMA table_info(documents)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "path");
+        assert!(has_path, "init should back-fill documents.path on a legacy DB");
+
+        // ...and the partial unique index exists (created after the back-fill).
+        let has_index = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_documents_path'",
+        )
+        .fetch_optional(&pool)
+        .await?
+        .is_some();
+        assert!(has_index, "idx_documents_path should exist after migration");
+
+        // And it's usable: filing two docs at the same path is rejected by the unique index.
+        let ts = "2026-01-01T00:00:00Z";
+        for (i, p) in [("A", "a/b"), ("B", "a/b")].iter().enumerate() {
+            let r = sqlx::query(
+                "INSERT INTO documents(title, path, created_at, updated_at) VALUES(?,?,?,?)",
+            )
+            .bind(p.0)
+            .bind(p.1)
+            .bind(ts)
+            .bind(ts)
+            .execute(&pool)
+            .await;
+            if i == 0 {
+                r.expect("first doc at a/b inserts");
+            } else {
+                assert!(r.is_err(), "second doc at the same path violates the unique index");
+            }
+        }
+        Ok(())
+    }
 }
