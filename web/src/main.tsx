@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Route, Routes } from 'react-router-dom'
 import './index.css'
 import AgentView from './AgentView.tsx'
+import Agents from './Agents.tsx'
 import Board from './Board.tsx'
 import ChannelView from './ChannelView.tsx'
 import Channels from './Channels.tsx'
@@ -31,6 +32,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="search" element={<Search />} />
           <Route path="documents" element={<Documents />} />
           <Route path="documents/:documentId" element={<DocumentView />} />
+          <Route path="agents" element={<Agents />} />
           <Route path="agents/:agentId" element={<AgentView />} />
           <Route path="channels" element={<Channels />} />
           <Route path="channels/:channelId" element={<ChannelView />} />

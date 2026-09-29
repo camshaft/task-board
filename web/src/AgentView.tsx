@@ -1,5 +1,6 @@
+import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { useAgent, useAgentTasks, useProjects } from './resources'
+import { useAgent, useAgentTasks, useEvents, useProjects, updateAgent } from './resources'
 import { AGENT_DOT, relTime, StatusChip } from './ui'
 
 // Per-agent page (/agents/:agentId): identity + presence, charter, registry metadata (repos),
@@ -12,8 +13,42 @@ export default function AgentView() {
   const { data: agent, error, loading } = useAgent(id)
   const { data: tasks = [] } = useAgentTasks(id)
   const { data: projects = [] } = useProjects()
+  // A wide window of the activity log, filtered to this agent's own actions. Client-side for
+  // now; a server-side ?actor= filter (v-task-board) would make the feed complete past 200.
+  const { data: recentEvents = [] } = useEvents(200)
+  const activity = recentEvents.filter((e) => e.actor === id)
   const projectName = (pid: number | null | undefined) =>
     pid == null ? '' : (projects.find((p) => p.id === pid)?.name ?? `#${pid}`)
+
+  // Metadata editor: null = not editing, string = editing this JSON draft (merged server-side).
+  const [editMeta, setEditMeta] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  async function saveMeta() {
+    if (editMeta === null) return
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(editMeta)
+    } catch {
+      setSaveError('Metadata must be valid JSON.')
+      return
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      setSaveError('Metadata must be a JSON object.')
+      return
+    }
+    setBusy(true)
+    setSaveError(null)
+    try {
+      await updateAgent(id, { metadata: parsed as Record<string, unknown> })
+      setEditMeta(null)
+    } catch (e) {
+      setSaveError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   // Registry repos, if present: metadata.repos = [{ repo, branch }, ...].
   const repos = Array.isArray(agent?.metadata?.repos)
@@ -114,6 +149,106 @@ export default function AgentView() {
               ))}
               {tasks.length === 0 && (
                 <li className="text-sm text-[var(--color-muted)]">No assigned tasks.</li>
+              )}
+            </ul>
+          </div>
+
+          <div className="mt-6">
+            <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
+              <span>Metadata</span>
+              {editMeta === null && (
+                <button
+                  onClick={() => {
+                    setSaveError(null)
+                    setEditMeta(JSON.stringify(agent.metadata ?? {}, null, 2))
+                  }}
+                  className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)]"
+                >
+                  edit
+                </button>
+              )}
+            </div>
+            {saveError && (
+              <div className="mb-2 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
+                {saveError}
+              </div>
+            )}
+            {editMeta === null ? (
+              Object.keys(agent.metadata ?? {}).length > 0 ? (
+                <pre className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 text-xs">
+                  {JSON.stringify(agent.metadata, null, 2)}
+                </pre>
+              ) : (
+                <p className="text-sm text-[var(--color-muted)]">— none —</p>
+              )
+            ) : (
+              <div className="space-y-2">
+                <textarea
+                  autoFocus
+                  value={editMeta}
+                  rows={8}
+                  onChange={(e) => setEditMeta(e.target.value)}
+                  className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-2 font-mono text-xs outline-none focus:border-sky-500/50"
+                />
+                <p className="text-[11px] text-[var(--color-muted)]">
+                  Keys are merged into the agent's existing metadata server-side; this can't
+                  remove a key.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    disabled={busy}
+                    onClick={saveMeta}
+                    className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+                  >
+                    Save
+                  </button>
+                  <button
+                    onClick={() => {
+                      setEditMeta(null)
+                      setSaveError(null)
+                    }}
+                    className="rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-6">
+            <div className="mb-2 text-xs text-[var(--color-muted)]">
+              Recent activity ({activity.length})
+            </div>
+            <ul className="space-y-2">
+              {activity.map((e) => (
+                <li key={e.seq} className="text-xs">
+                  <div className="flex items-center gap-1.5">
+                    <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                      {e.type}
+                    </span>
+                    <span className="text-[var(--color-muted)]">{relTime(e.created_at)}</span>
+                  </div>
+                  {typeof e.data?.title === 'string' && (
+                    <div className="mt-0.5 text-[var(--color-muted)]">
+                      {e.task_id != null && e.project_id != null ? (
+                        <Link
+                          to={`/projects/${e.project_id}/tasks/${e.task_id}`}
+                          className="hover:text-sky-300"
+                        >
+                          {e.data.title as string}
+                        </Link>
+                      ) : (
+                        (e.data.title as string)
+                      )}
+                    </div>
+                  )}
+                </li>
+              ))}
+              {activity.length === 0 && (
+                <li className="text-xs text-[var(--color-muted)]">
+                  No recent activity by this agent.
+                </li>
               )}
             </ul>
           </div>
