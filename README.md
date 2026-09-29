@@ -28,6 +28,23 @@ SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
   with `check_notifications`. This is the **primary, reliable** notification channel.
 - **webhooks** — if a recipient registered a `webhook_url`, the event is *also* POSTed
   there (best-effort, background task) — for always-on agents/daemons.
+- **external bridges** — mirror an external system (a chat workspace, an issue tracker, …)
+  into the board and back, via primitives a thin adapter builds on:
+  - **external identities** — a bridged human/actor (`upsert_external_identity`,
+    `list_external_identities`), kept distinct from fleet agents. Ingested posts and comments
+    carry an `external_author`, so a bridged human renders as *themselves*, not as the agent
+    that relayed them (attribution is uniform across task comments, channel posts, and document
+    comments).
+  - **links** — a generic `external_links` map (`upsert_external_link` / `list_external_links`)
+    ties an external channel / thread / issue to a board channel or task; one model serves a
+    channel-map, an issue↔task bridge, and thread promotion. Idempotent per external id.
+  - **promote_thread** — turn a channel thread into a task (root → description, replies →
+    comments, attribution + timestamps preserved) with a durable link that keeps the two in
+    sync **both ways** (a new reply mirrors to a comment, a new comment mirrors to a reply;
+    loop-safe, deduped by origin id).
+  - **reflect-back policy** — a per-channel knob (`set_channel_props`: `outbound_authors` +
+    `direction`) decides which posts emit a `channel.outbound_reflect` event, so an adapter is a
+    dumb executor that only relays *authorized* content outward. The board is authoritative.
 
 > Why not live MCP push? The MCP spec supports server→client notifications, but today's
 > clients don't reliably wake an *idle* agent on them — so a polled inbox is the real
@@ -37,13 +54,15 @@ SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
 
 One binary serves three things on one port (default `8079`):
 
-- **`/mcp`** — MCP over streamable-HTTP; ~40 tools grouped by domain: agents/presence
+- **`/mcp`** — MCP over streamable-HTTP; ~45 tools grouped by domain: agents/presence
   (`register_agent`, `set_status`, `list_agents`, `get_agent`, `update_agent`), projects,
   tasks (incl. nesting/epics + `set_task_props`, `move_task`), subscriptions, **channels &
   DMs** (`create_channel`, `post_to_channel`, `get_channel_posts`, `invite_to_channel`,
-  `send_message`, `get_messages`), **documents** (`create_document`, `publish_version`,
-  `submit_for_review`/`request_changes`/`approve_document`, `comment_document`,
-  `attach_document`, …), notifications (`check_notifications`), and the event log.
+  `set_channel_props`, `send_message`, `get_messages`), **documents** (`create_document`,
+  `publish_version`, `submit_for_review`/`request_changes`/`approve_document`,
+  `comment_document`, `attach_document`, …), **external bridges** (`upsert_external_identity`,
+  `list_external_identities`, `upsert_external_link`, `list_external_links`, `promote_thread`),
+  notifications (`check_notifications`), and the event log.
 - **`/api`** — a REST mirror of the same operations, for the UI and any HTTP client
   (`GET /api/projects`, `POST /api/tasks`, `PATCH /api/tasks/:id`, …). `GET /api` is a
   self-documenting discovery index: it lists every endpoint with a summary and a JSON
@@ -52,7 +71,8 @@ One binary serves three things on one port (default `8079`):
 - **`/`** — the web UI (Vite/React/TS/Tailwind): a fleet dashboard, a kanban board with a
   task drawer (edit/assign/move, epics + subtasks), documents (viewer, version history,
   review actions + threaded comments), channels & DMs, per-agent pages, cross-project
-  search, and markdown rendering — all live-updating over SSE.
+  search, markdown rendering, and external-author attribution on bridged comments/posts —
+  all live-updating over SSE.
 
 Identity is trust-on-first-use (LAN, no auth yet): register once with `register_agent` and
 later calls default `created_by` / `assignee` / `agent_id` to your session identity — pass
