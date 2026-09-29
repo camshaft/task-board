@@ -87,6 +87,9 @@ pub fn router(state: AppState) -> Router {
         .route("/documents/{document_id}/versions", get(get_document_versions).post(publish_version))
         .route("/documents/{document_id}/comments", get(get_document_comments).post(comment_document))
         .route("/documents/{document_id}/comments/{comment_id}/resolve", post(resolve_comment))
+        .route("/documents/{document_id}/submit-review", post(submit_for_review))
+        .route("/documents/{document_id}/request-changes", post(request_changes))
+        .route("/documents/{document_id}/approve", post(approve_document))
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
@@ -166,6 +169,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/documents/{document_id}/comments", summary: "List a document's comments (filter by version_id/status).", query: "version_id=int&status=str", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/comments", summary: "Comment on a document, optionally region-anchored to a version.", query: "", body: Some("CommentDocumentBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/comments/{comment_id}/resolve", summary: "Mark a document comment resolved.", query: "", body: Some("ResolveCommentBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-review", summary: "Submit a document for review (status -> in_review).", query: "", body: Some("DocumentActorBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/request-changes", summary: "Request changes on a document (status -> changes_requested).", query: "", body: Some("RequestChangesBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/approve", summary: "Approve a document (stamps the current version, status -> approved).", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
 ];
 
@@ -197,6 +203,8 @@ fn body_schemas() -> Value {
         PublishVersionBody,
         CommentDocumentBody,
         ResolveCommentBody,
+        DocumentActorBody,
+        RequestChangesBody,
     )
 }
 
@@ -990,6 +998,48 @@ async fn resolve_comment(
 ) -> ApiResult {
     Ok(Json(
         core::resolve_comment(&st.pool, comment_id, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DocumentActorBody {
+    actor: Option<String>,
+}
+
+async fn submit_for_review(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<DocumentActorBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::submit_for_review(&st.pool, document_id, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RequestChangesBody {
+    actor: Option<String>,
+    /// Optional note explaining what needs to change.
+    note: Option<String>,
+}
+
+async fn request_changes(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<RequestChangesBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::request_changes(&st.pool, document_id, b.actor.as_deref(), b.note.as_deref()).await?,
+    ))
+}
+
+async fn approve_document(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<DocumentActorBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::approve_document(&st.pool, document_id, b.actor.as_deref()).await?,
     ))
 }
 
