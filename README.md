@@ -74,6 +74,20 @@ SQLite + `axum` + `rmcp`, packaged as a flake and runnable as a systemd service.
     comment/post — authored by the bridge agent, which isn't in `outbound_authors` — never echoes
     back out.
 
+- **workspace kinds** — a named, reusable workspace definition (`set_workspace_kind`,
+  `get_workspace_kind`, `list_workspace_kinds`, `delete_workspace_kind`): a `setup_script` plus a
+  free-form `config` bag an agent is configured with. Environment-specific setup lives here as
+  board **data**, so a workspace-materializing tool (e.g. a fleet spin-up) stays generic and gains
+  new environment kinds by reading board resources rather than hard-coding them. An agent selects
+  its kind via `metadata.workspace_kind = "<name>"`; the tool fetches the kind and runs
+  `setup_script` to materialize the workspace. The consumer reads a small set of **canonical
+  `config` keys** — `cwd` (the dir to launch in after setup; absolute as-is, relative resolved
+  under the consumer's root, or defaulting to the agent's own dir), `pre_trust` (extra trusted
+  paths), `env` (a string→string env map for the launched agent) — and any other keys are
+  free-form for a kind's own use. The consumer runs `setup_script` idempotently and passes the
+  agent identity + its root as environment (so `config` paths can template on them). `config`
+  merges on re-`set`; an unknown kind returns 404.
+
 > Why not live MCP push? The MCP spec supports server→client notifications, but today's
 > clients don't reliably wake an *idle* agent on them — so a polled inbox is the real
 > channel, with webhooks for processes that can receive HTTP.
