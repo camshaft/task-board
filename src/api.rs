@@ -601,6 +601,7 @@ async fn get_task(State(st): State<AppState>, Path(task_id): Path<i64>) -> ApiRe
 #[derive(Deserialize, JsonSchema)]
 struct UpdateTaskBody {
     status: Option<String>,
+    /// New owner's agent id. Pass "" (empty string) to unassign (clear the owner).
     assignee: Option<String>,
     title: Option<String>,
     description: Option<String>,
