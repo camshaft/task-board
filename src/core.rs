@@ -2171,6 +2171,145 @@ fn hydrate_external_identity(r: &SqliteRow) -> Value {
     v
 }
 
+// --- External links (bridged mappings: channel-map, issue↔task, thread↔task) ---
+
+/// The board entity kinds an external link may target.
+const EXTERNAL_LINK_KINDS: &[&str] = &["channel", "task", "thread"];
+
+/// Create or update a mapping between a board entity and an external one — the generic link
+/// behind the Slack channel-map, the GitHub issue↔task bridge, and thread promotion. Idempotent
+/// on (source, external_id): re-linking the same external entity updates its board target /
+/// parent / metadata (metadata MERGED) and bumps `updated_at`. Returns the stored record.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_external_link(
+    pool: &Pool,
+    source: &str,
+    external_id: &str,
+    external_parent_id: Option<&str>,
+    board_kind: &str,
+    board_id: i64,
+    metadata: Option<Value>,
+) -> anyhow::Result<Value> {
+    let source = source.trim();
+    let external_id = external_id.trim();
+    if source.is_empty() {
+        anyhow::bail!("give a `source` for the external link (e.g. slack, github)");
+    }
+    if external_id.is_empty() {
+        anyhow::bail!("give an `external_id` for the external link (the external system's key)");
+    }
+    if !EXTERNAL_LINK_KINDS.contains(&board_kind) {
+        anyhow::bail!("give a `board_kind` of one of: channel, task, thread");
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    // A clean 404 for the two kinds backed by a real table (thread = a channel post seq, skipped).
+    match board_kind {
+        "channel" => {
+            if sqlx::query("SELECT 1 FROM channels WHERE id=?").bind(board_id).fetch_optional(&mut *tx).await?.is_none() {
+                anyhow::bail!("no channel {board_id}");
+            }
+        }
+        "task" => {
+            if sqlx::query("SELECT 1 FROM tasks WHERE id=?").bind(board_id).fetch_optional(&mut *tx).await?.is_none() {
+                anyhow::bail!("no task {board_id}");
+            }
+        }
+        _ => {}
+    }
+    // Merge metadata into any existing bag (mirrors the other upserts).
+    let existing: Option<String> = sqlx::query("SELECT metadata FROM external_links WHERE source=? AND external_id=?")
+        .bind(source)
+        .bind(external_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .and_then(|r| r.try_get::<Option<String>, _>("metadata").ok().flatten());
+    let mut meta: Map<String, Value> = existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if let Some(Value::Object(incoming)) = metadata {
+        meta.extend(incoming);
+    }
+    let meta_str = Value::Object(meta).to_string();
+    sqlx::query(
+        "INSERT INTO external_links(source, external_id, external_parent_id, board_kind, board_id, metadata, created_at, updated_at) \
+         VALUES(?,?,?,?,?,?,?,?) \
+         ON CONFLICT(source, external_id) DO UPDATE SET \
+            external_parent_id=excluded.external_parent_id, \
+            board_kind=excluded.board_kind, \
+            board_id=excluded.board_id, \
+            metadata=excluded.metadata, \
+            updated_at=excluded.updated_at",
+    )
+    .bind(source)
+    .bind(external_id)
+    .bind(external_parent_id)
+    .bind(board_kind)
+    .bind(board_id)
+    .bind(&meta_str)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let out = sqlx::query("SELECT * FROM external_links WHERE source=? AND external_id=?")
+        .bind(source)
+        .bind(external_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let out = hydrate_external_link(&out);
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// List external links, filtered by any combination of `source`, `board_kind`, and `board_id`
+/// (the read path a bridge adapter uses to resolve a board entity to its external counterpart).
+pub async fn list_external_links(
+    pool: &Pool,
+    source: Option<&str>,
+    board_kind: Option<&str>,
+    board_id: Option<i64>,
+) -> anyhow::Result<Value> {
+    // Build a filtered query with only the provided predicates (all optional).
+    let mut sql = String::from("SELECT * FROM external_links WHERE 1=1");
+    if source.is_some() {
+        sql.push_str(" AND source=?");
+    }
+    if board_kind.is_some() {
+        sql.push_str(" AND board_kind=?");
+    }
+    if board_id.is_some() {
+        sql.push_str(" AND board_id=?");
+    }
+    sql.push_str(" ORDER BY updated_at DESC");
+    let mut q = sqlx::query(&sql);
+    if let Some(s) = source {
+        q = q.bind(s);
+    }
+    if let Some(k) = board_kind {
+        q = q.bind(k);
+    }
+    if let Some(id) = board_id {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(pool).await?;
+    Ok(Value::Array(rows.iter().map(hydrate_external_link).collect()))
+}
+
+/// Row -> JSON with `metadata` parsed into an object.
+fn hydrate_external_link(r: &SqliteRow) -> Value {
+    let mut v = row_to_json(r);
+    if let Value::Object(ref mut m) = v {
+        let meta: Value = m
+            .get("metadata")
+            .and_then(|x| x.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        m.insert("metadata".into(), meta);
+    }
+    v
+}
+
 /// Merge case-insensitive duplicate projects into one canonical row each. For every group
 /// of projects whose names match ignoring case, the earliest-created (lowest id on a tie)
 /// is kept; tasks, project subscriptions, and events pointing at the others are repointed
@@ -4285,6 +4424,49 @@ mod tests {
 
         // A missing root post is an error.
         assert!(promote_thread(&pool, cid, 999999, pid, Some("concierge")).await.is_err());
+        Ok(())
+    }
+
+    /// external_links (#149 slice 2): the generic bridged mapping — channel-map + a task link in
+    /// ONE table, idempotent on (source, external_id), filterable by the adapter's read path.
+    #[tokio::test]
+    async fn external_link_channel_map_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let ch = create_channel(&pool, "planning", None, Some("concierge"), None).await?;
+        let cid = ch["id"].as_i64().unwrap();
+        let p = create_project(&pool, "P", None, Some("concierge"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, None, None, Some("concierge"), None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Channel-map link (board channel <-> Slack channel).
+        let l = upsert_external_link(&pool, "slack", "C123", None, "channel", cid, Some(json!({"name":"#planning"}))).await?;
+        assert_eq!(l["source"], json!("slack"));
+        assert_eq!(l["external_id"], json!("C123"));
+        assert_eq!(l["board_kind"], json!("channel"));
+        assert_eq!(l["board_id"], json!(cid));
+        assert_eq!(l["metadata"]["name"], json!("#planning"));
+
+        // Idempotent on (source, external_id): re-link updates parent + MERGES metadata.
+        let l2 = upsert_external_link(&pool, "slack", "C123", Some("workspaceA"), "channel", cid, Some(json!({"topic":"x"}))).await?;
+        assert_eq!(l2["external_parent_id"], json!("workspaceA"));
+        assert_eq!(l2["metadata"]["name"], json!("#planning"), "metadata merged, not replaced");
+        assert_eq!(l2["metadata"]["topic"], json!("x"));
+        assert_eq!(list_external_links(&pool, Some("slack"), None, None).await?.as_array().unwrap().len(), 1, "still one link");
+
+        // The SAME table carries a task link from a different source.
+        upsert_external_link(&pool, "github", "https://gh/issues/1", None, "task", tid, None).await?;
+        assert_eq!(list_external_links(&pool, None, None, None).await?.as_array().unwrap().len(), 2);
+        assert_eq!(list_external_links(&pool, None, Some("channel"), Some(cid)).await?.as_array().unwrap().len(), 1, "adapter resolves board->external");
+        assert_eq!(list_external_links(&pool, None, Some("task"), None).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_external_links(&pool, Some("github"), None, None).await?.as_array().unwrap().len(), 1);
+
+        // Guards: bad kind, missing board entity, empty source/external_id.
+        assert!(upsert_external_link(&pool, "slack", "C9", None, "widget", cid, None).await.is_err());
+        assert!(upsert_external_link(&pool, "slack", "C9", None, "channel", 999999, None).await.is_err());
+        assert!(upsert_external_link(&pool, "  ", "C9", None, "channel", cid, None).await.is_err());
+        assert!(upsert_external_link(&pool, "slack", "  ", None, "channel", cid, None).await.is_err());
         Ok(())
     }
 }

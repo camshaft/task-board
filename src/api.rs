@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
         .route("/messages", post(send_message))
         .route("/events", get(get_events))
         .route("/external-identities", get(list_external_identities).post(upsert_external_identity))
+        .route("/external-links", get(list_external_links).post(upsert_external_link))
         .route("/ipfs/add", post(ipfs_add))
         .route("/documents", get(list_documents).post(create_document))
         .route("/documents/{document_id}", get(get_document))
@@ -191,6 +192,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log.", query: "since_seq=int&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/external-identities", summary: "List external (bridged) identities, optionally filtered by source.", query: "source=str", body: None },
     Endpoint { method: "POST", path: "/api/external-identities", summary: "Register/update an external identity (a bridged human/actor, e.g. slack:U123).", query: "", body: Some("UpsertExternalIdentityBody") },
+    Endpoint { method: "GET", path: "/api/external-links", summary: "List bridged links (channel-map / issue↔task / thread↔task), filter by source/board_kind/board_id.", query: "source=str&board_kind=str&board_id=int", body: None },
+    Endpoint { method: "POST", path: "/api/external-links", summary: "Map a board entity (channel|task|thread) to an external one; idempotent on (source, external_id).", query: "", body: Some("UpsertExternalLinkBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author).", query: "project_id=int&status=str&tag=str&task_id=int&author=str", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
@@ -241,6 +244,7 @@ fn body_schemas() -> Value {
         AttachDocumentBody,
         IpfsAddBody,
         UpsertExternalIdentityBody,
+        UpsertExternalLinkBody,
         PromoteThreadBody,
     )
 }
@@ -978,6 +982,57 @@ async fn upsert_external_identity(
     Ok(Json(
         core::upsert_external_identity(&st.pool, &b.id, &b.source, b.display_name.as_deref(), b.metadata)
             .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct ListExternalLinksQuery {
+    source: Option<String>,
+    board_kind: Option<String>,
+    board_id: Option<i64>,
+}
+
+async fn list_external_links(
+    State(st): State<AppState>,
+    Query(q): Query<ListExternalLinksQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_external_links(&st.pool, q.source.as_deref(), q.board_kind.as_deref(), q.board_id)
+            .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UpsertExternalLinkBody {
+    /// Originating system, e.g. "slack" or "github".
+    source: String,
+    /// The external system's canonical key (Slack channel id, thread ts, issue url, ...).
+    external_id: String,
+    /// Optional external container (e.g. the Slack channel of a thread).
+    external_parent_id: Option<String>,
+    /// Board entity kind: "channel", "task", or "thread".
+    board_kind: String,
+    /// Board-side id (channel id / task id / thread root post seq).
+    board_id: i64,
+    /// Arbitrary props. MERGED into any existing bag.
+    metadata: Option<Value>,
+}
+
+async fn upsert_external_link(
+    State(st): State<AppState>,
+    Json(b): Json<UpsertExternalLinkBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::upsert_external_link(
+            &st.pool,
+            &b.source,
+            &b.external_id,
+            b.external_parent_id.as_deref(),
+            &b.board_kind,
+            b.board_id,
+            b.metadata,
+        )
+        .await?,
     ))
 }
 

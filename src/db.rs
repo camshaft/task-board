@@ -171,6 +171,27 @@ CREATE TABLE IF NOT EXISTS task_links (
     created_at  TEXT NOT NULL,
     UNIQUE(source_kind, source_id)
 );
+-- Generic mapping between a board entity and an entity in a bridged external system: the ONE
+-- link model behind the Slack channel-map, the GitHub issue-to-task bridge, and thread-to-task
+-- promotion. source names the system (slack, github). external_id is that system's canonical key
+-- (a Slack channel id, a thread ts, an issue url). external_parent_id is an optional container
+-- (e.g. the Slack channel of a thread). board_kind is channel, task, or thread and board_id is
+-- the board-side id. UNIQUE(source, external_id) keeps the mapping idempotent -- one external
+-- entity maps to one board entity per system.
+-- (Keep schema comments free of semicolons: this SCHEMA string is applied statement-by-statement
+-- by splitting on the semicolon, so a semicolon in a comment would truncate the statement.)
+CREATE TABLE IF NOT EXISTS external_links (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    source             TEXT NOT NULL,
+    external_id        TEXT NOT NULL,
+    external_parent_id TEXT,
+    board_kind         TEXT NOT NULL,
+    board_id           INTEGER NOT NULL,
+    metadata           TEXT NOT NULL DEFAULT '{}',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    UNIQUE(source, external_id)
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
@@ -182,6 +203,7 @@ CREATE INDEX IF NOT EXISTS idx_doc_attach_task ON document_attachments(task_id);
 CREATE INDEX IF NOT EXISTS idx_doc_attach_doc  ON document_attachments(document_id);
 CREATE INDEX IF NOT EXISTS idx_ext_ident_source ON external_identities(source);
 CREATE INDEX IF NOT EXISTS idx_task_links_task ON task_links(task_id);
+CREATE INDEX IF NOT EXISTS idx_external_links_board ON external_links(board_kind, board_id);
 "#;
 
 /// Open (creating if needed) the pool and apply the schema. WAL + foreign keys on.
