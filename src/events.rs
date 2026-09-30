@@ -24,12 +24,13 @@ pub struct WebhookDelivery {
     pub agent_id: String,
     pub url: String,
     pub payload: Value,
-    /// Whether this event is ACTIONABLE for this recipient (assignee / @mentioned / a direct
-    /// message) vs a passive FYI (a broad subscriber or the firehose). The host notifier wakes
-    /// the agent only on an actionable push, so collaboration (a comment to the assignee, an
-    /// @mention) wakes instantly while FYI fan-out stays quiet (no wake drain). See
-    /// [`actionable_recipients`].
-    pub actionable: bool,
+    /// Whether this recipient is a DIRECT subscriber of the event's target (a task/project/channel/
+    /// document subscription, which includes an auto-subscribed assignee/creator/commenter and an
+    /// @mentioned agent) vs present only via the whole-board firehose. The host notifier wakes the
+    /// agent on a `subscribed` push for every event type (comments included) — subscription is the
+    /// wake control (unsubscribe to opt out), per the operator's subscription-based wake model —
+    /// while a firehose-only coordinator stays inbox/poll (not woken on every ticket).
+    pub subscribed: bool,
 }
 
 /// Recipients that get an explicit set (possibly empty) rather than task-derived.
@@ -187,60 +188,6 @@ async fn recipients_for_task(
     Ok(recips)
 }
 
-/// The subset of `recips` for whom this event is ACTIONABLE (they are expected to do something)
-/// rather than a passive FYI. Actionable = a direct message to them, the task's assignee on task
-/// activity, a freshly-assigned assignee, or an `@id` mention in the event's body/summary/note.
-/// The host notifier wakes an idle agent only on an actionable push, so collaboration wakes
-/// instantly without the broad-subscriber wake drain that gated FYI wakes (#215).
-async fn actionable_recipients(
-    tx: &mut Transaction<'_, Sqlite>,
-    event_type: &str,
-    task_id: Option<i64>,
-    data: &Value,
-    recips: &BTreeSet<String>,
-) -> anyhow::Result<BTreeSet<String>> {
-    // A direct message is inherently actionable for whoever receives it.
-    if event_type.starts_with("message.") {
-        return Ok(recips.clone());
-    }
-    let mut out: BTreeSet<String> = BTreeSet::new();
-    // The task's current assignee is an actionable target for any activity on their task.
-    if let Some(tid) = task_id {
-        if let Some(row) = sqlx::query("SELECT assignee FROM tasks WHERE id=?")
-            .bind(tid)
-            .fetch_optional(&mut **tx)
-            .await?
-        {
-            if let Some(a) = row.try_get::<Option<String>, _>("assignee")? {
-                if recips.contains(&a) {
-                    out.insert(a);
-                }
-            }
-        }
-    }
-    // A freshly-assigned assignee (task.assigned carries it in data) is actionable even before a
-    // re-read would see it.
-    if let Some(a) = data.get("assignee").and_then(|v| v.as_str()) {
-        if recips.contains(a) {
-            out.insert(a.to_string());
-        }
-    }
-    // `@id` mentions in any human-authored text on the event -> actionable for the mentioned id.
-    let text: String = ["body", "summary", "note"]
-        .iter()
-        .filter_map(|k| data.get(*k).and_then(|v| v.as_str()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if !text.is_empty() {
-        for r in recips {
-            if text.contains(&format!("@{r}")) {
-                out.insert(r.clone());
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Record an event and deliver it to each recipient's inbox. Returns the event seq.
 /// Any webhook deliveries are appended to `hooks` to be fired after commit.
 #[allow(clippy::too_many_arguments)]
@@ -289,6 +236,12 @@ pub async fn emit(
         }
     };
 
+    // The DIRECT subscribers of this event's target (before the firehose union below): the target's
+    // task/project/channel/document subscribers plus an auto-subscribed assignee/creator/commenter/
+    // @mention, or the Explicit set. These are the recipients the notifier push-wakes (subscription
+    // is the wake control); a firehose-only recipient is added below but is NOT in this set.
+    let direct: BTreeSet<String> = recips.clone();
+
     // Whole-board firehose: anyone subscribed with target_type='board' receives EVERY event,
     // regardless of the per-event recipient set above (even otherwise-silent Explicit events).
     // Minus the actor, so an agent isn't notified of its own action.
@@ -314,9 +267,6 @@ pub async fn emit(
 
     // Collect webhook targets (agents in the recipient set with a webhook_url).
     if !recips.is_empty() {
-        // Who is this event actionable for (wake now) vs a passive FYI (inbox only)? Computed once
-        // over the final recipient set, then stamped per recipient on both push paths.
-        let actionable = actionable_recipients(tx, r#type, task_id, &data, &recips).await?;
         let payload = serde_json::json!({
             "event_seq": seq,
             "type": r#type,
@@ -329,7 +279,7 @@ pub async fn emit(
             "created_at": ts,
         });
         for r in &recips {
-            let is_actionable = actionable.contains(r);
+            let is_subscribed = direct.contains(r);
             if let Some(row) = sqlx::query(
                 "SELECT webhook_url FROM agents WHERE id=? AND webhook_url IS NOT NULL AND webhook_url != ''",
             )
@@ -342,18 +292,18 @@ pub async fn emit(
                     agent_id: r.clone(),
                     url,
                     payload: payload.clone(),
-                    actionable: is_actionable,
+                    subscribed: is_subscribed,
                 });
             }
 
             // Best-effort live-tunnel wake: for a recipient reachable over a reverse tunnel,
-            // push the same notification (with `recipient` + `actionable` set, matching the webhook
+            // push the same notification (with `recipient` + `subscribed` set, matching the webhook
             // body) as a `req` frame the daemon replays locally — so an idle agent wakes without
             // polling. A missing/failed tunnel is fine: the inbox row above + the poll deliver it.
             let mut wake = payload.clone();
             if let Value::Object(ref mut m) = wake {
                 m.insert("recipient".into(), Value::String(r.clone()));
-                m.insert("actionable".into(), Value::Bool(is_actionable));
+                m.insert("subscribed".into(), Value::Bool(is_subscribed));
             }
             crate::tunnel::try_wake(r, &wake);
         }
@@ -380,7 +330,7 @@ pub fn fire_webhooks(hooks: Vec<WebhookDelivery>, timeout: Duration) {
             let mut body = h.payload.clone();
             if let Value::Object(ref mut m) = body {
                 m.insert("recipient".into(), Value::String(h.agent_id.clone()));
-                m.insert("actionable".into(), Value::Bool(h.actionable));
+                m.insert("subscribed".into(), Value::Bool(h.subscribed));
             }
             if let Err(e) = client.post(&h.url).json(&body).send().await {
                 tracing::warn!(
@@ -398,42 +348,48 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// actionable_recipients marks the assignee + @mentioned ids on task activity, every recipient
-    /// of a direct message, and a freshly-assigned assignee — while a plain subscriber is FYI.
+    /// emit stamps `subscribed=true` on a DIRECT target subscriber's wake (so the notifier wakes
+    /// them on a comment — the operator's subscription-based model) and `subscribed=false` on a
+    /// firehose-only recipient (inbox/poll, not woken on every ticket). Verified via the collected
+    /// WebhookDelivery flags.
     #[tokio::test]
-    async fn actionable_targets_assignee_mention_and_dm() -> anyhow::Result<()> {
+    async fn wake_marks_direct_subscribers_not_firehose() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // Two agents with webhook_urls, so emit produces a WebhookDelivery (carrying `subscribed`)
+        // for each.
+        crate::core::register_agent(&pool, "alice", None, None, None, None, Some("http://x/wake")).await?;
+        crate::core::register_agent(&pool, "coord", None, None, None, None, Some("http://x/wake")).await?;
         let p = crate::core::create_project(&pool, "P", None, Some("owner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        // Task assigned to alice, created by owner.
-        let t = crate::core::create_task(&pool, pid, "T", None, Some("alice"), None, Some("owner"), None, None, None).await?;
+        let t = crate::core::create_task(&pool, pid, "T", None, None, None, Some("owner"), None, None, None).await?;
         let tid = t["id"].as_i64().unwrap();
+        // alice subscribes to the task directly; coord subscribes to the whole-board firehose.
+        crate::core::subscribe(&pool, "alice", Some(tid), None, None, None, false).await?;
+        crate::core::subscribe(&pool, "coord", None, None, None, None, true).await?;
 
-        let recips: BTreeSet<String> =
-            ["alice", "bob", "carol", "owner"].iter().map(|s| s.to_string()).collect();
+        // A comment by someone else: both are recipients, but only alice is a DIRECT subscriber.
         let mut tx = pool.begin().await?;
-
-        // task.commented: assignee (alice) + an @mentioned id (carol) are actionable; a plain
-        // subscriber (bob) and the creator without a mention (owner) are FYI.
-        let data = serde_json::json!({ "body": "hey @carol take a look", "comment_id": 1 });
-        let a = actionable_recipients(&mut tx, "task.commented", Some(tid), &data, &recips).await?;
-        assert!(a.contains("alice"), "assignee actionable: {a:?}");
-        assert!(a.contains("carol"), "mentioned actionable: {a:?}");
-        assert!(!a.contains("bob"), "plain subscriber is FYI: {a:?}");
-        assert!(!a.contains("owner"), "creator without mention is FYI: {a:?}");
-
-        // A direct message is actionable for every recipient.
-        let dm = actionable_recipients(&mut tx, "message.direct", None, &json!({ "body": "hi" }), &recips)
-            .await?;
-        assert_eq!(dm, recips, "every DM recipient is actionable");
-
-        // task.assigned: the freshly-assigned assignee (from data) is actionable.
-        let asg = actionable_recipients(&mut tx, "task.assigned", Some(tid), &json!({ "assignee": "bob" }), &recips)
-            .await?;
-        assert!(asg.contains("bob"), "new assignee actionable: {asg:?}");
-        assert!(asg.contains("alice"), "current assignee also actionable: {asg:?}");
+        let mut hooks: Vec<WebhookDelivery> = Vec::new();
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.commented",
+            Some("owner"),
+            Some(tid),
+            None,
+            None,
+            None,
+            json!({ "body": "ping", "comment_id": 1 }),
+            Recipients::FromTask,
+        )
+        .await?;
         tx.commit().await?;
+
+        let alice = hooks.iter().find(|h| h.agent_id == "alice").expect("alice hook");
+        let coord = hooks.iter().find(|h| h.agent_id == "coord").expect("coord hook");
+        assert!(alice.subscribed, "direct task subscriber is woken on a comment");
+        assert!(!coord.subscribed, "firehose-only recipient is not push-woken per ticket");
         Ok(())
     }
 }
