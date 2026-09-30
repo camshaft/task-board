@@ -227,7 +227,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/tunnels", summary: "Diagnostic: which agents currently have a live reverse tunnel (so the board can push a wake rather than the agent polling). An agent absent here has no live tunnel — its wakes fall back to the inbox + poll.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/health", summary: "Health beacon: cheap liveness+readiness probe. 200 {ok:true,db:true} when the process is up and the database is reachable; 503 {ok:false} when the database is not ready. Check before a full tick and treat any non-200 (incl a 502 from the origin when it is down) as back-off-and-retry.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/agents", summary: "List all known agents.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status} by default so the result stays under the token cap. Pass verbose=true for full objects (charter + metadata), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&limit=int&offset=int", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry).", query: "", body: Some("UpdateAgentBody") },
@@ -539,8 +539,35 @@ fn html_escape(s: &str) -> String {
 
 // --- Agents ---
 
-async fn list_agents(State(st): State<AppState>) -> ApiResult {
-    Ok(Json(core::list_agents(&st.pool).await?))
+#[derive(Deserialize)]
+struct ListAgentsQuery {
+    status: Option<String>,
+    q: Option<String>,
+    meta_key: Option<String>,
+    meta_value: Option<String>,
+    #[serde(default)]
+    verbose: bool,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+async fn list_agents(
+    State(st): State<AppState>,
+    Query(query): Query<ListAgentsQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_agents(
+            &st.pool,
+            query.status.as_deref(),
+            query.q.as_deref(),
+            query.meta_key.as_deref(),
+            query.meta_value.as_deref(),
+            query.verbose,
+            query.limit,
+            query.offset,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]

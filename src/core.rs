@@ -428,11 +428,80 @@ pub async fn set_status(
     Ok(out)
 }
 
-pub async fn list_agents(pool: &Pool) -> anyhow::Result<Value> {
-    let rows = sqlx::query("SELECT * FROM agents ORDER BY last_seen DESC")
-        .fetch_all(pool)
-        .await?;
-    Ok(Value::Array(rows.iter().map(agent_json).collect()))
+/// List agents as a lightweight ROSTER by default (task #418): each entry is a compact
+/// {id, display_name, status} — basically name + id, plus tiny presence — so a scoped read stays
+/// well under a caller's token cap (the full roster with every agent's charter overflowed it).
+/// Fetch a single agent's full record (charter, metadata) with get_agent, or pass `verbose` for
+/// the full objects. Optional filters: `status` (exact), `q` (substring over id + display_name),
+/// and `meta_key`/`meta_value` (equality on a scalar metadata field, e.g. area/host — for routing
+/// a task to an owning vertical). Always bounded by `limit` (default 200, max 1000) + `offset`.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_agents(
+    pool: &Pool,
+    status: Option<&str>,
+    q: Option<&str>,
+    meta_key: Option<&str>,
+    meta_value: Option<&str>,
+    verbose: bool,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> anyhow::Result<Value> {
+    let mut sql = String::from("SELECT * FROM agents");
+    let mut conds: Vec<&str> = Vec::new();
+    if status.is_some() {
+        conds.push("status=?");
+    }
+    if q.is_some() {
+        conds.push("(id LIKE ? OR display_name LIKE ?)");
+    }
+    let use_meta = meta_key.is_some() && meta_value.is_some();
+    if use_meta {
+        conds.push("json_extract(metadata, '$.' || ?) = ?");
+    }
+    if !conds.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conds.join(" AND "));
+    }
+    sql.push_str(" ORDER BY last_seen DESC LIMIT ? OFFSET ?");
+    let lim = limit.unwrap_or(200).clamp(1, 1000);
+    let off = offset.unwrap_or(0).max(0);
+
+    let mut query = sqlx::query(&sql);
+    if let Some(s) = status {
+        query = query.bind(s.to_string());
+    }
+    if let Some(qq) = q {
+        let like = format!("%{qq}%");
+        query = query.bind(like.clone()).bind(like);
+    }
+    if use_meta {
+        query = query
+            .bind(meta_key.unwrap().to_string())
+            .bind(meta_value.unwrap().to_string());
+    }
+    query = query.bind(lim).bind(off);
+    let rows = query.fetch_all(pool).await?;
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            if verbose {
+                return agent_json(r);
+            }
+            // Compact roster projection: id + display_name + status. get_agent for the rest.
+            let full = agent_json(r);
+            let mut m = Map::new();
+            if let Value::Object(o) = &full {
+                for k in ["id", "display_name", "status"] {
+                    if let Some(v) = o.get(k) {
+                        m.insert(k.to_string(), v.clone());
+                    }
+                }
+            }
+            Value::Object(m)
+        })
+        .collect();
+    Ok(Value::Array(items))
 }
 
 pub async fn get_agent(pool: &Pool, agent_id: &str) -> anyhow::Result<Value> {
@@ -6941,6 +7010,59 @@ mod tests {
         // A fresh agent gets an empty bag by default, not null.
         register_agent(&pool, "v-y", None, None, None, None, None).await?;
         assert_eq!(get_agent(&pool, "v-y").await?["metadata"], json!({}));
+        Ok(())
+    }
+
+    /// list_agents is a lightweight roster by default (task #418): compact {id, display_name,
+    /// status}, no charter/metadata blob; verbose returns the full objects; status/q/meta filters
+    /// and limit/offset narrow it.
+    #[tokio::test]
+    async fn list_agents_roster_projection_and_filters() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let big_charter = "x".repeat(3000);
+        register_agent(&pool, "v-compiler", Some("Compiler"), Some("vertical"), Some(&big_charter), Some(json!({"area":"compiler"})), None).await?;
+        register_agent(&pool, "v-runtime", Some("Runtime"), Some("vertical"), Some(&big_charter), Some(json!({"area":"runtime"})), None).await?;
+        register_agent(&pool, "concierge", Some("Concierge"), Some("ops"), Some(&big_charter), Some(json!({"area":"ops"})), None).await?;
+        set_status(&pool, "v-compiler", "online", None).await?;
+        set_status(&pool, "v-runtime", "offline", None).await?;
+        set_status(&pool, "concierge", "offline", None).await?; // register defaults to online
+
+        // Default: compact projection, no charter/metadata (the roster stays small).
+        let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
+        let arr = roster.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        for a in arr {
+            assert!(a.get("id").is_some() && a.get("status").is_some());
+            assert!(a.get("charter").is_none(), "roster must omit charter: {a}");
+            assert!(a.get("metadata").is_none(), "roster must omit metadata: {a}");
+        }
+
+        // verbose -> full objects (charter present).
+        let full = list_agents(&pool, None, None, None, None, true, None, None).await?;
+        assert!(full.as_array().unwrap().iter().all(|a| a["charter"].is_string()));
+
+        // status filter.
+        let online = list_agents(&pool, Some("online"), None, None, None, false, None, None).await?;
+        let online = online.as_array().unwrap();
+        assert_eq!(online.len(), 1);
+        assert_eq!(online[0]["id"], json!("v-compiler"));
+
+        // q substring over id + display_name.
+        let q = list_agents(&pool, None, Some("runtime"), None, None, false, None, None).await?;
+        assert_eq!(q.as_array().unwrap().len(), 1);
+        assert_eq!(q.as_array().unwrap()[0]["id"], json!("v-runtime"));
+
+        // meta_key/meta_value routing filter (the v-cadenza-ci case: find the owning area).
+        let by_area = list_agents(&pool, None, None, Some("area"), Some("compiler"), false, None, None).await?;
+        assert_eq!(by_area.as_array().unwrap().len(), 1);
+        assert_eq!(by_area.as_array().unwrap()[0]["id"], json!("v-compiler"));
+
+        // limit + offset paginate.
+        let page1 = list_agents(&pool, None, None, None, None, false, Some(2), Some(0)).await?;
+        let page2 = list_agents(&pool, None, None, None, None, false, Some(2), Some(2)).await?;
+        assert_eq!(page1.as_array().unwrap().len(), 2);
+        assert_eq!(page2.as_array().unwrap().len(), 1);
         Ok(())
     }
 

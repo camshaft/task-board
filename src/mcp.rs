@@ -110,6 +110,31 @@ pub struct GetAgentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListAgentsArgs {
+    /// Filter by exact presence status (online / busy / away / offline).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Substring filter over id + display_name (case-insensitive).
+    #[serde(default)]
+    pub q: Option<String>,
+    /// With meta_value, match a scalar metadata field (e.g. meta_key="area", meta_value="compiler").
+    #[serde(default)]
+    pub meta_key: Option<String>,
+    #[serde(default)]
+    pub meta_value: Option<String>,
+    /// Return full agent objects (charter + metadata) instead of the compact {id, display_name,
+    /// status} roster projection. Default false.
+    #[serde(default)]
+    pub verbose: Option<bool>,
+    /// Max rows (default 200, capped at 1000).
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Rows to skip (pagination).
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UpdateAgentArgs {
     pub agent_id: String,
     #[serde(default)]
@@ -1049,9 +1074,24 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "List all registered agents with their presence, charter, metadata, and last-seen time.")]
-    async fn list_agents(&self) -> Result<CallToolResult, McpError> {
-        core::list_agents(&self.pool).await.map_err(err).and_then(ok)
+    #[tool(description = "List agents as a lightweight roster: each entry is a compact {id, display_name, status} so the result stays under the token cap. Use get_agent for one agent's full charter + metadata, or pass verbose:true for full objects. Filters: status (exact), q (substring over id + display_name), and meta_key+meta_value (match a scalar metadata field like area/host — e.g. to find the vertical that owns a repo/area). Bounded by limit (default 200, max 1000) + offset.")]
+    async fn list_agents(
+        &self,
+        Parameters(a): Parameters<ListAgentsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_agents(
+            &self.pool,
+            s(&a.status),
+            s(&a.q),
+            s(&a.meta_key),
+            s(&a.meta_value),
+            a.verbose.unwrap_or(false),
+            a.limit,
+            a.offset,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "Get one agent by id, including its charter and metadata bag. O(1) vs filtering list_agents.")]
