@@ -709,6 +709,8 @@ async fn update_agent(
 
 #[derive(Deserialize, JsonSchema)]
 struct SetStatusBody {
+    /// Roster presence, one of: online, idle, busy, blocked, away, offline. Other/free-form text is
+    /// coerced to the nearest presence (the original is salvaged into status_message).
     status: String,
     status_message: Option<String>,
 }

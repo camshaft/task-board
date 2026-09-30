@@ -559,12 +559,68 @@ pub async fn update_agent(
     Ok(out)
 }
 
+/// The canonical roster presence states (task 496). `set_status` coerces any input to one of these
+/// so the presence field stays a clean enum instead of accumulating free-form per-tick narrative.
+pub const PRESENCE_STATES: &[&str] = &["online", "idle", "busy", "blocked", "away", "offline"];
+
+/// Coerce a caller-supplied `status` to a canonical presence value, non-destructively (task 496).
+/// The roster presence field is an enum, but agents were cramming per-tick narrative into it,
+/// corrupting presence and leaving `status_message` stale. This maps the input (via its first token
+/// and a small synonym set) to a canonical value; when the input carried narrative beyond the
+/// presence word (or was unrecognized free-text) and no explicit `status_message` was given, the
+/// original text is salvaged into `status_message` so nothing is lost. Never rejects.
+///
+/// NOT-RUNNING coupling: done/cancelled/stopped/etc. coerce to `offline`, because the watchdog's
+/// `agent_expected_running` rule keys on {offline, done, cancelled} = not-running and this enum has
+/// no separate done/cancelled value (confirmed with v-fleet-tooling, task 496). If this enum ever
+/// gains a distinct not-running value, `agent_expected_running`'s match set is the SINGLE place that
+/// must be updated to keep the not-running semantics.
+fn normalize_presence(status: &str, status_message: Option<&str>) -> (String, Option<String>) {
+    let raw = status.trim();
+    // The presence intent is the first whitespace/':'-delimited token (agents write e.g.
+    // "idle: inbox drained" or "blocked on review").
+    let token = raw.split([':', ' ']).next().unwrap_or("").trim().to_ascii_lowercase();
+    let canonical = match token.as_str() {
+        "online" | "active" | "available" | "up" | "ready" | "live" | "healthy" => Some("online"),
+        "idle" | "free" => Some("idle"),
+        "busy" | "working" | "in_progress" | "running" | "processing" => Some("busy"),
+        "blocked" | "waiting" | "stuck" => Some("blocked"),
+        "away" | "afk" => Some("away"),
+        "offline" | "done" | "cancelled" | "canceled" | "stopped" | "complete" | "completed"
+        | "finished" | "shutdown" | "dead" | "exited" | "terminated" | "gone" | "down" => {
+            Some("offline")
+        }
+        _ => None,
+    };
+    let recognized = canonical.is_some();
+    // Unrecognized free-text is still a live agent that called in: treat presence as online.
+    let presence = canonical.unwrap_or("online").to_string();
+    // Salvage when the input carried narrative beyond the presence word, or was unrecognized text --
+    // but only into an empty status_message (an explicit status_message always wins).
+    let has_narrative = raw.contains(' ') || raw.contains(':');
+    let salvage = !recognized || has_narrative;
+    let effective_message = match status_message {
+        Some(m) if !m.trim().is_empty() => Some(m.to_string()),
+        _ if salvage && !raw.is_empty() => Some(raw.to_string()),
+        _ => status_message.map(|s| s.to_string()),
+    };
+    debug_assert!(
+        PRESENCE_STATES.contains(&presence.as_str()),
+        "normalize_presence produced a non-canonical value: {presence}"
+    );
+    (presence, effective_message)
+}
+
 pub async fn set_status(
     pool: &Pool,
     agent_id: &str,
     status: &str,
     status_message: Option<&str>,
 ) -> anyhow::Result<Value> {
+    // Coerce to a canonical presence + salvage any narrative into status_message (task 496).
+    let (status_norm, message_norm) = normalize_presence(status, status_message);
+    let status = status_norm.as_str();
+    let status_message = message_norm.as_deref();
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     // Going offline honors any pending spin-down request, so clear it (the request's lifecycle end).
@@ -9901,5 +9957,41 @@ mod tests {
         // Non-text content is out of scope for the banned-phrase/ASCII gate: skipped before any fetch.
         assert!(check_cid_content(&pool, Some("http://127.0.0.1:1"), "Qm-x", "image/png", false).await.is_ok());
         Ok(())
+    }
+
+    /// normalize_presence (task 496) coerces free-form status into the canonical presence enum,
+    /// salvaging narrative into status_message, never rejecting. Not-running narratives coerce to
+    /// offline (the agent_expected_running coupling); an explicit status_message always wins.
+    #[test]
+    fn normalize_presence_coerces_and_salvages() {
+        // Canonical value passes through untouched; an explicit message is preserved.
+        assert_eq!(normalize_presence("online", None), ("online".to_string(), None));
+        assert_eq!(
+            normalize_presence("busy", Some("compiling")),
+            ("busy".to_string(), Some("compiling".to_string()))
+        );
+        // Synonyms map to canonical presence.
+        assert_eq!(normalize_presence("working", None).0, "busy");
+        assert_eq!(normalize_presence("afk", None).0, "away");
+        assert_eq!(normalize_presence("available", None).0, "online");
+        // Not-running narratives coerce to offline (keeps agent_expected_running's semantics).
+        assert_eq!(normalize_presence("done", None).0, "offline");
+        assert_eq!(normalize_presence("stopped", None).0, "offline");
+        assert_eq!(normalize_presence("cancelled", None).0, "offline");
+        // Narrative after the presence word: first token gives presence, full text is salvaged.
+        assert_eq!(
+            normalize_presence("idle: inbox drained", None),
+            ("idle".to_string(), Some("idle: inbox drained".to_string()))
+        );
+        // Pure unrecognized narrative: presence defaults to online (a live caller), text salvaged.
+        assert_eq!(
+            normalize_presence("fixing the gate", None),
+            ("online".to_string(), Some("fixing the gate".to_string()))
+        );
+        // An explicit status_message always wins over salvage.
+        assert_eq!(
+            normalize_presence("idle: drained", Some("real note")),
+            ("idle".to_string(), Some("real note".to_string()))
+        );
     }
 }
