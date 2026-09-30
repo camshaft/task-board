@@ -57,6 +57,7 @@ impl IntoResponse for ApiError {
             || msg.contains("is in a different project")
             || msg.starts_with("banned phrase")
             || msg.starts_with("non-ASCII")
+            || msg.starts_with("ambiguous bare reference")
             || msg.starts_with("submit link already used")
             || msg.contains("is not awaiting submission")
             || msg.contains("has no ciphertext to pull")
