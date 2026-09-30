@@ -3727,7 +3727,23 @@ pub fn check_non_ascii(text: &str, acknowledge: bool) -> anyhow::Result<()> {
     if acknowledge {
         return Ok(());
     }
+    if let Some(&(ch, line, col)) = scan_non_ascii(text).first() {
+        anyhow::bail!(
+            "non-ASCII character {ch:?} (U+{:04X}) at line {line}, column {col}. Board content \
+             must be ASCII — replace it (an em dash with '-', curly quotes with straight quotes, \
+             an arrow with '<->', drop emoji), or pass acknowledge_banned=true to submit anyway.",
+            ch as u32
+        );
+    }
+    Ok(())
+}
+
+/// Scan `text` for EVERY non-ASCII character, returning `(char, line, column)` (1-based) for each.
+/// The report-all counterpart to `check_non_ascii` (which bails on the first) — a dry-run lint
+/// wants the full list, not just the earliest offender. Empty when the text is all ASCII.
+pub fn scan_non_ascii(text: &str) -> Vec<(char, usize, usize)> {
     let (mut line, mut col) = (1usize, 1usize);
+    let mut out = Vec::new();
     for ch in text.chars() {
         if ch == '\n' {
             line += 1;
@@ -3735,16 +3751,11 @@ pub fn check_non_ascii(text: &str, acknowledge: bool) -> anyhow::Result<()> {
             continue;
         }
         if !ch.is_ascii() {
-            anyhow::bail!(
-                "non-ASCII character {ch:?} (U+{:04X}) at line {line}, column {col}. Board content \
-                 must be ASCII — replace it (an em dash with '-', curly quotes with straight quotes, \
-                 an arrow with '<->', drop emoji), or pass acknowledge_banned=true to submit anyway.",
-                ch as u32
-            );
+            out.push((ch, line, col));
         }
         col += 1;
     }
-    Ok(())
+    out
 }
 
 /// Combined pre-submit content lint for authored free text (task/document comments + document
@@ -3755,6 +3766,32 @@ pub async fn check_content(pool: &Pool, text: &str, acknowledge: bool) -> anyhow
     check_non_ascii(text, acknowledge)?;
     check_banned_phrases(pool, text, acknowledge).await?;
     Ok(())
+}
+
+/// Non-bailing dry-run lint (task 558): run the SAME authoritative checks as `check_content`
+/// (ASCII-format + banned-phrase) over `text` and return a structured report of EVERY finding
+/// instead of failing on the first. This is the source of truth for pre-publish checks so authors
+/// verify against the live banned-phrases list + ASCII rule rather than a hand-maintained local
+/// copy that drifts (and that a CID publish would otherwise skip entirely). Returns
+/// `{clean, banned_phrases:[..], non_ascii:[{char, codepoint, line, column}, ..]}`.
+pub async fn lint_text(pool: &Pool, text: &str) -> anyhow::Result<Value> {
+    let banned = scan_banned_phrases(pool, text).await?;
+    let non_ascii: Vec<Value> = scan_non_ascii(text)
+        .into_iter()
+        .map(|(ch, line, column)| {
+            json!({
+                "char": ch.to_string(),
+                "codepoint": format!("U+{:04X}", ch as u32),
+                "line": line,
+                "column": column,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "clean": banned.is_empty() && non_ascii.is_empty(),
+        "banned_phrases": banned,
+        "non_ascii": non_ascii,
+    }))
 }
 
 // --- External links (bridged mappings: channel-map, issue↔task, thread↔task) ---
@@ -9775,6 +9812,38 @@ mod tests {
 
         // Unknown review errors (404 at the API).
         assert!(set_review_vetted(&pool, 99999, true, Some("x"), None).await.is_err());
+        Ok(())
+    }
+
+    /// lint_text (task 558) is the non-bailing dry-run: it reports EVERY finding against the live
+    /// list (both banned phrases and all non-ASCII chars with position) instead of failing on the
+    /// first, and reflects clean text as clean=true. Same source of truth as check_content.
+    #[tokio::test]
+    async fn lint_text_reports_all_findings_without_bailing() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        add_banned_phrase(&pool, "robust", None, Some("tester")).await?;
+
+        // Clean ASCII text with no banned phrase: clean=true, both lists empty.
+        let clean = lint_text(&pool, "a perfectly fine sentence").await?;
+        assert_eq!(clean["clean"], json!(true), "clean text: {clean}");
+        assert_eq!(clean["banned_phrases"].as_array().unwrap().len(), 0);
+        assert_eq!(clean["non_ascii"].as_array().unwrap().len(), 0);
+
+        // A banned phrase plus two non-ASCII chars: all reported, clean=false, and no early bail
+        // means the em dash on line 2 is caught even though the banned phrase came first.
+        let dirty = lint_text(&pool, "this is robust\nand uses \u{2014} plus \u{2764}").await?;
+        assert_eq!(dirty["clean"], json!(false), "dirty text: {dirty}");
+        assert_eq!(dirty["banned_phrases"], json!(["robust"]));
+        let na = dirty["non_ascii"].as_array().unwrap();
+        assert_eq!(na.len(), 2, "both non-ASCII chars reported: {dirty}");
+        assert_eq!(na[0]["codepoint"], json!("U+2014"));
+        assert_eq!(na[0]["line"], json!(2));
+        assert_eq!(na[1]["codepoint"], json!("U+2764"));
+
+        // check_non_ascii (the bailing path) agrees on the first offender: same source of truth.
+        assert!(check_non_ascii("ok \u{2014} no", false).is_err());
+        assert!(check_non_ascii("all ascii here", false).is_ok());
         Ok(())
     }
 }

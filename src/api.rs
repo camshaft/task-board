@@ -169,6 +169,7 @@ pub fn router(state: AppState) -> Router {
         .route("/external-links", get(list_external_links).post(upsert_external_link))
         .route("/workspace-kinds", get(list_workspace_kinds).post(set_workspace_kind))
         .route("/workspace-kinds/{name}", get(get_workspace_kind).delete(delete_workspace_kind))
+        .route("/lint", post(lint_text))
         .route("/banned-phrases", get(list_banned_phrases).post(add_banned_phrase))
         .route("/banned-phrases/{phrase}", axum::routing::delete(remove_banned_phrase))
         .route("/identity-aliases", get(list_identity_aliases).post(set_identity_alias))
@@ -311,6 +312,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/workspace-kinds", summary: "Define/update a workspace kind (setup_script + config an agent is configured with); idempotent on name, config merges.", query: "", body: Some("SetWorkspaceKindBody") },
     Endpoint { method: "GET", path: "/api/workspace-kinds/{name}", summary: "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize a workspace.", query: "", body: None },
     Endpoint { method: "DELETE", path: "/api/workspace-kinds/{name}", summary: "Retire a workspace kind by name.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/lint", summary: "Dry-run the pre-submit content lint on arbitrary text without writing: returns {clean, banned_phrases, non_ascii} against the authoritative live banned-phrases list + ASCII-only rule. Use this to pre-check content (incl. before a CID publish, which the write-path gate does not cover) instead of a drift-prone local copy.", query: "", body: Some("LintTextBody") },
     Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list (what the pre-submit content lint checks docs and comments against).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
     Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None },
@@ -396,6 +398,7 @@ fn body_schemas() -> Value {
         PromoteThreadBody,
         SetWorkspaceKindBody,
         AddBannedPhraseBody,
+        LintTextBody,
         UpdateDocumentBody,
         CreateSecretRequestBody,
         SubmitSecretBody,
@@ -1462,6 +1465,19 @@ async fn add_banned_phrase(State(st): State<AppState>, Json(b): Json<AddBannedPh
 
 async fn list_banned_phrases(State(st): State<AppState>) -> ApiResult {
     Ok(Json(core::list_banned_phrases(&st.pool).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct LintTextBody {
+    /// The text to check against the live content gate (banned-phrase list + ASCII-only rule).
+    text: String,
+}
+
+/// Dry-run the pre-submit content lint without writing anything: returns every finding
+/// (`{clean, banned_phrases, non_ascii}`) against the authoritative live list, so authors verify
+/// here instead of a hand-maintained local copy that drifts.
+async fn lint_text(State(st): State<AppState>, Json(b): Json<LintTextBody>) -> ApiResult {
+    Ok(Json(core::lint_text(&st.pool, &b.text).await?))
 }
 
 // --- Identity aliases (task 532) ---
