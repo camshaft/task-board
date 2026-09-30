@@ -255,7 +255,18 @@ export default function Board() {
                           </span>
                         </div>
                         <div className="flex items-center justify-between text-xs text-[var(--color-muted)]">
-                          <span className="font-mono">#{t.id}</span>
+                          <span className="flex items-center gap-1.5 font-mono">
+                            #{t.id}
+                            {/* Liveness-monitor exemption marker (task 520 family / #506 guard). */}
+                            {t.monitor_exempt && (
+                              <span
+                                title="Exempt from the liveness monitor / nudge daemon"
+                                className="rounded bg-amber-500/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-300"
+                              >
+                                exempt
+                              </span>
+                            )}
+                          </span>
                           {t.assignee && <span className="font-mono">{t.assignee}</span>}
                         </div>
                       </Link>

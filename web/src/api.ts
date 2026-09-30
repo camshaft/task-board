@@ -52,6 +52,9 @@ export interface TaskSummary {
   project_id?: number
   parent_id?: number | null
   updated_at?: string
+  // Derived from metadata.monitor_exempt (default false): the task is exempt from the liveness
+  // monitor / nudge daemon (task 520 family / #506 guard).
+  monitor_exempt?: boolean
 }
 
 export interface Comment {
@@ -92,6 +95,9 @@ export interface Task {
   subscribers: string[]
   parent_id?: number | null
   parent_title?: string | null
+  // Derived from metadata.monitor_exempt (default false): exempt from the liveness monitor / nudge
+  // daemon (#506 guard). Editable via the metadata merge (set metadata.monitor_exempt).
+  monitor_exempt?: boolean
   children?: { id: number; title: string; status: TaskStatus }[]
   child_rollup?: { done: number; total: number }
   attached_documents?: {
