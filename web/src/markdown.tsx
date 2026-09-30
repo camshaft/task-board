@@ -33,9 +33,15 @@ const EmbedContext = createContext<{ depth: number; chain: string[] }>({ depth: 
 const EMBED_RE =
   /^!\[\[\s*([^\]#@|]+?)\s*(?:@v(\d+))?\s*(?:#([^\]|]+?))?\s*(?:\|\s*([^\]]+?)\s*)?\]\]$/
 
-// Inline spans, in priority order: code (verbatim), wiki-links, links, bold, italic. Returns a
-// mix of strings (React escapes them) and elements. `gen` yields globally-unique keys;
-// `resolve` maps a [[wiki-path]] to its document (or null → dangling red-link).
+// Shared link styling (sky underline) — used by markdown links and the bare-URL / task-ref
+// autolinkers below.
+const LINK_CLS = 'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
+
+// Inline spans, in priority order: code (verbatim), wiki-links, links, bold, italic, and then
+// autolinkers for bare URLs + task refs. Returns a mix of strings (React escapes them) and
+// elements. `gen` yields globally-unique keys; `resolve` maps a [[wiki-path]] to its document
+// (or null → dangling red-link). The earliest match across all patterns wins, so an explicit
+// [text](url) link (its `[` comes first) always beats the bare-URL autolinker on the same URL.
 function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNode[] {
   const patterns: [RegExp, (m: RegExpExecArray) => ReactNode][] = [
     [
@@ -116,6 +122,28 @@ function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNo
     [
       /\*([^*]+)\*|_([^_]+)_/,
       (m) => <em key={gen()}>{inline(m[1] ?? m[2], gen, resolve)}</em>,
+    ],
+    [
+      // Bare URL autolink. Only http/https, so the resulting href is always a safe scheme (no
+      // javascript:/data:). The greedy body stops at whitespace; the final char class trims the
+      // sentence punctuation that commonly trails a URL in prose (".", ")", ",", …).
+      /https?:\/\/[^\s]+[^\s.,;:!?)\]}'"]/,
+      (m) => (
+        <a key={gen()} href={m[0]} target="_blank" rel="noreferrer" className={LINK_CLS}>
+          {m[0]}
+        </a>
+      ),
+    ],
+    [
+      // Bare task reference (#123) → the task redirect route (which resolves the task's project).
+      // The lookbehind rejects a leading word char / another # / & so "abc#1", "##", and numeric
+      // HTML entities like "&#123;" don't match; \b after the digits rejects "#12ab".
+      /(?<![\w#&])#(\d+)\b/,
+      (m) => (
+        <Link key={gen()} to={`/tasks/${m[1]}`} className={LINK_CLS}>
+          {m[0]}
+        </Link>
+      ),
     ],
   ]
 
