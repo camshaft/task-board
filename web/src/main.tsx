@@ -15,6 +15,7 @@ import ReviewView from './ReviewView.tsx'
 import Reviews from './Reviews.tsx'
 import Search from './Search.tsx'
 import SecretSubmit from './SecretSubmit.tsx'
+import Settings from './Settings.tsx'
 import Wiki from './Wiki.tsx'
 import { TaskDrawer, TaskRedirect } from './TaskDrawer.tsx'
 
@@ -36,6 +37,7 @@ createRoot(document.getElementById('root')!).render(
         <Route element={<Layout />}>
           <Route index element={<Home />} />
           <Route path="search" element={<Search />} />
+          <Route path="settings" element={<Settings />} />
           <Route path="documents" element={<Documents />} />
           <Route path="documents/:documentId" element={<DocumentView />} />
           <Route path="wiki" element={<Wiki />} />
