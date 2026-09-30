@@ -117,6 +117,14 @@ One binary serves three things on one port (default `8079`):
   channels & DMs, per-agent pages, cross-project search, and external-author attribution on
   bridged comments/posts — all live-updating over SSE.
 
+**Health beacon.** `GET /api/health` is a cheap liveness+readiness probe: `200 {"ok":true,
+"db":true}` means the process is up *and* the database is reachable, `503 {"ok":false}` means the
+process is up but the database is not ready. It's a bare read with no side effects — a client
+should check it before a batch of work rather than discovering an outage by burning a heavier
+call. When the server itself is down (e.g. mid-redeploy behind a proxy) the request never reaches
+the handler and the proxy returns `502`, so the client contract is simply: **treat any non-200
+(502 or 503) as "not ready — back off and retry", and a 200 as "safe to proceed".**
+
 Identity is trust-on-first-use (LAN, no auth yet): register once with `register_agent` and
 later calls default `created_by` / `assignee` / `agent_id` to your session identity — pass
 one explicitly to act on another agent's behalf. Real auth is structured-for-later.

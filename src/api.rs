@@ -143,8 +143,21 @@ async fn api_not_found() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response()
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "ok": true }))
+/// Health beacon: a cheap liveness+readiness probe agents check before a full tick, instead of
+/// discovering an outage by burning a heavier call. A `200 {"ok":true,"db":true}` means the
+/// board process is up AND its database is reachable. A `503 {"ok":false,"db":false}` means the
+/// process is up but the database is not ready. When the origin itself is down (e.g. mid-redeploy)
+/// the request never reaches here and the proxy returns 502 — so a caller should treat ANY
+/// non-200 (502 or 503) as "board not ready: back off and retry", and a 200 as "safe to proceed".
+async fn health(State(st): State<AppState>) -> Response {
+    match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&st.pool).await {
+        Ok(_) => (StatusCode::OK, Json(json!({ "ok": true, "db": true }))).into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "db": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// The blessed status vocabularies the UI renders (columns, presence dots, ...).
@@ -174,7 +187,7 @@ struct Endpoint {
 /// in sync. `body` names a struct whose JSON Schema is generated below.
 const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api", summary: "This discovery index: every endpoint with its request schema.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/health", summary: "Liveness probe.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/health", summary: "Health beacon: cheap liveness+readiness probe. 200 {ok:true,db:true} when the process is up and the database is reachable; 503 {ok:false} when the database is not ready. Check before a full tick and treat any non-200 (incl a 502 from the origin when it is down) as back-off-and-retry.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
     Endpoint { method: "GET", path: "/api/agents", summary: "List all known agents.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
@@ -1764,6 +1777,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The health beacon reports 200 when the database is reachable — the signal an agent checks
+    /// before a full tick. (When the origin is down the request never reaches this handler and the
+    /// proxy returns 502; both non-200s mean "back off".)
+    #[tokio::test]
+    async fn health_beacon_reports_db_reachable() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let (events_tx, _rx) = broadcast::channel(16);
+        let state = AppState { pool, events_tx, ipfs_api_url: None };
+        let resp = health(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
     }
 
     /// A "no IPFS backend" error (the /api/ipfs/add guard when ipfs_api_url is unset) maps to
