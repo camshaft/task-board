@@ -304,7 +304,7 @@ pub struct UpdateTaskArgs {
     pub verbose: Option<bool>,
 }
 
-/// What a blocked task is waiting on: kind is task | agent | operator (or "none" to clear),
+/// What a blocked task is waiting on: kind is task | agent | operator | external (or "none" to clear),
 /// target is the blocking task id or agent id (ignored for operator). When kind=agent, that
 /// agent is notified they are blocking.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -474,7 +474,7 @@ pub struct ListTasksArgs {
     /// project_id it searches across every project.
     #[serde(default)]
     pub q: Option<String>,
-    /// "What is waiting on X" views: filter blocked tasks by blocked_on kind (task|agent|operator).
+    /// "What is waiting on X" views: filter blocked tasks by blocked_on kind (task|agent|operator|external).
     #[serde(default)]
     pub blocked_on_kind: Option<String>,
     /// Filter by blocked_on ref (a blocking task id or agent id) — e.g. what is blocked on you.
@@ -1373,7 +1373,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. To CLEAR the owner (unassign), set `unassign: true` — this emits task.unassigned. (Prefer `unassign: true` over an empty-string `assignee`: the server treats `assignee=\"\"` as unassign too, but some clients can't serialize an empty string and produce malformed JSON.) Setting a non-empty `assignee` reassigns and emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent. When you set status=blocked you MUST pass `blocked_on` (kind: task, agent, or operator) recording what it waits on — kind=agent notifies that agent they are blocking; blocked_on auto-clears when the task leaves the blocked state. The response omits the (potentially large) `description` unless you pass verbose:true; fetch the full task with get_task."
+        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. To CLEAR the owner (unassign), set `unassign: true` — this emits task.unassigned. (Prefer `unassign: true` over an empty-string `assignee`: the server treats `assignee=\"\"` as unassign too, but some clients can't serialize an empty string and produce malformed JSON.) Setting a non-empty `assignee` reassigns and emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent. When you set status=blocked you MUST pass `blocked_on` (kind: task, agent, operator, or external) recording what it waits on — kind=agent notifies that agent they are blocking; kind=external is for an infra/no-owner dependency (put what it waits on in blocked_on.note, no target) and stays OFF the operator queue; blocked_on auto-clears when the task leaves the blocked state. The response omits the (potentially large) `description` unless you pass verbose:true; fetch the full task with get_task."
     )]
     async fn update_task(
         &self,
@@ -1476,7 +1476,7 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, or blocked_on_ref=<agent> for what is blocked on that agent. Archived tasks are hidden by default; pass `include_archived: true` to list them too.")]
+    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator|external) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, blocked_on_kind=external for tasks waiting on infra, or blocked_on_ref=<agent> for what is blocked on that agent. Archived tasks are hidden by default; pass `include_archived: true` to list them too.")]
     async fn list_tasks(
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
