@@ -101,12 +101,13 @@ function inline(
         const href = m[2]
         const cls =
           'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
-        // External links open in a new tab; an in-app path navigates client-side via <Link> so
-        // the router basename (e.g. a /board sub-path) is preserved and it stays in the same tab
-        // — an <a href="/documents/2"> would drop the prefix and open a broken new tab (#185).
+        // Links stay in the same tab; the operator opts into a new tab via cmd/ctrl/middle-click
+        // (#453). External URLs use a plain <a>; an in-app path navigates client-side via <Link>
+        // so the router basename (e.g. a /board sub-path) is preserved — a raw
+        // <a href="/documents/2"> would drop the prefix and navigate to a broken URL (#185).
         if (/^(https?:\/\/|mailto:)/i.test(href)) {
           return (
-            <a key={gen()} href={href} target="_blank" rel="noreferrer" className={cls}>
+            <a key={gen()} href={href} className={cls}>
               {inline(m[1], gen, resolve, mentions)}
             </a>
           )
@@ -140,7 +141,7 @@ function inline(
       // sentence punctuation that commonly trails a URL in prose (".", ")", ",", …).
       /https?:\/\/[^\s]+[^\s.,;:!?)\]}'"]/,
       (m) => (
-        <a key={gen()} href={m[0]} target="_blank" rel="noreferrer" className={LINK_CLS}>
+        <a key={gen()} href={m[0]} className={LINK_CLS}>
           {m[0]}
         </a>
       ),
@@ -670,8 +671,6 @@ export function Embed({
       ) : (
         <a
           href={body.url}
-          target="_blank"
-          rel="noreferrer"
           className="text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
         >
           open embedded content
