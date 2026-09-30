@@ -534,6 +534,17 @@ pub struct SetChannelPropsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetChannelAutoJoinArgs {
+    pub channel_id: i64,
+    /// true = every agent is a member (existing agents joined now + new agents auto-join on
+    /// register); false = stop auto-joining (existing members stay).
+    pub auto_join: bool,
+    /// The agent performing the change (event actor). Defaults to this session's identity.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UpsertExternalLinkArgs {
     /// Originating system, e.g. "slack" or "github".
     pub source: String,
@@ -1397,6 +1408,20 @@ impl Board {
         Parameters(a): Parameters<SetChannelPropsArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::set_channel_props(&self.pool, a.channel_id, Value::Object(a.props))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Set (or clear) a channel's auto_join flag — a fleet-wide broadcast channel every agent belongs to. Enabling joins every currently-registered agent immediately AND auto-joins each agent registered later, so posts reach everyone without hand-inviting. Disabling only stops future auto-joins (existing members stay; they can unsubscribe). Idempotent."
+    )]
+    async fn set_channel_auto_join(
+        &self,
+        Parameters(a): Parameters<SetChannelAutoJoinArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::set_channel_auto_join(&self.pool, a.channel_id, a.auto_join, actor.as_deref())
             .await
             .map_err(err)
             .and_then(ok)
