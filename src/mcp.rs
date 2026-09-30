@@ -122,8 +122,8 @@ pub struct ListAgentsArgs {
     pub meta_key: Option<String>,
     #[serde(default)]
     pub meta_value: Option<String>,
-    /// Return full agent objects (charter + metadata) instead of the compact {id, display_name,
-    /// status} roster projection. Default false.
+    /// Return full agent objects (incl the heavy charter) instead of the compact {id, display_name,
+    /// status, metadata} roster projection. Default false.
     #[serde(default)]
     pub verbose: Option<bool>,
     /// Max rows (default 200, capped at 1000).
@@ -1095,7 +1095,7 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "List agents as a lightweight roster: each entry is a compact {id, display_name, status} so the result stays under the token cap. Use get_agent for one agent's full charter + metadata, or pass verbose:true for full objects. Filters: status (exact), q (substring over id + display_name), and meta_key+meta_value (match a scalar metadata field like area/host — e.g. to find the vertical that owns a repo/area). Bounded by limit (default 200, max 1000) + offset.")]
+    #[tool(description = "List agents as a lightweight roster: each entry is a compact {id, display_name, status, metadata} — the small metadata bag is kept so callers can filter (e.g. metadata.native); only the heavy charter is dropped to stay under the token cap. Use get_agent for one agent's full charter, or pass verbose:true for full objects. Filters: status (exact), q (substring over id + display_name), and meta_key+meta_value (match a scalar metadata field like area/host — e.g. to find the vertical that owns a repo/area). Bounded by limit (default 200, max 1000) + offset.")]
     async fn list_agents(
         &self,
         Parameters(a): Parameters<ListAgentsArgs>,
