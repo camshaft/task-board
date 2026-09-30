@@ -1973,6 +1973,17 @@ async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumen
     }
     let cid =
         ipfs::resolve_cid(b.cid.as_deref(), b.content.as_deref(), st.ipfs_api_url.as_deref()).await?;
+    // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
+    if b.content.is_none() {
+        core::check_cid_content(
+            &st.pool,
+            st.ipfs_api_url.as_deref(),
+            &cid,
+            b.content_type.as_deref().unwrap_or("text/markdown"),
+            b.acknowledge_banned.unwrap_or(false),
+        )
+        .await?;
+    }
     Ok(Json(
         core::create_document(
             &st.pool,
@@ -2082,6 +2093,17 @@ async fn publish_version(
     }
     let cid =
         ipfs::resolve_cid(b.cid.as_deref(), b.content.as_deref(), st.ipfs_api_url.as_deref()).await?;
+    // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
+    if b.content.is_none() {
+        core::check_cid_content(
+            &st.pool,
+            st.ipfs_api_url.as_deref(),
+            &cid,
+            b.content_type.as_deref().unwrap_or("text/markdown"),
+            b.acknowledge_banned.unwrap_or(false),
+        )
+        .await?;
+    }
     Ok(Json(
         core::publish_version(
             &st.pool,

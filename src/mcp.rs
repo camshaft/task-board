@@ -1949,6 +1949,18 @@ impl Board {
         let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
             .await
             .map_err(err)?;
+        // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
+        if a.content.is_none() {
+            core::check_cid_content(
+                &self.pool,
+                self.ipfs_api_url.as_deref(),
+                &cid,
+                a.content_type.as_deref().unwrap_or("text/markdown"),
+                a.acknowledge_banned.unwrap_or(false),
+            )
+            .await
+            .map_err(err)?;
+        }
         core::create_document(
             &self.pool,
             &a.title,
@@ -1982,6 +1994,18 @@ impl Board {
         let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
             .await
             .map_err(err)?;
+        // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
+        if a.content.is_none() {
+            core::check_cid_content(
+                &self.pool,
+                self.ipfs_api_url.as_deref(),
+                &cid,
+                a.content_type.as_deref().unwrap_or("text/markdown"),
+                a.acknowledge_banned.unwrap_or(false),
+            )
+            .await
+            .map_err(err)?;
+        }
         core::publish_version(&self.pool, a.document_id, &cid, s(&a.summary), s(&a.created_by), s(&a.content_type), s(&a.content))
             .await
             .map_err(err)

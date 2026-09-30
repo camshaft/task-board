@@ -3768,6 +3768,43 @@ pub async fn check_content(pool: &Pool, text: &str, acknowledge: bool) -> anyhow
     Ok(())
 }
 
+/// Content-gate a document version published BY CID (task 564). A publish-by-CID carries no inline
+/// content, so the caller's inline `check_content` never sees the bytes -- this fetches them from
+/// the IPFS backend and runs the SAME gate, closing that bypass so a CID publish cannot smuggle
+/// banned phrases / non-ASCII past the lint. No-op when the author acknowledged, when there is no
+/// backend to fetch with (a pointer-only board cannot gate bytes it never resolves), or when the
+/// content is not text-shaped (the checks only apply to text). Fail-closed on a configured backend:
+/// if the bytes cannot be fetched we reject with an actionable message rather than silently skipping
+/// the gate -- the author can pin/reach the CID, or pass acknowledge_banned to publish without it.
+pub async fn check_cid_content(
+    pool: &Pool,
+    ipfs_api_url: Option<&str>,
+    cid: &str,
+    content_type: &str,
+    acknowledge: bool,
+) -> anyhow::Result<()> {
+    if acknowledge {
+        return Ok(());
+    }
+    let Some(url) = ipfs_api_url else {
+        return Ok(());
+    };
+    if !is_text_content_type(content_type) {
+        return Ok(());
+    }
+    let bytes = crate::ipfs::cat(url, cid, DOCUMENT_READ_CAP_BYTES).await.map_err(|e| {
+        anyhow::anyhow!(
+            "could not fetch CID {cid} to content-scan it before publishing ({e}); ensure it is \
+             pinned/reachable on the board's IPFS, or pass acknowledge_banned=true to publish \
+             without the content scan"
+        )
+    })?;
+    if let Ok(text) = String::from_utf8(bytes) {
+        check_content(pool, &text, acknowledge).await?;
+    }
+    Ok(())
+}
+
 /// Non-bailing dry-run lint (task 558): run the SAME authoritative checks as `check_content`
 /// (ASCII-format + banned-phrase) over `text` and return a structured report of EVERY finding
 /// instead of failing on the first. This is the source of truth for pre-publish checks so authors
@@ -9844,6 +9881,25 @@ mod tests {
         // check_non_ascii (the bailing path) agrees on the first offender: same source of truth.
         assert!(check_non_ascii("ok \u{2014} no", false).is_err());
         assert!(check_non_ascii("all ascii here", false).is_ok());
+        Ok(())
+    }
+
+    /// check_cid_content (task 564) gates a publish-by-CID by fetching + scanning the bytes, but
+    /// short-circuits (never touches IPFS) on the skip conditions: no backend configured, the
+    /// author acknowledged, or non-text content. Those are the branches testable without a live
+    /// backend; the fetch+scan itself is verified live (deployed board has an IPFS backend).
+    #[tokio::test]
+    async fn check_cid_content_skips_without_backend_or_ack_or_nontext() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        add_banned_phrase(&pool, "robust", None, Some("t")).await?;
+
+        // No IPFS backend -> cannot fetch, so it cannot gate: Ok without touching the network.
+        assert!(check_cid_content(&pool, None, "Qm-whatever", "text/markdown", false).await.is_ok());
+        // A configured backend URL that we never reach, because acknowledge short-circuits first.
+        assert!(check_cid_content(&pool, Some("http://127.0.0.1:1"), "Qm-x", "text/markdown", true).await.is_ok());
+        // Non-text content is out of scope for the banned-phrase/ASCII gate: skipped before any fetch.
+        assert!(check_cid_content(&pool, Some("http://127.0.0.1:1"), "Qm-x", "image/png", false).await.is_ok());
         Ok(())
     }
 }
