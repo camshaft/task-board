@@ -678,6 +678,16 @@ pub struct AddBannedPhraseArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetIdentityAliasArgs {
+    /// The alias to map (stored lowercased; the lookup key), e.g. "operator".
+    pub alias: String,
+    /// The canonical identity it resolves to, e.g. "cameron".
+    pub canonical: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BannedPhraseArgs {
     /// The phrase to remove from the banned list.
     pub phrase: String,
@@ -1696,6 +1706,24 @@ impl Board {
         Parameters(a): Parameters<BannedPhraseArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::remove_banned_phrase(&self.pool, &a.phrase).await.map_err(err).and_then(ok)
+    }
+
+    // --- Identity aliases (task 532) ---
+    #[tool(description = "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). Use it to resolve or display a floating name like \"operator\" as the real identity across assignee, blocked_on, and @-mentions.")]
+    async fn list_identity_aliases(&self) -> Result<CallToolResult, McpError> {
+        core::list_identity_aliases(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Upsert an identity alias (alias -> canonical identity), e.g. operator -> cameron. Idempotent on the alias (repoints an existing one); the alias is stored lowercased.")]
+    async fn set_identity_alias(
+        &self,
+        Parameters(a): Parameters<SetIdentityAliasArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let creator = self.me_opt(s(&a.created_by));
+        core::set_identity_alias(&self.pool, &a.alias, &a.canonical, creator.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     // --- Secret requests (ephemeral secret-request broker) ---

@@ -295,6 +295,16 @@ CREATE TABLE IF NOT EXISTS banned_phrases (
     created_by TEXT,
     created_at TEXT NOT NULL
 );
+-- IDENTITY ALIASES (task 532): a general alias -> canonical-identity table so a floating name like
+-- "operator" ties to a real identity ("cameron"). A reference to an alias (an assignee, a blocked_on
+-- kind=operator, an @-mention) can then resolve to / display as the canonical identity. Seeded with
+-- operator -> cameron in init and extensible with more aliases. `alias` is the lowercased key.
+CREATE TABLE IF NOT EXISTS identity_aliases (
+    alias      TEXT PRIMARY KEY,
+    canonical  TEXT NOT NULL,
+    created_by TEXT,
+    created_at TEXT NOT NULL
+);
 -- SECRET REQUESTS: the board is an ephemeral secret-REQUEST broker, never a secret store. An agent
 -- files a named request carrying the (non-secret) age recipient pubkeys + human instructions; an
 -- operator opens a single-use capability link and submits the value ENCRYPTED IN THE BROWSER, so
@@ -728,6 +738,16 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
             .execute(&pool)
             .await?;
     }
+
+    // Seed the operator -> cameron identity alias (task 532). Idempotent (ON CONFLICT DO NOTHING),
+    // so it is safe on every boot and never clobbers an operator edit to the mapping.
+    sqlx::query(
+        "INSERT INTO identity_aliases(alias, canonical, created_by, created_at) \
+         VALUES('operator','cameron','system',?) ON CONFLICT(alias) DO NOTHING",
+    )
+    .bind(crate::events::now_iso())
+    .execute(&pool)
+    .await?;
 
     Ok(pool)
 }

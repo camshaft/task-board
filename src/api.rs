@@ -170,6 +170,7 @@ pub fn router(state: AppState) -> Router {
         .route("/workspace-kinds/{name}", get(get_workspace_kind).delete(delete_workspace_kind))
         .route("/banned-phrases", get(list_banned_phrases).post(add_banned_phrase))
         .route("/banned-phrases/{phrase}", axum::routing::delete(remove_banned_phrase))
+        .route("/identity-aliases", get(list_identity_aliases).post(set_identity_alias))
         .route("/secret-requests", get(list_secret_requests).post(create_secret_request))
         .route("/secret-requests/{id}", get(get_secret_request))
         .route("/secret-requests/{id}/submit", post(submit_secret))
@@ -312,6 +313,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list (what the pre-submit content lint checks docs and comments against).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
     Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/identity-aliases", summary: "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). A small config table consumers/UI use to resolve or display a floating name as the canonical identity across assignee, blocked_on, and @-mentions.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/identity-aliases", summary: "Upsert an identity alias (alias -> canonical). Idempotent on the alias (repoints an existing one); alias is stored lowercased.", query: "", body: Some("SetIdentityAliasBody") },
     Endpoint { method: "GET", path: "/api/secret-requests", summary: "List secret requests (metadata only — never the ciphertext or tokens). The board is an ephemeral request broker, not a secret store.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/secret-requests", summary: "File a named secret request (carries the age recipient pubkeys + instructions). Returns a single-use submit_url the operator opens to submit the value encrypted in-browser, plus the fulfiller_token.", query: "", body: Some("CreateSecretRequestBody") },
     Endpoint { method: "GET", path: "/api/secret-requests/{id}", summary: "Fetch one secret request as metadata (name, instructions, recipients, status) — drives the submit page. Never returns ciphertext or tokens.", query: "", body: None },
@@ -402,6 +405,7 @@ fn body_schemas() -> Value {
         SetReviewStatusBody,
         SetReviewVettedBody,
         AppendReviewLogBody,
+        SetIdentityAliasBody,
     )
 }
 
@@ -1457,6 +1461,27 @@ async fn add_banned_phrase(State(st): State<AppState>, Json(b): Json<AddBannedPh
 
 async fn list_banned_phrases(State(st): State<AppState>) -> ApiResult {
     Ok(Json(core::list_banned_phrases(&st.pool).await?))
+}
+
+// --- Identity aliases (task 532) ---
+
+#[derive(Deserialize, JsonSchema)]
+struct SetIdentityAliasBody {
+    /// The alias to map (stored lowercased; the lookup key), e.g. "operator".
+    alias: String,
+    /// The canonical identity it resolves to, e.g. "cameron".
+    canonical: String,
+    created_by: Option<String>,
+}
+
+async fn list_identity_aliases(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_identity_aliases(&st.pool).await?))
+}
+
+async fn set_identity_alias(State(st): State<AppState>, Json(b): Json<SetIdentityAliasBody>) -> ApiResult {
+    Ok(Json(
+        core::set_identity_alias(&st.pool, &b.alias, &b.canonical, b.created_by.as_deref()).await?,
+    ))
 }
 
 async fn remove_banned_phrase(State(st): State<AppState>, Path(phrase): Path<String>) -> ApiResult {

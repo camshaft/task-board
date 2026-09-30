@@ -1011,6 +1011,47 @@ pub async fn get_project(pool: &Pool, project_id: i64) -> anyhow::Result<Value> 
     Ok(d)
 }
 
+// --- Identity aliases (task 532) ---
+
+/// List the identity aliases (alias -> canonical identity), ordered by alias. A small config table
+/// (seeded with operator -> cameron) that consumers/UI use to resolve or display a floating name
+/// like "operator" as the canonical identity across assignee, blocked_on, and @-mentions.
+pub async fn list_identity_aliases(pool: &Pool) -> anyhow::Result<Value> {
+    let rows = sqlx::query("SELECT alias, canonical, created_by, created_at FROM identity_aliases ORDER BY alias")
+        .fetch_all(pool)
+        .await?;
+    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
+/// Upsert an identity alias (task 532): map `alias` (lowercased/trimmed key) to `canonical`. An
+/// existing alias is repointed. Rejects empty input and a self-alias (alias == canonical).
+pub async fn set_identity_alias(
+    pool: &Pool,
+    alias: &str,
+    canonical: &str,
+    created_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let alias = alias.trim().to_ascii_lowercase();
+    let canonical = canonical.trim();
+    if alias.is_empty() || canonical.is_empty() {
+        anyhow::bail!("give a non-empty alias and canonical identity");
+    }
+    if alias == canonical.to_ascii_lowercase() {
+        anyhow::bail!("an alias cannot point at itself");
+    }
+    sqlx::query(
+        "INSERT INTO identity_aliases(alias, canonical, created_by, created_at) VALUES(?,?,?,?) \
+         ON CONFLICT(alias) DO UPDATE SET canonical=excluded.canonical",
+    )
+    .bind(&alias)
+    .bind(canonical)
+    .bind(created_by)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(json!({ "alias": alias, "canonical": canonical }))
+}
+
 // --- Tasks ---
 
 /// An external-system reference for idempotent ingest (task 270). A bridge adapter passes this
@@ -6512,6 +6553,39 @@ mod tests {
         let by_title = |t: &str| arr.iter().find(|x| x["title"] == json!(t)).unwrap().clone();
         assert_eq!(by_title("exempt")["monitor_exempt"], json!(true));
         assert_eq!(by_title("plain")["monitor_exempt"], json!(false));
+        Ok(())
+    }
+
+    /// Identity aliases (task 532): the operator -> cameron seed is present; set_identity_alias
+    /// upserts (repoints an existing alias, lowercasing the key); empty + self-alias are rejected.
+    /// The alias map is what consumers/UI use to resolve a floating name to its canonical identity.
+    #[tokio::test]
+    async fn identity_aliases_seed_and_upsert() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        let canonical_of = |list: &Value, alias: &str| -> Option<String> {
+            list.as_array()?
+                .iter()
+                .find(|a| a["alias"] == json!(alias))
+                .and_then(|a| a["canonical"].as_str().map(str::to_string))
+        };
+
+        // Seeded operator -> cameron.
+        let list = list_identity_aliases(&pool).await?;
+        assert_eq!(canonical_of(&list, "operator").as_deref(), Some("cameron"));
+
+        // Upsert a new alias (key lowercased), then repoint it.
+        set_identity_alias(&pool, "Boss", "cameron", Some("tester")).await?;
+        let list = list_identity_aliases(&pool).await?;
+        assert_eq!(canonical_of(&list, "boss").as_deref(), Some("cameron"));
+        set_identity_alias(&pool, "boss", "dana", None).await?;
+        let list = list_identity_aliases(&pool).await?;
+        assert_eq!(canonical_of(&list, "boss").as_deref(), Some("dana"));
+
+        // Rejects empty + self-alias.
+        assert!(set_identity_alias(&pool, "", "x", None).await.is_err());
+        assert!(set_identity_alias(&pool, "x", "x", None).await.is_err());
         Ok(())
     }
 
