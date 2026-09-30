@@ -296,11 +296,11 @@ pub struct UpdateTaskArgs {
     pub parent_id: Option<i64>,
     /// What this task is blocked on. REQUIRED when setting status=blocked — a blocked task must
     /// record what it is waiting on. Omit to leave unchanged; pass kind="none" to clear.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_blocked_on_lenient")]
     pub blocked_on: Option<BlockedOnArgs>,
     /// Return the full task (including the `description`) in the response. Default false — the
     /// response omits the description to keep a looping caller's context light; fetch it with get_task.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub verbose: Option<bool>,
 }
 
@@ -314,6 +314,115 @@ pub struct BlockedOnArgs {
     pub target: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+// String-tolerant `deserialize_with` helpers for MCP arg fields (task 351). Some MCP clients
+// JSON-stringify scalar/struct argument values, so a strict serde type rejects them ("expected a
+// boolean", "invalid type: string, expected i64", "expected struct BlockedOnArgs") and the agent
+// abandons the call. These accept EITHER the native JSON type OR its stringified form, so one helper
+// hardens a whole class of args (include_body: bool, comments_limit: i64, blocked_on: struct, ...)
+// against the stringification. The advertised JsonSchema is unchanged (still the native type), so a
+// well-behaved client is unaffected; this only widens what is accepted.
+
+/// Coerce a JSON value into a bool, tolerating a stringified form: a real bool, "true"/"false"/
+/// "yes"/"no"/"1"/"0" (case-insensitive), or a number (0 = false, else true). Returns a message on
+/// anything else, which each deserializer maps to its own error type.
+fn coerce_bool(v: &serde_json::Value) -> Result<bool, String> {
+    match v {
+        serde_json::Value::Bool(b) => Ok(*b),
+        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" => Ok(true),
+            "false" | "no" | "0" | "" => Ok(false),
+            other => Err(format!("expected a boolean (or \"true\"/\"false\"), got string {other:?}")),
+        },
+        serde_json::Value::Number(n) => Ok(n.as_i64().map(|x| x != 0).unwrap_or(true)),
+        other => Err(format!("expected a boolean, got {other}")),
+    }
+}
+
+/// A bool that a client may have stringified (see [`coerce_bool`]).
+fn de_bool_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    coerce_bool(&v).map_err(serde::de::Error::custom)
+}
+
+/// An `Option<bool>` variant of [`de_bool_lenient`]: null/absent -> None.
+fn de_opt_bool_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => coerce_bool(&v).map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// An `Option<i64>` where the client may have stringified the number: accepts null, an integer, or a
+/// string that parses to an i64 (empty string -> None).
+fn de_opt_i64_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("expected an integer")),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            t.parse::<i64>()
+                .map(Some)
+                .map_err(|_| serde::de::Error::custom(format!("expected an integer, got string {s:?}")))
+        }
+        Some(other) => Err(serde::de::Error::custom(format!("expected an integer, got {other}"))),
+    }
+}
+
+/// Parse a bare-string blocked_on into a [`BlockedOnArgs`] (task 351): "operator" -> {kind:operator};
+/// "task:123" / "agent:foo" (or space-separated) -> {kind, target}. The convenience form that lets
+/// an agent write blocked_on:"operator" instead of the nested object.
+fn parse_bare_blocked_on(s: &str) -> BlockedOnArgs {
+    let s = s.trim();
+    match s.split_once([':', ' ']) {
+        Some((k, t)) => {
+            let t = t.trim();
+            BlockedOnArgs {
+                kind: k.trim().to_string(),
+                target: if t.is_empty() { None } else { Some(t.to_string()) },
+                note: None,
+            }
+        }
+        None => BlockedOnArgs { kind: s.to_string(), target: None, note: None },
+    }
+}
+
+/// An `Option<BlockedOnArgs>` the client may have sent as: null, the object, a JSON-string that
+/// parses to the object, or a bare string kind ("operator", "task:123"). This is the task 351 fix:
+/// a board-native MCP client that stringifies blocked_on can now set it, so status=blocked is
+/// reachable and the task 506 park-as-blocked contract is satisfiable.
+fn de_opt_blocked_on_lenient<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<BlockedOnArgs>, D::Error> {
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            if t.starts_with('{') {
+                serde_json::from_str::<BlockedOnArgs>(t)
+                    .map(Some)
+                    .map_err(|e| serde::de::Error::custom(format!("blocked_on JSON string did not parse: {e}")))
+            } else {
+                Ok(Some(parse_bare_blocked_on(t)))
+            }
+        }
+        Some(v @ serde_json::Value::Object(_)) => serde_json::from_value::<BlockedOnArgs>(v)
+            .map(Some)
+            .map_err(|e| serde::de::Error::custom(format!("invalid blocked_on object: {e}"))),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected blocked_on as an object or a kind string (e.g. \"operator\"), got {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -331,7 +440,7 @@ pub struct GetTaskArgs {
     /// page in more history, or a negative number for the whole thread. The response always carries
     /// `comment_count` (total) and `comments_truncated`, so you know when there is more to fetch.
     /// Bounding this keeps a long, busy task from overflowing the read/context cap (#511).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub comments_limit: Option<i64>,
 }
 
@@ -346,20 +455,20 @@ pub struct ArchiveTaskArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListTasksArgs {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub project_id: Option<i64>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
     pub assignee: Option<String>,
     /// Only tasks with no assignee (assignee IS NULL). Takes precedence over `assignee`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub unassigned: Option<bool>,
     /// Only the direct children of this task (an epic's subtasks). Takes precedence over `top_level`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub parent_id: Option<i64>,
     /// Only top-level tasks (no parent) — epics + loose tasks, the default board view.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub top_level: Option<bool>,
     /// Free-text search over task title + description (case-insensitive substring). With no
     /// project_id it searches across every project.
@@ -379,7 +488,7 @@ pub struct ListTasksArgs {
     #[serde(default)]
     pub meta_value: Option<String>,
     /// Include archived tasks. Archived tasks are hidden by default; set true to list them too.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub include_archived: Option<bool>,
 }
 
@@ -814,7 +923,7 @@ pub struct GetDocumentArgs {
     /// approved doc gets the content in one call, whatever its own host can reach. Omit/false for
     /// metadata only. If the fetch fails (no backend, unreachable, non-text) the metadata still
     /// returns with `body: null` + a `body_error`. The doc stays CID-only at rest (fetched on read).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub include_body: bool,
 }
 
@@ -2181,6 +2290,44 @@ impl ServerHandler for Board {
 mod tests {
     use super::*;
     use rmcp::schemars::schema_for;
+    use serde_json::{from_value, json};
+
+    /// MCP arg fields tolerate a client that JSON-stringifies scalar/struct values (task 351):
+    /// include_body (bool), comments_limit (i64), the list_tasks scalar filters, and blocked_on
+    /// (struct) all accept either the native type or its stringified form, while the native form
+    /// still works.
+    #[test]
+    fn mcp_args_tolerate_stringified_scalars() {
+        // bool: "true"/"false" strings and the native bool.
+        assert!(from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": "true"})).unwrap().include_body);
+        assert!(!from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": "false"})).unwrap().include_body);
+        assert!(from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": true})).unwrap().include_body);
+        assert!(!from_value::<GetDocumentArgs>(json!({"document_id": 1})).unwrap().include_body);
+
+        // i64: stringified and native, plus absent -> None.
+        assert_eq!(from_value::<GetTaskArgs>(json!({"task_id": 1, "comments_limit": "5"})).unwrap().comments_limit, Some(5));
+        assert_eq!(from_value::<GetTaskArgs>(json!({"task_id": 1, "comments_limit": 5})).unwrap().comments_limit, Some(5));
+        assert_eq!(from_value::<GetTaskArgs>(json!({"task_id": 1})).unwrap().comments_limit, None);
+
+        // list_tasks scalar filters: stringified bool + i64.
+        let lt = from_value::<ListTasksArgs>(json!({"project_id": "28", "unassigned": "true", "top_level": "false"})).unwrap();
+        assert_eq!(lt.project_id, Some(28));
+        assert_eq!(lt.unassigned, Some(true));
+        assert_eq!(lt.top_level, Some(false));
+
+        // blocked_on: bare kind string, JSON-string of the object, native object, "kind:target", null.
+        let bare = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "operator"})).unwrap().blocked_on.unwrap();
+        assert_eq!(bare.kind, "operator");
+        assert!(bare.target.is_none());
+        let jstr = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "{\"kind\":\"operator\"}"})).unwrap().blocked_on.unwrap();
+        assert_eq!(jstr.kind, "operator");
+        let obj = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": {"kind": "agent", "target": "foo"}})).unwrap().blocked_on.unwrap();
+        assert_eq!((obj.kind.as_str(), obj.target.as_deref()), ("agent", Some("foo")));
+        let kt = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "task:123"})).unwrap().blocked_on.unwrap();
+        assert_eq!((kt.kind.as_str(), kt.target.as_deref()), ("task", Some("123")));
+        assert!(from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": null})).unwrap().blocked_on.is_none());
+        assert!(from_value::<UpdateTaskArgs>(json!({"task_id": 1})).unwrap().blocked_on.is_none());
+    }
 
     // The board advertises tools/list_changed so a client refetches its tool list after a
     // redeploy adds/changes a tool (see on_initialized).
