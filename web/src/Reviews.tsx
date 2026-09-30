@@ -2,7 +2,7 @@ import { type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import ReviewTrend from './ReviewTrend'
 import { useReviews } from './resources'
-import { relTime } from './ui'
+import { Identity, relTime } from './ui'
 
 // The reviews list + the shared review chrome (status chip, lifecycle order, per-source link)
 // reused by the single-review view. A review is a source-agnostic record over an artifact
@@ -106,9 +106,10 @@ export default function Reviews() {
                 {r.kind}
               </span>
               {r.assignee && (
-                <span className="hidden font-mono text-[11px] text-[var(--color-muted)] md:inline">
-                  {r.assignee}
-                </span>
+                <Identity
+                  id={r.assignee}
+                  className="hidden font-mono text-[11px] text-[var(--color-muted)] md:inline"
+                />
               )}
               <span className="text-[11px] text-[var(--color-muted)]">{relTime(r.updated_at)}</span>
             </li>

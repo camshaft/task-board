@@ -7,7 +7,15 @@ import {
   WikiLinkContext,
   type WikiResolver,
 } from './markdown'
-import { createProject, eventHref, useAgents, useEvents, useProjects, useWiki } from './resources'
+import {
+  createProject,
+  eventHref,
+  useAgents,
+  useEvents,
+  useIdentityAliases,
+  useProjects,
+  useWiki,
+} from './resources'
 import { type ThemePref, useTheme } from './theme'
 import { relTime } from './ui'
 
@@ -60,7 +68,14 @@ export default function Layout() {
   // @word stays plain text). Live-updates as agents register.
   const { data: agents = [] } = useAgents()
   const agentIds = useMemo(() => new Set(agents.map((a) => a.id)), [agents])
-  const resolveMention = useCallback<AgentResolver>((id) => agentIds.has(id), [agentIds])
+  // Identity aliases (task 532): a mention of an alias (@operator) links to its canonical identity
+  // (/agents/cameron). Curated data, so we link even if the canonical has no agent row yet.
+  const { data: aliases = [] } = useIdentityAliases()
+  const aliasMap = useMemo(() => new Map(aliases.map((a) => [a.alias, a.canonical])), [aliases])
+  const resolveMention = useCallback<AgentResolver>(
+    (id) => (agentIds.has(id) ? id : (aliasMap.get(id) ?? null)),
+    [agentIds, aliasMap],
+  )
   const [showArchived, setShowArchived] = useState(false)
   // The left sidebar is an off-canvas drawer on small screens (toggled from the header) and a
   // static column on lg+. Navigating from a drawer link closes it so the content is visible.

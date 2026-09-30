@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { api, type TaskStatus, type TaskSummary } from './api'
 import { useBoardContext } from './Layout'
 import { commentTask, updateTask, useProjects } from './resources'
-import { STATUS_LABEL, StatusChip, TASK_COLUMNS, relTime } from './ui'
+import { Identity, STATUS_LABEL, StatusChip, TASK_COLUMNS, relTime } from './ui'
 
 // Cross-project search + a personal "my tasks" view. Unlike the per-project Board, this queries
 // the WHOLE board (no project_id) so you can find or triage tasks anywhere — filtered by free
@@ -178,7 +178,10 @@ export default function Search() {
                 {projectName(t.project_id)}
               </span>
               {t.assignee && (
-                <span className="font-mono text-[11px] text-[var(--color-muted)]">{t.assignee}</span>
+                <Identity
+                  id={t.assignee}
+                  className="font-mono text-[11px] text-[var(--color-muted)]"
+                />
               )}
               <span className="text-[11px] text-[var(--color-muted)]">{relTime(t.updated_at)}</span>
               <select

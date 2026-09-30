@@ -26,8 +26,12 @@ export const WikiLinkContext = createContext<WikiResolver>(() => null)
 // Resolves whether an @mention names a known agent, so only real agents autolink and an unknown
 // @word stays plain text (no dead links). Provided app-wide from the live agents list; the
 // default resolves nothing, so mentions degrade to plain text outside the provider.
-export type AgentResolver = (id: string) => boolean
-export const AgentMentionContext = createContext<AgentResolver>(() => false)
+// Resolve an @mention id to the agent-page target to link to: the id itself for a known agent, an
+// alias's canonical identity for a known alias (task 532), or null when it names nothing linkable
+// (the mention then degrades to plain text). Returning the target — not just a boolean — lets an
+// alias mention (@operator) point at the canonical agent (/agents/cameron).
+export type AgentResolver = (id: string) => string | null
+export const AgentMentionContext = createContext<AgentResolver>(() => null)
 
 // Transclusion recursion state: how deep we are and which paths are already on the embed chain,
 // so ![[a]] → ![[b]] → ![[a]] (or an over-deep nest) stops with a placeholder instead of looping.
@@ -213,14 +217,24 @@ function inline(
       // leading word char / @ so emails (a@b.com) and @@ don't match. Agent ids may contain
       // hyphens (e.g. v-board-ui).
       /(?<![\w@])@([a-z0-9][\w-]*)/i,
-      (m) =>
-        mentions(m[1]) ? (
-          <Link key={gen()} to={`/agents/${m[1]}`} className={LINK_CLS}>
+      (m) => {
+        // The target is the agent id, or an alias's canonical (@operator -> cameron). Keep the
+        // literal typed text (@operator) but link to the canonical page, with a tooltip noting the
+        // alias so the resolution is discoverable.
+        const target = mentions(m[1])
+        return target ? (
+          <Link
+            key={gen()}
+            to={`/agents/${target}`}
+            title={target !== m[1] ? `alias: @${m[1]} -> ${target}` : undefined}
+            className={LINK_CLS}
+          >
             {m[0]}
           </Link>
         ) : (
           m[0]
-        ),
+        )
+      },
     ],
   ]
 

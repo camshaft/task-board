@@ -2,6 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { api } from './api'
 import type { AgentStatus, TaskStatus } from './api'
+import { useIdentityAliases } from './resources'
 
 export const TASK_COLUMNS: TaskStatus[] = [
   'todo',
@@ -85,6 +86,21 @@ export function AuthorLabel({
     )
   }
   return <span className="font-mono">{author ?? 'anon'}</span>
+}
+
+// Render an identity id, resolving a known alias to its canonical identity for DISPLAY (task 532).
+// Generic: any alias -> canonical (operator -> cameron today; extensible for the multi-operator
+// model). Shows the canonical, with a tooltip noting the alias so the original reference stays
+// discoverable. Stored data (assignee, etc.) is never rewritten — this is display-only.
+export function Identity({ id, className }: { id: string; className?: string }) {
+  const { data: aliases } = useIdentityAliases()
+  const hit = aliases?.find((a) => a.alias === id)
+  if (!hit) return <span className={className}>{id}</span>
+  return (
+    <span className={className} title={`alias: ${hit.alias} -> ${hit.canonical}`}>
+      {hit.canonical}
+    </span>
+  )
 }
 
 export function relTime(iso: string | null | undefined): string {

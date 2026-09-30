@@ -3,7 +3,7 @@ import { Link, Outlet, useParams } from 'react-router-dom'
 import { type TaskSummary } from './api'
 import { useBoardContext } from './Layout'
 import { createTask, updateProject, useProjects, useTasks } from './resources'
-import { PriorityDot, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
+import { Identity, PriorityDot, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // The kanban board for one project (from the :projectId route param). Renders its own
 // <Outlet/> so the task drawer (a nested route) layers over the board.
@@ -267,7 +267,7 @@ export default function Board() {
                               </span>
                             )}
                           </span>
-                          {t.assignee && <span className="font-mono">{t.assignee}</span>}
+                          {t.assignee && <Identity id={t.assignee} className="font-mono" />}
                         </div>
                       </Link>
                       {/* Epic: a roll-up badge + a toggle to reveal the (one level of) subtasks

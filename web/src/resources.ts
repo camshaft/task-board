@@ -13,6 +13,7 @@ import {
   type DocumentSummary,
   type EventRow,
   type ExternalIdentity,
+  type IdentityAlias,
   type Project,
   type Review,
   type ReviewTrend,
@@ -46,6 +47,7 @@ const keys = {
   channel: (id: number) => `channel:${id}`,
   channelPosts: (id: number) => `channelPosts:${id}`,
   externalIdentities: 'externalIdentities',
+  identityAliases: 'identityAliases',
   reviews: 'reviews',
   review: (id: number) => `review:${id}`,
   reviewTrend: 'reviewTrend',
@@ -93,6 +95,12 @@ export function useExternalIdentities() {
   return useResource<ExternalIdentity[]>(keys.externalIdentities, () =>
     api.listExternalIdentities(),
   )
+}
+
+// Identity aliases (task 532): the alias -> canonical map. Reference data that changes rarely;
+// resolved client-side for DISPLAY only (assignee labels, @-mentions) — stored data is untouched.
+export function useIdentityAliases() {
+  return useResource<IdentityAlias[]>(keys.identityAliases, () => api.listIdentityAliases())
 }
 
 // A resolver from an external identity id (e.g. "slack:U123") to its display name, falling back
