@@ -2319,20 +2319,33 @@ pub async fn get_channel_posts(
     pool: &Pool,
     channel_id: i64,
     since_seq: i64,
+    before_seq: Option<i64>,
     limit: i64,
+    desc: bool,
 ) -> anyhow::Result<Value> {
     // Only post events — a channel's event stream also carries channel.created / channel.invite
     // which aren't messages. DM channels post as message.direct, named ones as channel.post.
-    let rows = sqlx::query(
+    //
+    // Two read modes over the same window, mirroring get_events (#266):
+    // - ascending (desc=false, default): oldest-first — scrollback and incremental pollers
+    //   (advance `since_seq` to the max seq seen for the next page).
+    // - descending (desc=true): newest-first, so `since_seq=0, limit=N` yields the LATEST N posts
+    //   (a chat view; a plain ORDER BY seq LIMIT N returns the N OLDEST). For a "load earlier"
+    //   button, pass `before_seq` = the oldest seq you already have to get the N posts just older.
+    // `seq>since_seq` (lower bound) and `seq<before_seq` (optional upper bound) compose with either
+    // order.
+    let order = if desc { "DESC" } else { "ASC" };
+    let before_clause = if before_seq.is_some() { "AND seq<?" } else { "" };
+    let sql = format!(
         "SELECT seq, type, actor, channel_id, data, created_at FROM events \
-         WHERE channel_id=? AND seq>? AND type IN ('channel.post','message.direct') \
-         ORDER BY seq LIMIT ?",
-    )
-    .bind(channel_id)
-    .bind(since_seq)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+         WHERE channel_id=? AND seq>? {before_clause} AND type IN ('channel.post','message.direct') \
+         ORDER BY seq {order} LIMIT ?"
+    );
+    let mut q = sqlx::query(&sql).bind(channel_id).bind(since_seq);
+    if let Some(b) = before_seq {
+        q = q.bind(b);
+    }
+    let rows = q.bind(limit).fetch_all(pool).await?;
     let mut out = Vec::new();
     for r in &rows {
         let mut d = row_to_json(r);
@@ -5795,17 +5808,58 @@ mod tests {
         assert_eq!(bob["notifications"][0]["type"], json!("channel.post"));
 
         // A fresh joiner reads history from the backlog (inbox only holds post-join events).
-        let backlog = get_channel_posts(&pool, cid, 0, 100).await?;
+        let backlog = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         let posts = backlog.as_array().unwrap();
         assert_eq!(posts.len(), 1, "one post in history");
         assert_eq!(posts[0]["data"]["body"], json!("hello all"));
 
         // A threaded reply carries the parent seq.
         post_to_channel(&pool, cid, "bob", "hi alice", Some(post_seq), None).await?;
-        let backlog = get_channel_posts(&pool, cid, 0, 100).await?;
+        let backlog = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         let posts = backlog.as_array().unwrap();
         assert_eq!(posts.len(), 2);
         assert_eq!(posts[1]["data"]["reply_to"].as_i64(), Some(post_seq));
+        Ok(())
+    }
+
+    /// get_channel_posts read modes (task #315, mirroring get_events #266): ascending is oldest-
+    /// first (scrollback); desc is newest-first so since_seq=0 + a limit yields the LATEST N (a chat
+    /// view); before_seq pages earlier; and the seq bounds compose with either order.
+    #[tokio::test]
+    async fn get_channel_posts_desc_and_paging() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let c = create_channel(&pool, "log", None, Some("alice"), None).await?;
+        let cid = c["id"].as_i64().unwrap();
+        // Five posts, in order.
+        let mut seqs = Vec::new();
+        for i in 1..=5 {
+            let p = post_to_channel(&pool, cid, "alice", &format!("m{i}"), None, None).await?;
+            seqs.push(p["seq"].as_i64().unwrap());
+        }
+        let bodies = |v: &Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["data"]["body"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Ascending (default): oldest-first.
+        let asc = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
+        assert_eq!(bodies(&asc), vec!["m1", "m2", "m3", "m4", "m5"]);
+
+        // Descending latest-N: the 2 most recent, newest-first (a plain ASC LIMIT 2 would give m1,m2).
+        let latest2 = get_channel_posts(&pool, cid, 0, None, 2, true).await?;
+        assert_eq!(bodies(&latest2), vec!["m5", "m4"]);
+
+        // Load earlier: before_seq = the oldest seq shown (m4's), desc, limit 2 -> m3, m2.
+        let earlier = get_channel_posts(&pool, cid, 0, Some(seqs[3]), 2, true).await?;
+        assert_eq!(bodies(&earlier), vec!["m3", "m2"]);
+
+        // The since_seq lower bound still composes (asc): posts strictly after m2.
+        let after = get_channel_posts(&pool, cid, seqs[1], None, 100, false).await?;
+        assert_eq!(bodies(&after), vec!["m3", "m4", "m5"]);
         Ok(())
     }
 
@@ -5840,7 +5894,7 @@ mod tests {
         assert_eq!(alices[0]["private"], json!(true));
 
         // Full conversation is readable as a backlog on the shared channel.
-        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         assert_eq!(posts.as_array().unwrap().len(), 2);
         Ok(())
     }
@@ -5912,7 +5966,7 @@ mod tests {
         let c = create_channel(&pool, "general", None, Some("alice"), None).await?;
         let cid = c["id"].as_i64().unwrap();
         post_to_channel(&pool, cid, "alice", "first post", None, None).await?;
-        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         assert_eq!(posts.as_array().unwrap().len(), 1);
         assert_eq!(posts[0]["data"]["body"], json!("first post"));
         Ok(())
@@ -5961,7 +6015,7 @@ mod tests {
         let ch = create_channel(&pool, "bridge", None, Some("slack-bridge"), None).await?;
         let cid = ch["id"].as_i64().unwrap();
         post_to_channel(&pool, cid, "slack-bridge", "hello", None, Some("slack:U123")).await?;
-        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         assert_eq!(posts[0]["data"]["from"], json!("slack-bridge"));
         assert_eq!(posts[0]["data"]["external_author"], json!("slack:U123"));
         assert_eq!(
@@ -5972,7 +6026,7 @@ mod tests {
         // An identity with no registered display_name: external_author stays, name is absent
         // (consumers fall back to the id — never a fabricated name).
         post_to_channel(&pool, cid, "slack-bridge", "who am i", None, Some("slack:UNKNOWN")).await?;
-        let posts2 = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts2 = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         let last = posts2.as_array().unwrap().last().unwrap();
         assert_eq!(last["data"]["external_author"], json!("slack:UNKNOWN"));
         assert!(
@@ -6263,7 +6317,7 @@ mod tests {
         assert_eq!(comments[1]["body"], json!("second reply"));
 
         // Timestamp fidelity: the imported comment carries the original reply's created_at.
-        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         let r1_created = posts.as_array().unwrap().iter()
             .find(|p| p["seq"].as_i64() == Some(r1_seq)).unwrap()["created_at"].clone();
         assert_eq!(comments[0]["created_at"], r1_created, "reply timestamp preserved");
@@ -6351,11 +6405,11 @@ mod tests {
         assert_eq!(comments[0]["external_author"], json!("slack:U1"));
         assert_eq!(comments[0]["origin_ref"], json!(r1_seq.to_string()));
         // No echo: the mirrored comment did NOT create another thread post.
-        assert_eq!(get_channel_posts(&pool, cid, 0, 100).await?.as_array().unwrap().len(), 2, "root + r1 only");
+        assert_eq!(get_channel_posts(&pool, cid, 0, None, 100, false).await?.as_array().unwrap().len(), 2, "root + r1 only");
 
         // Direction 2: a new task comment -> a thread reply.
         comment_task(&pool, tid, "reply from board", Some("worker"), None, None).await?;
-        let posts = get_channel_posts(&pool, cid, 0, 100).await?;
+        let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         let posts = posts.as_array().unwrap();
         assert_eq!(posts.len(), 3, "root + r1 + the mirrored comment");
         let mirrored = posts.iter().find(|p| p["data"]["origin_comment"].is_i64()).unwrap();
@@ -6368,7 +6422,7 @@ mod tests {
         // Safety: a comment on a NON-linked task posts nothing to the channel.
         let solo = create_task(&pool, pid, "solo", None, None, None, Some("worker"), None, None, None).await?["id"].as_i64().unwrap();
         comment_task(&pool, solo, "unrelated", Some("worker"), None, None).await?;
-        assert_eq!(get_channel_posts(&pool, cid, 0, 100).await?.as_array().unwrap().len(), 3, "unlinked task doesn't post");
+        assert_eq!(get_channel_posts(&pool, cid, 0, None, 100, false).await?.as_array().unwrap().len(), 3, "unlinked task doesn't post");
         Ok(())
     }
 

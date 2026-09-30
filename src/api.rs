@@ -199,7 +199,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None },
     Endpoint { method: "POST", path: "/api/channels", summary: "Create (or get) a named channel.", query: "", body: Some("CreateChannelBody") },
     Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/channels/{channel_id}/posts", summary: "Read a channel's post history.", query: "since_seq=int&limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/channels/{channel_id}/posts", summary: "Read a channel's post history. order=desc returns the latest N (newest-first) for a chat view; default asc is oldest-first for scrollback. before_seq pages earlier.", query: "since_seq=int&limit=int&before_seq=int&order=asc|desc", body: None },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/posts", summary: "Post a message to a channel.", query: "", body: Some("PostToChannelBody") },
     Endpoint { method: "PATCH", path: "/api/channels/{channel_id}/props", summary: "Merge props into a channel's metadata (e.g. the outbound reflect-back policy).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/promote-thread", summary: "Promote a channel thread into a task (root→description, replies→comments); idempotent.", query: "", body: Some("PromoteThreadBody") },
@@ -963,6 +963,12 @@ struct ChannelPostsQuery {
     since_seq: i64,
     #[serde(default = "default_events_limit")]
     limit: i64,
+    /// Upper bound: only posts with `seq < before_seq`. For a "load earlier" page, pass the oldest
+    /// seq you already have (with `order=desc`) to get the N posts just before it.
+    before_seq: Option<i64>,
+    /// `asc` (default, oldest-first — scrollback / incremental pollers) or `desc` (newest-first, so
+    /// `since_seq=0&limit=N` returns the LATEST N posts — a chat view).
+    order: Option<String>,
 }
 
 async fn get_channel_posts(
@@ -970,8 +976,9 @@ async fn get_channel_posts(
     Path(channel_id): Path<i64>,
     Query(q): Query<ChannelPostsQuery>,
 ) -> ApiResult {
+    let desc = q.order.as_deref() == Some("desc");
     Ok(Json(
-        core::get_channel_posts(&st.pool, channel_id, q.since_seq, q.limit).await?,
+        core::get_channel_posts(&st.pool, channel_id, q.since_seq, q.before_seq, q.limit, desc).await?,
     ))
 }
 
