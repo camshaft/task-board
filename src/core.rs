@@ -2079,13 +2079,14 @@ pub async fn get_channel(pool: &Pool, channel_id: i64) -> anyhow::Result<Value> 
 /// parent post's event seq (one level only — a reply carries the parent seq in its data).
 /// The event type is `channel.post` for named channels and `message.direct` for DM channels,
 /// so DMs keep flowing through get_messages/the inbox exactly as before.
-pub async fn post_to_channel(
+pub async fn post_to_channel_meta(
     pool: &Pool,
     channel_id: i64,
     sender: &str,
     body: &str,
     reply_to: Option<i64>,
     external_author: Option<&str>,
+    metadata: Option<Value>,
 ) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
@@ -2117,6 +2118,12 @@ pub async fn post_to_channel(
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
     }
+    // Per-post metadata (#429): an arbitrary bag stored on the post (e.g. a bridge stamps a
+    // relayed message's {slack_ts, slack_channel, thread_ts}). Carried on the post event's data so
+    // it survives on the durable log and can be surfaced on reads + the outbound reflect.
+    if let Some(ref m) = metadata {
+        data["metadata"] = m.clone();
+    }
     let seq = emit(
         &mut tx,
         &mut hooks,
@@ -2142,8 +2149,29 @@ pub async fn post_to_channel(
             "author": sender,
             "body": body,
         });
+        if let Some(ref m) = metadata {
+            reflect["metadata"] = m.clone();
+        }
         if let Some(parent) = reply_to {
             reflect["reply_to"] = json!(parent);
+            // Stateless threading (#429): surface the reply parent's stored metadata (e.g. a Slack
+            // thread_ts) so a bridge can thread the reflected message with no {post_seq -> ts} map
+            // of its own. One-level parent lookup — a bridge stamps the thread ROOT id on every
+            // relayed post's metadata, so the immediate parent already carries the root.
+            if let Some(prow) = sqlx::query("SELECT data FROM events WHERE seq=?")
+                .bind(parent)
+                .fetch_optional(&mut *tx)
+                .await?
+            {
+                let pdata: Value = prow
+                    .try_get::<String, _>("data")
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .unwrap_or(Value::Null);
+                if let Some(pm) = pdata.get("metadata") {
+                    reflect["parent_metadata"] = pm.clone();
+                }
+            }
         }
         if let Some(ext) = external_author {
             reflect["external_author"] = json!(ext);
@@ -2178,6 +2206,19 @@ pub async fn post_to_channel(
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(json!({ "channel_id": channel_id, "seq": seq }))
+}
+
+/// Post to a channel with no per-post metadata (the common path). Thin wrapper over
+/// `post_to_channel_meta`.
+pub async fn post_to_channel(
+    pool: &Pool,
+    channel_id: i64,
+    sender: &str,
+    body: &str,
+    reply_to: Option<i64>,
+    external_author: Option<&str>,
+) -> anyhow::Result<Value> {
+    post_to_channel_meta(pool, channel_id, sender, body, reply_to, external_author, None).await
 }
 
 /// Outbound reflect-back policy (design #141 §5), read from a policy-bearing `metadata` bag —
@@ -7903,6 +7944,80 @@ mod tests {
         post_to_channel(&pool, pid, "concierge", "now out", None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(reflects(&ev, pid).len(), 1, "policy configurable after creation");
+        Ok(())
+    }
+
+    /// Stateless bridge threading (#429): per-post metadata is stored on the post and surfaced on
+    /// channel.outbound_reflect; a reply's reflect also carries the reply-parent's metadata as
+    /// `parent_metadata`, so a bridge threads without keeping its own {post_seq -> ts} map.
+    #[tokio::test]
+    async fn post_metadata_and_parent_metadata_on_reflect() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "frank", None, None, None, None, None).await?;
+        register_agent(&pool, "membrane-bridge", None, None, None, None, None).await?;
+
+        // A bridged channel where frank reflects OUT.
+        let ch = create_channel(
+            &pool,
+            "membrain-sync",
+            None,
+            Some("membrane-bridge"),
+            Some(json!({ "direction": "both", "outbound_authors": ["frank"] })),
+        )
+        .await?;
+        let cid = ch["id"].as_i64().unwrap();
+
+        // Inbound relay: the bridge posts a human's Slack message with its thread metadata. The
+        // bridge is not in outbound_authors, so this post does NOT reflect out.
+        let human = post_to_channel_meta(
+            &pool,
+            cid,
+            "membrane-bridge",
+            "hello from a human",
+            None,
+            Some("slack:U1"),
+            Some(json!({ "slack_ts": "1727.001", "slack_channel": "C0", "thread_ts": "1727.001" })),
+        )
+        .await?;
+        let human_seq = human["seq"].as_i64().unwrap();
+
+        // The metadata is stored on the post event (surfaced on reads).
+        let ev = get_events(&pool, 0, 500, None, false).await?;
+        let human_ev = ev.as_array().unwrap().iter().find(|e| e["seq"] == json!(human_seq)).unwrap();
+        assert_eq!(human_ev["data"]["metadata"]["thread_ts"], json!("1727.001"));
+
+        // Frank replies on the board -> reflects OUT, and the reflect carries parent_metadata (the
+        // human post's thread metadata) so the daemon threads statelessly.
+        post_to_channel(&pool, cid, "frank", "Frank's reply", Some(human_seq), None).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
+        let reflect = ev
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == json!("channel.outbound_reflect")
+                && e["data"]["channel_id"] == json!(cid)
+                && e["data"]["author"] == json!("frank"))
+            .expect("frank's reply reflects out");
+        assert_eq!(reflect["data"]["reply_to"], json!(human_seq));
+        assert_eq!(
+            reflect["data"]["parent_metadata"]["thread_ts"],
+            json!("1727.001"),
+            "reflect carries the parent's thread_ts for stateless threading: {reflect}"
+        );
+
+        // A top-level reflected post carries its OWN metadata and no parent_metadata.
+        post_to_channel_meta(&pool, cid, "frank", "top-level", None, None, Some(json!({ "k": "v" }))).await?;
+        let ev = get_events(&pool, 0, 500, None, false).await?;
+        let top = ev
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == json!("channel.outbound_reflect") && e["data"]["author"] == json!("frank"))
+            .next_back()
+            .unwrap();
+        assert_eq!(top["data"]["metadata"]["k"], json!("v"));
+        assert!(top["data"].get("parent_metadata").is_none(), "no parent_metadata without reply_to");
         Ok(())
     }
 
