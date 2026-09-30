@@ -19,6 +19,7 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use axum::response::{Html, IntoResponse};
+use listenfd::ListenFd;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -174,9 +175,25 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("serving web UI from {dir}");
     }
 
+    // Prefer a socket-activated listener: systemd passes the already-bound listening socket via
+    // LISTEN_FDS (see the task-board.socket unit). Because systemd owns that socket, it stays open
+    // across a service stop->start (e.g. a colmena redeploy), so mid-deploy connections queue in the
+    // kernel backlog and are served the instant the new process accepts — no connection-refused
+    // window, so no deploy-time 502 at whatever proxy sits in front. Fall back to binding the port
+    // ourselves when not socket-activated (dev / non-systemd runs), preserving existing behavior.
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("task-board listening on http://{addr}  (MCP: /mcp, API: /api)");
+    let listener = match ListenFd::from_env().take_tcp_listener(0)? {
+        Some(std_listener) => {
+            std_listener.set_nonblocking(true)?;
+            tracing::info!("task-board listening on socket-activated fd (LISTEN_FDS)  (MCP: /mcp, API: /api)");
+            tokio::net::TcpListener::from_std(std_listener)?
+        }
+        None => {
+            let l = tokio::net::TcpListener::bind(&addr).await?;
+            tracing::info!("task-board listening on http://{addr}  (MCP: /mcp, API: /api)");
+            l
+        }
+    };
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
