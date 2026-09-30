@@ -496,7 +496,11 @@ pub struct ListTasksArgs {
 pub struct CommentTaskArgs {
     pub task_id: i64,
     pub body: String,
-    #[serde(default)]
+    /// Who is commenting (your agent id). `agent_id`/`actor` are accepted as aliases, since those
+    /// are the identity field names other board tools use — so a call that passes agent_id (a common
+    /// habit) still records the author, and the self-notify "minus the actor" exclusion fires,
+    /// instead of silently storing a null author and echoing your own comment back to you (task 531).
+    #[serde(default, alias = "agent_id", alias = "actor")]
     pub author: Option<String>,
     /// Optional external identity id (e.g. "slack:U123") to attribute this comment to — for an
     /// ingested human. `author` stays the fleet agent (you) that performed the write.
@@ -981,7 +985,10 @@ pub struct CommentDocumentArgs {
     /// The version this comment is written against (anchors the region to immutable content).
     #[serde(default)]
     pub version_id: Option<i64>,
-    #[serde(default)]
+    /// Who is commenting (your agent id). `agent_id`/`actor` are accepted as aliases (the identity
+    /// field names other board tools use), so a call that passes agent_id still records the author
+    /// instead of storing null and defeating the self-notify exclusion (task 531).
+    #[serde(default, alias = "agent_id", alias = "actor")]
     pub author: Option<String>,
     /// Free-form JSON anchor (e.g. W3C/Hypothesis selectors). Stored verbatim; omit for a
     /// doc-level comment.
@@ -2355,6 +2362,28 @@ mod tests {
         assert_eq!((kt.kind.as_str(), kt.target.as_deref()), ("task", Some("123")));
         assert!(from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": null})).unwrap().blocked_on.is_none());
         assert!(from_value::<UpdateTaskArgs>(json!({"task_id": 1})).unwrap().blocked_on.is_none());
+    }
+
+    /// comment_task / comment_document accept the fleet-habit identity field (agent_id / actor) as an
+    /// alias for author, so a call that passes agent_id records the author instead of a null that
+    /// would defeat the self-notify "minus the actor" exclusion (task 531). Native author still works;
+    /// absent stays anonymous (None).
+    #[test]
+    fn comment_author_accepts_agent_id_and_actor_aliases() {
+        let via_agent_id =
+            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x", "agent_id": "v-task-board"})).unwrap();
+        assert_eq!(via_agent_id.author.as_deref(), Some("v-task-board"));
+        let via_actor =
+            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x", "actor": "v-task-board"})).unwrap();
+        assert_eq!(via_actor.author.as_deref(), Some("v-task-board"));
+        let native =
+            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x", "author": "alice"})).unwrap();
+        assert_eq!(native.author.as_deref(), Some("alice"));
+        assert!(from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x"})).unwrap().author.is_none());
+
+        let doc =
+            from_value::<CommentDocumentArgs>(json!({"document_id": 1, "body": "x", "agent_id": "v-task-board"})).unwrap();
+        assert_eq!(doc.author.as_deref(), Some("v-task-board"));
     }
 
     // The board advertises tools/list_changed so a client refetches its tool list after a
