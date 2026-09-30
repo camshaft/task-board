@@ -2779,6 +2779,21 @@ pub async fn send_message(
     Ok(json!({ "to": to_agent, "channel_id": cid, "delivered": true }))
 }
 
+/// Get (or create) the private 1:1 DM channel for a pair of agents, returning the channel with
+/// its members. Idempotent and order-independent: the same pair always resolves to the same
+/// channel (keyed on the sorted pair), created on first request. Lets a client open/link a DM
+/// before any message is sent — send_message reuses this exact channel. Silent: resolving the
+/// channel emits no event (a message.direct fires only when a post is actually sent).
+pub async fn get_or_create_dm(pool: &Pool, a: &str, b: &str) -> anyhow::Result<Value> {
+    if a == b {
+        anyhow::bail!("give two distinct agents for a DM");
+    }
+    let mut tx = pool.begin().await?;
+    let cid = dm_channel(&mut tx, a, b).await?;
+    tx.commit().await?;
+    get_channel(pool, cid).await
+}
+
 pub async fn get_messages(
     pool: &Pool,
     agent_id: &str,
@@ -8270,6 +8285,41 @@ mod tests {
 
         // Unknown agent -> error (surfaces as a 404 at the API).
         assert!(request_stand_down(&pool, "ghost", Some("x"), None).await.is_err());
+        Ok(())
+    }
+
+    /// get_or_create_dm resolves the same private 1:1 channel for a pair regardless of order,
+    /// creates it once (idempotent), lists both as members, and stays consistent with the channel
+    /// send_message uses. A self-DM is rejected.
+    #[tokio::test]
+    async fn get_or_create_dm_is_idempotent_and_order_independent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "alice", None, None, None, None, None).await?;
+        register_agent(&pool, "bob", None, None, None, None, None).await?;
+
+        let c1 = get_or_create_dm(&pool, "alice", "bob").await?;
+        let cid1 = c1["id"].as_i64().unwrap();
+        // Order-independent + idempotent: (bob, alice) resolves to the same channel.
+        let c2 = get_or_create_dm(&pool, "bob", "alice").await?;
+        assert_eq!(c2["id"].as_i64().unwrap(), cid1, "same DM channel either way");
+
+        // Both are members, and it's private.
+        let members: BTreeSet<String> = c1["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(members, ["alice", "bob"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(c1["private"], json!(true));
+
+        // send_message reuses the exact same channel (no duplicate DM).
+        let sent = send_message(&pool, "alice", "bob", "hi").await?;
+        assert_eq!(sent["channel_id"].as_i64().unwrap(), cid1);
+
+        // A self-DM is rejected (400 at the API).
+        assert!(get_or_create_dm(&pool, "alice", "alice").await.is_err());
         Ok(())
     }
 }

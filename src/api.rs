@@ -125,6 +125,7 @@ pub fn router(state: AppState) -> Router {
         .route("/channels/{channel_id}/promote-thread", post(promote_thread))
         .route("/channels/{channel_id}/invites", post(invite_to_channel))
         .route("/messages", post(send_message))
+        .route("/dms", post(open_dm))
         .route("/events", get(get_events))
         .route("/external-identities", get(list_external_identities).post(upsert_external_identity))
         .route("/external-links", get(list_external_links).post(upsert_external_link))
@@ -259,6 +260,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/promote-thread", summary: "Promote a channel thread into a task (root→description, replies→comments); idempotent.", query: "", body: Some("PromoteThreadBody") },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
     Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
+    Endpoint { method: "POST", path: "/api/dms", summary: "Get (or create) the private 1:1 DM channel for a pair of agents, returning the channel + members. Idempotent and order-independent — lets a client open/link a DM before any message is sent.", query: "", body: Some("OpenDmBody") },
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log (optionally filtered to one actor). order=desc returns the latest N (newest-first) for a live feed; default asc is oldest-first for incremental pollers.", query: "since_seq=int&limit=int&actor=str&order=asc|desc", body: None },
     Endpoint { method: "GET", path: "/api/external-identities", summary: "List external (bridged) identities, optionally filtered by source.", query: "source=str", body: None },
     Endpoint { method: "POST", path: "/api/external-identities", summary: "Register/update an external identity (a bridged human/actor, e.g. slack:U123).", query: "", body: Some("UpsertExternalIdentityBody") },
@@ -334,6 +336,7 @@ fn body_schemas() -> Value {
         PostToChannelBody,
         InviteChannelBody,
         SendMessageBody,
+        OpenDmBody,
         CreateDocumentBody,
         PublishVersionBody,
         SetDocumentPathBody,
@@ -1203,6 +1206,18 @@ async fn send_message(State(st): State<AppState>, Json(b): Json<SendMessageBody>
     Ok(Json(
         core::send_message(&st.pool, &b.from_agent, &b.to_agent, &b.body).await?,
     ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct OpenDmBody {
+    /// One side of the 1:1 DM.
+    agent_a: String,
+    /// The other side. Order doesn't matter — (a,b) resolves to the same channel as (b,a).
+    agent_b: String,
+}
+
+async fn open_dm(State(st): State<AppState>, Json(b): Json<OpenDmBody>) -> ApiResult {
+    Ok(Json(core::get_or_create_dm(&st.pool, &b.agent_a, &b.agent_b).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]

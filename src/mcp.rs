@@ -628,6 +628,15 @@ pub struct SendMessageArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OpenDmArgs {
+    /// The other agent in the 1:1 DM.
+    pub with_agent: String,
+    /// This side of the DM. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetMessagesArgs {
     /// Whose messages. Defaults to the agent this session registered as.
     #[serde(default)]
@@ -1587,6 +1596,18 @@ impl Board {
     ) -> Result<CallToolResult, McpError> {
         let from = self.me_req(a.from_agent.as_deref())?;
         core::send_message(&self.pool, &from, &a.to_agent, &a.body)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Get (or create) the private 1:1 DM channel with another agent, returning the channel and its members. Idempotent and order-independent — the same pair always resolves to the same channel, created on first call. Lets you open/link a DM before any message is sent; send_message reuses this same channel.")]
+    async fn open_dm(
+        &self,
+        Parameters(a): Parameters<OpenDmArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let me = self.me_req(a.agent_id.as_deref())?;
+        core::get_or_create_dm(&self.pool, &me, &a.with_agent)
             .await
             .map_err(err)
             .and_then(ok)
