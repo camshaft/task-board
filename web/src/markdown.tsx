@@ -23,6 +23,12 @@ import { api, ipfsUrl, type DocumentVersion } from './api'
 export type WikiResolver = (path: string) => { id: number; title: string } | null
 export const WikiLinkContext = createContext<WikiResolver>(() => null)
 
+// Resolves whether an @mention names a known agent, so only real agents autolink and an unknown
+// @word stays plain text (no dead links). Provided app-wide from the live agents list; the
+// default resolves nothing, so mentions degrade to plain text outside the provider.
+export type AgentResolver = (id: string) => boolean
+export const AgentMentionContext = createContext<AgentResolver>(() => false)
+
 // Transclusion recursion state: how deep we are and which paths are already on the embed chain,
 // so ![[a]] → ![[b]] → ![[a]] (or an over-deep nest) stops with a placeholder instead of looping.
 const MAX_EMBED_DEPTH = 4
@@ -42,7 +48,12 @@ const LINK_CLS = 'text-sky-400 underline decoration-dotted underline-offset-2 ho
 // elements. `gen` yields globally-unique keys; `resolve` maps a [[wiki-path]] to its document
 // (or null → dangling red-link). The earliest match across all patterns wins, so an explicit
 // [text](url) link (its `[` comes first) always beats the bare-URL autolinker on the same URL.
-function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNode[] {
+function inline(
+  text: string,
+  gen: () => number,
+  resolve: WikiResolver,
+  mentions: AgentResolver,
+): ReactNode[] {
   const patterns: [RegExp, (m: RegExpExecArray) => ReactNode][] = [
     [
       /`([^`]+)`/,
@@ -96,21 +107,21 @@ function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNo
         if (/^(https?:\/\/|mailto:)/i.test(href)) {
           return (
             <a key={gen()} href={href} target="_blank" rel="noreferrer" className={cls}>
-              {inline(m[1], gen, resolve)}
+              {inline(m[1], gen, resolve, mentions)}
             </a>
           )
         }
         if (href.startsWith('/') && !href.startsWith('//')) {
           return (
             <Link key={gen()} to={href} className={cls}>
-              {inline(m[1], gen, resolve)}
+              {inline(m[1], gen, resolve, mentions)}
             </Link>
           )
         }
         if (href.startsWith('#')) {
           return (
             <a key={gen()} href={href} className={cls}>
-              {inline(m[1], gen, resolve)}
+              {inline(m[1], gen, resolve, mentions)}
             </a>
           )
         }
@@ -118,10 +129,10 @@ function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNo
         return <span key={gen()}>{m[0]}</span>
       },
     ],
-    [/\*\*([^*]+)\*\*/, (m) => <strong key={gen()}>{inline(m[1], gen, resolve)}</strong>],
+    [/\*\*([^*]+)\*\*/, (m) => <strong key={gen()}>{inline(m[1], gen, resolve, mentions)}</strong>],
     [
       /\*([^*]+)\*|_([^_]+)_/,
-      (m) => <em key={gen()}>{inline(m[1] ?? m[2], gen, resolve)}</em>,
+      (m) => <em key={gen()}>{inline(m[1] ?? m[2], gen, resolve, mentions)}</em>,
     ],
     [
       // Bare URL autolink. Only http/https, so the resulting href is always a safe scheme (no
@@ -144,6 +155,21 @@ function inline(text: string, gen: () => number, resolve: WikiResolver): ReactNo
           {m[0]}
         </Link>
       ),
+    ],
+    [
+      // @agent mention → the agent's page, but ONLY when it names a known agent (per the app-wide
+      // resolver); an unknown @word stays plain text (no dead links). The lookbehind rejects a
+      // leading word char / @ so emails (a@b.com) and @@ don't match. Agent ids may contain
+      // hyphens (e.g. v-board-ui).
+      /(?<![\w@])@([a-z0-9][\w-]*)/i,
+      (m) =>
+        mentions(m[1]) ? (
+          <Link key={gen()} to={`/agents/${m[1]}`} className={LINK_CLS}>
+            {m[0]}
+          </Link>
+        ) : (
+          m[0]
+        ),
     ],
   ]
 
@@ -260,7 +286,12 @@ function isBlockStart(line: string): boolean {
   )
 }
 
-function blocks(src: string, resolve: WikiResolver, opts: BlockOpts): ReactNode[] {
+function blocks(
+  src: string,
+  resolve: WikiResolver,
+  mentions: AgentResolver,
+  opts: BlockOpts,
+): ReactNode[] {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const out: ReactNode[] = []
   let i = 0
@@ -321,7 +352,7 @@ function blocks(src: string, resolve: WikiResolver, opts: BlockOpts): ReactNode[
 
     const h = /^(#{1,6})\s+(.*)$/.exec(line)
     if (h) {
-      out.push(heading(h[1].length, inline(h[2], gen, resolve), k++, h[2], opts))
+      out.push(heading(h[1].length, inline(h[2], gen, resolve, mentions), k++, h[2], opts))
       i++
       continue
     }
@@ -343,7 +374,7 @@ function blocks(src: string, resolve: WikiResolver, opts: BlockOpts): ReactNode[
           key={k++}
           className="border-l-2 border-[var(--color-border)] pl-3 text-[var(--color-muted)]"
         >
-          {blocks(buf.join('\n'), resolve, opts)}
+          {blocks(buf.join('\n'), resolve, mentions, opts)}
         </blockquote>,
       )
       continue
@@ -358,7 +389,7 @@ function blocks(src: string, resolve: WikiResolver, opts: BlockOpts): ReactNode[
       out.push(
         <ul key={k++} className="list-disc space-y-0.5 pl-5">
           {items.map((it, j) => (
-            <li key={j}>{inline(it, gen, resolve)}</li>
+            <li key={j}>{inline(it, gen, resolve, mentions)}</li>
           ))}
         </ul>,
       )
@@ -374,7 +405,7 @@ function blocks(src: string, resolve: WikiResolver, opts: BlockOpts): ReactNode[
       out.push(
         <ol key={k++} className="list-decimal space-y-0.5 pl-5">
           {items.map((it, j) => (
-            <li key={j}>{inline(it, gen, resolve)}</li>
+            <li key={j}>{inline(it, gen, resolve, mentions)}</li>
           ))}
         </ol>,
       )
@@ -387,7 +418,7 @@ function blocks(src: string, resolve: WikiResolver, opts: BlockOpts): ReactNode[
       buf.push(lines[i])
       i++
     }
-    out.push(<p key={k++}>{inline(buf.join(' '), gen, resolve)}</p>)
+    out.push(<p key={k++}>{inline(buf.join(' '), gen, resolve, mentions)}</p>)
   }
   return out
 }
@@ -405,8 +436,11 @@ export function Markdown({
   anchors?: boolean
 }) {
   const resolve = useContext(WikiLinkContext)
+  const mentions = useContext(AgentMentionContext)
   const opts: BlockOpts = { anchors, slugs: new Map() }
-  return <div className={`space-y-2 ${className ?? ''}`}>{blocks(source, resolve, opts)}</div>
+  return (
+    <div className={`space-y-2 ${className ?? ''}`}>{blocks(source, resolve, mentions, opts)}</div>
+  )
 }
 
 // A Mermaid diagram, rendered client-side to SVG. mermaid.js is a heavy dep, so it's loaded

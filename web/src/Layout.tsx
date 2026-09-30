@@ -1,8 +1,13 @@
 import { useCallback, useMemo, useState } from 'react'
 import { Link, Outlet, useOutletContext, useParams } from 'react-router-dom'
 import { useLiveUpdates } from './live'
-import { WikiLinkContext, type WikiResolver } from './markdown'
-import { createProject, eventHref, useEvents, useProjects, useWiki } from './resources'
+import {
+  AgentMentionContext,
+  type AgentResolver,
+  WikiLinkContext,
+  type WikiResolver,
+} from './markdown'
+import { createProject, eventHref, useAgents, useEvents, useProjects, useWiki } from './resources'
 import { relTime } from './ui'
 
 // The only thing nested routes still need handed down is the current actor (per-user
@@ -46,6 +51,11 @@ export default function Layout() {
     return m
   }, [wikiDocs])
   const resolveWikiLink = useCallback<WikiResolver>((path) => wikiByPath.get(path) ?? null, [wikiByPath])
+  // Known agent ids, so @mentions in any rendered markdown link only to real agents (an unknown
+  // @word stays plain text). Live-updates as agents register.
+  const { data: agents = [] } = useAgents()
+  const agentIds = useMemo(() => new Set(agents.map((a) => a.id)), [agents])
+  const resolveMention = useCallback<AgentResolver>((id) => agentIds.has(id), [agentIds])
   const [showArchived, setShowArchived] = useState(false)
   // The left sidebar is an off-canvas drawer on small screens (toggled from the header) and a
   // static column on lg+. Navigating from a drawer link closes it so the content is visible.
@@ -224,7 +234,9 @@ export default function Layout() {
         {/* Whatever the URL points at: the board for a project, plus the task drawer. Wrapped so
             [[wiki-links]] in any markdown below resolve against the live wiki. */}
         <WikiLinkContext.Provider value={resolveWikiLink}>
-          <Outlet context={{ actor } satisfies BoardContext} />
+          <AgentMentionContext.Provider value={resolveMention}>
+            <Outlet context={{ actor } satisfies BoardContext} />
+          </AgentMentionContext.Provider>
         </WikiLinkContext.Provider>
 
         {/* Event feed */}
