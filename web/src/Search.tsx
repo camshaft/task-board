@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { api, type TaskStatus, type TaskSummary } from './api'
 import { useBoardContext } from './Layout'
 import { commentTask, updateTask, useProjects } from './resources'
@@ -16,12 +16,34 @@ export default function Search() {
   const projectName = (id?: number) =>
     projects.find((p) => p.id === id)?.name ?? (id != null ? `#${id}` : '')
 
-  const [q, setQ] = useState('')
-  const [assignee, setAssignee] = useState(actor)
-  const [status, setStatus] = useState<'' | TaskStatus>('')
+  // Filters are hydrated from the URL query so a filtered view is bookmarkable + shareable
+  // (task 524). A bare /search (no params) defaults to your own tasks (the my-tasks view); once
+  // ANY filter param is present the URL is authoritative — so `?status=blocked` with no assignee
+  // means "anyone blocked", and `?assignee=<you>&status=blocked` is the bookmarkable "blocked on me".
+  const [searchParams, setSearchParams] = useSearchParams()
+  const hadParams = ['q', 'assignee', 'status'].some((k) => searchParams.has(k))
+  const [q, setQ] = useState(() => searchParams.get('q') ?? '')
+  const [assignee, setAssignee] = useState(() =>
+    searchParams.has('assignee') ? (searchParams.get('assignee') ?? '') : hadParams ? '' : actor,
+  )
+  const [status, setStatus] = useState<'' | TaskStatus>(() => {
+    const s = searchParams.get('status')
+    return s && (TASK_COLUMNS as string[]).includes(s) ? (s as TaskStatus) : ''
+  })
   const [results, setResults] = useState<TaskSummary[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // Reflect the active filters into the URL query (omitting empties) so the view is a stable,
+  // bookmarkable link. Called when the user runs a search (submit / status change / a shortcut),
+  // not on every keystroke or on mount, so a bare /search stays bare until you act.
+  function syncUrl(vals: { q: string; assignee: string; status: '' | TaskStatus }) {
+    const next: Record<string, string> = {}
+    if (vals.q.trim()) next.q = vals.q.trim()
+    if (vals.assignee.trim()) next.assignee = vals.assignee.trim()
+    if (vals.status) next.status = vals.status
+    setSearchParams(next, { replace: true })
+  }
 
   async function run(override?: { q?: string; assignee?: string; status?: '' | TaskStatus }) {
     const qq = override?.q ?? q
@@ -78,6 +100,7 @@ export default function Search() {
           className="mt-2 flex flex-wrap items-center gap-2"
           onSubmit={(e) => {
             e.preventDefault()
+            syncUrl({ q, assignee, status })
             void run()
           }}
         >
@@ -95,7 +118,12 @@ export default function Search() {
           />
           <select
             value={status}
-            onChange={(e) => setStatus(e.target.value as '' | TaskStatus)}
+            onChange={(e) => {
+              const s = e.target.value as '' | TaskStatus
+              setStatus(s)
+              syncUrl({ q, assignee, status: s })
+              void run({ status: s })
+            }}
             className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
           >
             <option value="">any status</option>
@@ -117,6 +145,7 @@ export default function Search() {
               setQ('')
               setAssignee(actor)
               setStatus('blocked')
+              syncUrl({ q: '', assignee: actor, status: 'blocked' })
               void run({ q: '', assignee: actor, status: 'blocked' })
             }}
             className="rounded-md px-2 py-1 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
