@@ -102,6 +102,7 @@ pub fn router(state: AppState) -> Router {
         .route("/agents", get(list_agents).post(register_agent))
         .route("/agents/{agent_id}", get(get_agent).patch(update_agent))
         .route("/agents/{agent_id}/status", post(set_status))
+        .route("/agents/{agent_id}/request-stand-down", post(request_stand_down))
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/projects", get(list_projects).post(create_project))
@@ -228,6 +229,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry).", query: "", body: Some("UpdateAgentBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/request-stand-down", summary: "Request that an agent gracefully wind down: records the request (who/why/when, shown on the agent's page) and notifies the agent so it stands down on its own terms. A SIGNAL — never changes the agent's status and never kills a live agent. Cleared when the agent goes offline.", query: "", body: Some("RequestStandDownBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
@@ -318,6 +320,7 @@ fn body_schemas() -> Value {
         RegisterAgentBody,
         UpdateAgentBody,
         SetStatusBody,
+        RequestStandDownBody,
         CreateProjectBody,
         UpdateProjectBody,
         CreateTaskBody,
@@ -614,6 +617,25 @@ async fn set_status(
 ) -> ApiResult {
     Ok(Json(
         core::set_status(&st.pool, &agent_id, &b.status, b.status_message.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RequestStandDownBody {
+    /// Who is asking (for the audit event + the agent's page).
+    requested_by: Option<String>,
+    /// Optional reason shown to the agent.
+    reason: Option<String>,
+}
+
+async fn request_stand_down(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<RequestStandDownBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::request_stand_down(&st.pool, &agent_id, b.requested_by.as_deref(), b.reason.as_deref())
+            .await?,
     ))
 }
 

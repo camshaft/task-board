@@ -360,12 +360,21 @@ pub async fn set_status(
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
+    // Going offline honors any pending spin-down request, so clear it (the request's lifecycle end).
+    // Any other status leaves a pending request in place — it stands, visibly, until honored.
+    let clear_stand_down = status == "offline";
     let n = sqlx::query(
-        "UPDATE agents SET status=?, status_message=COALESCE(?,status_message), last_seen=? WHERE id=?",
+        "UPDATE agents SET status=?, status_message=COALESCE(?,status_message), last_seen=?, \
+         stand_down_requested_at=CASE WHEN ? THEN NULL ELSE stand_down_requested_at END, \
+         stand_down_requested_by=CASE WHEN ? THEN NULL ELSE stand_down_requested_by END, \
+         stand_down_reason=CASE WHEN ? THEN NULL ELSE stand_down_reason END WHERE id=?",
     )
     .bind(status)
     .bind(status_message)
     .bind(&ts)
+    .bind(clear_stand_down)
+    .bind(clear_stand_down)
+    .bind(clear_stand_down)
     .bind(agent_id)
     .execute(&mut *tx)
     .await?
@@ -408,6 +417,62 @@ pub async fn get_agent(pool: &Pool, agent_id: &str) -> anyhow::Result<Value> {
         Some(r) => Ok(agent_json(&r)),
         None => anyhow::bail!("no agent {agent_id}"),
     }
+}
+
+/// File a graceful spin-down request for an agent: record who asked + why + when, and drop an
+/// `agent.stand_down_requested` event into the target's inbox (plus a live-tunnel wake) so the
+/// agent observes it on its next loop tick and winds down on its own terms (status->offline, end
+/// its loop). This is a SIGNAL, never an action: it does NOT change the agent's status and NEVER
+/// kills or reaps a live agent mid-work (the live-watchdog ban). The request stays visible until
+/// the agent honors it by going offline (set_status clears it then). Re-requesting refreshes the
+/// stamp/reason. Board-native equivalent of the concierge/operator graceful stand-down path.
+pub async fn request_stand_down(
+    pool: &Pool,
+    agent_id: &str,
+    requested_by: Option<&str>,
+    reason: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let n = sqlx::query(
+        "UPDATE agents SET stand_down_requested_at=?, stand_down_requested_by=?, stand_down_reason=? WHERE id=?",
+    )
+    .bind(&ts)
+    .bind(requested_by)
+    .bind(reason)
+    .bind(agent_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        anyhow::bail!("no agent {agent_id}");
+    }
+    // Deliver to the target so it observes the request in its loop (check_notifications). The
+    // firehose union in emit also lets a coordinator/UI-watcher see stand-down requests.
+    let mut recips = BTreeSet::new();
+    recips.insert(agent_id.to_string());
+    emit(
+        &mut tx,
+        &mut hooks,
+        "agent.stand_down_requested",
+        requested_by,
+        None,
+        None,
+        None,
+        None,
+        json!({ "agent_id": agent_id, "requested_by": requested_by, "reason": reason }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let row = sqlx::query("SELECT * FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let out = agent_json(&row);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
 }
 
 // --- Projects ---
@@ -8167,6 +8232,44 @@ mod tests {
 
         let all = list_reviews(&pool, None, None, None).await?;
         assert_eq!(all["reviews"].as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// A spin-down request is a signal, not an action: it records who/why, drops an
+    /// agent.stand_down_requested into the target's inbox, does NOT change the agent's status, and
+    /// clears when the agent honors it by going offline. Requesting for an unknown agent errors.
+    #[tokio::test]
+    async fn request_stand_down_signals_without_killing() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        set_status(&pool, "worker", "online", None).await?;
+
+        let a = request_stand_down(&pool, "worker", Some("concierge"), Some("rebalancing the fleet")).await?;
+        // Recorded, but status is untouched (never a kill / forced offline).
+        assert_eq!(a["status"], json!("online"), "status must not change");
+        assert_eq!(a["stand_down_requested_by"], json!("concierge"));
+        assert_eq!(a["stand_down_reason"], json!("rebalancing the fleet"));
+        assert!(a["stand_down_requested_at"].is_string());
+
+        // The target observes it in its inbox.
+        let inbox = check_notifications(&pool, "worker", true, 50, None).await?;
+        let has_signal = inbox["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["type"] == json!("agent.stand_down_requested"));
+        assert!(has_signal, "target must receive the signal: {inbox}");
+
+        // Honoring it by going offline clears the request.
+        let off = set_status(&pool, "worker", "offline", None).await?;
+        assert_eq!(off["status"], json!("offline"));
+        assert!(off["stand_down_requested_at"].is_null(), "cleared on offline");
+        assert!(off["stand_down_requested_by"].is_null());
+        assert!(off["stand_down_reason"].is_null());
+
+        // Unknown agent -> error (surfaces as a 404 at the API).
+        assert!(request_stand_down(&pool, "ghost", Some("x"), None).await.is_err());
         Ok(())
     }
 }
