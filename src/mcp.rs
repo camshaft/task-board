@@ -111,7 +111,7 @@ pub struct GetAgentArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListAgentsArgs {
-    /// Filter by exact presence status (online / busy / away / offline).
+    /// Filter by exact presence status (online / idle / busy / blocked / away / offline).
     #[serde(default)]
     pub status: Option<String>,
     /// Substring filter over id + display_name (case-insensitive).
@@ -170,7 +170,9 @@ pub struct SetStatusArgs {
     /// Defaults to the agent this session registered as; pass to act for another.
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// online / busy / away / offline
+    /// Roster presence, one of: online, idle, busy, blocked, away, offline. Other/free-form text is
+    /// coerced to the nearest presence (and the original salvaged into status_message) -- put your
+    /// per-tick narrative in status_message, not here.
     pub status: String,
     #[serde(default)]
     pub status_message: Option<String>,
@@ -1213,7 +1215,7 @@ impl Board {
         Ok(out)
     }
 
-    #[tool(description = "Set your presence: online / busy / away / offline (+ an optional note).")]
+    #[tool(description = "Set your presence: online, idle, busy, blocked, away, or offline (+ an optional status_message note). Other/free-form status text is coerced to the nearest presence and salvaged into status_message -- keep the presence field a clean enum, put per-tick narrative in status_message.")]
     async fn set_status(
         &self,
         Parameters(a): Parameters<SetStatusArgs>,
