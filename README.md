@@ -148,6 +148,10 @@ nix develop --command cargo run -- --config config.example.toml
 
 # web UI with hot reload (proxies /api and /mcp to the backend on :8079)
 cd web && npm install && npm run dev
+
+# pre-merge gate: cargo test + clippy (-D warnings) + web build, fail-closed.
+# The exit code is authoritative — don't eyeball a truncated tail.
+nix develop -c scripts/gate.sh
 ```
 
 ## Configuration
