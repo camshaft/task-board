@@ -128,6 +128,10 @@ pub struct UpdateAgentArgs {
     /// MERGED into the agent's registry bag, not replaced.
     #[serde(default)]
     pub metadata: Option<JsonObject>,
+    /// Return the full agent (including the `charter`) in the response. Default false — the response
+    /// omits the charter to keep a looping caller's context light; fetch it with get_agent.
+    #[serde(default)]
+    pub verbose: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -263,6 +267,10 @@ pub struct UpdateTaskArgs {
     /// record what it is waiting on. Omit to leave unchanged; pass kind="none" to clear.
     #[serde(default)]
     pub blocked_on: Option<BlockedOnArgs>,
+    /// Return the full task (including the `description`) in the response. Default false — the
+    /// response omits the description to keep a looping caller's context light; fetch it with get_task.
+    #[serde(default)]
+    pub verbose: Option<bool>,
 }
 
 /// What a blocked task is waiting on: kind is task | agent | operator (or "none" to clear),
@@ -1001,8 +1009,11 @@ impl Board {
         Parameters(a): Parameters<SetStatusArgs>,
     ) -> Result<CallToolResult, McpError> {
         let me = self.me_req(a.agent_id.as_deref())?;
+        // Return only presence fields, not the full agent — a looping caller re-ingests this on
+        // every tick and never needs its own charter echoed back (task #416).
         core::set_status(&self.pool, &me, &a.status, s(&a.status_message))
             .await
+            .map(core::presence_projection)
             .map_err(err)
             .and_then(ok)
     }
@@ -1033,12 +1044,13 @@ impl Board {
     }
 
     #[tool(
-        description = "Update an existing agent's fields + metadata WITHOUT re-registering (this is the registry-write path: the board agent list serves as the fleet registry). Pass only the fields you're changing. `metadata` is MERGED into the existing bag, not replaced. Unlike register_agent this does not force status online and fails if the agent doesn't exist."
+        description = "Update an existing agent's fields + metadata WITHOUT re-registering (this is the registry-write path: the board agent list serves as the fleet registry). Pass only the fields you're changing. `metadata` is MERGED into the existing bag, not replaced. Unlike register_agent this does not force status online and fails if the agent doesn't exist. The response omits the (potentially large) `charter` unless you pass verbose:true; fetch the full agent with get_agent."
     )]
     async fn update_agent(
         &self,
         Parameters(a): Parameters<UpdateAgentArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let verbose = a.verbose.unwrap_or(false);
         core::update_agent(
             &self.pool,
             &a.agent_id,
@@ -1051,6 +1063,7 @@ impl Board {
             a.metadata.map(Value::Object),
         )
         .await
+        .map(|v| if verbose { v } else { core::strip_field(v, "charter") })
         .map_err(err)
         .and_then(ok)
     }
@@ -1140,7 +1153,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. To CLEAR the owner (unassign), set `unassign: true` — this emits task.unassigned. (Prefer `unassign: true` over an empty-string `assignee`: the server treats `assignee=\"\"` as unassign too, but some clients can't serialize an empty string and produce malformed JSON.) Setting a non-empty `assignee` reassigns and emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent. When you set status=blocked you MUST pass `blocked_on` (kind: task, agent, or operator) recording what it waits on — kind=agent notifies that agent they are blocking; blocked_on auto-clears when the task leaves the blocked state."
+        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. To CLEAR the owner (unassign), set `unassign: true` — this emits task.unassigned. (Prefer `unassign: true` over an empty-string `assignee`: the server treats `assignee=\"\"` as unassign too, but some clients can't serialize an empty string and produce malformed JSON.) Setting a non-empty `assignee` reassigns and emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent. When you set status=blocked you MUST pass `blocked_on` (kind: task, agent, or operator) recording what it waits on — kind=agent notifies that agent they are blocking; blocked_on auto-clears when the task leaves the blocked state. The response omits the (potentially large) `description` unless you pass verbose:true; fetch the full task with get_task."
     )]
     async fn update_task(
         &self,
@@ -1161,6 +1174,7 @@ impl Board {
                 serde_json::json!({ "kind": bo.kind, "target": bo.target, "note": bo.note })
             }
         });
+        let verbose = a.verbose.unwrap_or(false);
         core::update_task(
             &self.pool,
             a.task_id,
@@ -1175,6 +1189,8 @@ impl Board {
             blocked_on,
         )
         .await
+        // The response omits the (potentially large) `description` unless verbose:true (task #416).
+        .map(|v| if verbose { v } else { core::strip_field(v, "description") })
         .map_err(err)
         .and_then(ok)
     }
