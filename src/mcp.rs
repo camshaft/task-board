@@ -278,6 +278,15 @@ pub struct GetTaskArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArchiveTaskArgs {
+    pub task_id: i64,
+    /// The agent performing the archive/restore (for the event actor). Defaults to the
+    /// agent this session registered as.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListTasksArgs {
     #[serde(default)]
     pub project_id: Option<i64>,
@@ -311,6 +320,9 @@ pub struct ListTasksArgs {
     /// The value `meta_key` must equal (matched against `json_extract(metadata, '$.'||key)`).
     #[serde(default)]
     pub meta_value: Option<String>,
+    /// Include archived tasks. Archived tasks are hidden by default; set true to list them too.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1033,12 +1045,36 @@ impl Board {
         core::get_task(&self.pool, a.task_id).await.map_err(err).and_then(ok)
     }
 
-    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, or blocked_on_ref=<agent> for what is blocked on that agent.")]
+    #[tool(description = "Soft-archive a task: it's hidden from list_tasks by default (still visible with include_archived: true), but its comments, subscribers, links, and history are preserved and it still resolves by id. Archiving is orthogonal to status — an archived task keeps whatever status it had. Reversible with restore_task. Use to retire settled or superseded tasks from the active board. Notifies the task's subscribers.")]
+    async fn archive_task(
+        &self,
+        Parameters(a): Parameters<ArchiveTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::set_task_archived(&self.pool, a.task_id, true, actor.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Restore a previously archived task (clears the archive stamp so it reappears in the default list_tasks view). Notifies the task's subscribers.")]
+    async fn restore_task(
+        &self,
+        Parameters(a): Parameters<ArchiveTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::set_task_archived(&self.pool, a.task_id, false, actor.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, or blocked_on_ref=<agent> for what is blocked on that agent. Archived tasks are hidden by default; pass `include_archived: true` to list them too.")]
     async fn list_tasks(
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false), s(&a.q), s(&a.blocked_on_kind), s(&a.blocked_on_ref), s(&a.meta_key), s(&a.meta_value))
+        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false), s(&a.q), s(&a.blocked_on_kind), s(&a.blocked_on_ref), s(&a.meta_key), s(&a.meta_value), a.include_archived.unwrap_or(false))
             .await
             .map_err(err)
             .and_then(ok)
@@ -1774,7 +1810,7 @@ mod tests {
                 .as_i64()
                 .unwrap()
         };
-        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None).await?;
+        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
         let got = core::get_task(&pool, find(&tasks, "T")).await?;
         assert_eq!(got["created_by"], serde_json::json!("agent:x"));
 
@@ -1785,7 +1821,7 @@ mod tests {
             )?))
             .await
             .map_err(mkfail)?;
-        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None).await?;
+        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
         let got2 = core::get_task(&pool, find(&tasks, "T2")).await?;
         assert_eq!(got2["created_by"], serde_json::json!("other"));
 

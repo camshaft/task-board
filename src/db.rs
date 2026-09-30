@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     blocked_on_kind TEXT,
     blocked_on_ref  TEXT,
     blocked_on_note TEXT,
+    -- Soft-archive stamp (mirrors documents.archived_at): a retired task drops out of list_tasks
+    -- by default but stays queryable. Orthogonal to status; NULL = not archived.
+    archived_at TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -393,6 +396,11 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     }
     if !tasks_has("blocked_on_note") {
         sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_note TEXT").execute(&pool).await?;
+    }
+    // Back-fill tasks.archived_at (soft-archive, mirroring documents.archived_at): a retired task
+    // stays queryable but drops out of list_tasks by default. Orthogonal to status; nullable.
+    if !tasks_has("archived_at") {
+        sqlx::query("ALTER TABLE tasks ADD COLUMN archived_at TEXT").execute(&pool).await?;
     }
 
     // Back-fill tasks.parent_id (added when tasks gained nesting/epics). Nullable, self-

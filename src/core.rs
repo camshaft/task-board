@@ -1201,6 +1201,54 @@ pub async fn move_task(
     Ok(out)
 }
 
+/// Soft-archive (retire) a task, or restore it. Archiving stamps `archived_at` so the task drops
+/// out of list_tasks by default (pass include_archived to see it), but keeps its comments, links,
+/// and event history intact — reversible, never a destructive delete. Orthogonal to status (a done
+/// task stays done AND archived). Emits task.archived / task.restored to the task's subscribers.
+/// Idempotent (re-archiving refreshes the stamp). Returns the updated task.
+pub async fn set_task_archived(
+    pool: &Pool,
+    task_id: i64,
+    archived: bool,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    if sqlx::query("SELECT 1 FROM tasks WHERE id=?")
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no task {task_id}");
+    }
+    let stamp = archived.then(|| ts.clone());
+    sqlx::query("UPDATE tasks SET archived_at=?, updated_at=? WHERE id=?")
+        .bind(stamp.as_deref())
+        .bind(&ts)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    let event_type = if archived { "task.archived" } else { "task.restored" };
+    emit(
+        &mut tx,
+        &mut hooks,
+        event_type,
+        actor,
+        Some(task_id),
+        None,
+        None,
+        None,
+        json!({ "archived": archived }),
+        Recipients::FromTask,
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    get_task(pool, task_id).await
+}
+
 pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
     let t = sqlx::query("SELECT * FROM tasks WHERE id=?")
         .bind(task_id)
@@ -1316,12 +1364,18 @@ pub async fn list_tasks(
     blocked_on_ref: Option<&str>,
     meta_key: Option<&str>,
     meta_value: Option<&str>,
+    include_archived: bool,
 ) -> anyhow::Result<Value> {
     let mut q = String::from(
         "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at, \
          blocked_on_kind, blocked_on_ref FROM tasks",
     );
     let mut conds: Vec<&str> = Vec::new();
+    // Soft-archived tasks are hidden by default (like list_documents); include_archived shows them.
+    // Binds no value, so it can sit anywhere in conds without disturbing the bind order below.
+    if !include_archived {
+        conds.push("archived_at IS NULL");
+    }
     if project_id.is_some() {
         conds.push("project_id=?");
     }
@@ -5272,9 +5326,9 @@ mod tests {
         assert_eq!(c["parent_title"], json!("Epic"));
 
         // list_tasks top_level -> only the epic; parent_id -> the two children.
-        assert_eq!(ids(&list_tasks(&pool, Some(pid), None, None, false, None, true, None, None, None, None, None).await?), vec![eid]);
+        assert_eq!(ids(&list_tasks(&pool, Some(pid), None, None, false, None, true, None, None, None, None, None, false).await?), vec![eid]);
         assert_eq!(
-            ids(&list_tasks(&pool, Some(pid), None, None, false, Some(eid), false, None, None, None, None, None).await?),
+            ids(&list_tasks(&pool, Some(pid), None, None, false, Some(eid), false, None, None, None, None, None, false).await?),
             vec![c1id, c2id]
         );
 
@@ -5320,26 +5374,26 @@ mod tests {
 
         // "widget" across ALL projects (case-insensitive) -> the two widget tasks, not the chore.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("widget"), None, None, None, None).await?),
+            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("widget"), None, None, None, None, false).await?),
             vec!["Fix the widget pipeline".to_string(), "Widget docs".to_string()]
         );
         // Matches description too.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("reflow"), None, None, None, None).await?),
+            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("reflow"), None, None, None, None, false).await?),
             vec!["Fix the widget pipeline".to_string()]
         );
         // Composable with assignee: widget + alice -> only the Beta doc task.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, Some("alice"), false, None, false, Some("widget"), None, None, None, None).await?),
+            titles(&list_tasks(&pool, None, None, Some("alice"), false, None, false, Some("widget"), None, None, None, None, false).await?),
             vec!["Widget docs".to_string()]
         );
         // Composable with project scope: widget in Alpha -> only the pipeline task.
         assert_eq!(
-            titles(&list_tasks(&pool, Some(pid1), None, None, false, None, false, Some("widget"), None, None, None, None).await?),
+            titles(&list_tasks(&pool, Some(pid1), None, None, false, None, false, Some("widget"), None, None, None, None, false).await?),
             vec!["Fix the widget pipeline".to_string()]
         );
         // No match -> empty.
-        assert!(list_tasks(&pool, None, None, None, false, None, false, Some("zzznope"), None, None, None, None)
+        assert!(list_tasks(&pool, None, None, None, false, None, false, Some("zzznope"), None, None, None, None, false)
             .await?
             .as_array()
             .unwrap()
@@ -5529,7 +5583,7 @@ mod tests {
         assert_eq!(arr[0]["id"], json!(1));
 
         // The task moved onto the surviving project.
-        let tasks = list_tasks(&pool, Some(1), None, None, false, None, false, None, None, None, None, None).await?;
+        let tasks = list_tasks(&pool, Some(1), None, None, false, None, false, None, None, None, None, None, false).await?;
         assert_eq!(tasks.as_array().unwrap().len(), 1);
 
         // Subscriptions: alice (deduped to one), bob (repointed) both on project 1.
@@ -5615,8 +5669,8 @@ mod tests {
         let moved = move_task(&pool, tid, bid, Some("u")).await?;
         assert_eq!(moved["project_id"], json!(bid));
         // It now lists under B, not A.
-        assert_eq!(list_tasks(&pool, Some(aid), None, None, false, None, false, None, None, None, None, None).await?.as_array().unwrap().len(), 0);
-        assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false, None, None, None, None, None).await?.as_array().unwrap().len(), 1);
+        assert_eq!(list_tasks(&pool, Some(aid), None, None, false, None, false, None, None, None, None, None, false).await?.as_array().unwrap().len(), 0);
+        assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false, None, None, None, None, None, false).await?.as_array().unwrap().len(), 1);
 
         // A task.moved event was recorded carrying both ends.
         let events = get_events(&pool, 0, 100, None, false).await?;
@@ -5649,27 +5703,27 @@ mod tests {
         create_task(&pool, pid, "free", None, None, None, Some("u"), None, None, None).await?;
 
         // unassigned=true -> only the ownerless task.
-        let un = list_tasks(&pool, Some(pid), None, None, true, None, false, None, None, None, None, None).await?;
+        let un = list_tasks(&pool, Some(pid), None, None, true, None, false, None, None, None, None, None, false).await?;
         let un = un.as_array().unwrap();
         assert_eq!(un.len(), 1);
         assert_eq!(un[0]["title"], json!("free"));
         assert!(un[0]["assignee"].is_null());
 
         // assignee equality still works when unassigned is false.
-        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false, None, false, None, None, None, None, None).await?;
+        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false, None, false, None, None, None, None, None, false).await?;
         let mine = mine.as_array().unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0]["title"], json!("owned"));
 
         // unassigned=true wins over a contradictory assignee= filter (no owner beats owner=alice).
-        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true, None, false, None, None, None, None, None).await?;
+        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true, None, false, None, None, None, None, None, false).await?;
         let both = both.as_array().unwrap();
         assert_eq!(both.len(), 1);
         assert_eq!(both[0]["title"], json!("free"));
 
         // No filter returns both.
         assert_eq!(
-            list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None).await?.as_array().unwrap().len(),
+            list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?.as_array().unwrap().len(),
             2
         );
         Ok(())
@@ -5690,24 +5744,63 @@ mod tests {
         create_task(&pool, pid, "obs-b", None, None, None, Some("u"), Some(json!({"observes": "widget-b"})), None, None).await?;
         create_task(&pool, pid, "plain", None, None, None, Some("u"), None, None, None).await?;
 
-        let a = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("widget-a")).await?;
+        let a = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("widget-a"), false).await?;
         let titles: Vec<_> = a.as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap().to_string()).collect();
         assert_eq!(titles, vec!["obs-a1", "obs-a2"]);
 
         // Composes with a status filter: no open task observes widget-b once it's marked done.
-        let bid = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("widget-b"))
+        let bid = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("widget-b"), false)
             .await?[0]["id"]
             .as_i64()
             .unwrap();
         update_task(&pool, bid, Some("done"), None, None, None, None, Some("u"), None, None, None).await?;
-        let open_b = list_tasks(&pool, Some(pid), Some("todo"), None, false, None, false, None, None, None, Some("observes"), Some("widget-b")).await?;
+        let open_b = list_tasks(&pool, Some(pid), Some("todo"), None, false, None, false, None, None, None, Some("observes"), Some("widget-b"), false).await?;
         assert_eq!(open_b.as_array().unwrap().len(), 0, "no OPEN task observes widget-b after it's done");
 
         // A key with no matching value returns nothing; only meta_key (no value) does not filter.
-        let none = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("nope")).await?;
+        let none = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("nope"), false).await?;
         assert_eq!(none.as_array().unwrap().len(), 0);
-        let unfiltered = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), None).await?;
+        let unfiltered = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), None, false).await?;
         assert_eq!(unfiltered.as_array().unwrap().len(), 4, "meta_key without meta_value is inert");
+        Ok(())
+    }
+
+    /// Archiving hides a task from the default list_tasks view but keeps it fetchable by id and
+    /// listable with include_archived; archiving is orthogonal to status; restore reverses it.
+    #[tokio::test]
+    async fn set_task_archived_hides_by_default_and_restores() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("owner"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let keep = create_task(&pool, pid, "keep", None, None, None, Some("owner"), None, None, None).await?;
+        let retire = create_task(&pool, pid, "retire", None, None, None, Some("owner"), None, None, None).await?;
+        let retire_id = retire["id"].as_i64().unwrap();
+        let _ = keep;
+
+        // Both visible before archiving.
+        let before = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
+        assert_eq!(before.as_array().unwrap().len(), 2);
+
+        // Archive one: the default view drops it, but include_archived still lists it.
+        let archived = set_task_archived(&pool, retire_id, true, Some("owner")).await?;
+        assert!(archived["archived_at"].is_string(), "archived_at stamped: {archived}");
+        let default_view = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
+        let titles: Vec<_> = default_view.as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap().to_string()).collect();
+        assert_eq!(titles, vec!["keep"], "archived task hidden by default");
+        let with_archived = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, true).await?;
+        assert_eq!(with_archived.as_array().unwrap().len(), 2, "include_archived lists it");
+        // Still fetchable by id.
+        assert_eq!(get_task(&pool, retire_id).await?["title"].as_str(), Some("retire"));
+
+        // Restore: reappears in the default view, stamp cleared.
+        let restored = set_task_archived(&pool, retire_id, false, Some("owner")).await?;
+        assert!(restored["archived_at"].is_null(), "archived_at cleared: {restored}");
+        let after = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
+        assert_eq!(after.as_array().unwrap().len(), 2, "restored task back in default view");
+
+        // Archiving an unknown task errors.
+        assert!(set_task_archived(&pool, 999_999, true, None).await.is_err());
         Ok(())
     }
 
@@ -6293,7 +6386,7 @@ mod tests {
         assert_eq!(b["created"], json!(false));
         assert_eq!(b["id"].as_i64().unwrap(), tid, "same task, not a duplicate");
         assert_eq!(b["title"], json!("issue 1"), "existing task returned unchanged");
-        let tasks = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None).await?;
+        let tasks = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
         assert_eq!(tasks.as_array().unwrap().len(), 1, "exactly one task, no duplicate");
 
         // Comment idempotency on the new board_kind='comment'.
@@ -6707,7 +6800,7 @@ mod tests {
         );
 
         // "What is blocked on agent:rev" view.
-        let on_agent = list_tasks(&pool, Some(pid), None, None, false, None, false, None, Some("agent"), Some("agent:rev"), None, None).await?;
+        let on_agent = list_tasks(&pool, Some(pid), None, None, false, None, false, None, Some("agent"), Some("agent:rev"), None, None, false).await?;
         assert_eq!(on_agent.as_array().unwrap().len(), 1);
 
         // Block on the OPERATOR -> ref is null, and the operator view lists it.
@@ -6716,7 +6809,7 @@ mod tests {
         let bo = get_task(&pool, tid).await?["blocked_on"].clone();
         assert_eq!(bo["kind"], json!("operator"));
         assert!(bo["target"].is_null());
-        let on_op = list_tasks(&pool, None, None, None, false, None, false, None, Some("operator"), None, None, None).await?;
+        let on_op = list_tasks(&pool, None, None, None, false, None, false, None, Some("operator"), None, None, None, false).await?;
         assert!(on_op.as_array().unwrap().iter().any(|t| t["id"] == json!(tid)));
 
         // Leaving blocked clears blocked_on.
