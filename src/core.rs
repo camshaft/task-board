@@ -1874,6 +1874,40 @@ pub async fn subscribe(
     Ok(json!({ "subscriber": subscriber, "target_type": tt, "target_id": tid }))
 }
 
+/// Subscribe with an event-class filter (#462): the subscription is delivery-gated to `event_classes`
+/// — only events in one of those classes reach the inbox AND wake the subscriber, everything else is
+/// dropped for this subscription. The low-noise alternative to the full firehose (board + ["created"]
+/// for a triage agent) or to a creator-subscribed all-events gap ticket (task + ["done", "blocked"]).
+/// Idempotent: UPSERTS the class set, so a caller can safely re-register the same (subscriber,
+/// target) with an updated filter. For an unfiltered (every-event) subscription, use `subscribe`.
+#[allow(clippy::too_many_arguments)]
+pub async fn subscribe_classed(
+    pool: &Pool,
+    subscriber: &str,
+    task_id: Option<i64>,
+    project_id: Option<i64>,
+    channel_id: Option<i64>,
+    document_id: Option<i64>,
+    board: bool,
+    event_classes: &[String],
+) -> anyhow::Result<Value> {
+    let (tt, tid) = target(task_id, project_id, channel_id, document_id, board)?;
+    let ec = json!(event_classes).to_string();
+    sqlx::query(
+        "INSERT INTO subscriptions(subscriber, target_type, target_id, event_classes, created_at) \
+         VALUES(?,?,?,?,?) \
+         ON CONFLICT(subscriber, target_type, target_id) DO UPDATE SET event_classes=excluded.event_classes",
+    )
+    .bind(subscriber)
+    .bind(tt)
+    .bind(tid)
+    .bind(&ec)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(json!({ "subscriber": subscriber, "target_type": tt, "target_id": tid, "event_classes": event_classes }))
+}
+
 pub async fn unsubscribe(
     pool: &Pool,
     subscriber: &str,

@@ -250,7 +250,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/restore", summary: "Restore an archived task so it reappears in the default list_tasks view.", query: "", body: Some("ArchiveTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/mute", summary: "Mute a task for an agent: detach them from its event fan-out (stop FYI notifications).", query: "", body: Some("MuteTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/unmute", summary: "Unmute a task for an agent (rejoin its fan-out).", query: "", body: Some("MuteTaskBody") },
-    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, document, or the whole board (board=true).", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, document, or the whole board (board=true). Optional event_classes (e.g. [\"created\"]) makes it a delivery-gated filtered subscription (only those classes reach the inbox and wake you); omit for every event. Idempotent (re-subscribe updates the class set).", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, channel, document, or the whole board (board=true).", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None },
     Endpoint { method: "POST", path: "/api/channels", summary: "Create (or get) a named channel.", query: "", body: Some("CreateChannelBody") },
@@ -1038,21 +1038,22 @@ struct SubscribeBody {
     document_id: Option<i64>,
     /// Whole-board firehose: subscribe to EVERY event on the board (for a coordinator/auto-assigner).
     board: Option<bool>,
+    /// Optional event-class filter (#462): a subset of ["created", "done", "blocked", "status",
+    /// "comment", "assigned", "review", "doc"]. When given, this subscription is delivery-gated to
+    /// just those classes (only they reach the inbox and wake the subscriber); omit for every event.
+    /// Applies to any target. (Ignored by unsubscribe.)
+    event_classes: Option<Vec<String>>,
 }
 
 async fn subscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
-    Ok(Json(
-        core::subscribe(
-            &st.pool,
-            &b.subscriber,
-            b.task_id,
-            b.project_id,
-            b.channel_id,
-            b.document_id,
-            b.board.unwrap_or(false),
-        )
-        .await?,
-    ))
+    let board = b.board.unwrap_or(false);
+    let out = match b.event_classes.as_deref() {
+        Some(ec) if !ec.is_empty() => {
+            core::subscribe_classed(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id, b.document_id, board, ec).await?
+        }
+        _ => core::subscribe(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id, b.document_id, board).await?,
+    };
+    Ok(Json(out))
 }
 
 async fn unsubscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
