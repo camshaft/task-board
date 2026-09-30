@@ -356,6 +356,7 @@ pub async fn update_agent(
     status_message: Option<&str>,
     webhook_url: Option<&str>,
     metadata: Option<Value>,
+    clear: Option<&[String]>,
 ) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
     let old = sqlx::query("SELECT metadata FROM agents WHERE id=?")
@@ -378,6 +379,23 @@ pub async fn update_agent(
     for (col, val) in fields.iter() {
         if val.is_some() {
             set_clauses.push(format!("{col}=?"));
+        }
+    }
+    // Explicit clear affordance (task 489): a merge-PATCH treats a null/omitted field as "leave
+    // unchanged", so there was no way to reset a nullable agent field (e.g. a stale webhook_url)
+    // to NULL through the tool — callers thrashed on malformed JSON and empty-string workarounds.
+    // `clear` names columns to set to NULL. An explicit value for the same field wins (its `field=?`
+    // is already queued, so we skip the NULL to avoid a duplicate SET). status is not clearable
+    // (presence is a keyword, not nullable); metadata is merged, not cleared, via update.
+    const CLEARABLE: [&str; 5] = ["display_name", "kind", "charter", "status_message", "webhook_url"];
+    if let Some(clear) = clear {
+        for name in clear {
+            if !CLEARABLE.contains(&name.as_str()) {
+                anyhow::bail!("cannot clear field '{name}'; clearable fields: {}", CLEARABLE.join(", "));
+            }
+            if !set_clauses.iter().any(|c| c == &format!("{name}=?")) {
+                set_clauses.push(format!("{name}=NULL"));
+            }
         }
     }
     let merged_meta: Option<String> = if let Some(meta) = metadata {
@@ -7169,7 +7187,7 @@ mod tests {
         assert_eq!(a["charter"], "own X");
 
         // update_agent: away without a message keeps status_message; metadata merges again.
-        update_agent(&pool, "v-x", None, None, None, Some("away"), None, None, Some(json!({"branch": "main"}))).await?;
+        update_agent(&pool, "v-x", None, None, None, Some("away"), None, None, Some(json!({"branch": "main"})), None).await?;
         let got = get_agent(&pool, "v-x").await?;
         assert_eq!(got["status"], "away");
         assert_eq!(
@@ -7177,8 +7195,20 @@ mod tests {
             json!({"role": "vertical", "model": "opus", "effort": "high", "branch": "main"})
         );
 
+        // clear affordance (task 489): set then CLEAR webhook_url to null in one call. A null/omitted
+        // field would leave it unchanged, so clear is the only way to empty it.
+        update_agent(&pool, "v-x", None, None, None, None, None, Some("http://x/wake"), None, None).await?;
+        assert_eq!(get_agent(&pool, "v-x").await?["webhook_url"], json!("http://x/wake"));
+        update_agent(&pool, "v-x", None, None, None, None, None, None, None, Some(&["webhook_url".to_string()])).await?;
+        assert!(get_agent(&pool, "v-x").await?["webhook_url"].is_null(), "clear empties the field");
+        // An explicit value wins over clearing the same field in one call.
+        update_agent(&pool, "v-x", None, None, None, None, None, Some("http://y/wake"), None, Some(&["webhook_url".to_string()])).await?;
+        assert_eq!(get_agent(&pool, "v-x").await?["webhook_url"], json!("http://y/wake"), "explicit value wins over clear");
+        // A non-clearable field name is rejected.
+        assert!(update_agent(&pool, "v-x", None, None, None, None, None, None, None, Some(&["status".to_string()])).await.is_err());
+
         // update_agent on an unknown agent errors (it's a mutate, not an upsert).
-        assert!(update_agent(&pool, "nope", None, None, None, None, None, None, None).await.is_err());
+        assert!(update_agent(&pool, "nope", None, None, None, None, None, None, None, None).await.is_err());
 
         // A fresh agent gets an empty bag by default, not null.
         register_agent(&pool, "v-y", None, None, None, None, None).await?;

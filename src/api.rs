@@ -230,7 +230,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&limit=int&offset=int", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
-    Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry).", query: "", body: Some("UpdateAgentBody") },
+    Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry). Merge-PATCH: an omitted/null field is left unchanged; to reset a nullable field to null, name it in `clear` (e.g. [\"webhook_url\"]).", query: "", body: Some("UpdateAgentBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/request-stand-down", summary: "Request that an agent gracefully wind down: records the request (who/why/when, shown on the agent's page) and notifies the agent so it stands down on its own terms. A SIGNAL — never changes the agent's status and never kills a live agent. Cleared when the agent goes offline.", query: "", body: Some("RequestStandDownBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
@@ -616,6 +616,11 @@ struct UpdateAgentBody {
     webhook_url: Option<String>,
     /// MERGED into the agent's registry bag, not replaced.
     metadata: Option<Value>,
+    /// Field names to CLEAR to null (a merge-PATCH leaves an omitted/null field unchanged, so this
+    /// is the only way to reset a nullable field, e.g. ["webhook_url"]). Clearable: display_name,
+    /// kind, charter, status_message, webhook_url. An explicit value for a field wins over clearing.
+    #[serde(default)]
+    clear: Option<Vec<String>>,
     /// Return the full agent (including `charter`) in the response. Default false — the response
     /// omits the charter to keep a looping caller's context light; fetch it via GET /api/agents/{id}.
     #[serde(default)]
@@ -637,6 +642,7 @@ async fn update_agent(
         b.status_message.as_deref(),
         b.webhook_url.as_deref(),
         b.metadata,
+        b.clear.as_deref(),
     )
     .await?;
     Ok(Json(if b.verbose.unwrap_or(false) {
