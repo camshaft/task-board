@@ -26,7 +26,12 @@
           };
         in
         {
-          task-board = final.callPackage ./nix/package.nix { inherit rustPlatform; };
+          # Pass the flake's git rev so the binary can report the commit it was built from
+          # (surfaced at /api/health). `or "dev"` covers a dirty/non-git build.
+          task-board = final.callPackage ./nix/package.nix {
+            inherit rustPlatform;
+            rev = self.rev or "dev";
+          };
         };
     in
     flake-utils.lib.eachDefaultSystem (

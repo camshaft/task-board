@@ -1,4 +1,4 @@
-{ lib, rustPlatform, buildNpmPackage, nodejs_22, makeWrapper }:
+{ lib, rustPlatform, buildNpmPackage, nodejs_22, makeWrapper, rev ? "dev" }:
 
 let
   # The web UI (Vite/React/TS/Tailwind) built to static assets. No Node at runtime —
@@ -23,6 +23,10 @@ rustPlatform.buildRustPackage {
   version = "0.1.0";
   src = lib.cleanSource ../.;
   cargoLock.lockFile = ../Cargo.lock;
+
+  # Bake the build's git rev into the binary (read via option_env! and reported at /api/health)
+  # so an agent can confirm its just-merged commit is the live one instead of blind-polling.
+  TASK_BOARD_COMMIT = rev;
 
   nativeBuildInputs = [ makeWrapper ];
 

@@ -220,14 +220,24 @@ async fn api_not_found() -> Response {
 /// non-200 (502 or 503) as "board not ready: back off and retry", and a 200 as "safe to proceed".
 async fn health(State(st): State<AppState>) -> Response {
     match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&st.pool).await {
-        Ok(_) => (StatusCode::OK, Json(json!({ "ok": true, "db": true }))).into_response(),
+        Ok(_) => (StatusCode::OK, Json(json!({ "ok": true, "db": true, "commit": BUILD_COMMIT })))
+            .into_response(),
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ok": false, "db": false, "error": e.to_string() })),
+            Json(json!({ "ok": false, "db": false, "commit": BUILD_COMMIT, "error": e.to_string() })),
         )
             .into_response(),
     }
 }
+
+/// The git rev this binary was built from, baked in by the nix build (package.nix sets
+/// `TASK_BOARD_COMMIT` = the flake rev). `"unknown"` for a non-nix build (e.g. `cargo test`).
+/// Reported at `/api/health` so an agent that just merged + auto-deployed can poll and confirm its
+/// own commit is the live one, instead of blind-polling the new behavior until it stops 404-ing.
+const BUILD_COMMIT: &str = match option_env!("TASK_BOARD_COMMIT") {
+    Some(c) => c,
+    None => "unknown",
+};
 
 /// Diagnostic: which agents currently have a live reverse tunnel (so the board can push a wake
 /// instead of the agent polling). Used to bisect a lost-wake regression — an agent absent here
