@@ -74,6 +74,54 @@ fn column_to_json(row: &SqliteRow, col: &SqliteColumn) -> Value {
     }
 }
 
+/// The `@id` tokens in `text` (id chars = alphanumeric / `-` / `_`), for @mention auto-subscribe.
+/// Returns the bare ids (no `@`), in order, with duplicates possible — callers dedupe via the
+/// idempotent subscribe.
+fn extract_mentions(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-' || bytes[j] == b'_')
+            {
+                j += 1;
+            }
+            if j > start {
+                out.push(text[start..j].to_string());
+            }
+            i = j.max(start);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Auto-subscribe any @mentioned REGISTERED agent in `text` to the task (idempotent). Per the
+/// operator's subscription-based wake model, an @mention adds the agent to the subscription list
+/// so they are woken on this and future activity. Unregistered `@tokens` are ignored (no junk subs).
+async fn subscribe_mentions(
+    tx: &mut Transaction<'_, Sqlite>,
+    text: &str,
+    task_id: i64,
+) -> anyhow::Result<()> {
+    for id in extract_mentions(text) {
+        let exists = sqlx::query("SELECT 1 FROM agents WHERE id=?")
+            .bind(&id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+        if exists {
+            auto_subscribe(tx, Some(&id), task_id).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn auto_subscribe(
     tx: &mut Transaction<'_, Sqlite>,
     subscriber: Option<&str>,
@@ -1503,6 +1551,9 @@ pub async fn comment_task(
     .await?
     .try_get("id")?;
     auto_subscribe(&mut tx, author, task_id).await?;
+    // An @mention subscribes that agent to the task, so they are woken on this comment + future
+    // activity (operator subscription-based wake model). Idempotent; unregistered @tokens ignored.
+    subscribe_mentions(&mut tx, body, task_id).await?;
     let mut data = json!({ "comment_id": cid, "body": body });
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
@@ -6384,6 +6435,37 @@ mod tests {
         assert!(update_document(&pool, id, "Renamed \u{2194} bad", Some("u")).await.is_err());
         update_document(&pool, id, "Renamed good", Some("u")).await?;
         Ok(())
+    }
+
+    /// An @mention in a task comment auto-subscribes that REGISTERED agent to the task (so the
+    /// wake model notifies them), while an unregistered @token is ignored.
+    #[tokio::test]
+    async fn comment_at_mention_subscribes_registered_agent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "alice", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("owner"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, None, None, Some("owner"), None, None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        // owner comments mentioning @alice (registered) and @nobody (not registered).
+        comment_task(&pool, tid, "hey @alice and @nobody take a look", Some("owner"), None, None).await?;
+        let task = get_task(&pool, tid).await?;
+        let subs: Vec<&str> =
+            task["subscribers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(subs.contains(&"alice"), "mentioned registered agent subscribed: {subs:?}");
+        assert!(!subs.contains(&"nobody"), "unregistered @token ignored: {subs:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn extract_mentions_parses_at_tokens() {
+        assert_eq!(
+            extract_mentions("hi @v-task-board and @board-pm, cc @alice_1"),
+            vec!["v-task-board", "board-pm", "alice_1"]
+        );
+        assert!(extract_mentions("no mentions here").is_empty());
+        assert_eq!(extract_mentions("email a@b.com is not a mention start"), vec!["b"]);
     }
 
     /// Clearing an assignee (assignee="") unsets the owner and emits task.unassigned carrying the
