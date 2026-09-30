@@ -2990,6 +2990,46 @@ pub async fn check_banned_phrases(
     );
 }
 
+/// Pre-submit FORMAT lint (task 368, the ASCII-only ruling): bail if `text` contains any non-ASCII
+/// character (codepoint > U+007F) — em dashes, curly quotes, arrows, emoji, and the like — unless
+/// the author acknowledged. Reports the FIRST offending character with its codepoint and 1-based
+/// line:column so the author can find and fix it. This is a distinct pass from the banned-phrase
+/// matcher (a format rule, not a wording rule). The message starts with "non-ASCII" so the REST
+/// layer maps it to 400.
+pub fn check_non_ascii(text: &str, acknowledge: bool) -> anyhow::Result<()> {
+    if acknowledge {
+        return Ok(());
+    }
+    let (mut line, mut col) = (1usize, 1usize);
+    for ch in text.chars() {
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+            continue;
+        }
+        if !ch.is_ascii() {
+            anyhow::bail!(
+                "non-ASCII character {ch:?} (U+{:04X}) at line {line}, column {col}. Board content \
+                 must be ASCII — replace it (an em dash with '-', curly quotes with straight quotes, \
+                 an arrow with '<->', drop emoji), or pass acknowledge_banned=true to submit anyway.",
+                ch as u32
+            );
+        }
+        col += 1;
+    }
+    Ok(())
+}
+
+/// Combined pre-submit content lint for authored free text (task/document comments + document
+/// versions): the ASCII-format check then the banned-phrase check, both honoring the same
+/// `acknowledge` escape hatch. One funnel so every authored surface runs the same checks and a new
+/// check only has to be added here.
+pub async fn check_content(pool: &Pool, text: &str, acknowledge: bool) -> anyhow::Result<()> {
+    check_non_ascii(text, acknowledge)?;
+    check_banned_phrases(pool, text, acknowledge).await?;
+    Ok(())
+}
+
 // --- External links (bridged mappings: channel-map, issue↔task, thread↔task) ---
 
 /// The board entity kinds an external link may target.
@@ -3504,6 +3544,9 @@ pub async fn create_document(
     content_type: Option<&str>,
     content: Option<&str>,
 ) -> anyhow::Result<Value> {
+    // A document title renders as the page h1, so it is in scope for the ASCII-only ruling. Hard
+    // rule (no acknowledge): a non-ASCII title is never legitimate.
+    check_non_ascii(title, false)?;
     let ts = now_iso();
     let ct = content_type.unwrap_or("text/markdown");
     let mut tx = pool.begin().await?;
@@ -3676,6 +3719,8 @@ pub async fn update_document(
     if title.is_empty() {
         anyhow::bail!("give a non-empty title");
     }
+    // Titles are in scope for the ASCII-only ruling (they render as the page h1). Hard rule.
+    check_non_ascii(title, false)?;
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
@@ -6295,6 +6340,49 @@ mod tests {
         assert!(scan_banned_phrases(&pool, "we hit the floor").await?.is_empty());
         assert_eq!(list_banned_phrases(&pool).await?.as_array().unwrap().len(), 1);
         assert_eq!(remove_banned_phrase(&pool, "the floor").await?["deleted"], json!(false), "already gone");
+        Ok(())
+    }
+
+    /// The non-ASCII FORMAT check (task 368): ASCII passes; an em dash / curly quote / arrow /
+    /// emoji is rejected with a located "non-ASCII" message; line:column tracks newlines; and
+    /// acknowledge is the escape hatch.
+    #[test]
+    fn non_ascii_format_check() {
+        assert!(check_non_ascii("plain ascii - straight \"quotes\" ok", false).is_ok());
+        for bad in [
+            "an em dash \u{2014} here",
+            "curly \u{201c}quote\u{201d}",
+            "arrow \u{2194} x",
+            "emoji \u{1F600}",
+        ] {
+            let e = check_non_ascii(bad, false).unwrap_err().to_string();
+            assert!(e.starts_with("non-ASCII"), "starts with non-ASCII: {e}");
+            assert!(e.contains("line 1, column"), "reports a location: {e}");
+        }
+        // Location counts newlines.
+        let e = check_non_ascii("line one\nsecond \u{2014} dash", false).unwrap_err().to_string();
+        assert!(e.contains("line 2"), "counts newlines: {e}");
+        // Acknowledge overrides.
+        assert!(check_non_ascii("em dash \u{2014} acked", true).is_ok());
+    }
+
+    /// A document title is in scope for the ASCII-only ruling: create_document and update_document
+    /// reject a non-ASCII title (hard rule, no acknowledge), so new non-ASCII titles can't enter.
+    #[tokio::test]
+    async fn document_title_must_be_ascii() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // Create with a non-ASCII (em dash) title is rejected before any DB write.
+        let e = create_document(&pool, "Bad \u{2014} title", None, "Qmcid", None, Some("u"), None, None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("non-ASCII"), "create rejects non-ASCII title: {e}");
+        // An ASCII create succeeds; renaming to a non-ASCII title is rejected; ASCII rename is fine.
+        let d = create_document(&pool, "Good title", None, "Qmcid", None, Some("u"), None, None, None).await?;
+        let id = d["id"].as_i64().unwrap();
+        assert!(update_document(&pool, id, "Renamed \u{2194} bad", Some("u")).await.is_err());
+        update_document(&pool, id, "Renamed good", Some("u")).await?;
         Ok(())
     }
 
