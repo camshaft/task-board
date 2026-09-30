@@ -112,10 +112,24 @@ in
     };
     users.groups.${cfg.group} = { };
 
+    # Socket activation: systemd owns the listening socket, not the service process. Because the
+    # socket unit stays active across a service stop->start (e.g. a redeploy / `colmena switch`),
+    # the listening fd is never closed during the swap — mid-deploy connections queue in the kernel
+    # backlog and are served the moment the new process accepts, instead of hitting a
+    # connection-refused window that surfaces as a deploy-time 502 at the proxy. The board binary
+    # picks up the passed fd via LISTEN_FDS (listenfd) and falls back to binding itself when run
+    # outside systemd.
+    systemd.sockets.task-board = {
+      description = "task-board listening socket (survives service restarts so a redeploy queues connections instead of refusing them)";
+      wantedBy = [ "sockets.target" ];
+      socketConfig.ListenStream = "${cfg.host}:${toString cfg.port}";
+    };
+
     systemd.services.task-board = {
       description = "task-board: agent coordination board (MCP + REST + UI)";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      requires = [ "task-board.socket" ];
+      after = [ "network.target" "task-board.socket" ];
 
       environment = {
         RUST_LOG = lib.mkDefault "info,task_board=debug";
