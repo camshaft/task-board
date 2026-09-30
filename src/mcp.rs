@@ -898,6 +898,16 @@ pub struct ListReviewsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewTrendArgs {
+    /// Restrict the trend to one review kind (document / code / design / ...).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Restrict the trend to one producing area/agent.
+    #[serde(default)]
+    pub area: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetReviewStatusArgs {
     pub review_id: i64,
     /// The new A2 status: open / in_review / changes_requested / approved / closed. Re-applying
@@ -1928,6 +1938,17 @@ impl Board {
         Parameters(a): Parameters<ListReviewsArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::list_reviews(&self.pool, s(&a.status), s(&a.kind), s(&a.assignee))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Improvement trend derived from review logs (no stored counter): findings-per-review with an earlier-vs-later trend, overall and sliced by review kind and by producing area/agent, counterbalanced by an escaped-defect signal (findings logged after approval, re-opens, and lineage follow-ups). A slice where findings fell while escaped defects rose is `flagged` rather than counted as improvement. Optionally filter to one kind and/or area.")]
+    async fn review_improvement_trend(
+        &self,
+        Parameters(a): Parameters<ReviewTrendArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::review_improvement_trend(&self.pool, s(&a.kind), s(&a.area))
             .await
             .map_err(err)
             .and_then(ok)

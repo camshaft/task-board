@@ -5373,9 +5373,12 @@ pub async fn set_review_status(
         .bind(review_id)
         .execute(&mut *tx)
         .await?;
-    let body = note
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{old_status} -> {new_status}"));
+    // Canonical, parseable transition prefix ("{old} -> {new}") so the improvement-trend reader
+    // can reconstruct each review's status history from the log alone; an optional note follows.
+    let body = match note {
+        Some(n) => format!("{old_status} -> {new_status}: {n}"),
+        None => format!("{old_status} -> {new_status}"),
+    };
     sqlx::query(
         "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
          VALUES(?,?,?,?,NULL,NULL,?)",
@@ -5516,6 +5519,244 @@ pub async fn append_review_log(
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(json!({ "review_id": review_id, "entry_id": eid, "appended": true, "entry_type": entry_type }))
+}
+
+// --- Reviews: improvement trend (Document #5, increment 5 / BUILD 5) ---
+
+/// Parse a state_change log body of the canonical form "{from} -> {to}" (optionally followed by
+/// ": {note}") into (from, to). Returns None for a legacy/free-form body that isn't a transition.
+fn parse_transition(body: &str) -> Option<(&str, &str)> {
+    let (from, rest) = body.split_once(" -> ")?;
+    let to = rest.split(':').next().unwrap_or(rest).trim();
+    Some((from.trim(), to))
+}
+
+fn is_terminal_status(s: &str) -> bool {
+    s == "approved" || s == "closed"
+}
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// Per-review derived numbers the trend aggregates over — all read from the generic log + metadata,
+/// never a stored counter.
+struct ReviewAgg {
+    kind: String,
+    area: String,
+    findings: u64,
+    /// Escaped-defect score: post-approval findings + (reopened as 1) + (lineage follow-up as 1).
+    escaped: u64,
+    post_approval_findings: u64,
+    reopened: bool,
+    lineage_followup: bool,
+}
+
+/// Summarize a set of reviews (already in created_at-ascending order) into a trend slice: total
+/// findings + findings-per-review, the escaped-defect breakdown, and an earlier-vs-later split so a
+/// FALL in findings BESIDE a RISE in escaped defects is `flagged` (looks like improvement but isn't)
+/// rather than counted as improvement.
+fn trend_slice(aggs: &[&ReviewAgg]) -> Value {
+    let n = aggs.len();
+    let findings: u64 = aggs.iter().map(|a| a.findings).sum();
+    let escaped: u64 = aggs.iter().map(|a| a.escaped).sum();
+    let post: u64 = aggs.iter().map(|a| a.post_approval_findings).sum();
+    let reopens: u64 = aggs.iter().filter(|a| a.reopened).count() as u64;
+    let lineage: u64 = aggs.iter().filter(|a| a.lineage_followup).count() as u64;
+    let fpr = if n > 0 { findings as f64 / n as f64 } else { 0.0 };
+
+    let eps = 1e-9;
+    let (findings_trend, escaped_trend, flagged, earlier_v, later_v) = if n >= 2 {
+        let mid = n / 2;
+        let (e, l) = (&aggs[..mid], &aggs[mid..]);
+        let mean = |s: &[&ReviewAgg], f: fn(&ReviewAgg) -> u64| {
+            s.iter().map(|a| f(a)).sum::<u64>() as f64 / s.len() as f64
+        };
+        let (efpr, lfpr) = (mean(e, |a| a.findings), mean(l, |a| a.findings));
+        let (eepr, lepr) = (mean(e, |a| a.escaped), mean(l, |a| a.escaped));
+        // Fewer findings later = improving; more = worsening.
+        let ft = if lfpr + eps < efpr {
+            "improving"
+        } else if lfpr > efpr + eps {
+            "worsening"
+        } else {
+            "flat"
+        };
+        // More escaped defects later = rising (bad); fewer = falling.
+        let et = if lepr > eepr + eps {
+            "rising"
+        } else if lepr + eps < eepr {
+            "falling"
+        } else {
+            "flat"
+        };
+        let fl = ft == "improving" && et == "rising";
+        (
+            ft,
+            et,
+            fl,
+            json!({ "reviews": e.len(), "findings_per_review": round2(efpr), "escaped_per_review": round2(eepr) }),
+            json!({ "reviews": l.len(), "findings_per_review": round2(lfpr), "escaped_per_review": round2(lepr) }),
+        )
+    } else {
+        ("insufficient_data", "insufficient_data", false, Value::Null, Value::Null)
+    };
+
+    json!({
+        "reviews": n,
+        "findings": findings,
+        "findings_per_review": round2(fpr),
+        "escaped_defects": {
+            "total": escaped,
+            "post_approval_findings": post,
+            "reopens": reopens,
+            "lineage_followups": lineage,
+        },
+        "earlier": earlier_v,
+        "later": later_v,
+        "findings_trend": findings_trend,
+        "escaped_trend": escaped_trend,
+        "flagged": flagged,
+    })
+}
+
+/// The improvement reading (Document #5, A5/A6), derived entirely from each review's generic log +
+/// metadata — no stored counter, no separate reporting store. For each review it counts `finding`
+/// entries and three escaped-defect signals (a finding logged AFTER approval; a re-open, i.e. a
+/// transition back out of a terminal state; and a lineage follow-up, i.e. a review that declares a
+/// predecessor and still surfaced findings). It then reports findings-per-review and an
+/// earlier-vs-later trend — overall and sliced by review `kind` and by producing `area`/agent — and
+/// `flagged`s any slice where findings fell while escaped defects rose. Optionally filter to one
+/// `kind` and/or one `area`.
+pub async fn review_improvement_trend(
+    pool: &Pool,
+    kind: Option<&str>,
+    area: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut sql = String::from("SELECT id, kind, created_by, metadata FROM reviews");
+    if kind.is_some() {
+        sql.push_str(" WHERE kind=?");
+    }
+    // created_at-ascending so a slice's earlier/later split is chronological without re-sorting.
+    sql.push_str(" ORDER BY created_at ASC, id ASC");
+    let mut q = sqlx::query(&sql);
+    if let Some(k) = kind {
+        q = q.bind(k.to_string());
+    }
+    let rows = q.fetch_all(pool).await?;
+
+    let mut aggs: Vec<ReviewAgg> = Vec::new();
+    for row in &rows {
+        let rid: i64 = row.try_get("id")?;
+        let rkind: String = row.try_get("kind")?;
+        let created_by: Option<String> = row.try_get("created_by")?;
+        let meta_str: String = row.try_get("metadata")?;
+        let meta: Value = serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({}));
+        // Producing area: metadata.area, else metadata.produced_by, else the creator, else unknown.
+        let r_area = meta
+            .get("area")
+            .and_then(|v| v.as_str())
+            .or_else(|| meta.get("produced_by").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .or_else(|| created_by.clone())
+            .unwrap_or_else(|| "unknown".into());
+        if let Some(a) = area {
+            if r_area != a {
+                continue;
+            }
+        }
+        let has_predecessor = ["predecessor_review_id", "predecessor", "predecessor_id"]
+            .iter()
+            .any(|k| meta.get(*k).map(|v| !v.is_null()).unwrap_or(false));
+
+        let logs = sqlx::query(
+            "SELECT entry_type, body, created_at FROM review_log WHERE review_id=? ORDER BY id ASC",
+        )
+        .bind(rid)
+        .fetch_all(pool)
+        .await?;
+        let mut findings: u64 = 0;
+        let mut finding_times: Vec<String> = Vec::new();
+        let mut approved_at: Option<String> = None;
+        let mut seen_terminal = false;
+        let mut reopened = false;
+        for lg in &logs {
+            let et: String = lg.try_get("entry_type")?;
+            let lts: String = lg.try_get("created_at")?;
+            match et.as_str() {
+                "finding" => {
+                    findings += 1;
+                    finding_times.push(lts);
+                }
+                "state_change" => {
+                    let body: String = lg.try_get::<Option<String>, _>("body")?.unwrap_or_default();
+                    if let Some((_from, to)) = parse_transition(&body) {
+                        if to == "approved" && approved_at.is_none() {
+                            approved_at = Some(lts);
+                        }
+                        if is_terminal_status(to) {
+                            seen_terminal = true;
+                        } else if seen_terminal {
+                            reopened = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Timestamps share now_iso()'s fixed RFC3339 (micros + 'Z') shape, so lexicographic > is
+        // chronologically after.
+        let post_approval_findings = match &approved_at {
+            Some(at) => finding_times.iter().filter(|t| t.as_str() > at.as_str()).count() as u64,
+            None => 0,
+        };
+        let lineage_followup = has_predecessor && findings > 0;
+        let escaped = post_approval_findings + u64::from(reopened) + u64::from(lineage_followup);
+        aggs.push(ReviewAgg {
+            kind: rkind,
+            area: r_area,
+            findings,
+            escaped,
+            post_approval_findings,
+            reopened,
+            lineage_followup,
+        });
+    }
+
+    let overall = trend_slice(&aggs.iter().collect::<Vec<_>>());
+    let mut by_kind_map: std::collections::BTreeMap<String, Vec<&ReviewAgg>> = Default::default();
+    let mut by_area_map: std::collections::BTreeMap<String, Vec<&ReviewAgg>> = Default::default();
+    for a in &aggs {
+        by_kind_map.entry(a.kind.clone()).or_default().push(a);
+        by_area_map.entry(a.area.clone()).or_default().push(a);
+    }
+    let by_kind: Vec<Value> = by_kind_map
+        .iter()
+        .map(|(k, v)| {
+            let mut s = trend_slice(v);
+            if let Value::Object(ref mut m) = s {
+                m.insert("kind".into(), json!(k));
+            }
+            s
+        })
+        .collect();
+    let by_area: Vec<Value> = by_area_map
+        .iter()
+        .map(|(k, v)| {
+            let mut s = trend_slice(v);
+            if let Value::Object(ref mut m) = s {
+                m.insert("area".into(), json!(k));
+            }
+            s
+        })
+        .collect();
+
+    Ok(json!({
+        "filters": { "kind": kind, "area": area },
+        "overall": overall,
+        "by_kind": by_kind,
+        "by_area": by_area,
+    }))
 }
 
 #[cfg(test)]
@@ -8320,6 +8561,80 @@ mod tests {
 
         // A self-DM is rejected (400 at the API).
         assert!(get_or_create_dm(&pool, "alice", "alice").await.is_err());
+        Ok(())
+    }
+
+    /// The improvement trend is derived purely from the review logs on a seeded dataset: a fall in
+    /// findings that hides a RISE in escaped defects is flagged, not counted as improvement; and
+    /// post-approval findings, re-opens, and lineage follow-ups each register as escaped defects.
+    #[tokio::test]
+    async fn review_improvement_trend_from_log() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // r1 (code, alpha): 3 findings, no escaped defects. Created first => earlier window.
+        let r1 = create_review(&pool, "code", None, None, Some("r1"), None, Some("alpha"), None, None, None).await?;
+        let r1id = r1["id"].as_i64().unwrap();
+        for _ in 0..3 {
+            append_review_log(&pool, r1id, "finding", Some("f"), Some("alpha"), None, None).await?;
+        }
+
+        // r2 (code, alpha): 1 pre-approval finding + 1 finding logged AFTER approval (escaped).
+        let r2 = create_review(&pool, "code", None, None, Some("r2"), None, Some("alpha"), None, None, None).await?;
+        let r2id = r2["id"].as_i64().unwrap();
+        append_review_log(&pool, r2id, "finding", Some("pre"), Some("alpha"), None, None).await?;
+        set_review_status(&pool, r2id, "in_review", Some("alpha"), None).await?;
+        set_review_status(&pool, r2id, "approved", Some("alpha"), None).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await; // ensure a strictly later ts
+        append_review_log(&pool, r2id, "finding", Some("escaped after approval"), Some("qa"), None, None).await?;
+
+        // r3 (design, beta): a lineage follow-up (declares a predecessor) that still found something.
+        let r3 = create_review(&pool, "design", None, None, Some("r3"), None, Some("beta"), None,
+            Some(json!({ "predecessor_review_id": r1id })), None).await?;
+        let r3id = r3["id"].as_i64().unwrap();
+        append_review_log(&pool, r3id, "finding", Some("missed by predecessor"), Some("beta"), None, None).await?;
+
+        // r4 (design, beta): a re-open (approved -> back to in_review), no findings.
+        let r4 = create_review(&pool, "design", None, None, Some("r4"), None, Some("beta"), None, None, None).await?;
+        let r4id = r4["id"].as_i64().unwrap();
+        set_review_status(&pool, r4id, "in_review", Some("beta"), None).await?;
+        set_review_status(&pool, r4id, "approved", Some("beta"), None).await?;
+        set_review_status(&pool, r4id, "in_review", Some("beta"), Some("reopened for a regression")).await?;
+
+        let t = review_improvement_trend(&pool, None, None).await?;
+        assert_eq!(t["overall"]["reviews"].as_u64(), Some(4));
+
+        // code slice: findings fell (3 -> 2) while escaped defects rose (0 -> 1) => FLAGGED.
+        let by_kind = t["by_kind"].as_array().unwrap();
+        let code = by_kind.iter().find(|s| s["kind"] == json!("code")).unwrap();
+        assert_eq!(code["findings_trend"], json!("improving"));
+        assert_eq!(code["escaped_trend"], json!("rising"));
+        assert_eq!(code["flagged"], json!(true));
+        assert_eq!(code["escaped_defects"]["post_approval_findings"].as_u64(), Some(1));
+        assert_eq!(code["escaped_defects"]["total"].as_u64(), Some(1));
+
+        // design slice: a lineage follow-up and a re-open each register as an escaped defect.
+        let design = by_kind.iter().find(|s| s["kind"] == json!("design")).unwrap();
+        assert_eq!(design["escaped_defects"]["lineage_followups"].as_u64(), Some(1));
+        assert_eq!(design["escaped_defects"]["reopens"].as_u64(), Some(1));
+
+        // Sliced by producing area too.
+        let areas: BTreeSet<String> = t["by_area"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["area"].as_str().unwrap().to_string())
+            .collect();
+        assert!(areas.contains("alpha") && areas.contains("beta"), "areas: {areas:?}");
+
+        // Filters narrow the population.
+        let code_only = review_improvement_trend(&pool, Some("code"), None).await?;
+        assert_eq!(code_only["overall"]["reviews"].as_u64(), Some(2));
+        assert_eq!(code_only["overall"]["flagged"], json!(true));
+        let beta_only = review_improvement_trend(&pool, None, Some("beta")).await?;
+        assert_eq!(beta_only["overall"]["reviews"].as_u64(), Some(2));
+        assert_eq!(beta_only["overall"]["escaped_defects"]["reopens"].as_u64(), Some(1));
+        assert_eq!(beta_only["overall"]["escaped_defects"]["lineage_followups"].as_u64(), Some(1));
         Ok(())
     }
 }
