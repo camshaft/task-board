@@ -353,6 +353,14 @@ export async function inviteToChannel(id: number, b: Parameters<typeof api.invit
   return c
 }
 
+// Resolve-or-create the private DM channel for a pair. A new DM should surface in the channel
+// lists, so refresh them (resolving an existing one is a cheap no-op refresh).
+export async function openDm(b: Parameters<typeof api.openDm>[0]) {
+  const c = await api.openDm(b)
+  invalidateMatching('channels')
+  return c
+}
+
 // A direct message to another agent (the server creates or reuses the private DM channel).
 // Refresh the channel lists so a freshly-created DM surfaces (e.g. the agent page's DM link),
 // plus the activity feed. The specific DM channel id isn't in the response, so refresh all lists.

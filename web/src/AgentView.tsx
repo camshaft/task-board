@@ -1,14 +1,14 @@
 import { useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useBoardContext } from './Layout'
 import {
   eventHref,
+  openDm,
   requestStandDown,
   sendDirectMessage,
   useAgent,
   useAgentActivity,
   useAgentTasks,
-  useChannels,
   useProjects,
   updateAgent,
 } from './resources'
@@ -28,19 +28,30 @@ export default function AgentView() {
   const { data: projects = [] } = useProjects()
   // This agent's own actions, server-filtered by actor (complete, not window-truncated).
   const { data: activity = [] } = useAgentActivity(id)
-  // The current actor's channels, to resolve an existing DM channel with this agent so the
-  // "Open DM" link can point at it. The channel LIST response omits the `members` array (it
-  // carries dm_key + member_count), so match on dm_key — the two member ids sorted and joined by
-  // NUL — falling back to a members check for any response shape that does include them.
-  const { data: myChannels = [] } = useChannels(actor)
-  const dmKey = [actor, id].sort().join('\u0000')
-  const dm = myChannels.find(
-    (c) =>
-      c.dm_key === dmKey || (c.private && c.members?.includes(id) && c.members?.includes(actor)),
-  )
+  // "Open DM": resolve-or-create the private 1:1 channel with this agent on click (POST /api/dms),
+  // then navigate to it. Resolved on click (not on mount) so merely viewing a page never creates
+  // an empty DM; the endpoint is idempotent + order-independent, so it reuses any existing DM.
+  const navigate = useNavigate()
+  const [dmBusy, setDmBusy] = useState(false)
+  // One shared error banner for the header actions (open DM / request spin-down).
+  const [opError, setOpError] = useState<string | null>(null)
+
+  async function openDmChannel() {
+    if (dmBusy) return
+    setDmBusy(true)
+    setOpError(null)
+    try {
+      const ch = await openDm({ agent_a: actor, agent_b: id })
+      navigate(`/channels/${ch.id}`)
+    } catch (e) {
+      setOpError((e as Error).message)
+    } finally {
+      setDmBusy(false)
+    }
+  }
 
   // Quick nudge: a small inline composer that sends this agent a direct message (which also
-  // creates the DM channel on first send, after which the DM link resolves).
+  // creates the DM channel on first send).
   const [nudgeOpen, setNudgeOpen] = useState(false)
   const [nudge, setNudge] = useState('')
   const [sending, setSending] = useState(false)
@@ -67,7 +78,6 @@ export default function AgentView() {
   // Request a graceful stand-down (a signal the agent observes in its loop — not a kill). The
   // request stays pending on the agent until it honors it by going offline, which clears it.
   const standDownPending = agent?.stand_down_requested_at != null
-  const [standDownError, setStandDownError] = useState<string | null>(null)
 
   async function requestSpinDown() {
     if (sending || standDownPending) return
@@ -79,11 +89,11 @@ export default function AgentView() {
       return
     const reason = window.prompt('Reason (optional):') ?? undefined
     setSending(true)
-    setStandDownError(null)
+    setOpError(null)
     try {
       await requestStandDown(id, { requested_by: actor, reason: reason || undefined })
     } catch (e) {
-      setStandDownError((e as Error).message)
+      setOpError((e as Error).message)
     } finally {
       setSending(false)
     }
@@ -145,14 +155,13 @@ export default function AgentView() {
         {/* Contact actions. Hidden on your own page (no self-DM/nudge). */}
         {agent && actor && id !== actor && (
           <div className="ml-auto flex items-center gap-2">
-            {dm && (
-              <Link
-                to={`/channels/${dm.id}`}
-                className="rounded-md px-2.5 py-1 text-xs text-sky-400 ring-1 ring-inset ring-sky-500/40 hover:bg-sky-500/10"
-              >
-                Open DM
-              </Link>
-            )}
+            <button
+              onClick={openDmChannel}
+              disabled={dmBusy}
+              className="rounded-md px-2.5 py-1 text-xs text-sky-400 ring-1 ring-inset ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-40"
+            >
+              Open DM
+            </button>
             <button
               onClick={() => setNudgeOpen((o) => !o)}
               className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
@@ -179,9 +188,9 @@ export default function AgentView() {
           go offline.
         </div>
       )}
-      {standDownError && (
+      {opError && (
         <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
-          {standDownError}
+          {opError}
         </div>
       )}
 
@@ -222,11 +231,7 @@ export default function AgentView() {
               Cancel
             </button>
           </div>
-          {nudgeSent && (
-            <p className="mt-1 text-[11px] text-emerald-300">
-              Message sent{dm ? '.' : ' — opening a DM channel.'}
-            </p>
-          )}
+          {nudgeSent && <p className="mt-1 text-[11px] text-emerald-300">Message sent.</p>}
         </div>
       )}
 
