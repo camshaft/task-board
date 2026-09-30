@@ -424,6 +424,9 @@ export interface StreamEvent {
   task_id?: number | null
   document_id?: number | null
   channel_id?: number | null
+  // review.* events (created / status_changed / log_appended / vetted_changed / opened_for_review
+  // / terminal) carry the review they concern; null on non-review events.
+  review_id?: number | null
 }
 
 /**
@@ -451,4 +454,12 @@ export function applyStreamEvent(ev: StreamEvent) {
     channelId: ev.channel_id ?? undefined,
     activity: true,
   })
+  // review.* events carry review_id → refresh that review, the list, and the trend, so a status
+  // transition / vetted toggle / new finding by another client shows live (task 409). Mirrors the
+  // local review mutation wrappers, which invalidate the same three keys.
+  if (ev.review_id != null) {
+    invalidate(keys.review(ev.review_id))
+    invalidate(keys.reviews)
+    invalidate(keys.reviewTrend)
+  }
 }
