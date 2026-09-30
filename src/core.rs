@@ -44,6 +44,96 @@ pub fn row_to_json_ref(row: &SqliteRow, kind: &str) -> Value {
     d
 }
 
+/// Detect bare board-task references ("#<N>") in submitted user text that are ambiguous under the
+/// #504 typed-id convention (task #517). A bare "#N" still resolves to a board task, but is easy to
+/// confuse with an external GitHub reference, so a write nudges the author toward the typed `task_N`
+/// form (or a repo-qualified `owner/repo#N` for an external PR). The boundary rule mirrors the web
+/// linkifier: "#" + digits where the char before "#" is not a word char / another "#" / "&" (so
+/// "abc#1", "##", "&#123;", and a repo-qualified "owner/repo#1" -- whose "#" follows a word char --
+/// do NOT match), and the digits end at a word boundary (so "#12ab" does not match). Returns the
+/// referenced task numbers in first-seen order, de-duplicated. Pure text scan, no DB lookup.
+pub fn detect_bare_task_refs(text: &str) -> Vec<i64> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<i64> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'#' {
+            i += 1;
+            continue;
+        }
+        // Reject when the char immediately before '#' is a word char / '#' / '&' (this is what
+        // excludes a repo-qualified "owner/repo#N", whose '#' follows a word char).
+        if i > 0 {
+            let p = bytes[i - 1];
+            if p == b'_' || p == b'#' || p == b'&' || p.is_ascii_alphanumeric() {
+                i += 1;
+                continue;
+            }
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == start {
+            i += 1; // a bare '#' with no digits
+            continue;
+        }
+        // Require a word boundary after the digits (so "#12ab" is not a ref).
+        if j < bytes.len() {
+            let n = bytes[j];
+            if n == b'_' || n.is_ascii_alphanumeric() {
+                i = j + 1;
+                continue;
+            }
+        }
+        if let Ok(num) = text[start..j].parse::<i64>() {
+            if num > 0 && !out.contains(&num) {
+                out.push(num);
+            }
+        }
+        i = j;
+    }
+    out
+}
+
+/// One soft `ref_warnings` entry (task #517) for an ambiguous bare "#N" reference: warn-but-resolve
+/// (the ref still resolves to a board task) while nudging the typed `task_N` form.
+fn bare_ref_warning(n: i64) -> Value {
+    json!({
+        "kind": "ambiguous_bare_ref",
+        "raw": format!("#{n}"),
+        "resolves_to": format!("task_{n}"),
+        "suggest": [format!("task_{n}"), format!("<owner>/<repo>#{n}")],
+        "message": format!(
+            "bare #{n} is ambiguous: it resolves to board task_{n}. Write task_{n} for a board task, \
+             or <owner>/<repo>#{n} for an external GitHub reference."
+        ),
+    })
+}
+
+/// Attach a non-blocking `ref_warnings` array (task #517) to a write-result object when any of the
+/// submitted `texts` contains an ambiguous bare "#N" reference; the result is returned unchanged
+/// when there are none, so a clean write's response is untouched. Warn-but-resolve: never blocks the
+/// write, never fans out to subscribers -- it rides on the response the author already receives.
+pub fn with_ref_warnings(mut result: Value, texts: &[Option<&str>]) -> Value {
+    let mut nums: Vec<i64> = Vec::new();
+    for t in texts.iter().flatten() {
+        for n in detect_bare_task_refs(t) {
+            if !nums.contains(&n) {
+                nums.push(n);
+            }
+        }
+    }
+    if !nums.is_empty() {
+        if let Value::Object(ref mut m) = result {
+            let warns: Vec<Value> = nums.into_iter().map(bare_ref_warning).collect();
+            m.insert("ref_warnings".into(), Value::Array(warns));
+        }
+    }
+    result
+}
+
 /// If `data` carries an `external_author` (an external_identities id, e.g. an ingested Slack
 /// user like `slack:U0…`), resolve that identity's registered `display_name` and add it as
 /// `external_author_name`, so a consumer can show the human's name while `external_author`
@@ -1061,7 +1151,8 @@ pub async fn create_task(
     }
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
-    Ok(out)
+    // Nudge on an ambiguous bare "#N" in the submitted title/description (task #517).
+    Ok(with_ref_warnings(out, &[Some(title), description]))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1408,7 +1499,8 @@ pub async fn update_task(
         .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
-    Ok(out)
+    // Nudge on an ambiguous bare "#N" in the submitted title/description (task #517).
+    Ok(with_ref_warnings(out, &[title, description]))
 }
 
 /// Reparent a task onto a different project. Emits `task.moved` (carrying both the old and
@@ -1946,7 +2038,11 @@ pub async fn comment_task(
     }
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
-    Ok(json!({ "comment_id": cid, "task_id": task_id, "created": true }))
+    // Nudge on an ambiguous bare "#N" in the submitted comment body (task #517).
+    Ok(with_ref_warnings(
+        json!({ "comment_id": cid, "task_id": task_id, "created": true }),
+        &[Some(body)],
+    ))
 }
 
 /// Merge arbitrary key/value properties into a task's metadata (JSON). Returns the
@@ -2475,7 +2571,11 @@ pub async fn post_to_channel_meta(
         .await?;
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
-    Ok(json!({ "channel_id": channel_id, "seq": seq }))
+    // Nudge on an ambiguous bare "#N" in the submitted post body (task #517).
+    Ok(with_ref_warnings(
+        json!({ "channel_id": channel_id, "seq": seq }),
+        &[Some(body)],
+    ))
 }
 
 /// Post to a channel with no per-post metadata (the common path). Thin wrapper over
@@ -4227,7 +4327,8 @@ pub async fn publish_version(
     let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
-    Ok(out)
+    // Nudge on an ambiguous bare "#N" in the submitted version summary/content (task #517).
+    Ok(with_ref_warnings(out, &[summary, content]))
 }
 
 /// Fetch one document with its current version + version list.
@@ -6308,6 +6409,54 @@ mod tests {
         let wrapped = get_task(&pool, tid).await?;
         assert_eq!(wrapped["comments"].as_array().unwrap().len(), 5);
         assert_eq!(wrapped["comments_truncated"], json!(false));
+        Ok(())
+    }
+
+    /// detect_bare_task_refs finds bare "#N" refs using the linkifier boundary rule, de-duped in
+    /// first-seen order, and rejects the non-refs: a word char before "#" (incl. a repo-qualified
+    /// owner/repo#N), "##", "&#123;", "#12ab", and a bare "#" with no digits (task #517).
+    #[test]
+    fn detect_bare_task_refs_matches_only_ambiguous_bare_refs() {
+        assert_eq!(detect_bare_task_refs("see #183 please"), vec![183]);
+        assert_eq!(detect_bare_task_refs("#12 and #34 and #12 again"), vec![12, 34]);
+        assert_eq!(detect_bare_task_refs("(#7)"), vec![7]);
+        assert!(detect_bare_task_refs("abc#1").is_empty());
+        assert!(detect_bare_task_refs("camshaft/fleet#183").is_empty());
+        assert!(detect_bare_task_refs("##5").is_empty());
+        assert!(detect_bare_task_refs("&#123;").is_empty());
+        assert!(detect_bare_task_refs("#12ab").is_empty());
+        assert!(detect_bare_task_refs("a # b").is_empty());
+        assert!(detect_bare_task_refs("task_5 is fine").is_empty());
+    }
+
+    /// A write whose submitted text has a bare "#N" gets a soft, non-blocking ref_warnings entry
+    /// nudging the typed task_N form; the write still succeeds (warn-but-resolve), and a clean
+    /// write carries no ref_warnings key at all (task #517).
+    #[tokio::test]
+    async fn writes_warn_on_ambiguous_bare_ref() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Comment with a bare ref -> warned once (deduped), but the comment is still created.
+        let r = comment_task(&pool, tid, "duplicate of #7, see also #7", Some("a"), None, None).await?;
+        assert_eq!(r["created"], json!(true));
+        let warns = r["ref_warnings"].as_array().expect("ref_warnings present");
+        assert_eq!(warns.len(), 1, "deduped to one entry");
+        assert_eq!(warns[0]["raw"], json!("#7"));
+        assert_eq!(warns[0]["resolves_to"], json!("task_7"));
+        assert_eq!(warns[0]["kind"], json!("ambiguous_bare_ref"));
+
+        // A clean comment (typed form + repo-qualified external) -> no ref_warnings key.
+        let clean = comment_task(&pool, tid, "use task_7 and camshaft/fleet#7", Some("a"), None, None).await?;
+        assert!(clean.get("ref_warnings").is_none(), "clean write has no ref_warnings");
+
+        // create_task warns on the submitted description too.
+        let ct = create_task(&pool, pid, "title", Some("blocks #9"), None, None, Some("a"), None, None, None).await?;
+        assert_eq!(ct["ref_warnings"].as_array().unwrap()[0]["resolves_to"], json!("task_9"));
         Ok(())
     }
 
