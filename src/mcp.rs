@@ -153,6 +153,12 @@ pub struct UpdateAgentArgs {
     /// MERGED into the agent's registry bag, not replaced.
     #[serde(default)]
     pub metadata: Option<JsonObject>,
+    /// Field names to CLEAR to null (a merge-PATCH leaves an omitted/null field unchanged, so this
+    /// is the only way to reset a nullable field — e.g. clear: ["webhook_url"] to drop a stale wake
+    /// URL). Clearable: display_name, kind, charter, status_message, webhook_url. An explicit value
+    /// for the same field wins over clearing it.
+    #[serde(default)]
+    pub clear: Option<Vec<String>>,
     /// Return the full agent (including the `charter`) in the response. Default false — the response
     /// omits the charter to keep a looping caller's context light; fetch it with get_agent.
     #[serde(default)]
@@ -1124,7 +1130,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Update an existing agent's fields + metadata WITHOUT re-registering (this is the registry-write path: the board agent list serves as the fleet registry). Pass only the fields you're changing. `metadata` is MERGED into the existing bag, not replaced. Unlike register_agent this does not force status online and fails if the agent doesn't exist. The response omits the (potentially large) `charter` unless you pass verbose:true; fetch the full agent with get_agent."
+        description = "Update an existing agent's fields + metadata WITHOUT re-registering (this is the registry-write path: the board agent list serves as the fleet registry). Pass only the fields you're changing. `metadata` is MERGED into the existing bag, not replaced. To reset a nullable field to null, name it in `clear` (e.g. clear: [\"webhook_url\"]) — an omitted/null field is left unchanged, so `clear` is the only way to empty one. Unlike register_agent this does not force status online and fails if the agent doesn't exist. The response omits the (potentially large) `charter` unless you pass verbose:true; fetch the full agent with get_agent."
     )]
     async fn update_agent(
         &self,
@@ -1141,6 +1147,7 @@ impl Board {
             s(&a.status_message),
             s(&a.webhook_url),
             a.metadata.map(Value::Object),
+            a.clear.as_deref(),
         )
         .await
         .map(|v| if verbose { v } else { core::strip_field(v, "charter") })
