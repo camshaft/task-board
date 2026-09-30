@@ -1403,7 +1403,14 @@ pub async fn update_task(
                 }
             }
             "operator" => {}
-            other => anyhow::bail!("give a valid `blocked_on.kind` (task, agent, or operator), not '{other}'"),
+            // External/infra dependency with no board owner (task_112): the free-text blocked_on.note
+            // says what it waits on; no target. A DISTINCT kind from operator, so it stays OFF the
+            // operator queue (blocked_on_kind='operator') -- a task waiting on external infra is
+            // truthfully blocked without wrongly pinging the operator dashboard.
+            "external" => {}
+            other => anyhow::bail!(
+                "give a valid `blocked_on.kind` (task, agent, operator, or external), not '{other}'"
+            ),
         }
     }
     // A blocked task must end up with a blocked_on set.
@@ -1414,7 +1421,7 @@ pub async fn update_task(
     };
     if new_status == "blocked" && !will_have_blocked_on {
         anyhow::bail!(
-            "give a `blocked_on` (kind: task, agent, or operator) — a blocked task must record what it is waiting on"
+            "give a `blocked_on` (kind: task, agent, operator, or external) — a blocked task must record what it is waiting on"
         );
     }
     let mut blocked_changed = false;
@@ -1432,7 +1439,7 @@ pub async fn update_task(
             blocked_changed = true;
         }
     } else if let BlockedChange::Set { kind, target, note } = &change {
-        let stored_ref = if kind == "operator" { None } else { target.clone() };
+        let stored_ref = if kind == "operator" || kind == "external" { None } else { target.clone() };
         sqlx::query(
             "UPDATE tasks SET blocked_on_kind=?, blocked_on_ref=?, blocked_on_note=?, updated_at=? WHERE id=?",
         )
@@ -6636,6 +6643,40 @@ mod tests {
         // Rejects empty + self-alias.
         assert!(set_identity_alias(&pool, "", "x", None).await.is_err());
         assert!(set_identity_alias(&pool, "x", "x", None).await.is_err());
+        Ok(())
+    }
+
+    /// A task can be blocked on kind=external (an infra dependency with no board owner, task_112):
+    /// no target required, a free-text note, and it stays OFF the operator queue
+    /// (blocked_on_kind=operator) while being findable via blocked_on_kind=external. An unknown kind
+    /// is still rejected.
+    #[tokio::test]
+    async fn blocked_on_external_is_off_the_operator_queue() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "blocked on brazil merge", None, None, None, Some("a"), None, None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Block on external with a free-text note, no target.
+        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("a"), None, None,
+            Some(json!({ "kind": "external", "note": "daily Brazil TPCII->VS merge / stale CratesIoIndex" }))).await?;
+        let got = get_task(&pool, tid).await?;
+        assert_eq!(got["status"], json!("blocked"));
+        assert_eq!(got["blocked_on"]["kind"], json!("external"));
+        assert_eq!(got["blocked_on"]["target"], json!(null), "external has no target");
+        assert!(got["blocked_on"]["note"].as_str().unwrap().contains("Brazil"));
+
+        // OFF the operator queue; ON the external filter.
+        let op = list_tasks(&pool, None, None, None, false, None, false, None, Some("operator"), None, None, None, false).await?;
+        assert!(op.as_array().unwrap().iter().all(|x| x["id"] != json!(tid)), "external task must not be on the operator queue");
+        let ext = list_tasks(&pool, None, None, None, false, None, false, None, Some("external"), None, None, None, false).await?;
+        assert!(ext.as_array().unwrap().iter().any(|x| x["id"] == json!(tid)), "external task found via the external filter");
+
+        // An unknown kind is still rejected.
+        assert!(update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("a"), None, None,
+            Some(json!({ "kind": "bogus" }))).await.is_err());
         Ok(())
     }
 
