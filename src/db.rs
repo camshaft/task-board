@@ -18,7 +18,14 @@ CREATE TABLE IF NOT EXISTS agents (
     metadata       TEXT NOT NULL DEFAULT '{}',
     webhook_url    TEXT,
     created_at     TEXT NOT NULL,
-    last_seen      TEXT
+    last_seen      TEXT,
+    -- A graceful spin-down request: a SIGNAL another agent/operator files that the agent observes
+    -- in its own loop (via check_notifications) and honors by standing down (status->offline, end
+    -- its loop). Recording it never touches the agent's status or kills it — a live agent is never
+    -- reaped mid-work. Cleared when the agent goes offline (request honored). Purely advisory.
+    stand_down_requested_at TEXT,
+    stand_down_requested_by TEXT,
+    stand_down_reason       TEXT
 );
 CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -540,6 +547,25 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .any(|r| r.get::<String, _>("name") == "metadata");
     if !agents_have_metadata {
         sqlx::query("ALTER TABLE agents ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill the graceful spin-down request columns (a signal an agent observes + honors; never
+    // a status change or a kill). All nullable — an old DB simply has no pending request.
+    let agents_have_stand_down = sqlx::query("PRAGMA table_info(agents)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "stand_down_requested_at");
+    if !agents_have_stand_down {
+        sqlx::query("ALTER TABLE agents ADD COLUMN stand_down_requested_at TEXT")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE agents ADD COLUMN stand_down_requested_by TEXT")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE agents ADD COLUMN stand_down_reason TEXT")
             .execute(&pool)
             .await?;
     }

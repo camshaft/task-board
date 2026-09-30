@@ -142,6 +142,18 @@ pub struct SetStatusArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestStandDownArgs {
+    /// The agent asked to wind down.
+    pub agent_id: String,
+    /// Who is asking (defaults to this session's identity).
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    /// Optional reason shown to the agent + on its page.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateProjectArgs {
     pub name: String,
     #[serde(default)]
@@ -971,6 +983,18 @@ impl Board {
     ) -> Result<CallToolResult, McpError> {
         let me = self.me_req(a.agent_id.as_deref())?;
         core::set_status(&self.pool, &me, &a.status, s(&a.status_message))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Request that an agent gracefully wind down: records the request (who/why/when, visible on the agent's page) and drops an agent.stand_down_requested notification into the agent's inbox so it observes the request on its next loop tick and stands down on its own terms (sets status offline, ends its loop). This is a SIGNAL, not an action — it never changes the agent's status and never kills or interrupts a live agent mid-work. The request stays pending until the agent honors it by going offline (which clears it). Use it to stand an agent down cleanly rather than reaping it.")]
+    async fn request_stand_down(
+        &self,
+        Parameters(a): Parameters<RequestStandDownArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let requested_by = self.me_opt(s(&a.requested_by));
+        core::request_stand_down(&self.pool, &a.agent_id, requested_by.as_deref(), s(&a.reason))
             .await
             .map_err(err)
             .and_then(ok)
