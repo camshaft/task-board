@@ -118,7 +118,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ipfs/{cid}", get(ipfs_cat))
         .route("/wiki", get(list_wiki))
         .route("/documents", get(list_documents).post(create_document))
-        .route("/documents/{document_id}", get(get_document))
+        .route("/documents/{document_id}", get(get_document).patch(update_document))
         .route("/documents/{document_id}/content", get(read_document_content))
         .route("/documents/{document_id}/path", post(set_document_path))
         .route("/documents/{document_id}/versions", get(get_document_versions).post(publish_version))
@@ -223,6 +223,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
     Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
+    Endpoint { method: "PATCH", path: "/api/documents/{document_id}", summary: "Rename a document (set its title; metadata-only — versions/content/path/status untouched). Emits document.updated.", query: "", body: Some("UpdateDocumentBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version. Requires ipfs_api_url.", query: "version_no=int", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
@@ -279,6 +280,7 @@ fn body_schemas() -> Value {
         PromoteThreadBody,
         SetWorkspaceKindBody,
         AddBannedPhraseBody,
+        UpdateDocumentBody,
     )
 }
 
@@ -1395,6 +1397,23 @@ async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumen
 
 async fn get_document(State(st): State<AppState>, Path(document_id): Path<i64>) -> ApiResult {
     Ok(Json(core::get_document(&st.pool, document_id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UpdateDocumentBody {
+    /// New title — a short, specific noun phrase; the viewer renders the title as the page header.
+    title: String,
+    actor: Option<String>,
+}
+
+async fn update_document(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Json(b): Json<UpdateDocumentBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::update_document(&st.pool, document_id, &b.title, b.actor.as_deref()).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
