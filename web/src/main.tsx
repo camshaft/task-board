@@ -12,6 +12,7 @@ import DocumentView from './DocumentView.tsx'
 import Home from './Home.tsx'
 import Layout from './Layout.tsx'
 import Search from './Search.tsx'
+import SecretSubmit from './SecretSubmit.tsx'
 import Wiki from './Wiki.tsx'
 import { TaskDrawer, TaskRedirect } from './TaskDrawer.tsx'
 
@@ -28,6 +29,8 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <BrowserRouter basename={basename}>
       <Routes>
+        {/* Standalone secret-submission page — no board chrome; reached via a capability link. */}
+        <Route path="secret-requests/:id" element={<SecretSubmit />} />
         <Route element={<Layout />}>
           <Route index element={<Home />} />
           <Route path="search" element={<Search />} />
