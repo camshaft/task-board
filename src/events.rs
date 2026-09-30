@@ -240,7 +240,16 @@ pub async fn emit(
     // task/project/channel/document subscribers plus an auto-subscribed assignee/creator/commenter/
     // @mention, or the Explicit set. These are the recipients the notifier push-wakes (subscription
     // is the wake control); a firehose-only recipient is added below but is NOT in this set.
-    let direct: BTreeSet<String> = recips.clone();
+    let mut direct: BTreeSet<String> = recips.clone();
+
+    // A whole-board (firehose) subscriber is push-woken on task.created only — the new-task triage
+    // signal a board-wide coordinator must react to promptly (#461). It joins the `direct`
+    // (subscribed=true) set for THIS event type, so the notifier wakes it on creation instead of
+    // leaving it to the next poll / heartbeat. For every other event type a firehose subscriber
+    // stays firehose-tier (added to `recips` below but NOT `direct`, so subscribed=false — inbox/
+    // poll), preserving the #384 intent of not waking a coordinator on high-volume per-ticket
+    // chatter. (The durable, per-subscriber selective event-class filter is #462.)
+    let wakes_firehose = r#type == "task.created";
 
     // Whole-board firehose: anyone subscribed with target_type='board' receives EVERY event,
     // regardless of the per-event recipient set above (even otherwise-silent Explicit events).
@@ -252,6 +261,9 @@ pub async fn emit(
     for s in board_subs {
         let sub: String = s.try_get("subscriber")?;
         if Some(sub.as_str()) != actor {
+            if wakes_firehose {
+                direct.insert(sub.clone());
+            }
             recips.insert(sub);
         }
     }
@@ -390,6 +402,61 @@ mod tests {
         let coord = hooks.iter().find(|h| h.agent_id == "coord").expect("coord hook");
         assert!(alice.subscribed, "direct task subscriber is woken on a comment");
         assert!(!coord.subscribed, "firehose-only recipient is not push-woken per ticket");
+        Ok(())
+    }
+
+    /// #461: a whole-board firehose subscriber IS push-woken (subscribed=true) on task.created — the
+    /// new-task triage signal — but stays firehose-tier (subscribed=false, inbox/poll) on a
+    /// per-ticket event like task.commented, so the #384 "don't wake a coordinator on every ticket"
+    /// intent still holds. Verified via the collected WebhookDelivery flags.
+    #[tokio::test]
+    async fn firehose_woken_on_task_created_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        crate::core::register_agent(&pool, "triage", None, None, None, None, Some("http://x/wake")).await?;
+        // A whole-board (firehose) subscription — no task/project/etc. target.
+        crate::core::subscribe(&pool, "triage", None, None, None, None, true).await?;
+
+        // task.created: triage is woken even though it's only a firehose subscriber (not a direct
+        // target subscriber of the new task). Explicit(empty) isolates the firehose path.
+        let mut tx = pool.begin().await?;
+        let mut hooks: Vec<WebhookDelivery> = Vec::new();
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.created",
+            Some("owner"),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            json!({ "title": "T" }),
+            Recipients::Explicit(BTreeSet::new()),
+        )
+        .await?;
+        tx.commit().await?;
+        let created = hooks.iter().find(|h| h.agent_id == "triage").expect("triage woken on task.created");
+        assert!(created.subscribed, "firehose sub is push-woken (subscribed=true) on task.created");
+
+        // task.commented: triage still RECEIVES it (firehose delivery) but is NOT push-woken.
+        let mut tx = pool.begin().await?;
+        let mut hooks: Vec<WebhookDelivery> = Vec::new();
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.commented",
+            Some("owner"),
+            Some(1),
+            None,
+            None,
+            None,
+            json!({ "body": "hi" }),
+            Recipients::Explicit(BTreeSet::new()),
+        )
+        .await?;
+        tx.commit().await?;
+        let commented = hooks.iter().find(|h| h.agent_id == "triage").expect("triage still receives the comment");
+        assert!(!commented.subscribed, "firehose sub is NOT push-woken on a per-ticket comment");
         Ok(())
     }
 }
