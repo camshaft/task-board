@@ -29,6 +29,13 @@ export default function Board() {
       return n
     })
 
+  // Order every column (and each epic's subtasks) by most-recent activity — updated_at desc.
+  // This is the general, consistent ordering the operator asked for: whatever moved most
+  // recently floats to the top, so e.g. the done column reads newest-completed-first. ISO-8601
+  // timestamps sort lexicographically, so a plain string compare is chronological.
+  const byRecent = (a: TaskSummary, b: TaskSummary) =>
+    (b.updated_at ?? '').localeCompare(a.updated_at ?? '')
+
   // Nesting: group children under their parent and show only top-level tasks on the board, so
   // an epic collapses its subtasks instead of flooding the columns. The list already carries
   // parent_id, so this is a pure client-side partition — no extra fetch.
@@ -40,6 +47,7 @@ export default function Board() {
       childrenByParent.set(t.parent_id, arr)
     }
   }
+  for (const arr of childrenByParent.values()) arr.sort(byRecent)
   const topLevel = tasks.filter((t) => t.parent_id == null)
 
   function openComposer() {
@@ -219,7 +227,7 @@ export default function Board() {
 
       <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto p-4">
         {TASK_COLUMNS.map((col) => {
-          const items = topLevel.filter((t) => t.status === col)
+          const items = topLevel.filter((t) => t.status === col).sort(byRecent)
           return (
             <div key={col} className="flex w-72 shrink-0 flex-col">
               <div className="mb-2 flex items-center justify-between px-1">
@@ -228,7 +236,7 @@ export default function Board() {
                 </span>
                 <span className="text-xs text-[var(--color-muted)]">{items.length}</span>
               </div>
-              <div className="flex flex-1 flex-col gap-2 rounded-lg bg-[var(--color-panel)]/40 p-2">
+              <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded-lg bg-[var(--color-panel)]/40 p-2">
                 {items.map((t) => {
                   const children = childrenByParent.get(t.id) ?? []
                   const isEpic = children.length > 0
