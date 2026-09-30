@@ -240,6 +240,23 @@ export interface Meta {
   agent_statuses: AgentStatus[]
 }
 
+// A secret request as safe metadata (never the ciphertext or the capability tokens). The board
+// is an ephemeral request broker: this drives the submit page, which encrypts the value to
+// `recipients` in the browser and posts only ciphertext.
+export interface SecretRequest {
+  id: number
+  name: string
+  requested_by: string | null
+  fulfiller: string | null
+  status: string
+  recipients: string[]
+  instructions: string | null
+  target: string | null
+  created_at: string | null
+  submitted_at: string | null
+  expires_at: string | null
+}
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${API_ROOT}${path}`, {
     method,
@@ -457,6 +474,10 @@ export const api = {
       'GET',
       `/external-identities${source ? `?source=${encodeURIComponent(source)}` : ''}`,
     ),
+
+  getSecretRequest: (id: number) => req<SecretRequest>('GET', `/secret-requests/${id}`),
+  submitSecret: (id: number, b: { token: string; ciphertext: string }) =>
+    req<SecretRequest>('POST', `/secret-requests/${id}/submit`, b),
 }
 
 // Resolve a bare content id to a same-origin URL served by the board's scoped read-through
