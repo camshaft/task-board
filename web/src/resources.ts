@@ -341,6 +341,16 @@ export async function inviteToChannel(id: number, b: Parameters<typeof api.invit
   return c
 }
 
+// A direct message to another agent (the server creates or reuses the private DM channel).
+// Refresh the channel lists so a freshly-created DM surfaces (e.g. the agent page's DM link),
+// plus the activity feed. The specific DM channel id isn't in the response, so refresh all lists.
+export async function sendDirectMessage(b: Parameters<typeof api.sendMessage>[0]) {
+  const r = await api.sendMessage(b)
+  invalidateMatching('channels')
+  touched({ activity: true })
+  return r
+}
+
 // The compact event the SSE feed pushes (mirrors sse::StreamEvent on the server), plus the
 // synthetic resync signal the server sends when a client fell too far behind to replay.
 export interface StreamEvent {
