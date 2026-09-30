@@ -93,6 +93,43 @@ fn found(v: Value) -> ApiResult {
     }
 }
 
+/// Parse a resource id from a URL path segment (task 504), accepting three interchangeable forms:
+/// the bare integer (`472`), the `#472` shorthand, or the typed canonical form `<kind>_472` (e.g.
+/// `task_472`). `kind` is the route's own resource prefix ("task" | "doc" | "project" | "channel").
+/// A typed form whose prefix does NOT match the route (e.g. `doc_5` on a task route) is rejected so
+/// an id can't cross resource types. Returns None on anything else (non-numeric, id <= 0, ...).
+fn parse_ref(kind: &str, seg: &str) -> Option<i64> {
+    let s = seg.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    // Typed form: exactly "<kind>_<digits>". A wrong-kind prefix falls through and fails to parse.
+    if let Some(rest) = s.strip_prefix(kind).and_then(|r| r.strip_prefix('_')) {
+        return rest.parse::<i64>().ok().filter(|n| *n > 0);
+    }
+    s.parse::<i64>().ok().filter(|n| *n > 0)
+}
+
+/// Generate a `Path`-extractable newtype that accepts a resource id in bare / `#N` / typed
+/// (`<kind>_N`) form via [`parse_ref`], deserializing to the plain `i64`. Handlers destructure it
+/// (`Path(TaskRef(task_id))`) so their bodies still see an `i64` and need no other change (task 504).
+macro_rules! path_ref {
+    ($name:ident, $kind:literal) => {
+        #[derive(Debug, Clone, Copy)]
+        struct $name(i64);
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                parse_ref($kind, &s)
+                    .map($name)
+                    .ok_or_else(|| serde::de::Error::custom(format!("invalid {} id: {s}", $kind)))
+            }
+        }
+    };
+}
+path_ref!(TaskRef, "task");
+path_ref!(ProjectRef, "project");
+path_ref!(ChannelRef, "channel");
+path_ref!(DocRef, "doc");
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -753,7 +790,7 @@ async fn create_project(
     ))
 }
 
-async fn get_project(State(st): State<AppState>, Path(project_id): Path<i64>) -> ApiResult {
+async fn get_project(State(st): State<AppState>, Path(ProjectRef(project_id)): Path<ProjectRef>) -> ApiResult {
     found(core::get_project(&st.pool, project_id).await?)
 }
 
@@ -871,7 +908,7 @@ async fn create_task(State(st): State<AppState>, Json(b): Json<CreateTaskBody>) 
     ))
 }
 
-async fn get_task(State(st): State<AppState>, Path(task_id): Path<i64>) -> ApiResult {
+async fn get_task(State(st): State<AppState>, Path(TaskRef(task_id)): Path<TaskRef>) -> ApiResult {
     found(core::get_task(&st.pool, task_id).await?)
 }
 
@@ -1143,7 +1180,7 @@ async fn create_channel(State(st): State<AppState>, Json(b): Json<CreateChannelB
     ))
 }
 
-async fn get_channel(State(st): State<AppState>, Path(channel_id): Path<i64>) -> ApiResult {
+async fn get_channel(State(st): State<AppState>, Path(ChannelRef(channel_id)): Path<ChannelRef>) -> ApiResult {
     found(core::get_channel(&st.pool, channel_id).await?)
 }
 
@@ -1897,7 +1934,7 @@ struct GetDocumentQuery {
 
 async fn get_document(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Query(q): Query<GetDocumentQuery>,
 ) -> ApiResult {
     Ok(Json(
@@ -2237,6 +2274,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `parse_ref` accepts the bare int, the `#N` shorthand, and the typed `<kind>_N` form, and
+    /// rejects a wrong-kind prefix / non-numeric / non-positive input (task 504).
+    #[test]
+    fn parse_ref_accepts_bare_hash_and_typed_forms() {
+        assert_eq!(parse_ref("task", "472"), Some(472));
+        assert_eq!(parse_ref("task", "#472"), Some(472));
+        assert_eq!(parse_ref("task", "task_472"), Some(472));
+        assert_eq!(parse_ref("doc", "doc_23"), Some(23));
+        assert_eq!(parse_ref("project", "project_16"), Some(16));
+        assert_eq!(parse_ref("channel", "channel_123"), Some(123));
+        // Wrong-kind typed prefix is rejected so an id can't cross resource types.
+        assert_eq!(parse_ref("task", "doc_5"), None);
+        assert_eq!(parse_ref("doc", "task_5"), None);
+        // Junk / non-positive / partial forms.
+        assert_eq!(parse_ref("task", "task_"), None);
+        assert_eq!(parse_ref("task", "task_abc"), None);
+        assert_eq!(parse_ref("task", "0"), None);
+        assert_eq!(parse_ref("task", "-3"), None);
+        assert_eq!(parse_ref("task", "abc"), None);
+    }
+
+    /// A by-id GET route accepts the id in bare AND typed (`task_<n>`) form via the newtype Path
+    /// extractor, and the response carries the typed canonical `ref`; a wrong-kind typed id 404s
+    /// (the extractor rejects it -> no route match) (task 504).
+    #[tokio::test]
+    async fn get_task_accepts_typed_id_and_returns_ref() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = core::create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = core::create_task(&pool, pid, "T", None, None, None, Some("a"), None, None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        let (events_tx, _rx) = broadcast::channel(16);
+        let state = AppState { pool, events_tx, ipfs_api_url: None };
+
+        let get = |uri: String| {
+            let app = router(state.clone());
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Bare int form: 200 + ref == "task_<id>".
+        let resp = get(format!("/tasks/{tid}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(v["id"].as_i64(), Some(tid), "int id retained");
+        assert_eq!(v["ref"].as_str(), Some(format!("task_{tid}").as_str()));
+
+        // Typed form: same resource.
+        let resp = get(format!("/tasks/task_{tid}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(v["id"].as_i64(), Some(tid));
+
+        // Wrong-kind typed id on the task route: the extractor rejects it, so it never resolves to
+        // a resource -> a 4xx client error (a path-deserialize rejection), never a 200.
+        let resp = get(format!("/tasks/doc_{tid}")).await;
+        assert!(resp.status().is_client_error(), "got {}", resp.status());
+        Ok(())
     }
 
     /// The health beacon reports 200 when the database is reachable — the signal an agent checks
