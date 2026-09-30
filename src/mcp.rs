@@ -782,6 +782,13 @@ pub struct ListWikiArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentArgs {
     pub document_id: i64,
+    /// When true, also fetch the current version's markdown from its pinned CID (server-side, via
+    /// the board's IPFS backend) and inline it as `body` — so an agent building or reviewing from an
+    /// approved doc gets the content in one call, whatever its own host can reach. Omit/false for
+    /// metadata only. If the fetch fails (no backend, unreachable, non-text) the metadata still
+    /// returns with `body: null` + a `body_error`. The doc stays CID-only at rest (fetched on read).
+    #[serde(default)]
+    pub include_body: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1783,12 +1790,15 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Get one document with its current version and full version list (each version is a bare CID + summary).")]
+    #[tool(description = "Get one document with its current version and full version list (each version is a bare CID + summary). Pass include_body=true to also inline the current version's markdown, fetched server-side from its pinned CID.")]
     async fn get_document(
         &self,
         Parameters(a): Parameters<GetDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_document(&self.pool, a.document_id).await.map_err(err).and_then(ok)
+        core::get_document_with_body(&self.pool, self.ipfs_api_url.as_deref(), a.document_id, a.include_body)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(description = "Rename a document — set its title (a short, specific noun phrase; the viewer renders the title as the page header). Metadata-only: versions, content, wiki path, and review status are untouched. Emits document.updated and notifies subscribers.")]
