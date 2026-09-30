@@ -410,6 +410,14 @@ pub struct SubscribeArgs {
     /// Whole-board firehose: subscribe to EVERY event on the board (for a coordinator/auto-assigner).
     #[serde(default)]
     pub board: Option<bool>,
+    /// Optional event-class filter (#462): a subset of ["created", "done", "blocked", "status",
+    /// "comment", "assigned", "review", "doc"]. When given, this subscription is delivery-gated to
+    /// just those classes - only matching events reach your inbox AND wake you, everything else is
+    /// dropped for this subscription. Omit for every event (the default). Applies to ANY target
+    /// (board/project/channel/task): e.g. board + ["created"] wakes a triage agent only on new
+    /// tasks; a gap-ticket owner uses task/project + ["done", "blocked"]. (Ignored by unsubscribe.)
+    #[serde(default)]
+    pub event_classes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1347,16 +1355,21 @@ impl Board {
     }
 
     // --- Subscriptions ---
-    #[tool(description = "Subscribe an agent to a task, a project, a channel, a document, OR the whole board so it's notified of activity there. Give exactly one of task_id / project_id / channel_id / document_id, or set `board: true` for the whole-board firehose (every event — for a coordinator/auto-assigner). Subscribing to a channel joins it.")]
+    #[tool(description = "Subscribe an agent to a task, a project, a channel, a document, OR the whole board so it's notified of activity there. Give exactly one of task_id / project_id / channel_id / document_id, or set `board: true` for the whole-board firehose. Subscribing to a channel joins it. Pass `event_classes` (e.g. [\"created\"]) to make it a filtered, delivery-gated subscription that only delivers + wakes on those event classes — the low-noise alternative to the full firehose; omit for every event. Idempotent: re-subscribing the same target updates the class set.")]
     async fn subscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let sub = self.me_req(a.subscriber.as_deref())?;
-        core::subscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, a.board.unwrap_or(false))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        let board = a.board.unwrap_or(false);
+        match a.event_classes.as_deref() {
+            Some(ec) if !ec.is_empty() => {
+                core::subscribe_classed(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, board, ec).await
+            }
+            _ => core::subscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, board).await,
+        }
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "Stop notifying an agent about a task, project, channel (leaving a channel), document, or the whole board (board: true).")]

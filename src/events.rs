@@ -51,21 +51,66 @@ pub enum Recipients {
     Explicit(BTreeSet<String>),
 }
 
+/// Parse a subscription's stored `event_classes` (a JSON array of class-name strings, or NULL).
+/// NULL / unparseable / empty => None, i.e. "no filter: deliver every event" (the legacy default).
+fn parse_event_classes(raw: Option<String>) -> Option<Vec<String>> {
+    let v: Vec<String> = serde_json::from_str(raw?.as_str()).ok()?;
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Whether an event (`event_type` + its `data`) falls into any subscriber-declared class (#462).
+/// Classes are named bundles mapping to concrete emitted event types; `done` additionally refines
+/// on the status transition value. An unknown class name matches nothing (forward-compatible).
+fn event_in_classes(event_type: &str, data: &Value, classes: &[String]) -> bool {
+    classes.iter().any(|c| match c.as_str() {
+        "created" => event_type == "task.created",
+        "comment" => event_type == "task.commented",
+        "assigned" => event_type == "task.assigned",
+        "blocked" => event_type == "task.blocked_on_you",
+        "status" => event_type == "task.status_changed",
+        // done = a task reaching the terminal "done" status; cancelled is excluded (not "ready").
+        "done" => {
+            event_type == "task.status_changed"
+                && data.get("to").and_then(|v| v.as_str()) == Some("done")
+        }
+        "review" => event_type.starts_with("review."),
+        "doc" => event_type.starts_with("document."),
+        _ => false,
+    })
+}
+
+/// Whether a subscription with stored `raw_classes` should deliver this event. A NULL/empty filter
+/// delivers everything (legacy behavior); otherwise only events matching one of its classes.
+fn subscription_delivers(event_type: &str, data: &Value, raw_classes: Option<String>) -> bool {
+    match parse_event_classes(raw_classes) {
+        None => true,
+        Some(classes) => event_in_classes(event_type, data, &classes),
+    }
+}
+
 /// Who hears about a project change: its subscribers, minus whoever performed the action.
 async fn recipients_for_project(
     tx: &mut Transaction<'_, Sqlite>,
     project_id: i64,
     actor: Option<&str>,
+    event_type: &str,
+    data: &Value,
 ) -> anyhow::Result<BTreeSet<String>> {
     let mut recips: BTreeSet<String> = BTreeSet::new();
     let subs = sqlx::query(
-        "SELECT subscriber FROM subscriptions WHERE target_type='project' AND target_id=?",
+        "SELECT subscriber, event_classes FROM subscriptions WHERE target_type='project' AND target_id=?",
     )
     .bind(project_id)
     .fetch_all(&mut **tx)
     .await?;
     for s in subs {
-        recips.insert(s.try_get::<String, _>("subscriber")?);
+        if subscription_delivers(event_type, data, s.try_get("event_classes")?) {
+            recips.insert(s.try_get::<String, _>("subscriber")?);
+        }
     }
     if let Some(actor) = actor {
         recips.remove(actor);
@@ -79,16 +124,20 @@ async fn recipients_for_channel(
     tx: &mut Transaction<'_, Sqlite>,
     channel_id: i64,
     actor: Option<&str>,
+    event_type: &str,
+    data: &Value,
 ) -> anyhow::Result<BTreeSet<String>> {
     let mut recips: BTreeSet<String> = BTreeSet::new();
     let subs = sqlx::query(
-        "SELECT subscriber FROM subscriptions WHERE target_type='channel' AND target_id=?",
+        "SELECT subscriber, event_classes FROM subscriptions WHERE target_type='channel' AND target_id=?",
     )
     .bind(channel_id)
     .fetch_all(&mut **tx)
     .await?;
     for s in subs {
-        recips.insert(s.try_get::<String, _>("subscriber")?);
+        if subscription_delivers(event_type, data, s.try_get("event_classes")?) {
+            recips.insert(s.try_get::<String, _>("subscriber")?);
+        }
     }
     if let Some(actor) = actor {
         recips.remove(actor);
@@ -106,6 +155,8 @@ async fn recipients_for_document(
     tx: &mut Transaction<'_, Sqlite>,
     document_id: i64,
     actor: Option<&str>,
+    event_type: &str,
+    data: &Value,
 ) -> anyhow::Result<BTreeSet<String>> {
     let mut recips: BTreeSet<String> = BTreeSet::new();
     if let Some(row) = sqlx::query("SELECT created_by FROM documents WHERE id=?")
@@ -118,13 +169,15 @@ async fn recipients_for_document(
         }
     }
     let subs = sqlx::query(
-        "SELECT subscriber FROM subscriptions WHERE target_type='document' AND target_id=?",
+        "SELECT subscriber, event_classes FROM subscriptions WHERE target_type='document' AND target_id=?",
     )
     .bind(document_id)
     .fetch_all(&mut **tx)
     .await?;
     for s in subs {
-        recips.insert(s.try_get::<String, _>("subscriber")?);
+        if subscription_delivers(event_type, data, s.try_get("event_classes")?) {
+            recips.insert(s.try_get::<String, _>("subscriber")?);
+        }
     }
     if let Some(actor) = actor {
         recips.remove(actor);
@@ -138,6 +191,8 @@ async fn recipients_for_task(
     tx: &mut Transaction<'_, Sqlite>,
     task_id: i64,
     actor: Option<&str>,
+    event_type: &str,
+    data: &Value,
 ) -> anyhow::Result<BTreeSet<String>> {
     let mut recips: BTreeSet<String> = BTreeSet::new();
     if let Some(row) = sqlx::query("SELECT project_id, assignee, created_by FROM tasks WHERE id=?")
@@ -146,6 +201,9 @@ async fn recipients_for_task(
         .await?
     {
         let project_id: Option<i64> = row.try_get("project_id")?;
+        // The assignee and creator are in the fan-out unconditionally (they always hear about their
+        // own task); the per-subscription event-class filter (#462) applies only to subscription
+        // rows, not to ownership.
         if let Ok(Some(a)) = row.try_get::<Option<String>, _>("assignee") {
             recips.insert(a);
         }
@@ -153,23 +211,27 @@ async fn recipients_for_task(
             recips.insert(c);
         }
         let subs = sqlx::query(
-            "SELECT subscriber FROM subscriptions WHERE target_type='task' AND target_id=?",
+            "SELECT subscriber, event_classes FROM subscriptions WHERE target_type='task' AND target_id=?",
         )
         .bind(task_id)
         .fetch_all(&mut **tx)
         .await?;
         for s in subs {
-            recips.insert(s.try_get::<String, _>("subscriber")?);
+            if subscription_delivers(event_type, data, s.try_get("event_classes")?) {
+                recips.insert(s.try_get::<String, _>("subscriber")?);
+            }
         }
         if let Some(pid) = project_id {
             let psubs = sqlx::query(
-                "SELECT subscriber FROM subscriptions WHERE target_type='project' AND target_id=?",
+                "SELECT subscriber, event_classes FROM subscriptions WHERE target_type='project' AND target_id=?",
             )
             .bind(pid)
             .fetch_all(&mut **tx)
             .await?;
             for s in psubs {
-                recips.insert(s.try_get::<String, _>("subscriber")?);
+                if subscription_delivers(event_type, data, s.try_get("event_classes")?) {
+                    recips.insert(s.try_get::<String, _>("subscriber")?);
+                }
             }
         }
         // Muted agents detach from this task's fan-out even though they're the
@@ -223,15 +285,15 @@ pub async fn emit(
     let mut recips = match recipients {
         Recipients::Explicit(set) => set,
         Recipients::FromTask => match task_id {
-            Some(tid) => recipients_for_task(tx, tid, actor).await?,
+            Some(tid) => recipients_for_task(tx, tid, actor, r#type, &data).await?,
             None => BTreeSet::new(),
         },
-        Recipients::FromProject(pid) => recipients_for_project(tx, pid, actor).await?,
-        Recipients::FromChannel(cid) => recipients_for_channel(tx, cid, actor).await?,
-        Recipients::FromDocument(did) => recipients_for_document(tx, did, actor).await?,
+        Recipients::FromProject(pid) => recipients_for_project(tx, pid, actor, r#type, &data).await?,
+        Recipients::FromChannel(cid) => recipients_for_channel(tx, cid, actor, r#type, &data).await?,
+        Recipients::FromDocument(did) => recipients_for_document(tx, did, actor, r#type, &data).await?,
         Recipients::FromDocumentAndTask(did, tid) => {
-            let mut set = recipients_for_document(tx, did, actor).await?;
-            set.extend(recipients_for_task(tx, tid, actor).await?);
+            let mut set = recipients_for_document(tx, did, actor, r#type, &data).await?;
+            set.extend(recipients_for_task(tx, tid, actor, r#type, &data).await?);
             set
         }
     };
@@ -251,20 +313,34 @@ pub async fn emit(
     // chatter. (The durable, per-subscriber selective event-class filter is #462.)
     let wakes_firehose = r#type == "task.created";
 
-    // Whole-board firehose: anyone subscribed with target_type='board' receives EVERY event,
-    // regardless of the per-event recipient set above (even otherwise-silent Explicit events).
-    // Minus the actor, so an agent isn't notified of its own action.
+    // Whole-board firehose: anyone subscribed with target_type='board'. An UNFILTERED board
+    // subscription (event_classes NULL) receives EVERY event, regardless of the per-event recipient
+    // set above (even otherwise-silent Explicit events), at the inbox/poll tier (subscribed=false)
+    // — except the #461 task.created triage carve-out. A FILTERED board subscription (#462) receives
+    // ONLY events matching its classes, and a match is a genuine wake (subscribed=true) since the
+    // subscriber explicitly opted into those classes. Minus the actor either way.
     let board_subs =
-        sqlx::query("SELECT subscriber FROM subscriptions WHERE target_type='board'")
+        sqlx::query("SELECT subscriber, event_classes FROM subscriptions WHERE target_type='board'")
             .fetch_all(&mut **tx)
             .await?;
     for s in board_subs {
         let sub: String = s.try_get("subscriber")?;
-        if Some(sub.as_str()) != actor {
-            if wakes_firehose {
-                direct.insert(sub.clone());
+        if Some(sub.as_str()) == actor {
+            continue;
+        }
+        match parse_event_classes(s.try_get("event_classes")?) {
+            Some(classes) => {
+                if event_in_classes(r#type, &data, &classes) {
+                    direct.insert(sub.clone());
+                    recips.insert(sub);
+                }
             }
-            recips.insert(sub);
+            None => {
+                if wakes_firehose {
+                    direct.insert(sub.clone());
+                }
+                recips.insert(sub);
+            }
         }
     }
 
@@ -457,6 +533,72 @@ mod tests {
         tx.commit().await?;
         let commented = hooks.iter().find(|h| h.agent_id == "triage").expect("triage still receives the comment");
         assert!(!commented.subscribed, "firehose sub is NOT push-woken on a per-ticket comment");
+        Ok(())
+    }
+
+    /// #462: the event-class vocabulary maps to concrete emitted types, `done` refines on the
+    /// status transition value (done matches, cancelled/other do not), and an empty/NULL filter is
+    /// "no filter" (None).
+    #[test]
+    fn event_classes_match_expected_types() {
+        let done = ["done".to_string()];
+        assert!(event_in_classes("task.status_changed", &json!({ "to": "done" }), &done));
+        assert!(!event_in_classes("task.status_changed", &json!({ "to": "cancelled" }), &done));
+        assert!(!event_in_classes("task.status_changed", &json!({ "to": "in_progress" }), &done));
+        assert!(event_in_classes("task.created", &json!({}), &["created".to_string()]));
+        assert!(event_in_classes("task.blocked_on_you", &json!({}), &["blocked".to_string()]));
+        assert!(event_in_classes("task.assigned", &json!({}), &["assigned".to_string()]));
+        assert!(event_in_classes("task.commented", &json!({}), &["comment".to_string()]));
+        assert!(event_in_classes("task.status_changed", &json!({ "to": "blocked" }), &["status".to_string()]));
+        assert!(event_in_classes("review.status_changed", &json!({}), &["review".to_string()]));
+        assert!(event_in_classes("document.approved", &json!({}), &["doc".to_string()]));
+        // Non-matching type, and an unknown class name, match nothing.
+        assert!(!event_in_classes("task.commented", &json!({}), &["created".to_string()]));
+        assert!(!event_in_classes("task.created", &json!({}), &["bogus".to_string()]));
+        // NULL / empty filter => None (deliver everything); a real list round-trips.
+        assert!(parse_event_classes(None).is_none());
+        assert!(parse_event_classes(Some("[]".to_string())).is_none());
+        assert_eq!(
+            parse_event_classes(Some(r#"["created","blocked"]"#.to_string())),
+            Some(vec!["created".to_string(), "blocked".to_string()])
+        );
+    }
+
+    /// #462: a filtered board subscription ([created]) is delivery-gated — it is delivered + woken
+    /// (subscribed=true) on a matching event (task.created), but a non-matching event
+    /// (task.commented) is not delivered to it at all: no inbox row, no wake. This is what removes
+    /// the firehose inbox-noise, not just the wake.
+    #[tokio::test]
+    async fn event_class_filter_gates_delivery() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        crate::core::register_agent(&pool, "triage", None, None, None, None, Some("http://x/wake")).await?;
+        // A filtered board subscription: only the `created` class.
+        crate::core::subscribe_classed(&pool, "triage", None, None, None, None, true, &["created".to_string()])
+            .await?;
+
+        // task.created matches: delivered (one inbox row) and woken (subscribed=true).
+        let mut tx = pool.begin().await?;
+        let mut hooks: Vec<WebhookDelivery> = Vec::new();
+        emit(&mut tx, &mut hooks, "task.created", Some("owner"), Some(1), Some(1), None, None,
+            json!({ "title": "T" }), Recipients::Explicit(BTreeSet::new())).await?;
+        tx.commit().await?;
+        let created = hooks.iter().find(|h| h.agent_id == "triage").expect("filtered sub delivered task.created");
+        assert!(created.subscribed, "a matching class wakes the filtered subscriber");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE recipient='triage'")
+            .fetch_one(&pool).await?;
+        assert_eq!(n, 1, "one inbox row for the matching event");
+
+        // task.commented does NOT match: not delivered at all (no new inbox row, no wake).
+        let mut tx = pool.begin().await?;
+        let mut hooks: Vec<WebhookDelivery> = Vec::new();
+        emit(&mut tx, &mut hooks, "task.commented", Some("owner"), Some(1), None, None, None,
+            json!({ "body": "hi" }), Recipients::Explicit(BTreeSet::new())).await?;
+        tx.commit().await?;
+        assert!(hooks.iter().all(|h| h.agent_id != "triage"), "filtered-out event does not wake the subscriber");
+        let n2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE recipient='triage'")
+            .fetch_one(&pool).await?;
+        assert_eq!(n2, 1, "no new inbox row for the filtered-out event (delivery-gated)");
         Ok(())
     }
 }

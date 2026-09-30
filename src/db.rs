@@ -92,6 +92,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     subscriber  TEXT NOT NULL,
     target_type TEXT NOT NULL,
     target_id   INTEGER NOT NULL,
+    -- Optional event-class filter (#462): a JSON array of class names (e.g. ["created"]) the
+    -- subscriber wants delivered on this subscription. NULL = every event (the default / legacy
+    -- behavior). A filtered subscription is delivery-gated: non-matching events never reach the
+    -- inbox and never wake the subscriber.
+    event_classes TEXT,
     created_at  TEXT NOT NULL,
     UNIQUE(subscriber, target_type, target_id)
 );
@@ -489,6 +494,20 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .any(|r| r.get::<String, _>("name") == "auto_join");
     if !channels_have_auto_join {
         sqlx::query("ALTER TABLE channels ADD COLUMN auto_join INTEGER NOT NULL DEFAULT 0")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill subscriptions.event_classes (#462: per-subscription event-class filter). Nullable;
+    // a legacy subscriptions row opens without it, defaulting to NULL = every event (unchanged
+    // behavior), so existing subscriptions keep delivering everything until they opt into a filter.
+    let subs_have_event_classes = sqlx::query("PRAGMA table_info(subscriptions)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "event_classes");
+    if !subs_have_event_classes {
+        sqlx::query("ALTER TABLE subscriptions ADD COLUMN event_classes TEXT")
             .execute(&pool)
             .await?;
     }
