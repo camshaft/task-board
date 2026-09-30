@@ -44,6 +44,10 @@ pub struct StreamEvent {
     pub task_id: Option<i64>,
     pub channel_id: Option<i64>,
     pub document_id: Option<i64>,
+    /// Review this event concerns (review.* events). There is no review_id column on `events`
+    /// (reviews aren't a task/project/etc.), so it's read from the event `data` payload — enough
+    /// routing info for a client to invalidate review(id) + the reviews list + the trend.
+    pub review_id: Option<i64>,
 }
 
 /// Create the broadcast bus. The returned sender is cloned into app state (SSE handlers
@@ -148,7 +152,7 @@ fn resync_event() -> Event {
 /// Events with seq greater than `since`, oldest first, capped at `limit`.
 async fn fetch_since(pool: &Pool, since: i64, limit: i64) -> anyhow::Result<Vec<StreamEvent>> {
     let rows = sqlx::query(
-        "SELECT seq, type, project_id, task_id, channel_id, document_id FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
+        "SELECT seq, type, project_id, task_id, channel_id, document_id, data FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
     )
     .bind(since)
     .bind(limit)
@@ -156,6 +160,13 @@ async fn fetch_since(pool: &Pool, since: i64, limit: i64) -> anyhow::Result<Vec<
     .await?;
     rows.iter()
         .map(|r| {
+            // review_id isn't a column; review.* events carry it in their JSON data payload.
+            let review_id = r
+                .try_get::<Option<String>, _>("data")
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|d| d.get("review_id").and_then(|v| v.as_i64()));
             Ok(StreamEvent {
                 seq: r.try_get("seq")?,
                 r#type: r.try_get("type")?,
@@ -163,6 +174,7 @@ async fn fetch_since(pool: &Pool, since: i64, limit: i64) -> anyhow::Result<Vec<
                 task_id: r.try_get("task_id")?,
                 channel_id: r.try_get("channel_id")?,
                 document_id: r.try_get("document_id")?,
+                review_id,
             })
         })
         .collect()
@@ -252,6 +264,28 @@ mod tests {
         let after_first = fetch_since(&pool, all[0].seq, BATCH).await?;
         assert_eq!(after_first.len(), all.len() - 1);
         assert_eq!(after_first[0].seq, all[1].seq);
+        Ok(())
+    }
+
+    /// review.* events surface review_id on the StreamEvent (read from the event data, since
+    /// there's no review_id column) so a client can invalidate review(id) + reviews + trend (#409).
+    #[tokio::test]
+    async fn review_events_carry_review_id() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let r = core::create_review(&pool, "design", None, None, Some("d"), None, Some("author"), None, None, None).await?;
+        let rid = r["id"].as_i64().unwrap();
+        core::set_review_status(&pool, rid, "in_review", Some("author"), None).await?;
+
+        let evs = fetch_since(&pool, 0, BATCH).await?;
+        let review_evs: Vec<&StreamEvent> = evs.iter().filter(|e| e.r#type.starts_with("review.")).collect();
+        assert!(!review_evs.is_empty(), "should have review.* events");
+        for e in &review_evs {
+            assert_eq!(e.review_id, Some(rid), "review event carries review_id: {}", e.r#type);
+            assert!(e.task_id.is_none() && e.project_id.is_none());
+        }
+        // A non-review event has no review_id.
+        assert!(evs.iter().filter(|e| !e.r#type.starts_with("review.")).all(|e| e.review_id.is_none()));
         Ok(())
     }
 }
