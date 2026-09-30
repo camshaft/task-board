@@ -25,6 +25,32 @@ body {
     sans-serif;
 }
 
+/* Dark-theme scrollbars (task 518). macOS/Chrome's default light overlay scrollbars look out of
+   place on the dark UI; where a scrollbar must remain (task columns, panels, timelines) give it a
+   thin, muted thumb over a transparent track so it reads as intentional. Firefox uses the
+   standard scrollbar-* props; WebKit/Blink use the ::-webkit-scrollbar pseudo-elements. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-border);
+  background-clip: content-box;
+  border: 2px solid transparent;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: #2f3850;
+}
+
 /* Region-anchored document comments: the CSS Custom Highlight API paints the quoted text of
    each region comment over the rendered content (no DOM surgery), so anchors are visible. */
 ::highlight(tb-region) {
