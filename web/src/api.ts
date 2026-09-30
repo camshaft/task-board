@@ -22,6 +22,12 @@ export interface Agent {
   webhook_url: string | null
   created_at: string
   last_seen: string | null
+  // Set while a graceful stand-down has been requested (a signal, not a status change; the
+  // agent observes it in its loop). Cleared automatically once the agent honors it by going
+  // offline. Surfaced so the agent page can render the pending request (who / why / when).
+  stand_down_requested_at?: string | null
+  stand_down_requested_by?: string | null
+  stand_down_reason?: string | null
 }
 
 export interface Project {
@@ -305,6 +311,10 @@ export const api = {
       metadata?: Record<string, unknown>
     },
   ) => req<Agent>('PATCH', `/agents/${encodeURIComponent(id)}`, b),
+  // Request a graceful stand-down: records the request on the agent + drops an observable
+  // notification into its inbox. A signal only — never changes status / kills the agent.
+  requestStandDown: (id: string, b: { requested_by?: string; reason?: string } = {}) =>
+    req<Agent>('POST', `/agents/${encodeURIComponent(id)}/request-stand-down`, b),
 
   listProjects: (status?: string) =>
     req<Project[]>('GET', `/projects${status ? `?status=${encodeURIComponent(status)}` : ''}`),

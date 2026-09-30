@@ -265,6 +265,18 @@ export async function updateAgent(id: string, b: Parameters<typeof api.updateAge
   return a
 }
 
+// Request a graceful stand-down. The response carries the pending-request fields, so refresh
+// the agent's own view (to show pending state) and the roster.
+export async function requestStandDown(
+  id: string,
+  b: Parameters<typeof api.requestStandDown>[1] = {},
+) {
+  const a = await api.requestStandDown(id, b)
+  invalidate(keys.agent(id))
+  invalidate(keys.agents)
+  return a
+}
+
 // Document mutations. Same pattern as the task ones: perform the request, then funnel through
 // touched() keyed on the document so its viewer, comment panel, and the documents list all
 // refresh — locally and (via the SSE path below) when another client makes the change.

@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import { useBoardContext } from './Layout'
 import {
   eventHref,
+  requestStandDown,
   sendDirectMessage,
   useAgent,
   useAgentActivity,
@@ -58,6 +59,31 @@ export default function AgentView() {
       setNudgeSent(true)
     } catch (e) {
       setNudgeError((e as Error).message)
+    } finally {
+      setSending(false)
+    }
+  }
+
+  // Request a graceful stand-down (a signal the agent observes in its loop — not a kill). The
+  // request stays pending on the agent until it honors it by going offline, which clears it.
+  const standDownPending = agent?.stand_down_requested_at != null
+  const [standDownError, setStandDownError] = useState<string | null>(null)
+
+  async function requestSpinDown() {
+    if (sending || standDownPending) return
+    if (
+      !window.confirm(
+        `Request ${id} to gracefully stand down? This asks the agent to finish up and go offline — it does not force-stop it.`,
+      )
+    )
+      return
+    const reason = window.prompt('Reason (optional):') ?? undefined
+    setSending(true)
+    setStandDownError(null)
+    try {
+      await requestStandDown(id, { requested_by: actor, reason: reason || undefined })
+    } catch (e) {
+      setStandDownError((e as Error).message)
     } finally {
       setSending(false)
     }
@@ -133,9 +159,31 @@ export default function AgentView() {
             >
               Nudge
             </button>
+            <button
+              onClick={requestSpinDown}
+              disabled={sending || standDownPending}
+              className="rounded-md px-2.5 py-1 text-xs text-amber-300 ring-1 ring-inset ring-amber-500/40 hover:bg-amber-500/10 disabled:opacity-40"
+            >
+              {standDownPending ? 'Spin-down requested' : 'Request spin-down'}
+            </button>
           </div>
         )}
       </div>
+
+      {/* Pending graceful stand-down request (a signal; the agent clears it by going offline). */}
+      {agent && standDownPending && (
+        <div className="border-b border-amber-500/30 bg-amber-500/10 px-5 py-2 text-xs text-amber-200">
+          Spin-down requested {relTime(agent.stand_down_requested_at ?? null)}
+          {agent.stand_down_requested_by ? ` by ${agent.stand_down_requested_by}` : ''}
+          {agent.stand_down_reason ? ` — ${agent.stand_down_reason}` : ''}. Waiting for the agent to
+          go offline.
+        </div>
+      )}
+      {standDownError && (
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+          {standDownError}
+        </div>
+      )}
 
       {/* Quick nudge composer: a direct message without leaving the agent page. */}
       {nudgeOpen && agent && actor && id !== actor && (
