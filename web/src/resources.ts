@@ -15,6 +15,7 @@ import {
   type ExternalIdentity,
   type Project,
   type Review,
+  type ReviewTrend,
   type Task,
   type TaskSummary,
 } from './api'
@@ -47,6 +48,7 @@ const keys = {
   externalIdentities: 'externalIdentities',
   reviews: 'reviews',
   review: (id: number) => `review:${id}`,
+  reviewTrend: 'reviewTrend',
 }
 
 export function useProjects() {
@@ -166,6 +168,10 @@ export function useReviews() {
 
 export function useReview(id: number) {
   return useResource<Review>(keys.review(id), () => api.getReview(id))
+}
+
+export function useReviewTrend() {
+  return useResource<ReviewTrend>(keys.reviewTrend, () => api.reviewTrend())
 }
 
 /**

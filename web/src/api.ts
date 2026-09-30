@@ -283,6 +283,37 @@ export interface Review {
   log?: ReviewLogEntry[]
 }
 
+// The review improvement trend (GET /reviews/trend, task 376): findings-per-review with an
+// earlier-vs-later trend, counterbalanced by an escaped-defect signal, derived from review logs.
+export interface ReviewTrendSlice {
+  reviews: number
+  findings: number
+  findings_per_review: number
+  escaped_defects: {
+    total: number
+    post_approval_findings: number
+    reopens: number
+    lineage_followups: number
+  }
+  earlier: { reviews: number; findings_per_review: number; escaped_per_review: number } | null
+  later: { reviews: number; findings_per_review: number; escaped_per_review: number } | null
+  // improving | worsening | flat | insufficient_data
+  findings_trend: string
+  // rising | falling | flat | insufficient_data
+  escaped_trend: string
+  // findings fell while escaped defects rose — a slice worth a second look.
+  flagged: boolean
+  kind?: string
+  area?: string
+}
+
+export interface ReviewTrend {
+  filters: { kind: string | null; area: string | null }
+  overall: ReviewTrendSlice
+  by_kind: ReviewTrendSlice[]
+  by_area: ReviewTrendSlice[]
+}
+
 // A secret request as safe metadata (never the ciphertext or the capability tokens). The board
 // is an ephemeral request broker: this drives the submit page, which encrypts the value to
 // `recipients` in the browser and posts only ciphertext.
@@ -529,6 +560,13 @@ export const api = {
     return req<{ reviews: Review[] }>('GET', `/reviews${qs ? `?${qs}` : ''}`).then((r) => r.reviews)
   },
   getReview: (id: number) => req<Review>('GET', `/reviews/${id}`),
+  reviewTrend: (q: { kind?: string; area?: string } = {}) => {
+    const p = new URLSearchParams()
+    if (q.kind) p.set('kind', q.kind)
+    if (q.area) p.set('area', q.area)
+    const qs = p.toString()
+    return req<ReviewTrend>('GET', `/reviews/trend${qs ? `?${qs}` : ''}`)
+  },
 
   listExternalIdentities: (source?: string) =>
     req<ExternalIdentity[]>(
