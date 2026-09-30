@@ -1547,7 +1547,29 @@ pub async fn set_task_archived(
     get_task(pool, task_id).await
 }
 
+/// Default number of most-recent comments the agent-facing MCP `get_task` inlines when the caller
+/// gives no explicit `comments_limit` (task #511). The REST/UI path stays unbounded (`None`).
+pub const DEFAULT_TASK_COMMENTS: i64 = 20;
+
+/// Fetch a task with ALL its comments inlined (chronological). Thin wrapper over
+/// [`get_task_limited`] — the unbounded form kept for internal callers and the REST/UI path, which
+/// renders the full thread. Agent-facing MCP reads pass a bound to stay under the context cap (#511).
 pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
+    get_task_limited(pool, task_id, None).await
+}
+
+/// Fetch a task as JSON. `comments_limit` bounds the inlined `comments` array (task #511, sibling of
+/// #418): `None` inlines the whole thread (chronological); `Some(n)` with `n > 0` inlines only the
+/// most-recent `n` comments (still chronological within the slice); `Some(0)` inlines none
+/// (metadata-only). The response always carries `comment_count` (the total on the task) and
+/// `comments_truncated` (true when fewer than the total were inlined), so a caller knows there is
+/// more history to page in with a larger limit. Bounding the default keeps a long-lived, busy task
+/// from overflowing an agent's read/context cap and forcing a manual extraction workaround.
+pub async fn get_task_limited(
+    pool: &Pool,
+    task_id: i64,
+    comments_limit: Option<i64>,
+) -> anyhow::Result<Value> {
     let t = sqlx::query("SELECT * FROM tasks WHERE id=?")
         .bind(task_id)
         .fetch_optional(pool)
@@ -1577,19 +1599,47 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
         m.remove("blocked_on_note");
         m.insert("blocked_on".into(), blocked_on.unwrap_or(Value::Null));
 
-        let comments = sqlx::query(
-            "SELECT c.id, c.author, c.body, c.created_at, c.external_author, c.origin_ref, \
-             ei.display_name AS external_author_name \
-             FROM comments c LEFT JOIN external_identities ei ON ei.id = c.external_author \
-             WHERE c.task_id=? ORDER BY c.id",
-        )
-        .bind(task_id)
-        .fetch_all(pool)
-        .await?;
-        m.insert(
-            "comments".into(),
-            Value::Array(comments.iter().map(row_to_json).collect()),
-        );
+        // Comments, bounded by `comments_limit` (#511). Always report the total so a caller knows
+        // whether there is more than what was inlined.
+        let comment_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comments WHERE task_id=?")
+            .bind(task_id)
+            .fetch_one(pool)
+            .await?;
+        let comments: Vec<Value> = match comments_limit {
+            // Metadata-only: inline no comments.
+            Some(0) => Vec::new(),
+            // Most-recent `n`, fetched newest-first then reversed so the slice stays chronological.
+            Some(n) if n > 0 => {
+                let rows = sqlx::query(
+                    "SELECT c.id, c.author, c.body, c.created_at, c.external_author, c.origin_ref, \
+                     ei.display_name AS external_author_name \
+                     FROM comments c LEFT JOIN external_identities ei ON ei.id = c.external_author \
+                     WHERE c.task_id=? ORDER BY c.id DESC LIMIT ?",
+                )
+                .bind(task_id)
+                .bind(n)
+                .fetch_all(pool)
+                .await?;
+                rows.iter().rev().map(row_to_json).collect()
+            }
+            // None (or a non-positive n other than 0): the whole thread, chronological.
+            _ => {
+                let rows = sqlx::query(
+                    "SELECT c.id, c.author, c.body, c.created_at, c.external_author, c.origin_ref, \
+                     ei.display_name AS external_author_name \
+                     FROM comments c LEFT JOIN external_identities ei ON ei.id = c.external_author \
+                     WHERE c.task_id=? ORDER BY c.id",
+                )
+                .bind(task_id)
+                .fetch_all(pool)
+                .await?;
+                rows.iter().map(row_to_json).collect()
+            }
+        };
+        let inlined = comments.len() as i64;
+        m.insert("comments".into(), Value::Array(comments));
+        m.insert("comment_count".into(), json!(comment_count));
+        m.insert("comments_truncated".into(), json!(inlined < comment_count));
 
         let subs = sqlx::query(
             "SELECT subscriber FROM subscriptions WHERE target_type='task' AND target_id=?",
@@ -6211,6 +6261,53 @@ mod tests {
         let again = check_notifications(&pool, "planner", true, 50, None).await?;
         assert_eq!(again["count"].as_i64(), Some(0), "should be drained");
 
+        Ok(())
+    }
+
+    /// get_task_limited bounds the inlined comments (#511): None = the whole thread; Some(n) = the
+    /// most-recent n (chronological within the slice); Some(0) = metadata-only. `comment_count` is
+    /// always the true total and `comments_truncated` flags when fewer than all were inlined. The
+    /// bare get_task wrapper stays unbounded (the REST/UI full-thread path).
+    #[tokio::test]
+    async fn get_task_comment_limit_bounds_inlined_slice() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+        for i in 0..5 {
+            comment_task(&pool, tid, &format!("c{i}"), Some("a"), None, None).await?;
+        }
+
+        // None => all five, chronological, not truncated.
+        let all = get_task_limited(&pool, tid, None).await?;
+        let cs = all["comments"].as_array().unwrap();
+        assert_eq!(cs.len(), 5);
+        assert_eq!(cs[0]["body"], json!("c0"));
+        assert_eq!(cs[4]["body"], json!("c4"));
+        assert_eq!(all["comment_count"], json!(5));
+        assert_eq!(all["comments_truncated"], json!(false));
+
+        // Some(2) => the two MOST-RECENT, still chronological (c3, c4), truncated.
+        let recent = get_task_limited(&pool, tid, Some(2)).await?;
+        let cs = recent["comments"].as_array().unwrap();
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0]["body"], json!("c3"));
+        assert_eq!(cs[1]["body"], json!("c4"));
+        assert_eq!(recent["comment_count"], json!(5));
+        assert_eq!(recent["comments_truncated"], json!(true));
+
+        // Some(0) => metadata-only, still reporting the true count + truncation.
+        let meta_only = get_task_limited(&pool, tid, Some(0)).await?;
+        assert_eq!(meta_only["comments"].as_array().unwrap().len(), 0);
+        assert_eq!(meta_only["comment_count"], json!(5));
+        assert_eq!(meta_only["comments_truncated"], json!(true));
+
+        // The bare wrapper is unbounded (the REST/UI full-thread path).
+        let wrapped = get_task(&pool, tid).await?;
+        assert_eq!(wrapped["comments"].as_array().unwrap().len(), 5);
+        assert_eq!(wrapped["comments_truncated"], json!(false));
         Ok(())
     }
 

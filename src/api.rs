@@ -908,8 +908,21 @@ async fn create_task(State(st): State<AppState>, Json(b): Json<CreateTaskBody>) 
     ))
 }
 
-async fn get_task(State(st): State<AppState>, Path(TaskRef(task_id)): Path<TaskRef>) -> ApiResult {
-    found(core::get_task(&st.pool, task_id).await?)
+#[derive(Deserialize, JsonSchema)]
+struct GetTaskQuery {
+    /// Bound the inlined `comments` to the most-recent N (chronological within the slice). Omit for
+    /// the whole thread; 0 for metadata-only. The response carries `comment_count` +
+    /// `comments_truncated`. Mirrors the MCP `get_task` bounding (task #511).
+    #[serde(default)]
+    comments_limit: Option<i64>,
+}
+
+async fn get_task(
+    State(st): State<AppState>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
+    Query(q): Query<GetTaskQuery>,
+) -> ApiResult {
+    found(core::get_task_limited(&st.pool, task_id, q.comments_limit).await?)
 }
 
 /// What a blocked task is waiting on. `kind` is task | agent | operator (or "none"/"" to clear).
