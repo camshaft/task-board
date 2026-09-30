@@ -24,6 +24,12 @@ pub struct WebhookDelivery {
     pub agent_id: String,
     pub url: String,
     pub payload: Value,
+    /// Whether this event is ACTIONABLE for this recipient (assignee / @mentioned / a direct
+    /// message) vs a passive FYI (a broad subscriber or the firehose). The host notifier wakes
+    /// the agent only on an actionable push, so collaboration (a comment to the assignee, an
+    /// @mention) wakes instantly while FYI fan-out stays quiet (no wake drain). See
+    /// [`actionable_recipients`].
+    pub actionable: bool,
 }
 
 /// Recipients that get an explicit set (possibly empty) rather than task-derived.
@@ -181,6 +187,60 @@ async fn recipients_for_task(
     Ok(recips)
 }
 
+/// The subset of `recips` for whom this event is ACTIONABLE (they are expected to do something)
+/// rather than a passive FYI. Actionable = a direct message to them, the task's assignee on task
+/// activity, a freshly-assigned assignee, or an `@id` mention in the event's body/summary/note.
+/// The host notifier wakes an idle agent only on an actionable push, so collaboration wakes
+/// instantly without the broad-subscriber wake drain that gated FYI wakes (#215).
+async fn actionable_recipients(
+    tx: &mut Transaction<'_, Sqlite>,
+    event_type: &str,
+    task_id: Option<i64>,
+    data: &Value,
+    recips: &BTreeSet<String>,
+) -> anyhow::Result<BTreeSet<String>> {
+    // A direct message is inherently actionable for whoever receives it.
+    if event_type.starts_with("message.") {
+        return Ok(recips.clone());
+    }
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    // The task's current assignee is an actionable target for any activity on their task.
+    if let Some(tid) = task_id {
+        if let Some(row) = sqlx::query("SELECT assignee FROM tasks WHERE id=?")
+            .bind(tid)
+            .fetch_optional(&mut **tx)
+            .await?
+        {
+            if let Some(a) = row.try_get::<Option<String>, _>("assignee")? {
+                if recips.contains(&a) {
+                    out.insert(a);
+                }
+            }
+        }
+    }
+    // A freshly-assigned assignee (task.assigned carries it in data) is actionable even before a
+    // re-read would see it.
+    if let Some(a) = data.get("assignee").and_then(|v| v.as_str()) {
+        if recips.contains(a) {
+            out.insert(a.to_string());
+        }
+    }
+    // `@id` mentions in any human-authored text on the event -> actionable for the mentioned id.
+    let text: String = ["body", "summary", "note"]
+        .iter()
+        .filter_map(|k| data.get(*k).and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !text.is_empty() {
+        for r in recips {
+            if text.contains(&format!("@{r}")) {
+                out.insert(r.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Record an event and deliver it to each recipient's inbox. Returns the event seq.
 /// Any webhook deliveries are appended to `hooks` to be fired after commit.
 #[allow(clippy::too_many_arguments)]
@@ -254,6 +314,9 @@ pub async fn emit(
 
     // Collect webhook targets (agents in the recipient set with a webhook_url).
     if !recips.is_empty() {
+        // Who is this event actionable for (wake now) vs a passive FYI (inbox only)? Computed once
+        // over the final recipient set, then stamped per recipient on both push paths.
+        let actionable = actionable_recipients(tx, r#type, task_id, &data, &recips).await?;
         let payload = serde_json::json!({
             "event_seq": seq,
             "type": r#type,
@@ -266,6 +329,7 @@ pub async fn emit(
             "created_at": ts,
         });
         for r in &recips {
+            let is_actionable = actionable.contains(r);
             if let Some(row) = sqlx::query(
                 "SELECT webhook_url FROM agents WHERE id=? AND webhook_url IS NOT NULL AND webhook_url != ''",
             )
@@ -278,16 +342,18 @@ pub async fn emit(
                     agent_id: r.clone(),
                     url,
                     payload: payload.clone(),
+                    actionable: is_actionable,
                 });
             }
 
             // Best-effort live-tunnel wake: for a recipient reachable over a reverse tunnel,
-            // push the same notification (with `recipient` set, matching the webhook body) as a
-            // `req` frame the daemon replays locally — so an idle agent wakes without polling.
-            // A missing/failed tunnel is fine: the inbox row above + the agent's poll deliver it.
+            // push the same notification (with `recipient` + `actionable` set, matching the webhook
+            // body) as a `req` frame the daemon replays locally — so an idle agent wakes without
+            // polling. A missing/failed tunnel is fine: the inbox row above + the poll deliver it.
             let mut wake = payload.clone();
             if let Value::Object(ref mut m) = wake {
                 m.insert("recipient".into(), Value::String(r.clone()));
+                m.insert("actionable".into(), Value::Bool(is_actionable));
             }
             crate::tunnel::try_wake(r, &wake);
         }
@@ -314,6 +380,7 @@ pub fn fire_webhooks(hooks: Vec<WebhookDelivery>, timeout: Duration) {
             let mut body = h.payload.clone();
             if let Value::Object(ref mut m) = body {
                 m.insert("recipient".into(), Value::String(h.agent_id.clone()));
+                m.insert("actionable".into(), Value::Bool(h.actionable));
             }
             if let Err(e) = client.post(&h.url).json(&body).send().await {
                 tracing::warn!(
@@ -324,4 +391,49 @@ pub fn fire_webhooks(hooks: Vec<WebhookDelivery>, timeout: Duration) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// actionable_recipients marks the assignee + @mentioned ids on task activity, every recipient
+    /// of a direct message, and a freshly-assigned assignee — while a plain subscriber is FYI.
+    #[tokio::test]
+    async fn actionable_targets_assignee_mention_and_dm() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = crate::core::create_project(&pool, "P", None, Some("owner"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        // Task assigned to alice, created by owner.
+        let t = crate::core::create_task(&pool, pid, "T", None, Some("alice"), None, Some("owner"), None, None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        let recips: BTreeSet<String> =
+            ["alice", "bob", "carol", "owner"].iter().map(|s| s.to_string()).collect();
+        let mut tx = pool.begin().await?;
+
+        // task.commented: assignee (alice) + an @mentioned id (carol) are actionable; a plain
+        // subscriber (bob) and the creator without a mention (owner) are FYI.
+        let data = serde_json::json!({ "body": "hey @carol take a look", "comment_id": 1 });
+        let a = actionable_recipients(&mut tx, "task.commented", Some(tid), &data, &recips).await?;
+        assert!(a.contains("alice"), "assignee actionable: {a:?}");
+        assert!(a.contains("carol"), "mentioned actionable: {a:?}");
+        assert!(!a.contains("bob"), "plain subscriber is FYI: {a:?}");
+        assert!(!a.contains("owner"), "creator without mention is FYI: {a:?}");
+
+        // A direct message is actionable for every recipient.
+        let dm = actionable_recipients(&mut tx, "message.direct", None, &json!({ "body": "hi" }), &recips)
+            .await?;
+        assert_eq!(dm, recips, "every DM recipient is actionable");
+
+        // task.assigned: the freshly-assigned assignee (from data) is actionable.
+        let asg = actionable_recipients(&mut tx, "task.assigned", Some(tid), &json!({ "assignee": "bob" }), &recips)
+            .await?;
+        assert!(asg.contains("bob"), "new assignee actionable: {asg:?}");
+        assert!(asg.contains("alice"), "current assignee also actionable: {asg:?}");
+        tx.commit().await?;
+        Ok(())
+    }
 }
