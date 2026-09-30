@@ -43,6 +43,14 @@ const EMBED_RE =
 // autolinkers below.
 const LINK_CLS = 'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
 
+// A bare #N still resolves to a board task (no break, per #504), but it's ambiguous versus the
+// typed task_N / external owner/repo#N forms. Mark it with an amber dotted underline + help cursor
+// (the title tooltip carries the nudge) so it reads as "resolvable, but prefer the typed form",
+// visually distinct from the confident sky links — the display-time half of task 517 (layer 2),
+// complementing the backend's author-time ref_warnings (layer 1).
+const AMBIGUOUS_REF_CLS =
+  'text-amber-300/90 underline decoration-dotted decoration-amber-400/60 underline-offset-2 cursor-help hover:text-amber-200'
+
 // Typed resource id prefix -> the client route it deep-links to (task 504). The typed form
 // (task_472, doc_23, project_16, channel_123) is the canonical id the API returns; the linkifier
 // resolves it to the in-app route so a self-describing reference is clickable anywhere it's written.
@@ -184,9 +192,17 @@ function inline(
       // Bare task reference (#123) → the task redirect route (which resolves the task's project).
       // The lookbehind rejects a leading word char / another # / & so "abc#1", "##", and numeric
       // HTML entities like "&#123;" don't match; \b after the digits rejects "#12ab".
+      // Still resolves to task N, but carries the ambiguity affordance (task 517 layer 2): amber
+      // dotted underline + help cursor + a tooltip nudging the typed form. Message mirrors the
+      // backend's layer-1 ref_warnings text.
       /(?<![\w#&])#(\d+)\b/,
       (m) => (
-        <Link key={gen()} to={`/tasks/${m[1]}`} className={LINK_CLS}>
+        <Link
+          key={gen()}
+          to={`/tasks/${m[1]}`}
+          title={`bare ${m[0]} is ambiguous: it resolves to board task_${m[1]}. Write task_${m[1]} for a board task, or owner/repo#${m[1]} for an external GitHub reference.`}
+          className={AMBIGUOUS_REF_CLS}
+        >
           {m[0]}
         </Link>
       ),
