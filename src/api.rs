@@ -93,6 +93,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/health", get(health))
+        .route("/tunnels", get(tunnels))
         .route("/meta", get(meta))
         .route("/agents", get(list_agents).post(register_agent))
         .route("/agents/{agent_id}", get(get_agent).patch(update_agent))
@@ -175,6 +176,14 @@ async fn health(State(st): State<AppState>) -> Response {
     }
 }
 
+/// Diagnostic: which agents currently have a live reverse tunnel (so the board can push a wake
+/// instead of the agent polling). Used to bisect a lost-wake regression — an agent absent here
+/// has no live tunnel, so its wakes fall back to the durable inbox + poll, and the break is in
+/// the daemon/proxy layer rather than the board's emit path.
+async fn tunnels() -> Json<Value> {
+    Json(json!({ "tunnels": crate::tunnel::live_agents() }))
+}
+
 /// The blessed status vocabularies the UI renders (columns, presence dots, ...).
 async fn meta() -> Json<Value> {
     Json(json!({
@@ -202,6 +211,7 @@ struct Endpoint {
 /// in sync. `body` names a struct whose JSON Schema is generated below.
 const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api", summary: "This discovery index: every endpoint with its request schema.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/tunnels", summary: "Diagnostic: which agents currently have a live reverse tunnel (so the board can push a wake rather than the agent polling). An agent absent here has no live tunnel — its wakes fall back to the inbox + poll.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/health", summary: "Health beacon: cheap liveness+readiness probe. 200 {ok:true,db:true} when the process is up and the database is reachable; 503 {ok:false} when the database is not ready. Check before a full tick and treat any non-200 (incl a 502 from the origin when it is down) as back-off-and-retry.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
     Endpoint { method: "GET", path: "/api/agents", summary: "List all known agents.", query: "", body: None },
