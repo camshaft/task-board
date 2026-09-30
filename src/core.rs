@@ -5467,6 +5467,83 @@ pub async fn set_review_status(
     Ok(out)
 }
 
+/// Set (or clear) a review's `vetted` flag — the adversarial-review gate (A1): "adversarial review
+/// was run AND its findings were addressed." Per the D17 decision this is an AUDIT-CONTRACT, not an
+/// identity gate: the board does NOT check whether the caller is a person (actor is free-text), it
+/// records WHO set it. Every real change durably logs a `decision` entry (body "vetted: {old} ->
+/// {new}", author = actor) so any vetted flip is auditable after the fact, and emits
+/// `review.vetted_changed`. Setting vetted to its current value is an idempotent no-op (no log, no
+/// event). The concluding lifecycle transition stays with set_review_status; this only moves the
+/// gate flag.
+pub async fn set_review_vetted(
+    pool: &Pool,
+    review_id: i64,
+    vetted: bool,
+    actor: Option<&str>,
+    note: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT vetted, created_by, assignee FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no review {review_id}");
+    };
+    let old_vetted: bool = row.try_get::<i64, _>("vetted")? != 0;
+    let created_by: Option<String> = row.try_get("created_by")?;
+    let assignee: Option<String> = row.try_get("assignee")?;
+    // Same value -> idempotent no-op (no audit entry, no event).
+    if old_vetted == vetted {
+        let out = review_json(&mut tx, review_id, true).await?.unwrap_or(Value::Null);
+        tx.commit().await?;
+        return Ok(out);
+    }
+    sqlx::query("UPDATE reviews SET vetted=?, updated_at=? WHERE id=?")
+        .bind(i64::from(vetted))
+        .bind(&ts)
+        .bind(review_id)
+        .execute(&mut *tx)
+        .await?;
+    // Durable audit entry: WHO changed the gate and from/to. entry_type=decision (not state_change,
+    // so the improvement-trend's transition parser never mistakes it for a status transition).
+    let body = match note {
+        Some(n) => format!("vetted: {old_vetted} -> {vetted}: {n}"),
+        None => format!("vetted: {old_vetted} -> {vetted}"),
+    };
+    sqlx::query(
+        "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
+         VALUES(?,?,?,?,NULL,NULL,?)",
+    )
+    .bind(review_id)
+    .bind("decision")
+    .bind(&body)
+    .bind(actor)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let recips = review_recipients(created_by.as_deref(), assignee.as_deref(), actor);
+    emit(
+        &mut tx,
+        &mut hooks,
+        "review.vetted_changed",
+        actor,
+        None,
+        None,
+        None,
+        None,
+        json!({ "review_id": review_id, "vetted": vetted }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let out = review_json(&mut tx, review_id, true).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
 /// Append an entry to a review's log. Idempotent on `external_id` when given: if an entry with
 /// the same external_id already exists on this review, return it with `appended:false` — so a
 /// bridge replaying the same upstream comment/finding never double-logs. `entry_type` is one of
@@ -8692,6 +8769,51 @@ mod tests {
         assert!(trimmed.get("charter").is_none());
         assert_eq!(trimmed["display_name"], json!("Worker"), "other fields survive the strip");
         assert_eq!(strip_field(json!("scalar"), "charter"), json!("scalar"));
+        Ok(())
+    }
+
+    /// set_review_vetted flips the gate, durably logs WHO + from/to (a decision entry, per the D17
+    /// audit-contract), emits review.vetted_changed, and is an idempotent no-op on the same value.
+    #[tokio::test]
+    async fn set_review_vetted_audits_and_is_idempotent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "author", None, None, None, None, None).await?;
+        register_agent(&pool, "gatekeeper", None, None, None, None, None).await?;
+
+        let r = create_review(&pool, "design", None, None, Some("d"), None, Some("author"), None, None, None).await?;
+        let rid = r["id"].as_i64().unwrap();
+        assert_eq!(r["vetted"], json!(false));
+        let base_log = r["log"].as_array().unwrap().len();
+
+        // Mark vetted: flag flips, and a decision entry records actor + from/to.
+        let v = set_review_vetted(&pool, rid, true, Some("gatekeeper"), Some("adversarial pass clean")).await?;
+        assert_eq!(v["vetted"], json!(true));
+        let log = v["log"].as_array().unwrap();
+        assert_eq!(log.len(), base_log + 1, "one audit entry added");
+        let entry = log.last().unwrap();
+        assert_eq!(entry["entry_type"], json!("decision"));
+        assert_eq!(entry["author"], json!("gatekeeper"));
+        assert!(entry["body"].as_str().unwrap().contains("vetted: false -> true"), "audit records from/to: {entry}");
+
+        // The creator (author) hears review.vetted_changed; the actor (gatekeeper) does not self-notify.
+        let inbox = check_notifications(&pool, "author", true, 50, None).await?;
+        assert!(
+            inbox["notifications"].as_array().unwrap().iter().any(|n| n["type"] == json!("review.vetted_changed")),
+            "creator is notified of the vetted change: {inbox}"
+        );
+
+        // Idempotent no-op: setting true again adds no log entry.
+        let again = set_review_vetted(&pool, rid, true, Some("gatekeeper"), None).await?;
+        assert_eq!(again["log"].as_array().unwrap().len(), base_log + 1, "no-op adds no entry");
+
+        // Clearing flips it back and logs another decision entry.
+        let cleared = set_review_vetted(&pool, rid, false, Some("gatekeeper"), None).await?;
+        assert_eq!(cleared["vetted"], json!(false));
+        assert_eq!(cleared["log"].as_array().unwrap().len(), base_log + 2);
+
+        // Unknown review errors (404 at the API).
+        assert!(set_review_vetted(&pool, 99999, true, Some("x"), None).await.is_err());
         Ok(())
     }
 }
