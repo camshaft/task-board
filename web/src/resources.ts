@@ -174,6 +174,24 @@ export function useReviewTrend() {
   return useResource<ReviewTrend>(keys.reviewTrend, () => api.reviewTrend())
 }
 
+// Review mutations. Both change the log + (status) the lifecycle and can shift the trend, so
+// refresh the review, the list, and the trend.
+export async function setReviewStatus(id: number, b: Parameters<typeof api.setReviewStatus>[1]) {
+  const r = await api.setReviewStatus(id, b)
+  invalidate(keys.review(id))
+  invalidate(keys.reviews)
+  invalidate(keys.reviewTrend)
+  return r
+}
+
+export async function appendReviewLog(id: number, b: Parameters<typeof api.appendReviewLog>[1]) {
+  const r = await api.appendReviewLog(id, b)
+  invalidate(keys.review(id))
+  invalidate(keys.reviews)
+  invalidate(keys.reviewTrend)
+  return r
+}
+
 /**
  * Announce that some data changed, so every dependent resource refetches. This is the
  * single choke point for reactivity — the ONE place that maps a changed entity to the
