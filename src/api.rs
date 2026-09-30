@@ -40,15 +40,24 @@ impl IntoResponse for ApiError {
             || msg.starts_with("no document")
             || msg.starts_with("no comment")
             || msg.starts_with("no parent task")
+            || msg.starts_with("no secret request")
             || msg == "not found"
         {
             StatusCode::NOT_FOUND
+        } else if msg.starts_with("invalid submit token")
+            || msg.starts_with("invalid fulfiller token")
+        {
+            // A capability token that doesn't match — not authorized for this action.
+            StatusCode::FORBIDDEN
         } else if msg.starts_with("give ")
             || msg.starts_with("cannot move task")
             || msg.starts_with("a task cannot be its own parent")
             || msg.starts_with("reparenting would create a cycle")
             || msg.contains("is in a different project")
             || msg.starts_with("banned phrase")
+            || msg.starts_with("submit link already used")
+            || msg.contains("is not awaiting submission")
+            || msg.contains("has no ciphertext to pull")
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
@@ -116,6 +125,12 @@ pub fn router(state: AppState) -> Router {
         .route("/workspace-kinds/{name}", get(get_workspace_kind).delete(delete_workspace_kind))
         .route("/banned-phrases", get(list_banned_phrases).post(add_banned_phrase))
         .route("/banned-phrases/{phrase}", axum::routing::delete(remove_banned_phrase))
+        .route("/secret-requests", get(list_secret_requests).post(create_secret_request))
+        .route("/secret-requests/{id}", get(get_secret_request))
+        .route("/secret-requests/{id}/submit", post(submit_secret))
+        .route("/secret-requests/{id}/ciphertext", get(get_secret_ciphertext))
+        .route("/secret-requests/{id}/fulfill", post(fulfill_secret))
+        .route("/secret-requests/{id}/cancel", post(cancel_secret_request))
         .route("/ipfs/add", post(ipfs_add))
         .route("/ipfs/{cid}", get(ipfs_cat))
         .route("/wiki", get(list_wiki))
@@ -234,6 +249,13 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list (what the pre-submit content lint checks docs and comments against).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
     Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/secret-requests", summary: "List secret requests (metadata only — never the ciphertext or tokens). The board is an ephemeral request broker, not a secret store.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/secret-requests", summary: "File a named secret request (carries the age recipient pubkeys + instructions). Returns a single-use submit_url the operator opens to submit the value encrypted in-browser, plus the fulfiller_token.", query: "", body: Some("CreateSecretRequestBody") },
+    Endpoint { method: "GET", path: "/api/secret-requests/{id}", summary: "Fetch one secret request as metadata (name, instructions, recipients, status) — drives the submit page. Never returns ciphertext or tokens.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/secret-requests/{id}/submit", summary: "Submit the browser-encrypted ciphertext for a request (single-use submit token). Flips it to submitted with a TTL and directly notifies the fulfiller.", query: "", body: Some("SubmitSecretBody") },
+    Endpoint { method: "GET", path: "/api/secret-requests/{id}/ciphertext", summary: "Fulfiller pulls the ciphertext once to relocate it into durable storage (fulfiller token via ?token=). The one place ciphertext leaves the board.", query: "token=str", body: None },
+    Endpoint { method: "POST", path: "/api/secret-requests/{id}/fulfill", summary: "Fulfill a request: the secret is relocated, so the board deletes the row + its transient ciphertext. Idempotent; fulfiller-token-gated while the row exists.", query: "", body: Some("FulfillSecretBody") },
+    Endpoint { method: "POST", path: "/api/secret-requests/{id}/cancel", summary: "Cancel (delete) a pending secret request. Idempotent.", query: "", body: Some("CancelSecretBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author; archived hidden unless include_archived=true).", query: "project_id=int&status=str&tag=str&task_id=int&author=str&include_archived=bool", body: None },
@@ -299,6 +321,10 @@ fn body_schemas() -> Value {
         SetWorkspaceKindBody,
         AddBannedPhraseBody,
         UpdateDocumentBody,
+        CreateSecretRequestBody,
+        SubmitSecretBody,
+        FulfillSecretBody,
+        CancelSecretBody,
     )
 }
 
@@ -1227,6 +1253,109 @@ async fn list_banned_phrases(State(st): State<AppState>) -> ApiResult {
 
 async fn remove_banned_phrase(State(st): State<AppState>, Path(phrase): Path<String>) -> ApiResult {
     Ok(Json(core::remove_banned_phrase(&st.pool, &phrase).await?))
+}
+
+// --- Secret requests (ephemeral secret-request broker, task 272) ---
+
+#[derive(Deserialize, JsonSchema)]
+struct CreateSecretRequestBody {
+    /// The secret's name (e.g. the durable filename it will land as).
+    name: String,
+    /// Age recipient public keys (non-secret) the browser encrypts the value to. For a
+    /// host-bound secret, include the recovery/user keys too, not just the host key.
+    #[serde(default)]
+    recipients: Vec<String>,
+    /// Human instructions shown on the submit page (what the value is, where to obtain it).
+    instructions: Option<String>,
+    /// Advisory placement hint for the fulfiller (the durable path + any wiring note).
+    target: Option<String>,
+    /// The agent to directly notify on submit + whose token gates the ciphertext pull.
+    fulfiller: Option<String>,
+    /// The requesting agent (for the audit event).
+    requested_by: Option<String>,
+}
+
+async fn create_secret_request(
+    State(st): State<AppState>,
+    Json(b): Json<CreateSecretRequestBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::create_secret_request(
+            &st.pool,
+            &b.name,
+            &b.recipients,
+            b.instructions.as_deref(),
+            b.target.as_deref(),
+            b.fulfiller.as_deref(),
+            b.requested_by.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+async fn list_secret_requests(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_secret_requests(&st.pool).await?))
+}
+
+async fn get_secret_request(State(st): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    Ok(Json(core::get_secret_request(&st.pool, id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SubmitSecretBody {
+    /// The single-use submit capability token from the submit link.
+    token: String,
+    /// The browser-encrypted ciphertext (the board never receives plaintext).
+    ciphertext: String,
+}
+
+async fn submit_secret(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Json(b): Json<SubmitSecretBody>,
+) -> ApiResult {
+    Ok(Json(core::submit_secret(&st.pool, id, &b.token, &b.ciphertext).await?))
+}
+
+#[derive(Deserialize)]
+struct FulfillerTokenQuery {
+    token: String,
+}
+
+async fn get_secret_ciphertext(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FulfillerTokenQuery>,
+) -> ApiResult {
+    Ok(Json(core::get_secret_ciphertext(&st.pool, id, &q.token).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct FulfillSecretBody {
+    /// The fulfiller capability token.
+    token: String,
+}
+
+async fn fulfill_secret(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Json(b): Json<FulfillSecretBody>,
+) -> ApiResult {
+    Ok(Json(core::fulfill_secret(&st.pool, id, &b.token).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CancelSecretBody {
+    /// The agent cancelling the request (for the audit event).
+    actor: Option<String>,
+}
+
+async fn cancel_secret_request(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Json(b): Json<CancelSecretBody>,
+) -> ApiResult {
+    Ok(Json(core::cancel_secret_request(&st.pool, id, b.actor.as_deref()).await?))
 }
 
 #[derive(Deserialize)]

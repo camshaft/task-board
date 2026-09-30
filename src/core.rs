@@ -4425,6 +4425,390 @@ pub async fn detach_document(
     Ok(json!({ "removed": n }))
 }
 
+// ---------------------------------------------------------------------------
+// Secret requests — an ephemeral secret-REQUEST broker (task 272).
+//
+// The board brokers a *request* and a one-time, browser-encrypted handoff; it is never a secret
+// store. An agent files a named request carrying the (non-secret) age recipient pubkeys + human
+// instructions and gets a single-use capability submit link. An operator opens the link, and the
+// browser encrypts the pasted value to the recipients and posts CIPHERTEXT ONLY — so the board
+// never sees plaintext. A fulfiller pulls the ciphertext once (a separate token gates it),
+// relocates it to durable storage, then the row (and its transient ciphertext) is deleted. A stuck
+// submitted request is purged after its TTL. Ciphertext is never returned in list/metadata reads,
+// never carried in an event, and never logged.
+// ---------------------------------------------------------------------------
+
+/// How long a submitted-but-unfulfilled request keeps its transient ciphertext before it is
+/// auto-purged — the one at-rest window, so it is bounded.
+const SECRET_SUBMIT_TTL: chrono::Duration = chrono::Duration::hours(1);
+
+/// A fresh high-entropy capability token, from SQLite's CSPRNG (`randomblob`) — no plaintext
+/// secret is involved, this just gates the submit link and the fulfiller pull.
+async fn gen_capability_token(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<String> {
+    let row = sqlx::query("SELECT lower(hex(randomblob(32))) AS t")
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(row.try_get::<String, _>("t")?)
+}
+
+/// Render one secret-request row as safe metadata: never the ciphertext, never the tokens.
+/// `recipients` is parsed back from its JSON string into an array.
+fn secret_request_meta(row: &SqliteRow) -> Value {
+    let recipients: Value = row
+        .try_get::<String, _>("recipients")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!([]));
+    json!({
+        "id": row.try_get::<i64, _>("id").unwrap_or_default(),
+        "name": row.try_get::<String, _>("name").unwrap_or_default(),
+        "requested_by": row.try_get::<Option<String>, _>("requested_by").unwrap_or(None),
+        "fulfiller": row.try_get::<Option<String>, _>("fulfiller").unwrap_or(None),
+        "status": row.try_get::<String, _>("status").unwrap_or_default(),
+        "recipients": recipients,
+        "instructions": row.try_get::<Option<String>, _>("instructions").unwrap_or(None),
+        "target": row.try_get::<Option<String>, _>("target").unwrap_or(None),
+        "created_at": row.try_get::<Option<String>, _>("created_at").unwrap_or(None),
+        "submitted_at": row.try_get::<Option<String>, _>("submitted_at").unwrap_or(None),
+        "expires_at": row.try_get::<Option<String>, _>("expires_at").unwrap_or(None),
+    })
+}
+
+/// Purge submitted-but-unfulfilled requests whose TTL has passed (the transient-ciphertext window),
+/// emitting a metadata-only `secret.expired` for each. Called before any read so a stale request
+/// disappears rather than lingering with ciphertext at rest.
+async fn purge_expired_secret_requests(pool: &Pool) -> anyhow::Result<()> {
+    let now = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let expired = sqlx::query(
+        "SELECT id, name, fulfiller FROM secret_requests \
+         WHERE status='submitted' AND expires_at IS NOT NULL AND expires_at < ?",
+    )
+    .bind(&now)
+    .fetch_all(&mut *tx)
+    .await?;
+    for row in &expired {
+        let id: i64 = row.try_get("id")?;
+        let name: String = row.try_get("name")?;
+        let fulfiller: Option<String> = row.try_get("fulfiller")?;
+        sqlx::query("DELETE FROM secret_requests WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let mut recips = BTreeSet::new();
+        if let Some(f) = &fulfiller {
+            recips.insert(f.clone());
+        }
+        emit(
+            &mut tx,
+            &mut hooks,
+            "secret.expired",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json!({ "id": id, "name": name }),
+            Recipients::Explicit(recips),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(())
+}
+
+/// File a secret request. Returns the request metadata plus the `submit_url` (a relative path
+/// carrying the single-use capability token — the requester prefixes the board's public base and
+/// hands the link to the operator) and the `fulfiller_token` the fulfiller uses to pull + fulfill.
+pub async fn create_secret_request(
+    pool: &Pool,
+    name: &str,
+    recipients: &[String],
+    instructions: Option<&str>,
+    target: Option<&str>,
+    fulfiller: Option<&str>,
+    requested_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    if name.trim().is_empty() {
+        anyhow::bail!("give a name for the secret request");
+    }
+    let ts = now_iso();
+    let recipients_json = serde_json::to_string(recipients)?;
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let submit_token = gen_capability_token(&mut tx).await?;
+    let fulfiller_token = gen_capability_token(&mut tx).await?;
+    let id: i64 = sqlx::query(
+        "INSERT INTO secret_requests(name, requested_by, fulfiller, status, recipients, \
+         instructions, target, submit_token, fulfiller_token, submit_used, created_at) \
+         VALUES(?,?,?,'requested',?,?,?,?,?,0,?) RETURNING id",
+    )
+    .bind(name)
+    .bind(requested_by)
+    .bind(fulfiller)
+    .bind(&recipients_json)
+    .bind(instructions)
+    .bind(target)
+    .bind(&submit_token)
+    .bind(&fulfiller_token)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    // Audit only (no ciphertext exists yet); notify the fulfiller if one is named so they know a
+    // request is pending, but nothing is actionable until it's submitted.
+    let mut recips = BTreeSet::new();
+    if let Some(f) = fulfiller {
+        recips.insert(f.to_string());
+    }
+    emit(
+        &mut tx,
+        &mut hooks,
+        "secret.requested",
+        requested_by,
+        None,
+        None,
+        None,
+        None,
+        json!({ "id": id, "name": name, "fulfiller": fulfiller }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let row = sqlx::query("SELECT * FROM secret_requests WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let mut out = secret_request_meta(&row);
+    if let Value::Object(ref mut m) = out {
+        m.insert("submit_url".into(), json!(format!("/secret-requests/{id}?t={submit_token}")));
+        m.insert("submit_token".into(), json!(submit_token));
+        m.insert("fulfiller_token".into(), json!(fulfiller_token));
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// One secret request as safe metadata (drives the submit page: name, instructions, recipients,
+/// status). Never returns ciphertext or tokens. Purges expired requests first.
+pub async fn get_secret_request(pool: &Pool, id: i64) -> anyhow::Result<Value> {
+    purge_expired_secret_requests(pool).await?;
+    let row = sqlx::query("SELECT * FROM secret_requests WHERE id=?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => Ok(secret_request_meta(&r)),
+        None => anyhow::bail!("no secret request {id}"),
+    }
+}
+
+/// All secret requests as safe metadata (never ciphertext or tokens). Purges expired first.
+pub async fn list_secret_requests(pool: &Pool) -> anyhow::Result<Value> {
+    purge_expired_secret_requests(pool).await?;
+    let rows = sqlx::query("SELECT * FROM secret_requests ORDER BY id DESC")
+        .fetch_all(pool)
+        .await?;
+    Ok(Value::Array(rows.iter().map(secret_request_meta).collect()))
+}
+
+/// Submit the (browser-encrypted) ciphertext for a request. Gated by the single-use submit token:
+/// the link works once, then is spent. Stores the ciphertext transiently, flips the request to
+/// `submitted` with a TTL, and directly notifies the fulfiller (inbox + their webhook) so they can
+/// pull + relocate. The event carries metadata only — never the ciphertext.
+pub async fn submit_secret(
+    pool: &Pool,
+    id: i64,
+    token: &str,
+    ciphertext: &str,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let expires_at = (chrono::Utc::now() + SECRET_SUBMIT_TTL)
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let row = sqlx::query("SELECT submit_token, submit_used, status, name, fulfiller FROM secret_requests WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(row) = row else { anyhow::bail!("no secret request {id}") };
+    let stored_token: String = row.try_get("submit_token")?;
+    let submit_used: i64 = row.try_get("submit_used")?;
+    let status: String = row.try_get("status")?;
+    let name: String = row.try_get("name")?;
+    let fulfiller: Option<String> = row.try_get("fulfiller")?;
+    // Constant-length compare is unnecessary here (the token is high-entropy and single-use), but
+    // reject a wrong or spent token, and reject a re-submit onto an already-submitted request.
+    if token != stored_token {
+        anyhow::bail!("invalid submit token");
+    }
+    if submit_used != 0 {
+        anyhow::bail!("submit link already used");
+    }
+    if status != "requested" {
+        anyhow::bail!("secret request is not awaiting submission (status: {status})");
+    }
+    sqlx::query(
+        "UPDATE secret_requests SET ciphertext=?, status='submitted', submitted_at=?, \
+         expires_at=?, submit_used=1 WHERE id=?",
+    )
+    .bind(ciphertext)
+    .bind(&ts)
+    .bind(&expires_at)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    let mut recips = BTreeSet::new();
+    if let Some(f) = &fulfiller {
+        recips.insert(f.clone());
+    }
+    emit(
+        &mut tx,
+        &mut hooks,
+        "secret.submitted",
+        None,
+        None,
+        None,
+        None,
+        None,
+        json!({ "id": id, "name": name, "fulfiller": fulfiller, "expires_at": expires_at }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let out = sqlx::query("SELECT * FROM secret_requests WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let meta = secret_request_meta(&out);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(meta)
+}
+
+/// The fulfiller pulls the ciphertext ONCE to relocate it into durable storage. Gated by the
+/// fulfiller token; only valid while the request is `submitted`. Returns `{id, name, ciphertext}` —
+/// the one place ciphertext leaves the board, to an authorized holder. Purges expired first.
+pub async fn get_secret_ciphertext(pool: &Pool, id: i64, token: &str) -> anyhow::Result<Value> {
+    purge_expired_secret_requests(pool).await?;
+    let row = sqlx::query(
+        "SELECT fulfiller_token, status, name, ciphertext FROM secret_requests WHERE id=?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { anyhow::bail!("no secret request {id}") };
+    let stored_token: String = row.try_get("fulfiller_token")?;
+    if token != stored_token {
+        anyhow::bail!("invalid fulfiller token");
+    }
+    let status: String = row.try_get("status")?;
+    let ciphertext: Option<String> = row.try_get("ciphertext")?;
+    match (status.as_str(), ciphertext) {
+        ("submitted", Some(ct)) => Ok(json!({
+            "id": id,
+            "name": row.try_get::<String, _>("name").unwrap_or_default(),
+            "ciphertext": ct,
+        })),
+        _ => anyhow::bail!("secret request {id} has no ciphertext to pull (status: {status})"),
+    }
+}
+
+/// Fulfill a request: the fulfiller has relocated the secret to durable storage, so the board
+/// deletes the row (and its transient ciphertext) and emits a metadata-only `secret.fulfilled`.
+/// Idempotent: fulfilling an already-deleted request succeeds. Gated by the fulfiller token when
+/// the row still exists.
+pub async fn fulfill_secret(pool: &Pool, id: i64, token: &str) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let row = sqlx::query("SELECT fulfiller_token, name, fulfiller, requested_by FROM secret_requests WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(row) = row else {
+        // Already gone — idempotent success (a retried fulfill after the row was deleted).
+        tx.commit().await?;
+        return Ok(json!({ "fulfilled": true, "id": id, "already": true }));
+    };
+    let stored_token: String = row.try_get("fulfiller_token")?;
+    if token != stored_token {
+        anyhow::bail!("invalid fulfiller token");
+    }
+    let name: String = row.try_get("name")?;
+    let fulfiller: Option<String> = row.try_get("fulfiller")?;
+    let requested_by: Option<String> = row.try_get("requested_by")?;
+    sqlx::query("DELETE FROM secret_requests WHERE id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let mut recips = BTreeSet::new();
+    if let Some(r) = &requested_by {
+        recips.insert(r.clone());
+    }
+    emit(
+        &mut tx,
+        &mut hooks,
+        "secret.fulfilled",
+        fulfiller.as_deref(),
+        None,
+        None,
+        None,
+        None,
+        json!({ "id": id, "name": name }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "fulfilled": true, "id": id }))
+}
+
+/// Cancel (delete) a pending secret request — before submission or to abandon one. Deletes the row
+/// (and any transient ciphertext) and emits a metadata-only `secret.cancelled`. Idempotent.
+pub async fn cancel_secret_request(
+    pool: &Pool,
+    id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let row = sqlx::query("SELECT name, fulfiller FROM secret_requests WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(row) = row else {
+        tx.commit().await?;
+        return Ok(json!({ "cancelled": true, "id": id, "already": true }));
+    };
+    let name: String = row.try_get("name")?;
+    let fulfiller: Option<String> = row.try_get("fulfiller")?;
+    sqlx::query("DELETE FROM secret_requests WHERE id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let mut recips = BTreeSet::new();
+    if let Some(f) = &fulfiller {
+        recips.insert(f.clone());
+    }
+    emit(
+        &mut tx,
+        &mut hooks,
+        "secret.cancelled",
+        actor,
+        None,
+        None,
+        None,
+        None,
+        json!({ "id": id, "name": name }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "cancelled": true, "id": id }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5801,6 +6185,76 @@ mod tests {
 
         // Archiving an unknown task errors.
         assert!(set_task_archived(&pool, 999_999, true, None).await.is_err());
+        Ok(())
+    }
+
+    /// The secret-request broker lifecycle (task 272): request → submit (single-use token) →
+    /// fulfiller pulls ciphertext (token-gated) → fulfill deletes the row. Metadata reads never
+    /// expose the ciphertext or the tokens; a spent or wrong token is rejected; the fulfiller is
+    /// notified on submit; fulfilling a gone row is idempotent.
+    #[tokio::test]
+    async fn secret_request_broker_lifecycle() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        let recips = vec![
+            "ssh-ed25519 AAAA operator".to_string(),
+            "ssh-ed25519 BBBB green-machine".to_string(),
+        ];
+        let req = create_secret_request(
+            &pool,
+            "github-bridge.token.age",
+            &recips,
+            Some("GitHub PAT, repo+read:org scope"),
+            Some("secrets/github-bridge.token.age"),
+            Some("green-machine-ops"),
+            Some("v-github-bridge"),
+        )
+        .await?;
+        let id = req["id"].as_i64().unwrap();
+        let submit_token = req["submit_token"].as_str().unwrap().to_string();
+        let fulfiller_token = req["fulfiller_token"].as_str().unwrap().to_string();
+        assert!(req["submit_url"].as_str().unwrap().contains(&format!("/secret-requests/{id}?t=")));
+        assert_eq!(req["status"], "requested");
+        assert_eq!(req["recipients"].as_array().unwrap().len(), 2);
+
+        // A metadata read never carries the ciphertext or the tokens.
+        let meta = get_secret_request(&pool, id).await?;
+        assert!(meta.get("ciphertext").is_none());
+        assert!(meta.get("submit_token").is_none());
+        assert!(meta.get("fulfiller_token").is_none());
+
+        // A wrong submit token is rejected.
+        assert!(submit_secret(&pool, id, "wrong-token", "CT").await.is_err());
+
+        // Submit with the right token flips to submitted, hides the ciphertext, notifies the fulfiller.
+        let submitted = submit_secret(&pool, id, &submit_token, "AGE-CIPHERTEXT-BLOB").await?;
+        assert_eq!(submitted["status"], "submitted");
+        assert!(submitted.get("ciphertext").is_none(), "submit metadata hides ciphertext");
+        let notif = check_notifications(&pool, "green-machine-ops", true, 50, None).await?;
+        let types: Vec<String> = notif["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap().to_string())
+            .collect();
+        assert!(types.contains(&"secret.submitted".to_string()), "fulfiller notified: {types:?}");
+
+        // The submit link is single-use: a second submit is rejected.
+        assert!(submit_secret(&pool, id, &submit_token, "AGAIN").await.is_err());
+
+        // The fulfiller pulls the ciphertext (token-gated); a wrong token is rejected.
+        assert!(get_secret_ciphertext(&pool, id, "wrong-token").await.is_err());
+        let pulled = get_secret_ciphertext(&pool, id, &fulfiller_token).await?;
+        assert_eq!(pulled["ciphertext"], "AGE-CIPHERTEXT-BLOB");
+
+        // Fulfill deletes the row; a second fulfill (row gone) is idempotent.
+        let done = fulfill_secret(&pool, id, &fulfiller_token).await?;
+        assert_eq!(done["fulfilled"], true);
+        assert!(get_secret_request(&pool, id).await.is_err(), "row deleted after fulfill");
+        let again = fulfill_secret(&pool, id, "any").await?;
+        assert_eq!(again["already"], true, "idempotent fulfill on a gone row");
+
         Ok(())
     }
 
