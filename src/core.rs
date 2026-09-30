@@ -4039,6 +4039,44 @@ pub async fn get_document(pool: &Pool, document_id: i64) -> anyhow::Result<Value
     }
 }
 
+/// get_document plus, when `include_body` is set, the current version's markdown fetched
+/// server-side from the pinned CID and inlined as `body` (task #424: an agent building/reviewing
+/// from an approved doc gets the body in one call, regardless of its host — the board's own host
+/// reaches the IPFS gateway; the doc stays CID-only at rest per #126, the body is fetched on read,
+/// not stored). A body-fetch failure (no backend, unreachable, non-text) does NOT fail the call —
+/// the metadata still returns with `body: null` + a `body_error`/`body_note`, so the tool degrades
+/// gracefully instead of dead-ending.
+pub async fn get_document_with_body(
+    pool: &Pool,
+    ipfs_api_url: Option<&str>,
+    document_id: i64,
+    include_body: bool,
+) -> anyhow::Result<Value> {
+    let mut v = get_document(pool, document_id).await?;
+    if include_body {
+        match read_document_content(pool, ipfs_api_url, document_id, None).await {
+            Ok(content) => {
+                if let Value::Object(ref mut m) = v {
+                    m.insert("body".into(), content.get("content").cloned().unwrap_or(Value::Null));
+                    if let Some(ct) = content.get("content_type") {
+                        m.insert("body_content_type".into(), ct.clone());
+                    }
+                    if let Some(note) = content.get("note") {
+                        m.insert("body_note".into(), note.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                if let Value::Object(ref mut m) = v {
+                    m.insert("body".into(), Value::Null);
+                    m.insert("body_error".into(), json!(e.to_string()));
+                }
+            }
+        }
+    }
+    Ok(v)
+}
+
 /// Rename a document (metadata only — the title, and its derived slug). Versions, content, path,
 /// and review status are untouched. Emits document.updated to the doc's subscribers + owner and
 /// returns the updated document. The title is what the viewer renders as the page header.
@@ -6416,6 +6454,33 @@ mod tests {
         assert!(is_text_content_type(""));
         assert!(!is_text_content_type("image/png"));
         assert!(!is_text_content_type("application/pdf"));
+        Ok(())
+    }
+
+    /// get_document_with_body (task #424): include_body=false returns metadata only; include_body=true
+    /// tries to inline the current version's markdown from its CID, and when no IPFS backend is wired
+    /// it degrades gracefully - the metadata still returns with body:null + a body_error, never a
+    /// failed call - so a builder/reviewer tool keeps working even when content can't be resolved.
+    #[tokio::test]
+    async fn get_document_with_body_inlines_or_degrades() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(&pool, "Spec", None, "bafycurrent", None, Some("alice"), None, Some("text/markdown"), None).await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // Metadata-only: identical to get_document, no body fields.
+        let meta = get_document_with_body(&pool, None, did, false).await?;
+        assert_eq!(meta, get_document(&pool, did).await?);
+        assert!(meta.get("body").is_none());
+        assert!(meta.get("body_error").is_none());
+
+        // include_body with no backend: metadata still present, body null + a body_error note.
+        let full = get_document_with_body(&pool, None, did, true).await?;
+        assert_eq!(full["id"].as_i64(), Some(did));
+        assert!(full["title"].as_str().is_some(), "metadata is preserved");
+        assert!(full["body"].is_null(), "body is null when it can't be fetched");
+        let be = full["body_error"].as_str().expect("body_error note");
+        assert!(be.contains("no IPFS backend"), "got: {be}");
         Ok(())
     }
 

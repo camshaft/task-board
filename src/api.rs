@@ -294,7 +294,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author; archived hidden unless include_archived=true).", query: "project_id=int&status=str&tag=str&task_id=int&author=str&include_archived=bool", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
     Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None },
-    Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list. Pass ?include_body=true to also inline the current version's markdown (resolved server-side from its CID; body:null + body_error on fetch failure).", query: "include_body=bool", body: None },
     Endpoint { method: "PATCH", path: "/api/documents/{document_id}", summary: "Rename a document (set its title; metadata-only — versions/content/path/status untouched). Emits document.updated.", query: "", body: Some("UpdateDocumentBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version. Requires ipfs_api_url.", query: "version_no=int", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
@@ -1872,8 +1872,23 @@ async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumen
     ))
 }
 
-async fn get_document(State(st): State<AppState>, Path(document_id): Path<i64>) -> ApiResult {
-    Ok(Json(core::get_document(&st.pool, document_id).await?))
+#[derive(Deserialize, JsonSchema)]
+struct GetDocumentQuery {
+    /// When true, also inline the current version's markdown, fetched server-side from its pinned
+    /// CID. Omit/false for metadata only. A fetch failure leaves `body: null` + a `body_error`.
+    #[serde(default)]
+    include_body: bool,
+}
+
+async fn get_document(
+    State(st): State<AppState>,
+    Path(document_id): Path<i64>,
+    Query(q): Query<GetDocumentQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::get_document_with_body(&st.pool, st.ipfs_api_url.as_deref(), document_id, q.include_body)
+            .await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
