@@ -1,5 +1,6 @@
 import { type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
+import ReviewTrend from './ReviewTrend'
 import { useReviews } from './resources'
 import { relTime } from './ui'
 
@@ -77,6 +78,7 @@ export default function Reviews() {
         </p>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+        <ReviewTrend />
         {error && <p className="text-sm text-rose-300">{error.message}</p>}
         {loading && !reviews && <p className="text-sm text-[var(--color-muted)]">Loading…</p>}
         {reviews && reviews.length === 0 && (
