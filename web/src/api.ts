@@ -357,7 +357,9 @@ export const api = {
   // so it works at the origin root or behind a sub-path proxy. Consumed by useLiveUpdates.
   streamUrl: () => `${API_ROOT}/stream`,
 
-  listAgents: () => req<Agent[]>('GET', '/agents'),
+  // The roster page renders charter + metadata per agent, so it asks for the full objects.
+  // (Agents/MCP callers get the compact {id,display_name,status} default to stay under the token cap.)
+  listAgents: () => req<Agent[]>('GET', '/agents?verbose=true'),
   getAgent: (id: string) => req<Agent>('GET', `/agents/${encodeURIComponent(id)}`),
   registerAgent: (b: {
     agent_id: string
