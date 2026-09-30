@@ -1,5 +1,5 @@
 // Small presentational helpers shared across the app.
-import { useLayoutEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { AgentStatus, TaskStatus } from './api'
 
 export const TASK_COLUMNS: TaskStatus[] = [
@@ -100,9 +100,28 @@ export function relTime(iso: string | null | undefined): string {
   return `${d}d ago`
 }
 
+// True when the primary pointer is coarse (touch) — i.e. a phone/tablet. On such devices the
+// on-screen keyboard's Enter should insert a newline (submit via the send button), matching Slack
+// and most mobile text apps (task 435). Reactive, so a hybrid device that gains/loses a mouse
+// updates. SSR-safe (matchMedia may be absent).
+export function useCoarsePointer() {
+  const [coarse, setCoarse] = useState(
+    () => typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches,
+  )
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return
+    const mq = window.matchMedia('(pointer: coarse)')
+    const onChange = () => setCoarse(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return coarse
+}
+
 // A single-line-looking textarea that grows with its content (up to maxHeight, then scrolls) —
 // used for every comment/message composer so multi-line input isn't cramped in a fixed box.
-// Enter submits (matching the old <input> composers); Shift+Enter inserts a newline.
+// On desktop (fine pointer) Enter submits (matching the old <input> composers); on touch devices
+// Enter inserts a newline and you submit via the send button (task 435). Shift+Enter always newlines.
 export function AutoGrowTextarea({
   value,
   onChange,
@@ -121,6 +140,7 @@ export function AutoGrowTextarea({
   maxHeight?: number
 }) {
   const ref = useRef<HTMLTextAreaElement>(null)
+  const coarsePointer = useCoarsePointer()
   // Resize to fit content on every value change (including a reset to '' after submit, which
   // shrinks it back). Measuring requires clearing the height first so scrollHeight can drop.
   useLayoutEffect(() => {
@@ -138,7 +158,8 @@ export function AutoGrowTextarea({
       placeholder={placeholder}
       onChange={(e) => onChange(e.target.value)}
       onKeyDown={(e) => {
-        if (e.key === 'Enter' && !e.shiftKey && onSubmit) {
+        // Touch devices: let Enter insert a newline (submit via the send button) — task 435.
+        if (e.key === 'Enter' && !e.shiftKey && !coarsePointer && onSubmit) {
           e.preventDefault()
           onSubmit()
         }
