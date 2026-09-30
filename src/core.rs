@@ -3609,6 +3609,57 @@ pub async fn get_document(pool: &Pool, document_id: i64) -> anyhow::Result<Value
     }
 }
 
+/// Rename a document (metadata only — the title, and its derived slug). Versions, content, path,
+/// and review status are untouched. Emits document.updated to the doc's subscribers + owner and
+/// returns the updated document. The title is what the viewer renders as the page header.
+pub async fn update_document(
+    pool: &Pool,
+    document_id: i64,
+    title: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("give a non-empty title");
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT project_id FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let project_id: Option<i64> = row.try_get("project_id")?;
+    let slug = slugify(title);
+    sqlx::query("UPDATE documents SET title=?, slug=?, updated_at=? WHERE id=?")
+        .bind(title)
+        .bind(&slug)
+        .bind(&ts)
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.updated",
+        actor,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        json!({ "document_id": document_id, "title": title, "slug": slug }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
 /// Cap on a from-session document-body read, matching the REST IPFS gateway cap.
 pub const DOCUMENT_READ_CAP_BYTES: usize = 25 * 1024 * 1024;
 
@@ -4763,6 +4814,41 @@ mod tests {
         assert!(is_text_content_type(""));
         assert!(!is_text_content_type("image/png"));
         assert!(!is_text_content_type("application/pdf"));
+        Ok(())
+    }
+
+    /// update_document renames a doc: it sets the title + derived slug, persists, emits
+    /// document.updated to the owner/subscribers (actor excluded), and rejects an empty title or a
+    /// missing document. Versions/content are untouched. (design-review-entity rename request.)
+    #[tokio::test]
+    async fn update_document_renames_title_and_slug() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(&pool, "Design: a very long working title", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // bob renames it to a short noun phrase.
+        let updated = update_document(&pool, did, "Review entity", Some("bob")).await?;
+        assert_eq!(updated["title"], json!("Review entity"));
+        assert_eq!(updated["slug"], json!("review-entity"));
+        // Persisted, and the current version (content) is unchanged.
+        let got = get_document(&pool, did).await?;
+        assert_eq!(got["title"], json!("Review entity"));
+        assert_eq!(got["current_version"]["cid"], json!("bafy1"));
+
+        // The owner (alice) hears document.updated with the new title; the actor (bob) does not.
+        let alice = check_notifications(&pool, "alice", true, 50, None).await?;
+        assert!(
+            alice["notifications"].as_array().unwrap().iter().any(|n| n["type"] == json!("document.updated")
+                && n["data"]["title"] == json!("Review entity")),
+            "owner notified of rename: {alice}"
+        );
+        let bob = check_notifications(&pool, "bob", true, 50, None).await?;
+        assert_eq!(bob["count"].as_i64(), Some(0), "renamer excluded from own event");
+
+        // An empty title and an unknown document are rejected.
+        assert!(update_document(&pool, did, "   ", Some("bob")).await.is_err());
+        assert!(update_document(&pool, 9999, "x", None).await.is_err());
         Ok(())
     }
 

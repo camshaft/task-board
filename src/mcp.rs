@@ -681,6 +681,15 @@ pub struct ReadDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateDocumentArgs {
+    pub document_id: i64,
+    /// New title — a short, specific noun phrase; the viewer renders the title as the page header.
+    pub title: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListDocumentsArgs {
     #[serde(default)]
     pub project_id: Option<i64>,
@@ -1430,6 +1439,18 @@ impl Board {
         Parameters(a): Parameters<GetDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_document(&self.pool, a.document_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Rename a document — set its title (a short, specific noun phrase; the viewer renders the title as the page header). Metadata-only: versions, content, wiki path, and review status are untouched. Emits document.updated and notifies subscribers.")]
+    async fn update_document(
+        &self,
+        Parameters(a): Parameters<UpdateDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::update_document(&self.pool, a.document_id, &a.title, actor.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
