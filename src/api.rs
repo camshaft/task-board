@@ -55,6 +55,7 @@ impl IntoResponse for ApiError {
             || msg.starts_with("reparenting would create a cycle")
             || msg.contains("is in a different project")
             || msg.starts_with("banned phrase")
+            || msg.starts_with("non-ASCII")
             || msg.starts_with("submit link already used")
             || msg.contains("is not awaiting submission")
             || msg.contains("has no ciphertext to pull")
@@ -878,7 +879,7 @@ async fn comment_task(
     Path(task_id): Path<i64>,
     Json(b): Json<CommentBody>,
 ) -> ApiResult {
-    core::check_banned_phrases(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
+    core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
     Ok(Json(
         core::comment_task(&st.pool, task_id, &b.body, b.author.as_deref(), b.external_author.as_deref(), b.external_link).await?,
     ))
@@ -1560,7 +1561,7 @@ struct CreateDocumentBody {
 async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumentBody>) -> ApiResult {
     if let Some(c) = b.content.as_deref() {
         if core::is_text_content_type(b.content_type.as_deref().unwrap_or("text/markdown")) {
-            core::check_banned_phrases(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
+            core::check_content(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
         }
     }
     let cid =
@@ -1654,7 +1655,7 @@ async fn publish_version(
 ) -> ApiResult {
     if let Some(c) = b.content.as_deref() {
         if core::is_text_content_type(b.content_type.as_deref().unwrap_or("text/markdown")) {
-            core::check_banned_phrases(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
+            core::check_content(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
         }
     }
     let cid =
@@ -1729,7 +1730,7 @@ async fn comment_document(
     Path(document_id): Path<i64>,
     Json(b): Json<CommentDocumentBody>,
 ) -> ApiResult {
-    core::check_banned_phrases(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
+    core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
     Ok(Json(
         core::comment_document(
             &st.pool,

@@ -1115,7 +1115,7 @@ impl Board {
         Parameters(a): Parameters<CommentTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let author = self.me_opt(s(&a.author));
-        core::check_banned_phrases(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
+        core::check_content(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
             .await
             .map_err(err)?;
         core::comment_task(&self.pool, a.task_id, &a.body, author.as_deref(), s(&a.external_author), a.external_link)
@@ -1487,7 +1487,7 @@ impl Board {
     ) -> Result<CallToolResult, McpError> {
         if let Some(c) = a.content.as_deref() {
             if core::is_text_content_type(a.content_type.as_deref().unwrap_or("text/markdown")) {
-                core::check_banned_phrases(&self.pool, c, a.acknowledge_banned.unwrap_or(false))
+                core::check_content(&self.pool, c, a.acknowledge_banned.unwrap_or(false))
                     .await
                     .map_err(err)?;
             }
@@ -1520,7 +1520,7 @@ impl Board {
     ) -> Result<CallToolResult, McpError> {
         if let Some(c) = a.content.as_deref() {
             if core::is_text_content_type(a.content_type.as_deref().unwrap_or("text/markdown")) {
-                core::check_banned_phrases(&self.pool, c, a.acknowledge_banned.unwrap_or(false))
+                core::check_content(&self.pool, c, a.acknowledge_banned.unwrap_or(false))
                     .await
                     .map_err(err)?;
             }
@@ -1624,7 +1624,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<CommentDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::check_banned_phrases(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
+        core::check_content(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
             .await
             .map_err(err)?;
         core::comment_document(
