@@ -478,6 +478,9 @@ export const api = {
     req<Channel>('POST', `/channels/${id}/invites`, b),
   sendMessage: (b: { from_agent: string; to_agent: string; body: string }) =>
     req<{ seq: number }>('POST', '/messages', b),
+  // Resolve-or-create the private 1:1 DM channel for a pair (idempotent, order-independent).
+  // Resolving is silent — no event fires until an actual message is posted.
+  openDm: (b: { agent_a: string; agent_b: string }) => req<Channel>('POST', '/dms', b),
 
   listExternalIdentities: (source?: string) =>
     req<ExternalIdentity[]>(
