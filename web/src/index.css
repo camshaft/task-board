@@ -30,6 +30,22 @@ html[data-theme='light'] {
   --color-border: #d3d9e3;
   --color-ink: #1a1f2b;
   --color-muted: #5a6473;
+
+  /* Accent contrast on light backgrounds (task 520 follow-up). The UI uses Tailwind's light
+     accent shades (text-sky-300/400, and *-300 status text on translucent *-500/15 chips) which
+     are readable on the dark palette but fail WCAG AA on white. Tailwind v4 colors are CSS vars,
+     so remap the *text* shades to their darker ~700 equivalents here (light theme only — dark is
+     untouched). Solid buttons use bg-sky-500/600 + text-white and are unaffected (only text shades
+     are remapped, not the 500/600 backgrounds). */
+  --color-sky-200: #0369a1; /* sky-700 — active pills on a sky-500/15 tint */
+  --color-sky-300: #0369a1; /* sky-700 — links / accents / hovers */
+  --color-sky-400: #0369a1; /* sky-700 — primary link/accent text (>=4.5:1 on white) */
+  --color-emerald-300: #047857; /* emerald-700 */
+  --color-amber-300: #b45309; /* amber-700 — monitor-exempt + bare-#N ambiguity affordance */
+  --color-rose-300: #be123c; /* rose-700 — errors / adversarial */
+  --color-violet-300: #6d28d9; /* violet-700 — decisions */
+  --color-slate-300: #334155; /* slate-700 */
+  --color-zinc-400: #3f3f46; /* zinc-700 — closed/terminal */
 }
 
 html,
