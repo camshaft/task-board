@@ -69,6 +69,15 @@ export interface Comment {
   origin_ref?: string | null
 }
 
+// An identity alias (task 532): a name that resolves to a canonical identity (e.g. operator ->
+// cameron). Display-only resolution on the client — stored assignee/mentions are never rewritten.
+export interface IdentityAlias {
+  alias: string
+  canonical: string
+  created_at?: string
+  created_by?: string | null
+}
+
 // A bridged human/actor (from listExternalIdentities), distinct from a fleet Agent.
 export interface ExternalIdentity {
   id: string
@@ -596,6 +605,9 @@ export const api = {
       'GET',
       `/external-identities${source ? `?source=${encodeURIComponent(source)}` : ''}`,
     ),
+
+  // Identity aliases (task 532): the alias -> canonical map, resolved client-side for display.
+  listIdentityAliases: () => req<IdentityAlias[]>('GET', '/identity-aliases'),
 
   getSecretRequest: (id: number) => req<SecretRequest>('GET', `/secret-requests/${id}`),
   submitSecret: (id: number, b: { token: string; ciphertext: string }) =>

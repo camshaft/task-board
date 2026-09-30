@@ -5,7 +5,7 @@ import { useBoardContext } from './Layout'
 import { Markdown } from './markdown'
 import { ReviewStatusChip, REVIEW_STATUS_FLOW, reviewSourceLink } from './Reviews'
 import { appendReviewLog, setReviewStatus, setReviewVetted, useReview, useTask } from './resources'
-import { AutoGrowTextarea, relTime, StatusChip } from './ui'
+import { AutoGrowTextarea, Identity, relTime, StatusChip } from './ui'
 
 // Sensible next A2 transitions per current status (the backend accepts any valid status; this is
 // UX guidance). changes_requested / approved are person-owned decisions (design D17) — the UI
@@ -226,7 +226,9 @@ export default function ReviewView() {
             {review.assignee && (
               <>
                 <dt className="text-[var(--color-muted)]">Reviewer</dt>
-                <dd className="font-mono text-xs">{review.assignee}</dd>
+                <dd className="font-mono text-xs">
+                  <Identity id={review.assignee} />
+                </dd>
               </>
             )}
             <dt className="text-[var(--color-muted)]">Updated</dt>

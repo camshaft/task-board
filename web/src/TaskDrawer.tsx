@@ -21,7 +21,15 @@ import {
   useTasks,
 } from './resources'
 import { Markdown } from './markdown'
-import { AuthorLabel, AutoGrowTextarea, relTime, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
+import {
+  AuthorLabel,
+  AutoGrowTextarea,
+  Identity,
+  relTime,
+  StatusChip,
+  STATUS_LABEL,
+  TASK_COLUMNS,
+} from './ui'
 
 // Context handed down by the Board route (the parent <Outlet/>).
 interface DrawerContext {
@@ -364,7 +372,7 @@ export function TaskDrawer() {
                     onClick={reassign}
                     className="rounded px-1.5 py-0.5 font-mono text-xs hover:bg-[var(--color-panel-2)]"
                   >
-                    {task.assignee ?? '— assign —'}
+                    {task.assignee ? <Identity id={task.assignee} /> : '— assign —'}
                   </button>
                 </dd>
                 <dt className="text-[var(--color-muted)]">Project</dt>
