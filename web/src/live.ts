@@ -7,10 +7,12 @@
 import { useEffect } from 'react'
 import { api } from './api'
 import { applyStreamEvent, type StreamEvent } from './resources'
+import { setStreamConnected } from './store'
 
 export function useLiveUpdates() {
   useEffect(() => {
     const es = new EventSource(api.streamUrl())
+    es.onopen = () => setStreamConnected(true)
     es.onmessage = (e) => {
       try {
         applyStreamEvent(JSON.parse(e.data) as StreamEvent)
@@ -18,8 +20,14 @@ export function useLiveUpdates() {
         // A keep-alive comment or malformed frame — ignore; the next real event will refresh.
       }
     }
-    // On error EventSource auto-reconnects (resuming from the last event id); nothing to do
-    // but let it. A closed connection just means updates pause until it's back.
-    return () => es.close()
+    // On error EventSource auto-reconnects (resuming from the last event id); nothing to do but
+    // let it. Surface the drop as part of connection health (task 549) so the UI can show a
+    // "reconnecting" hint; onopen clears it once the stream is back.
+    es.onerror = () => setStreamConnected(false)
+    return () => {
+      es.close()
+      // Unmounting isn't a real outage — don't leave the health signal stuck "down".
+      setStreamConnected(true)
+    }
   }, [])
 }
