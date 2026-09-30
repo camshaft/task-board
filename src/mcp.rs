@@ -412,6 +412,14 @@ pub struct GetChannelPostsArgs {
     pub since_seq: i64,
     #[serde(default = "default_events_limit")]
     pub limit: i64,
+    /// Upper bound: only posts with seq < before_seq. For a "load earlier" page, pass the oldest
+    /// seq you already have (with desc=true) to get the N posts just before it.
+    #[serde(default)]
+    pub before_seq: Option<i64>,
+    /// false (default) = oldest-first (scrollback); true = newest-first, so since_seq=0 + limit=N
+    /// returns the LATEST N posts (a chat view).
+    #[serde(default)]
+    pub desc: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1130,12 +1138,12 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Read a channel's post history after `since_seq` (oldest first). Use this to catch up on a channel you just joined — the inbox only holds what arrived after you joined.")]
+    #[tool(description = "Read a channel's post history. Default is oldest-first after `since_seq` (scrollback / catching up on a channel you just joined). Pass desc=true for the LATEST N posts (newest-first — a chat view), and before_seq to page earlier.")]
     async fn get_channel_posts(
         &self,
         Parameters(a): Parameters<GetChannelPostsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_channel_posts(&self.pool, a.channel_id, a.since_seq, a.limit)
+        core::get_channel_posts(&self.pool, a.channel_id, a.since_seq, a.before_seq, a.limit, a.desc)
             .await
             .map_err(err)
             .and_then(ok)
