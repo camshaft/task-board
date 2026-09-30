@@ -435,6 +435,12 @@ pub struct PostToChannelArgs {
     /// ingested human. `sender` stays the fleet agent (you) that performed the write.
     #[serde(default)]
     pub external_author: Option<String>,
+    /// Optional per-post metadata bag stored on the post (e.g. a bridge stamps a relayed message's
+    /// {slack_ts, slack_channel, thread_ts}). Surfaced on reads and on channel.outbound_reflect —
+    /// and a reply's reflect also carries the parent post's metadata as `parent_metadata`, so a
+    /// bridge can thread statelessly.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1368,17 +1374,25 @@ impl Board {
     }
 
     #[tool(
-        description = "Post a message to a channel. You're auto-joined on posting. Every member's inbox gets it (drain with check_notifications). `reply_to` optionally threads under a parent post's seq (one level)."
+        description = "Post a message to a channel. You're auto-joined on posting. Every member's inbox gets it (drain with check_notifications). `reply_to` optionally threads under a parent post's seq (one level). `metadata` optionally stamps an arbitrary bag on the post (e.g. a bridge's {slack_ts, thread_ts}); it's surfaced on the post + on channel.outbound_reflect, and a reply's reflect also carries the parent's metadata as parent_metadata."
     )]
     async fn post_to_channel(
         &self,
         Parameters(a): Parameters<PostToChannelArgs>,
     ) -> Result<CallToolResult, McpError> {
         let sender = self.me_req(a.sender.as_deref())?;
-        core::post_to_channel(&self.pool, a.channel_id, &sender, &a.body, a.reply_to, s(&a.external_author))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::post_to_channel_meta(
+            &self.pool,
+            a.channel_id,
+            &sender,
+            &a.body,
+            a.reply_to,
+            s(&a.external_author),
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "Read a channel's post history. Default is oldest-first after `since_seq` (scrollback / catching up on a channel you just joined). Pass desc=true for the LATEST N posts (newest-first — a chat view), and before_seq to page earlier.")]

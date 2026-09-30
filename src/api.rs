@@ -1138,6 +1138,10 @@ struct PostToChannelBody {
     /// Optional external identity id (e.g. "slack:U123") this post is attributed to — for an
     /// ingested human author. `sender` stays the fleet agent that performed the write.
     external_author: Option<String>,
+    /// Optional per-post metadata bag stored on the post (e.g. a bridge's {slack_ts, slack_channel,
+    /// thread_ts}). Surfaced on the post + on channel.outbound_reflect; a reply's reflect also
+    /// carries the parent post's metadata as `parent_metadata` for stateless threading.
+    metadata: Option<Value>,
 }
 
 async fn post_to_channel(
@@ -1146,7 +1150,16 @@ async fn post_to_channel(
     Json(b): Json<PostToChannelBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::post_to_channel(&st.pool, channel_id, &b.sender, &b.body, b.reply_to, b.external_author.as_deref()).await?,
+        core::post_to_channel_meta(
+            &st.pool,
+            channel_id,
+            &b.sender,
+            &b.body,
+            b.reply_to,
+            b.external_author.as_deref(),
+            b.metadata,
+        )
+        .await?,
     ))
 }
 
