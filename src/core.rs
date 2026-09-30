@@ -4970,6 +4970,474 @@ pub async fn cancel_secret_request(
     Ok(json!({ "cancelled": true, "id": id }))
 }
 
+// --- Reviews (Document #5, increment 1): a typed review over an artifact, with an A2 lifecycle
+// state machine and a single append-only log. See src/db.rs for the schema + rationale. ---
+
+/// The five A2 lifecycle states. `open` (created/linked, not yet active), `in_review` (reviewers
+/// active; for a document this is submit-for-review, which spawns adversarial reviewers),
+/// `changes_requested` (issues raised, author revises, cycles back), `approved` (positive
+/// concluding), `closed` (non-approval concluding). approved/closed are conventionally terminal,
+/// but a reopen (e.g. a reopened GitHub PR) is permitted — the machine validates that a status is
+/// a KNOWN A2 state rather than forbidding transitions between them. Deliberately permissive: the
+/// github-bridge adapter maps whatever an upstream PR does onto set_review_status, and the board
+/// must not reject a legitimate upstream transition. A same-status set is an idempotent no-op.
+const REVIEW_STATUSES: [&str; 5] =
+    ["open", "in_review", "changes_requested", "approved", "closed"];
+
+/// The A1 log entry types. A finding is an entry of type `finding` (NOT a separate collection);
+/// an actionable finding links a child `task_id`. Any count/trend (open findings, etc.) is
+/// derived by reading the log in order — the log is the single source of truth.
+const REVIEW_LOG_TYPES: [&str; 8] = [
+    "submitted",
+    "revised",
+    "finding",
+    "finding_resolved",
+    "comment",
+    "state_change",
+    "adversarial_review",
+    "decision",
+];
+
+fn is_review_status(s: &str) -> bool {
+    REVIEW_STATUSES.contains(&s)
+}
+fn is_review_log_type(s: &str) -> bool {
+    REVIEW_LOG_TYPES.contains(&s)
+}
+
+/// Turn a review row's JSON into a normalized object: `metadata` TEXT parsed into an object
+/// (mirrors get_task/get_project) and `vetted` INTEGER surfaced as a bool.
+fn normalize_review_obj(mut obj: Map<String, Value>) -> Value {
+    let meta = obj
+        .get("metadata")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| json!({}));
+    obj.insert("metadata".into(), meta);
+    if let Some(v) = obj.get("vetted").and_then(|v| v.as_i64()) {
+        obj.insert("vetted".into(), json!(v != 0));
+    }
+    Value::Object(obj)
+}
+
+/// Fetch one review as JSON: its columns (normalized via `normalize_review_obj`) and, when
+/// `with_log`, its `log` array ordered oldest-first. Returns None if the review doesn't exist.
+async fn review_json(
+    tx: &mut Transaction<'_, Sqlite>,
+    review_id: i64,
+    with_log: bool,
+) -> anyhow::Result<Option<Value>> {
+    let Some(row) = sqlx::query("SELECT * FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let obj = match row_to_json(&row) {
+        Value::Object(m) => m,
+        other => return Ok(Some(other)),
+    };
+    let mut out = normalize_review_obj(obj);
+    if with_log {
+        let rows = sqlx::query("SELECT * FROM review_log WHERE review_id=? ORDER BY id ASC")
+            .bind(review_id)
+            .fetch_all(&mut **tx)
+            .await?;
+        let log: Vec<Value> = rows.iter().map(row_to_json).collect();
+        if let Value::Object(ref mut m) = out {
+            m.insert("log".into(), Value::Array(log));
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Who hears about a review event: its creator and its assignee (reviewers), minus the actor.
+/// The whole-board firehose union in `emit` adds board subscribers on top. Increment 1 has no
+/// per-review subscription table; a richer links/watchers model arrives in a later increment.
+fn review_recipients(
+    created_by: Option<&str>,
+    assignee: Option<&str>,
+    actor: Option<&str>,
+) -> BTreeSet<String> {
+    let mut recips = BTreeSet::new();
+    if let Some(c) = created_by {
+        recips.insert(c.to_string());
+    }
+    if let Some(a) = assignee {
+        recips.insert(a.to_string());
+    }
+    if let Some(actor) = actor {
+        recips.remove(actor);
+    }
+    recips
+}
+
+/// Create a review over an artifact. Idempotent external ingest (task #270 pattern): if
+/// `external_link` is given and a review is ALREADY linked on (source, external_id), return that
+/// existing review with `created:false` — so a bridge replaying the same upstream PR never
+/// duplicates. `status` defaults to `open`; a caller may seed another A2 state (validated). Emits
+/// `review.created` and records the initial `submitted` log entry. Returns the review object
+/// (including its `log`) with a `created` flag.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_review(
+    pool: &Pool,
+    kind: &str,
+    source: Option<&str>,
+    target_ref: Option<&str>,
+    title: Option<&str>,
+    status: Option<&str>,
+    created_by: Option<&str>,
+    assignee: Option<&str>,
+    metadata: Option<Value>,
+    external_link: Option<ExternalRef>,
+) -> anyhow::Result<Value> {
+    let status = status.unwrap_or("open");
+    if !is_review_status(status) {
+        anyhow::bail!(
+            "unknown review status '{status}' (expected one of: {})",
+            REVIEW_STATUSES.join(", ")
+        );
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    // Idempotent ingest: an existing link -> return that review, created:false. The
+    // SELECT-then-INSERT is atomic under one tx (the pool serializes writers), so a retrying
+    // adapter can't race two reviews in.
+    if let Some(ext) = &external_link {
+        if let Some(row) = sqlx::query(
+            "SELECT board_id FROM external_links WHERE source=? AND external_id=? AND board_kind='review'",
+        )
+        .bind(&ext.source)
+        .bind(&ext.external_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let existing: i64 = row.try_get("board_id")?;
+            let mut out = review_json(&mut tx, existing, true).await?.unwrap_or(Value::Null);
+            if let Value::Object(ref mut m) = out {
+                m.insert("created".into(), json!(false));
+            }
+            tx.commit().await?;
+            return Ok(out);
+        }
+    }
+    let meta_str = metadata.unwrap_or_else(|| json!({})).to_string();
+    let rid: i64 = sqlx::query(
+        "INSERT INTO reviews(kind, source, target_ref, status, title, vetted, created_by, assignee, metadata, created_at, updated_at) \
+         VALUES(?,?,?,?,?,0,?,?,?,?,?) RETURNING id",
+    )
+    .bind(kind)
+    .bind(source)
+    .bind(target_ref)
+    .bind(status)
+    .bind(title)
+    .bind(created_by)
+    .bind(assignee)
+    .bind(&meta_str)
+    .bind(&ts)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    // Initial log entry: the review was submitted/opened (A2 — every lifecycle event is a log row).
+    sqlx::query(
+        "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
+         VALUES(?,?,?,?,NULL,NULL,?)",
+    )
+    .bind(rid)
+    .bind("submitted")
+    .bind(title)
+    .bind(created_by)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let recips = review_recipients(created_by, assignee, created_by);
+    emit(
+        &mut tx,
+        &mut hooks,
+        "review.created",
+        created_by,
+        None,
+        None,
+        None,
+        None,
+        json!({ "review_id": rid, "kind": kind, "title": title, "status": status }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    // Record the external dedup link atomically with the create (a matching row was ruled out
+    // above, and the pool serializes writers).
+    if let Some(ext) = &external_link {
+        sqlx::query(
+            "INSERT INTO external_links(source, external_id, external_parent_id, board_kind, board_id, metadata, created_at, updated_at) \
+             VALUES(?,?,?,'review',?,'{}',?,?)",
+        )
+        .bind(&ext.source)
+        .bind(&ext.external_id)
+        .bind(&ext.external_parent_id)
+        .bind(rid)
+        .bind(&ts)
+        .bind(&ts)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let mut out = review_json(&mut tx, rid, true).await?.unwrap_or(Value::Null);
+    if let Value::Object(ref mut m) = out {
+        m.insert("created".into(), json!(true));
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Fetch one review with its full log. Bails if it doesn't exist.
+pub async fn get_review(pool: &Pool, review_id: i64) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let out = review_json(&mut tx, review_id, true).await?;
+    tx.commit().await?;
+    match out {
+        Some(v) => Ok(v),
+        None => anyhow::bail!("no review {review_id}"),
+    }
+}
+
+/// List reviews (newest-touched first), optionally filtered by status, kind, and/or assignee.
+/// Returns `{ "reviews": [...] }`; each review is normalized but WITHOUT its log (fetch one with
+/// get_review for the timeline).
+pub async fn list_reviews(
+    pool: &Pool,
+    status: Option<&str>,
+    kind: Option<&str>,
+    assignee: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut sql = String::from("SELECT * FROM reviews");
+    let mut conds: Vec<&str> = Vec::new();
+    if status.is_some() {
+        conds.push("status=?");
+    }
+    if kind.is_some() {
+        conds.push("kind=?");
+    }
+    if assignee.is_some() {
+        conds.push("assignee=?");
+    }
+    if !conds.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conds.join(" AND "));
+    }
+    sql.push_str(" ORDER BY updated_at DESC, id DESC");
+    let mut q = sqlx::query(&sql);
+    if let Some(s) = status {
+        q = q.bind(s.to_string());
+    }
+    if let Some(k) = kind {
+        q = q.bind(k.to_string());
+    }
+    if let Some(a) = assignee {
+        q = q.bind(a.to_string());
+    }
+    let rows = q.fetch_all(pool).await?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| match row_to_json(row) {
+            Value::Object(m) => normalize_review_obj(m),
+            other => other,
+        })
+        .collect();
+    Ok(json!({ "reviews": items }))
+}
+
+/// Transition a review to a new A2 status. A no-op if the review is already in `new_status`
+/// (returns it unchanged, emits nothing, writes no log entry) — so a bridge re-applying the same
+/// upstream state is idempotent. Rejects an unknown status. On a real transition it updates the
+/// status, appends a `state_change` log entry, and emits `review.status_changed`, plus
+/// `review.opened_for_review` when entering `in_review` and `review.terminal` when entering
+/// `approved`/`closed`.
+pub async fn set_review_status(
+    pool: &Pool,
+    review_id: i64,
+    new_status: &str,
+    actor: Option<&str>,
+    note: Option<&str>,
+) -> anyhow::Result<Value> {
+    if !is_review_status(new_status) {
+        anyhow::bail!(
+            "unknown review status '{new_status}' (expected one of: {})",
+            REVIEW_STATUSES.join(", ")
+        );
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT status, created_by, assignee FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no review {review_id}");
+    };
+    let old_status: String = row.try_get("status")?;
+    let created_by: Option<String> = row.try_get("created_by")?;
+    let assignee: Option<String> = row.try_get("assignee")?;
+    // Same status -> idempotent no-op (no log entry, no event).
+    if old_status == new_status {
+        let out = review_json(&mut tx, review_id, true).await?.unwrap_or(Value::Null);
+        tx.commit().await?;
+        return Ok(out);
+    }
+    sqlx::query("UPDATE reviews SET status=?, updated_at=? WHERE id=?")
+        .bind(new_status)
+        .bind(&ts)
+        .bind(review_id)
+        .execute(&mut *tx)
+        .await?;
+    let body = note
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{old_status} -> {new_status}"));
+    sqlx::query(
+        "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
+         VALUES(?,?,?,?,NULL,NULL,?)",
+    )
+    .bind(review_id)
+    .bind("state_change")
+    .bind(&body)
+    .bind(actor)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let recips = review_recipients(created_by.as_deref(), assignee.as_deref(), actor);
+    emit(
+        &mut tx,
+        &mut hooks,
+        "review.status_changed",
+        actor,
+        None,
+        None,
+        None,
+        None,
+        json!({ "review_id": review_id, "from": old_status, "to": new_status, "note": note }),
+        Recipients::Explicit(recips.clone()),
+    )
+    .await?;
+    if new_status == "in_review" {
+        emit(
+            &mut tx,
+            &mut hooks,
+            "review.opened_for_review",
+            actor,
+            None,
+            None,
+            None,
+            None,
+            json!({ "review_id": review_id }),
+            Recipients::Explicit(recips.clone()),
+        )
+        .await?;
+    }
+    if new_status == "approved" || new_status == "closed" {
+        emit(
+            &mut tx,
+            &mut hooks,
+            "review.terminal",
+            actor,
+            None,
+            None,
+            None,
+            None,
+            json!({ "review_id": review_id, "status": new_status }),
+            Recipients::Explicit(recips),
+        )
+        .await?;
+    }
+    let out = review_json(&mut tx, review_id, true).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Append an entry to a review's log. Idempotent on `external_id` when given: if an entry with
+/// the same external_id already exists on this review, return it with `appended:false` — so a
+/// bridge replaying the same upstream comment/finding never double-logs. `entry_type` is one of
+/// the A1 log types (validated); a `finding` may carry a `task_id` linking the child task it
+/// spawned. Emits `review.log_appended`.
+#[allow(clippy::too_many_arguments)]
+pub async fn append_review_log(
+    pool: &Pool,
+    review_id: i64,
+    entry_type: &str,
+    body: Option<&str>,
+    author: Option<&str>,
+    task_id: Option<i64>,
+    external_id: Option<&str>,
+) -> anyhow::Result<Value> {
+    if !is_review_log_type(entry_type) {
+        anyhow::bail!(
+            "unknown review log type '{entry_type}' (expected one of: {})",
+            REVIEW_LOG_TYPES.join(", ")
+        );
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT created_by, assignee FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no review {review_id}");
+    };
+    let created_by: Option<String> = row.try_get("created_by")?;
+    let assignee: Option<String> = row.try_get("assignee")?;
+    // Idempotent on external_id (scoped to this review): a replayed upstream item returns the
+    // existing entry rather than logging a duplicate.
+    if let Some(ext) = external_id {
+        if let Some(existing) =
+            sqlx::query("SELECT id FROM review_log WHERE review_id=? AND external_id=?")
+                .bind(review_id)
+                .bind(ext)
+                .fetch_optional(&mut *tx)
+                .await?
+        {
+            let eid: i64 = existing.try_get("id")?;
+            tx.commit().await?;
+            return Ok(json!({ "review_id": review_id, "entry_id": eid, "appended": false }));
+        }
+    }
+    let eid: i64 = sqlx::query(
+        "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
+         VALUES(?,?,?,?,?,?,?) RETURNING id",
+    )
+    .bind(review_id)
+    .bind(entry_type)
+    .bind(body)
+    .bind(author)
+    .bind(external_id)
+    .bind(task_id)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    let recips = review_recipients(created_by.as_deref(), assignee.as_deref(), author);
+    emit(
+        &mut tx,
+        &mut hooks,
+        "review.log_appended",
+        author,
+        None,
+        None,
+        None,
+        None,
+        json!({ "review_id": review_id, "entry_id": eid, "entry_type": entry_type, "task_id": task_id }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "review_id": review_id, "entry_id": eid, "appended": true, "entry_type": entry_type }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7580,6 +8048,125 @@ mod tests {
             // A panic or an Err (e.g. "database is locked") fails the test with the message.
             h.await.expect("worker task did not panic")?;
         }
+        Ok(())
+    }
+
+    /// The review lifecycle: create -> in_review -> changes_requested -> in_review -> approved,
+    /// each transition landing a state_change log entry and the right terminal/opened events, and
+    /// findings/comments appended to the single log. Also covers the same-status no-op.
+    #[tokio::test]
+    async fn review_lifecycle_and_log() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "author", None, None, None, None, None).await?;
+        register_agent(&pool, "reviewer", None, None, None, None, None).await?;
+
+        let r = create_review(
+            &pool,
+            "design",
+            Some("board-document"),
+            Some("42"),
+            Some("A design"),
+            None,
+            Some("author"),
+            Some("reviewer"),
+            None,
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        assert_eq!(r["created"], json!(true));
+        assert_eq!(r["status"], json!("open"));
+        assert_eq!(r["vetted"], json!(false));
+        // Initial 'submitted' log entry is present.
+        assert_eq!(r["log"].as_array().unwrap().len(), 1);
+        assert_eq!(r["log"][0]["entry_type"], json!("submitted"));
+
+        // open -> in_review emits status_changed + opened_for_review (reviewer hears them).
+        set_review_status(&pool, rid, "in_review", Some("author"), None).await?;
+        // Same status again = idempotent no-op: no new log entry.
+        let noop = set_review_status(&pool, rid, "in_review", Some("author"), None).await?;
+        assert_eq!(noop["status"], json!("in_review"));
+        assert_eq!(noop["log"].as_array().unwrap().len(), 2); // submitted + one state_change
+
+        // A finding with a linked child task, plus a comment.
+        let finding = append_review_log(
+            &pool,
+            rid,
+            "finding",
+            Some("null deref on empty input"),
+            Some("reviewer"),
+            None,
+            Some("gh:owner/repo#c1"),
+        )
+        .await?;
+        assert_eq!(finding["appended"], json!(true));
+        // Replaying the same external_id is idempotent.
+        let dup = append_review_log(
+            &pool,
+            rid,
+            "finding",
+            Some("null deref on empty input"),
+            Some("reviewer"),
+            None,
+            Some("gh:owner/repo#c1"),
+        )
+        .await?;
+        assert_eq!(dup["appended"], json!(false));
+        assert_eq!(dup["entry_id"], finding["entry_id"]);
+
+        set_review_status(&pool, rid, "changes_requested", Some("reviewer"), Some("fix the deref")).await?;
+        set_review_status(&pool, rid, "in_review", Some("author"), None).await?;
+        let approved = set_review_status(&pool, rid, "approved", Some("reviewer"), None).await?;
+        assert_eq!(approved["status"], json!("approved"));
+
+        // Full timeline: submitted + 4 real state_changes + 1 finding = 6 entries.
+        let got = get_review(&pool, rid).await?;
+        assert_eq!(got["log"].as_array().unwrap().len(), 6, "log: {got}");
+        let finding_count = got["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["entry_type"] == json!("finding"))
+            .count();
+        assert_eq!(finding_count, 1);
+
+        // An unknown status is rejected.
+        assert!(set_review_status(&pool, rid, "bogus", Some("x"), None).await.is_err());
+        Ok(())
+    }
+
+    /// Idempotent external ingest: creating twice on the same external_link returns the SAME
+    /// review with created:false, never a duplicate — the contract the github-bridge relies on.
+    #[tokio::test]
+    async fn review_external_ingest_is_idempotent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let ext = ExternalRef {
+            source: "github_pr".into(),
+            external_id: "owner/repo#7".into(),
+            external_parent_id: None,
+        };
+        let first = create_review(
+            &pool, "code", Some("github-pull-request"), Some("owner/repo#7"), Some("PR 7"),
+            Some("in_review"), Some("bridge"), None, None, Some(ext.clone()),
+        )
+        .await?;
+        assert_eq!(first["created"], json!(true));
+        assert_eq!(first["status"], json!("in_review"));
+        let rid = first["id"].as_i64().unwrap();
+
+        let second = create_review(
+            &pool, "code", Some("github-pull-request"), Some("owner/repo#7"), Some("PR 7 again"),
+            Some("open"), Some("bridge"), None, None, Some(ext),
+        )
+        .await?;
+        assert_eq!(second["created"], json!(false));
+        assert_eq!(second["id"].as_i64().unwrap(), rid, "same review, no duplicate");
+        assert_eq!(second["status"], json!("in_review"), "existing state preserved");
+
+        let all = list_reviews(&pool, None, None, None).await?;
+        assert_eq!(all["reviews"].as_array().unwrap().len(), 1);
         Ok(())
     }
 }

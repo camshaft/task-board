@@ -41,6 +41,7 @@ impl IntoResponse for ApiError {
             || msg.starts_with("no comment")
             || msg.starts_with("no parent task")
             || msg.starts_with("no secret request")
+            || msg.starts_with("no review")
             || msg == "not found"
         {
             StatusCode::NOT_FOUND
@@ -59,6 +60,8 @@ impl IntoResponse for ApiError {
             || msg.starts_with("submit link already used")
             || msg.contains("is not awaiting submission")
             || msg.contains("has no ciphertext to pull")
+            || msg.starts_with("unknown review status")
+            || msg.starts_with("unknown review log type")
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
@@ -134,6 +137,10 @@ pub fn router(state: AppState) -> Router {
         .route("/secret-requests/{id}/ciphertext", get(get_secret_ciphertext))
         .route("/secret-requests/{id}/fulfill", post(fulfill_secret))
         .route("/secret-requests/{id}/cancel", post(cancel_secret_request))
+        .route("/reviews", get(list_reviews).post(create_review))
+        .route("/reviews/{review_id}", get(get_review))
+        .route("/reviews/{review_id}/status", post(set_review_status))
+        .route("/reviews/{review_id}/log", post(append_review_log))
         .route("/ipfs/add", post(ipfs_add))
         .route("/ipfs/{cid}", get(ipfs_cat))
         .route("/wiki", get(list_wiki))
@@ -269,6 +276,11 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/secret-requests/{id}/ciphertext", summary: "Fulfiller pulls the ciphertext once to relocate it into durable storage (fulfiller token via ?token=). The one place ciphertext leaves the board.", query: "token=str", body: None },
     Endpoint { method: "POST", path: "/api/secret-requests/{id}/fulfill", summary: "Fulfill a request: the secret is relocated, so the board deletes the row + its transient ciphertext. Idempotent; fulfiller-token-gated while the row exists.", query: "", body: Some("FulfillSecretBody") },
     Endpoint { method: "POST", path: "/api/secret-requests/{id}/cancel", summary: "Cancel (delete) a pending secret request. Idempotent.", query: "", body: Some("CancelSecretBody") },
+    Endpoint { method: "GET", path: "/api/reviews", summary: "List reviews (newest-touched first), optionally filtered by status/kind/assignee. Without logs.", query: "status=str&kind=str&assignee=str", body: None },
+    Endpoint { method: "POST", path: "/api/reviews", summary: "Create a review over an artifact (document|code|design|agent-session|task). Starts in `open` unless a status is seeded; records a `submitted` log entry. Pass external_link for idempotent ingest (a review already linked on (source, external_id) is returned created:false).", query: "", body: Some("CreateReviewBody") },
+    Endpoint { method: "GET", path: "/api/reviews/{review_id}", summary: "Fetch one review with its full append-only log (findings are the entries of type `finding`).", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/reviews/{review_id}/status", summary: "Transition a review's A2 status (open/in_review/changes_requested/approved/closed). Same status = idempotent no-op. Emits review.status_changed (+ opened_for_review / terminal).", query: "", body: Some("SetReviewStatusBody") },
+    Endpoint { method: "POST", path: "/api/reviews/{review_id}/log", summary: "Append a log entry (comment / finding / decision / ...). Pass external_id for idempotent ingest (a bridge replaying an upstream item returns appended:false).", query: "", body: Some("AppendReviewLogBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/task_id/author; archived hidden unless include_archived=true).", query: "project_id=int&status=str&tag=str&task_id=int&author=str&include_archived=bool", body: None },
@@ -339,6 +351,9 @@ fn body_schemas() -> Value {
         FulfillSecretBody,
         CancelSecretBody,
         SetChannelAutoJoinBody,
+        CreateReviewBody,
+        SetReviewStatusBody,
+        AppendReviewLogBody,
     )
 }
 
@@ -1388,6 +1403,128 @@ async fn cancel_secret_request(
     Json(b): Json<CancelSecretBody>,
 ) -> ApiResult {
     Ok(Json(core::cancel_secret_request(&st.pool, id, b.actor.as_deref()).await?))
+}
+
+// --- Reviews (Document #5, increment 1: a typed review over an artifact, A2 lifecycle + log) ---
+
+#[derive(Deserialize, JsonSchema)]
+struct CreateReviewBody {
+    /// What is being reviewed: document | code | design | agent-session | task.
+    kind: String,
+    /// Where the artifact lives (board-document, github-pull-request, code-amazon-change-request,
+    /// url, agent-session, task). Metadata — the board never dereferences it.
+    source: Option<String>,
+    /// A pointer to the artifact within its source (a doc id, a PR url, a change-request id, ...).
+    target_ref: Option<String>,
+    /// A short title for the review.
+    title: Option<String>,
+    /// Initial A2 status; defaults to `open`. open / in_review / changes_requested / approved / closed.
+    status: Option<String>,
+    /// The agent that created/produced the review.
+    created_by: Option<String>,
+    /// The reviewer(s) assigned (a single agent id in increment 1).
+    assignee: Option<String>,
+    /// Arbitrary properties: producing agent id, predecessor review id, tags, ...
+    metadata: Option<Value>,
+    /// Optional external reference for idempotent ingest: a review already linked on
+    /// (source, external_id) is returned (`created:false`) instead of a duplicate.
+    external_link: Option<core::ExternalRef>,
+}
+
+async fn create_review(State(st): State<AppState>, Json(b): Json<CreateReviewBody>) -> ApiResult {
+    Ok(Json(
+        core::create_review(
+            &st.pool,
+            &b.kind,
+            b.source.as_deref(),
+            b.target_ref.as_deref(),
+            b.title.as_deref(),
+            b.status.as_deref(),
+            b.created_by.as_deref(),
+            b.assignee.as_deref(),
+            b.metadata,
+            b.external_link,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct ListReviewsQuery {
+    status: Option<String>,
+    kind: Option<String>,
+    assignee: Option<String>,
+}
+
+async fn list_reviews(
+    State(st): State<AppState>,
+    Query(q): Query<ListReviewsQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_reviews(&st.pool, q.status.as_deref(), q.kind.as_deref(), q.assignee.as_deref())
+            .await?,
+    ))
+}
+
+async fn get_review(State(st): State<AppState>, Path(review_id): Path<i64>) -> ApiResult {
+    found(core::get_review(&st.pool, review_id).await?)
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetReviewStatusBody {
+    /// The new A2 status: open / in_review / changes_requested / approved / closed. Re-applying
+    /// the current status is an idempotent no-op.
+    status: String,
+    /// The agent making the transition.
+    actor: Option<String>,
+    /// An optional note recorded on the state-change log entry.
+    note: Option<String>,
+}
+
+async fn set_review_status(
+    State(st): State<AppState>,
+    Path(review_id): Path<i64>,
+    Json(b): Json<SetReviewStatusBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_review_status(&st.pool, review_id, &b.status, b.actor.as_deref(), b.note.as_deref())
+            .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AppendReviewLogBody {
+    /// The entry type: submitted / revised / finding / finding_resolved / comment / state_change /
+    /// adversarial_review / decision.
+    entry_type: String,
+    /// The entry text.
+    body: Option<String>,
+    /// The author of this entry.
+    author: Option<String>,
+    /// For an actionable `finding`: the id of the child task tracking the fix.
+    task_id: Option<i64>,
+    /// Optional external id for idempotent ingest: an entry already logged under this external_id
+    /// on the review is returned (`appended:false`) instead of a duplicate.
+    external_id: Option<String>,
+}
+
+async fn append_review_log(
+    State(st): State<AppState>,
+    Path(review_id): Path<i64>,
+    Json(b): Json<AppendReviewLogBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::append_review_log(
+            &st.pool,
+            review_id,
+            &b.entry_type,
+            b.body.as_deref(),
+            b.author.as_deref(),
+            b.task_id,
+            b.external_id.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]
