@@ -174,10 +174,18 @@ export function useReviewTrend() {
   return useResource<ReviewTrend>(keys.reviewTrend, () => api.reviewTrend())
 }
 
-// Review mutations. Both change the log + (status) the lifecycle and can shift the trend, so
-// refresh the review, the list, and the trend.
+// Review mutations. Each writes the log + (status/vetted) the lifecycle or gate and can shift the
+// trend, so refresh the review, the list, and the trend.
 export async function setReviewStatus(id: number, b: Parameters<typeof api.setReviewStatus>[1]) {
   const r = await api.setReviewStatus(id, b)
+  invalidate(keys.review(id))
+  invalidate(keys.reviews)
+  invalidate(keys.reviewTrend)
+  return r
+}
+
+export async function setReviewVetted(id: number, b: Parameters<typeof api.setReviewVetted>[1]) {
+  const r = await api.setReviewVetted(id, b)
   invalidate(keys.review(id))
   invalidate(keys.reviews)
   invalidate(keys.reviewTrend)
