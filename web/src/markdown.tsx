@@ -43,6 +43,16 @@ const EMBED_RE =
 // autolinkers below.
 const LINK_CLS = 'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
 
+// Typed resource id prefix -> the client route it deep-links to (task 504). The typed form
+// (task_472, doc_23, project_16, channel_123) is the canonical id the API returns; the linkifier
+// resolves it to the in-app route so a self-describing reference is clickable anywhere it's written.
+const REF_ROUTE: Record<string, string> = {
+  task: 'tasks',
+  doc: 'documents',
+  project: 'projects',
+  channel: 'channels',
+}
+
 // Inline spans, in priority order: code (verbatim), wiki-links, links, bold, italic, and then
 // autolinkers for bare URLs + task refs. Returns a mix of strings (React escapes them) and
 // elements. `gen` yields globally-unique keys; `resolve` maps a [[wiki-path]] to its document
@@ -144,6 +154,30 @@ function inline(
         <a key={gen()} href={m[0]} className={LINK_CLS}>
           {m[0]}
         </a>
+      ),
+    ],
+    [
+      // External GitHub PR/issue reference: <owner>/<repo>#<N> (e.g. camshaft/fleet#183) → the PR
+      // URL (GitHub redirects /pull/<N> to /issues/<N> when it's an issue). Repo-qualified ONLY —
+      // a bare #N is a board task (below). The lookbehind rejects a preceding path/word char (a '/'
+      // or letter) so it never matches inside a longer path or URL (e.g. ".com/owner/repo#5").
+      /(?<![\w./@-])([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*)#(\d+)\b/,
+      (m) => (
+        <a key={gen()} href={`https://github.com/${m[1]}/${m[2]}/pull/${m[3]}`} className={LINK_CLS}>
+          {m[0]}
+        </a>
+      ),
+    ],
+    [
+      // Internal typed resource id: task_472 / doc_23 / project_16 / channel_123 → the board
+      // deep-link (task 504). This is the canonical id the API returns and accepts in URLs. The
+      // lookbehind rejects a leading word char / hyphen so "subtask_5" / "todoc_3" don't match;
+      // \b after the digits rejects "task_12ab".
+      /(?<![\w-])(task|doc|project|channel)_(\d+)\b/,
+      (m) => (
+        <Link key={gen()} to={`/${REF_ROUTE[m[1]]}/${m[2]}`} className={LINK_CLS}>
+          {m[0]}
+        </Link>
       ),
     ],
     [

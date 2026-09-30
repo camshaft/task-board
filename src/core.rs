@@ -23,6 +23,27 @@ pub fn row_to_json(row: &SqliteRow) -> Value {
     Value::Object(obj)
 }
 
+/// Add the typed canonical id `ref` ("<kind>_<id>", e.g. "task_472") to a resource object that
+/// already carries its integer `id` (task 504). `kind` is the resource prefix ("task" | "doc" |
+/// "project" | "channel"). The integer `id` field is RETAINED unchanged as a back-compat numeric
+/// alias; `ref` is the canonical form the API returns, links render, and agents pass around. A
+/// no-op if the object has no integer `id`.
+pub fn insert_ref(m: &mut Map<String, Value>, kind: &str) {
+    if let Some(id) = m.get("id").and_then(|v| v.as_i64()) {
+        m.insert("ref".into(), json!(format!("{kind}_{id}")));
+    }
+}
+
+/// `row_to_json` plus the typed canonical `ref` (see [`insert_ref`]) — for id-bearing resource
+/// rows (tasks, documents, ...) so nested summaries carry a deep-linkable ref too.
+pub fn row_to_json_ref(row: &SqliteRow, kind: &str) -> Value {
+    let mut d = row_to_json(row);
+    if let Value::Object(ref mut m) = d {
+        insert_ref(m, kind);
+    }
+    d
+}
+
 /// If `data` carries an `external_author` (an external_identities id, e.g. an ingested Slack
 /// user like `slack:U0…`), resolve that identity's registered `display_name` and add it as
 /// `external_author_name`, so a consumer can show the human's name while `external_author`
@@ -855,6 +876,7 @@ pub async fn list_projects(pool: &Pool, status: Option<&str>) -> anyhow::Result<
             cmap.insert(s, json!(n));
         }
         if let Value::Object(ref mut m) = d {
+            insert_ref(m, "project"); // typed canonical id (task 504)
             // metadata: parse JSON string -> object (mirrors get_project/get_task).
             let meta: Value = m
                 .get("metadata")
@@ -883,6 +905,7 @@ pub async fn get_project(pool: &Pool, project_id: i64) -> anyhow::Result<Value> 
     .fetch_all(pool)
     .await?;
     if let Value::Object(ref mut m) = d {
+        insert_ref(m, "project"); // typed canonical id (task 504)
         // metadata: parse JSON string -> object (mirrors get_task).
         let meta: Value = m
             .get("metadata")
@@ -892,7 +915,7 @@ pub async fn get_project(pool: &Pool, project_id: i64) -> anyhow::Result<Value> 
         m.insert("metadata".into(), meta);
         m.insert(
             "tasks".into(),
-            Value::Array(tasks.iter().map(row_to_json).collect()),
+            Value::Array(tasks.iter().map(|r| row_to_json_ref(r, "task")).collect()),
         );
     }
     Ok(d)
@@ -1532,6 +1555,7 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
     let Some(t) = t else { return Ok(Value::Null) };
     let mut d = row_to_json(&t);
     if let Value::Object(ref mut m) = d {
+        insert_ref(m, "task"); // typed canonical id (task 504)
         // metadata: parse JSON string -> object
         let meta: Value = m
             .get("metadata")
@@ -1590,7 +1614,7 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
         .await?;
         m.insert(
             "attached_documents".into(),
-            Value::Array(docs.iter().map(row_to_json).collect()),
+            Value::Array(docs.iter().map(|r| row_to_json_ref(r, "doc")).collect()),
         );
 
         // Epic nesting: children (id/title/status), a done/total roll-up, and the parent title.
@@ -1605,7 +1629,7 @@ pub async fn get_task(pool: &Pool, task_id: i64) -> anyhow::Result<Value> {
             .iter()
             .filter(|r| r.try_get::<String, _>("status").map(|s| s == "done").unwrap_or(false))
             .count() as i64;
-        m.insert("children".into(), Value::Array(children.iter().map(row_to_json).collect()));
+        m.insert("children".into(), Value::Array(children.iter().map(|r| row_to_json_ref(r, "task")).collect()));
         m.insert("child_rollup".into(), json!({ "done": done, "total": total }));
 
         let parent_id = m.get("parent_id").and_then(|v| v.as_i64());
@@ -1724,7 +1748,7 @@ pub async fn list_tasks(
         query = query.bind(k).bind(v);
     }
     let rows = query.fetch_all(pool).await?;
-    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+    Ok(Value::Array(rows.iter().map(|r| row_to_json_ref(r, "task")).collect()))
 }
 
 pub async fn comment_task(
@@ -2096,6 +2120,7 @@ fn channel_json(row: &SqliteRow) -> Value {
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or_else(|| json!({}));
     obj.insert("metadata".into(), meta);
+    insert_ref(&mut obj, "channel"); // typed canonical id (task 504)
     if let Some(p) = obj.get("private").and_then(|v| v.as_i64()) {
         obj.insert("private".into(), Value::Bool(p != 0));
     }
@@ -3905,6 +3930,7 @@ async fn document_json(
     .await?;
     let versions: Vec<Value> = vrows.iter().map(row_to_json).collect();
     if let Value::Object(ref mut m) = d {
+        insert_ref(m, "doc"); // typed canonical id (task 504)
         let meta: Value = m
             .get("metadata")
             .and_then(|v| v.as_str())
@@ -3926,7 +3952,7 @@ async fn document_json(
         .bind(document_id)
         .fetch_all(&mut **tx)
         .await?;
-        m.insert("attached_tasks".into(), Value::Array(tasks.iter().map(row_to_json).collect()));
+        m.insert("attached_tasks".into(), Value::Array(tasks.iter().map(|r| row_to_json_ref(r, "task")).collect()));
 
         // Outbound wiki links ([[target]] this doc points at, kind='link'), each resolved to the
         // document currently filed at that path (target_* are null when the link dangles).
@@ -4421,7 +4447,7 @@ pub async fn list_documents(
         query = query.bind(tg);
     }
     let rows = query.fetch_all(pool).await?;
-    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+    Ok(Value::Array(rows.iter().map(|r| row_to_json_ref(r, "doc")).collect()))
 }
 
 // --- Wiki: hierarchical paths over documents (#105) ---

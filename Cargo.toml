@@ -43,3 +43,5 @@ tempfile = "3"
 # WS client for the /tunnel/ws round-trip integration test (plain ws://, no TLS backend).
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 futures-util = "0.3"
+# `ServiceExt::oneshot` for router-level request tests (e.g. typed-id path extraction, task 504).
+tower = { version = "0.5", features = ["util"] }
