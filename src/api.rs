@@ -815,7 +815,7 @@ struct UpdateProjectBody {
 
 async fn update_project(
     State(st): State<AppState>,
-    Path(project_id): Path<i64>,
+    Path(ProjectRef(project_id)): Path<ProjectRef>,
     Json(b): Json<UpdateProjectBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -982,7 +982,7 @@ struct UpdateTaskBody {
 
 async fn update_task(
     State(st): State<AppState>,
-    Path(task_id): Path<i64>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<UpdateTaskBody>,
 ) -> ApiResult {
     // `unassign: true` clears the owner via the core empty-string sentinel and wins over `assignee`.
@@ -1029,7 +1029,7 @@ struct CommentBody {
 
 async fn comment_task(
     State(st): State<AppState>,
-    Path(task_id): Path<i64>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<CommentBody>,
 ) -> ApiResult {
     core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
@@ -1040,7 +1040,7 @@ async fn comment_task(
 
 async fn set_task_props(
     State(st): State<AppState>,
-    Path(task_id): Path<i64>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
     Json(props): Json<Value>,
 ) -> ApiResult {
     Ok(Json(core::set_task_props(&st.pool, task_id, props).await?))
@@ -1054,7 +1054,7 @@ struct MoveTaskBody {
 
 async fn move_task(
     State(st): State<AppState>,
-    Path(task_id): Path<i64>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<MoveTaskBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -1070,7 +1070,7 @@ struct ArchiveTaskBody {
 
 async fn archive_task(
     State(st): State<AppState>,
-    Path(task_id): Path<i64>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<ArchiveTaskBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -1080,7 +1080,7 @@ async fn archive_task(
 
 async fn restore_task(
     State(st): State<AppState>,
-    Path(task_id): Path<i64>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<ArchiveTaskBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -1151,7 +1151,7 @@ struct MuteTaskBody {
 
 async fn mute_task(
     State(st): State<AppState>,
-    Path(task_id): Path<i64>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<MuteTaskBody>,
 ) -> ApiResult {
     Ok(Json(core::mute_task(&st.pool, &b.agent, task_id).await?))
@@ -1159,7 +1159,7 @@ async fn mute_task(
 
 async fn unmute_task(
     State(st): State<AppState>,
-    Path(task_id): Path<i64>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<MuteTaskBody>,
 ) -> ApiResult {
     Ok(Json(core::unmute_task(&st.pool, &b.agent, task_id).await?))
@@ -1221,7 +1221,7 @@ struct ChannelPostsQuery {
 
 async fn get_channel_posts(
     State(st): State<AppState>,
-    Path(channel_id): Path<i64>,
+    Path(ChannelRef(channel_id)): Path<ChannelRef>,
     Query(q): Query<ChannelPostsQuery>,
 ) -> ApiResult {
     let desc = q.order.as_deref() == Some("desc");
@@ -1246,7 +1246,7 @@ struct PostToChannelBody {
 
 async fn post_to_channel(
     State(st): State<AppState>,
-    Path(channel_id): Path<i64>,
+    Path(ChannelRef(channel_id)): Path<ChannelRef>,
     Json(b): Json<PostToChannelBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -1265,7 +1265,7 @@ async fn post_to_channel(
 
 async fn set_channel_props(
     State(st): State<AppState>,
-    Path(channel_id): Path<i64>,
+    Path(ChannelRef(channel_id)): Path<ChannelRef>,
     Json(props): Json<Value>,
 ) -> ApiResult {
     Ok(Json(core::set_channel_props(&st.pool, channel_id, props).await?))
@@ -1281,7 +1281,7 @@ struct SetChannelAutoJoinBody {
 
 async fn set_channel_auto_join(
     State(st): State<AppState>,
-    Path(channel_id): Path<i64>,
+    Path(ChannelRef(channel_id)): Path<ChannelRef>,
     Json(b): Json<SetChannelAutoJoinBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -1300,7 +1300,7 @@ struct PromoteThreadBody {
 
 async fn promote_thread(
     State(st): State<AppState>,
-    Path(channel_id): Path<i64>,
+    Path(ChannelRef(channel_id)): Path<ChannelRef>,
     Json(b): Json<PromoteThreadBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -1317,7 +1317,7 @@ struct InviteChannelBody {
 
 async fn invite_to_channel(
     State(st): State<AppState>,
-    Path(channel_id): Path<i64>,
+    Path(ChannelRef(channel_id)): Path<ChannelRef>,
     Json(b): Json<InviteChannelBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2007,7 +2007,7 @@ struct UpdateDocumentBody {
 
 async fn update_document(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<UpdateDocumentBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2027,7 +2027,7 @@ struct DocumentContentQuery {
 /// + the CID to fetch via `/api/ipfs/{cid}`. Requires `ipfs_api_url` (503 without one).
 async fn read_document_content(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Query(q): Query<DocumentContentQuery>,
 ) -> ApiResult {
     Ok(Json(
@@ -2038,7 +2038,7 @@ async fn read_document_content(
 
 async fn get_document_versions(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
 ) -> ApiResult {
     Ok(Json(core::get_document_versions(&st.pool, document_id).await?))
 }
@@ -2062,7 +2062,7 @@ struct PublishVersionBody {
 
 async fn publish_version(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<PublishVersionBody>,
 ) -> ApiResult {
     if let Some(c) = b.content.as_deref() {
@@ -2096,7 +2096,7 @@ struct SetDocumentPathBody {
 
 async fn set_document_path(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<SetDocumentPathBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2112,7 +2112,7 @@ struct DocumentCommentsQuery {
 
 async fn get_document_comments(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Query(q): Query<DocumentCommentsQuery>,
 ) -> ApiResult {
     Ok(Json(
@@ -2139,7 +2139,7 @@ struct CommentDocumentBody {
 
 async fn comment_document(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<CommentDocumentBody>,
 ) -> ApiResult {
     core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
@@ -2165,7 +2165,7 @@ struct ResolveCommentBody {
 
 async fn resolve_comment(
     State(st): State<AppState>,
-    Path((_document_id, comment_id)): Path<(i64, i64)>,
+    Path((DocRef(_document_id), comment_id)): Path<(DocRef, i64)>,
     Json(b): Json<ResolveCommentBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2180,7 +2180,7 @@ struct DocumentActorBody {
 
 async fn submit_for_review(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<DocumentActorBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2197,7 +2197,7 @@ struct RequestChangesBody {
 
 async fn request_changes(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<RequestChangesBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2207,7 +2207,7 @@ async fn request_changes(
 
 async fn approve_document(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<DocumentActorBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2217,7 +2217,7 @@ async fn approve_document(
 
 async fn archive_document(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<DocumentActorBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2227,7 +2227,7 @@ async fn archive_document(
 
 async fn restore_document(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<DocumentActorBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2243,7 +2243,7 @@ struct AttachDocumentBody {
 
 async fn attach_document(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<AttachDocumentBody>,
 ) -> ApiResult {
     Ok(Json(
@@ -2253,7 +2253,7 @@ async fn attach_document(
 
 async fn detach_document(
     State(st): State<AppState>,
-    Path(document_id): Path<i64>,
+    Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<AttachDocumentBody>,
 ) -> ApiResult {
     Ok(Json(
