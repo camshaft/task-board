@@ -194,6 +194,33 @@ fn agent_json(row: &SqliteRow) -> Value {
     Value::Object(obj)
 }
 
+/// A minimal presence projection of an agent object — the fields a presence ping actually needs
+/// (id, status, status_message, last_seen). set_status returns this instead of the full agent so a
+/// long-running /loop agent doesn't re-ingest its own multi-KB charter into context on every tick
+/// (task #416); the full object stays available via get_agent.
+pub fn presence_projection(agent: Value) -> Value {
+    let Value::Object(o) = agent else {
+        return agent;
+    };
+    let mut m = Map::new();
+    for k in ["id", "status", "status_message", "last_seen"] {
+        if let Some(v) = o.get(k) {
+            m.insert(k.to_string(), v.clone());
+        }
+    }
+    Value::Object(m)
+}
+
+/// Drop one heavy long-text field (an agent `charter` or a task `description`) from a mutation
+/// response unless the caller opted into the full object via a `verbose` flag. A no-op on a
+/// non-object. Keeps update_agent/update_task responses light for a looping caller (task #416).
+pub fn strip_field(mut v: Value, field: &str) -> Value {
+    if let Value::Object(ref mut m) = v {
+        m.remove(field);
+    }
+    v
+}
+
 /// Merge `incoming` (an object) into `base_str` (a JSON string, default '{}') and return the
 /// merged JSON as a string. Shallow key-level merge — the same semantics tasks/projects use.
 fn merge_metadata(base_str: Option<&str>, incoming: Value) -> String {
@@ -8635,6 +8662,36 @@ mod tests {
         assert_eq!(beta_only["overall"]["reviews"].as_u64(), Some(2));
         assert_eq!(beta_only["overall"]["escaped_defects"]["reopens"].as_u64(), Some(1));
         assert_eq!(beta_only["overall"]["escaped_defects"]["lineage_followups"].as_u64(), Some(1));
+        Ok(())
+    }
+
+    /// Mutation responses are trimmed so a looping caller doesn't re-ingest its own charter /
+    /// a task's description on every tick (task #416): set_status returns presence fields only,
+    /// and strip_field drops a heavy blob while leaving everything else intact.
+    #[tokio::test]
+    async fn mutation_responses_are_trimmed() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", Some("Worker"), None, Some("a very long charter ".repeat(200).trim()), None, None).await?;
+
+        // set_status's core still returns the full agent; presence_projection (what the boundary
+        // applies) keeps only presence fields and drops the charter.
+        let full = set_status(&pool, "worker", "online", Some("ping")).await?;
+        assert!(full["charter"].is_string(), "core still has the full object");
+        let presence = presence_projection(full);
+        assert_eq!(presence["id"], json!("worker"));
+        assert_eq!(presence["status"], json!("online"));
+        assert_eq!(presence["status_message"], json!("ping"));
+        assert!(presence.get("last_seen").is_some());
+        assert!(presence.get("charter").is_none(), "presence response must omit the charter");
+        assert!(presence.get("metadata").is_none(), "presence response is presence-only");
+
+        // strip_field drops one blob, keeps the rest, and is a no-op on a non-object.
+        let agent = get_agent(&pool, "worker").await?;
+        let trimmed = strip_field(agent.clone(), "charter");
+        assert!(trimmed.get("charter").is_none());
+        assert_eq!(trimmed["display_name"], json!("Worker"), "other fields survive the strip");
+        assert_eq!(strip_field(json!("scalar"), "charter"), json!("scalar"));
         Ok(())
     }
 }

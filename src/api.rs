@@ -586,6 +586,10 @@ struct UpdateAgentBody {
     webhook_url: Option<String>,
     /// MERGED into the agent's registry bag, not replaced.
     metadata: Option<Value>,
+    /// Return the full agent (including `charter`) in the response. Default false — the response
+    /// omits the charter to keep a looping caller's context light; fetch it via GET /api/agents/{id}.
+    #[serde(default)]
+    verbose: Option<bool>,
 }
 
 async fn update_agent(
@@ -593,20 +597,23 @@ async fn update_agent(
     Path(agent_id): Path<String>,
     Json(b): Json<UpdateAgentBody>,
 ) -> ApiResult {
-    Ok(Json(
-        core::update_agent(
-            &st.pool,
-            &agent_id,
-            b.display_name.as_deref(),
-            b.kind.as_deref(),
-            b.charter.as_deref(),
-            b.status.as_deref(),
-            b.status_message.as_deref(),
-            b.webhook_url.as_deref(),
-            b.metadata,
-        )
-        .await?,
-    ))
+    let out = core::update_agent(
+        &st.pool,
+        &agent_id,
+        b.display_name.as_deref(),
+        b.kind.as_deref(),
+        b.charter.as_deref(),
+        b.status.as_deref(),
+        b.status_message.as_deref(),
+        b.webhook_url.as_deref(),
+        b.metadata,
+    )
+    .await?;
+    Ok(Json(if b.verbose.unwrap_or(false) {
+        out
+    } else {
+        core::strip_field(out, "charter")
+    }))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -620,9 +627,9 @@ async fn set_status(
     Path(agent_id): Path<String>,
     Json(b): Json<SetStatusBody>,
 ) -> ApiResult {
-    Ok(Json(
-        core::set_status(&st.pool, &agent_id, &b.status, b.status_message.as_deref()).await?,
-    ))
+    // Presence fields only — a looping caller re-ingests this every tick (task #416).
+    let out = core::set_status(&st.pool, &agent_id, &b.status, b.status_message.as_deref()).await?;
+    Ok(Json(core::presence_projection(out)))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -873,6 +880,10 @@ struct UpdateTaskBody {
     /// What this task is blocked on (required when setting status=blocked). Omit to leave
     /// unchanged; pass kind="none" to clear.
     blocked_on: Option<BlockedOnBody>,
+    /// Return the full task (including `description`) in the response. Default false — the response
+    /// omits the description to keep a looping caller's context light; fetch it via GET /api/tasks/{id}.
+    #[serde(default)]
+    verbose: Option<bool>,
 }
 
 async fn update_task(
@@ -886,22 +897,25 @@ async fn update_task(
     } else {
         b.assignee.as_deref()
     };
-    Ok(Json(
-        core::update_task(
-            &st.pool,
-            task_id,
-            b.status.as_deref(),
-            assignee,
-            b.title.as_deref(),
-            b.description.as_deref(),
-            b.priority.as_deref(),
-            b.actor.as_deref(),
-            b.metadata,
-            b.parent_id,
-            blocked_on_value(b.blocked_on),
-        )
-        .await?,
-    ))
+    let out = core::update_task(
+        &st.pool,
+        task_id,
+        b.status.as_deref(),
+        assignee,
+        b.title.as_deref(),
+        b.description.as_deref(),
+        b.priority.as_deref(),
+        b.actor.as_deref(),
+        b.metadata,
+        b.parent_id,
+        blocked_on_value(b.blocked_on),
+    )
+    .await?;
+    Ok(Json(if b.verbose.unwrap_or(false) {
+        out
+    } else {
+        core::strip_field(out, "description")
+    }))
 }
 
 #[derive(Deserialize, JsonSchema)]
