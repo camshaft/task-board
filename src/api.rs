@@ -250,8 +250,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/restore", summary: "Restore an archived task so it reappears in the default list_tasks view.", query: "", body: Some("ArchiveTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/mute", summary: "Mute a task for an agent: detach them from its event fan-out (stop FYI notifications).", query: "", body: Some("MuteTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/unmute", summary: "Unmute a task for an agent (rejoin its fan-out).", query: "", body: Some("MuteTaskBody") },
-    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, document, or the whole board (board=true). Optional event_classes (e.g. [\"created\"]) makes it a delivery-gated filtered subscription (only those classes reach the inbox and wake you); omit for every event. Idempotent (re-subscribe updates the class set).", query: "", body: Some("SubscribeBody") },
-    Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, channel, document, or the whole board (board=true).", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, document, or the whole board (board=true). Optional event_classes (e.g. [\"created\"]) makes it a delivery-gated filtered subscription (only those classes reach the inbox and wake you); omit for every event. Idempotent (re-subscribe updates the class set). Pass thread_root (a channel post's event seq) to subscribe to a THREAD and be delivered+woken on in-thread follow-ups (reply_to=that root) without a re-mention.", query: "", body: Some("SubscribeBody") },
+    Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, channel, document, the whole board (board=true), or a thread (thread_root=the root post seq).", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None },
     Endpoint { method: "POST", path: "/api/channels", summary: "Create (or get) a named channel.", query: "", body: Some("CreateChannelBody") },
     Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members.", query: "", body: None },
@@ -1043,12 +1043,17 @@ struct SubscribeBody {
     /// just those classes (only they reach the inbox and wake the subscriber); omit for every event.
     /// Applies to any target. (Ignored by unsubscribe.)
     event_classes: Option<Vec<String>>,
+    /// Subscribe to a channel THREAD (#438): the root is a channel post's event seq. Delivers +
+    /// wakes on in-thread follow-ups (reply_to = this root) without a re-mention. When set, takes
+    /// precedence over the other targets (and is the target for unsubscribe too).
+    thread_root: Option<i64>,
 }
 
 async fn subscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
     let board = b.board.unwrap_or(false);
-    let out = match b.event_classes.as_deref() {
-        Some(ec) if !ec.is_empty() => {
+    let out = match (b.thread_root, b.event_classes.as_deref()) {
+        (Some(root), _) => core::subscribe_thread(&st.pool, &b.subscriber, root).await?,
+        (None, Some(ec)) if !ec.is_empty() => {
             core::subscribe_classed(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id, b.document_id, board, ec).await?
         }
         _ => core::subscribe(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id, b.document_id, board).await?,
@@ -1057,6 +1062,9 @@ async fn subscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> 
 }
 
 async fn unsubscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
+    if let Some(root) = b.thread_root {
+        return Ok(Json(core::unsubscribe_thread(&st.pool, &b.subscriber, root).await?));
+    }
     Ok(Json(
         core::unsubscribe(
             &st.pool,
