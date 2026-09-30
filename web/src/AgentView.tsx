@@ -1,8 +1,18 @@
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { eventHref, useAgent, useAgentActivity, useAgentTasks, useProjects, updateAgent } from './resources'
+import { useBoardContext } from './Layout'
+import {
+  eventHref,
+  sendDirectMessage,
+  useAgent,
+  useAgentActivity,
+  useAgentTasks,
+  useChannels,
+  useProjects,
+  updateAgent,
+} from './resources'
 import { Markdown } from './markdown'
-import { AGENT_DOT, relTime, StatusChip } from './ui'
+import { AGENT_DOT, AutoGrowTextarea, relTime, StatusChip } from './ui'
 
 // Per-agent page (/agents/:agentId): identity + presence, charter, registry metadata (repos),
 // and the tasks currently assigned to this agent across every project. Read-only; backed by the
@@ -10,12 +20,48 @@ import { AGENT_DOT, relTime, StatusChip } from './ui'
 // `tasks:` prefix the mutation choke point already invalidates).
 export default function AgentView() {
   const { agentId } = useParams()
+  const { actor } = useBoardContext()
   const id = agentId ?? ''
   const { data: agent, error, loading } = useAgent(id)
   const { data: tasks = [] } = useAgentTasks(id)
   const { data: projects = [] } = useProjects()
   // This agent's own actions, server-filtered by actor (complete, not window-truncated).
   const { data: activity = [] } = useAgentActivity(id)
+  // The current actor's channels, to resolve an existing DM channel with this agent so the
+  // "Open DM" link can point at it. The channel LIST response omits the `members` array (it
+  // carries dm_key + member_count), so match on dm_key — the two member ids sorted and joined by
+  // NUL — falling back to a members check for any response shape that does include them.
+  const { data: myChannels = [] } = useChannels(actor)
+  const dmKey = [actor, id].sort().join('\u0000')
+  const dm = myChannels.find(
+    (c) =>
+      c.dm_key === dmKey || (c.private && c.members?.includes(id) && c.members?.includes(actor)),
+  )
+
+  // Quick nudge: a small inline composer that sends this agent a direct message (which also
+  // creates the DM channel on first send, after which the DM link resolves).
+  const [nudgeOpen, setNudgeOpen] = useState(false)
+  const [nudge, setNudge] = useState('')
+  const [sending, setSending] = useState(false)
+  const [nudgeError, setNudgeError] = useState<string | null>(null)
+  const [nudgeSent, setNudgeSent] = useState(false)
+
+  async function sendNudge() {
+    const body = nudge.trim()
+    if (!body || sending) return
+    setSending(true)
+    setNudgeError(null)
+    setNudgeSent(false)
+    try {
+      await sendDirectMessage({ from_agent: actor, to_agent: id, body })
+      setNudge('')
+      setNudgeSent(true)
+    } catch (e) {
+      setNudgeError((e as Error).message)
+    } finally {
+      setSending(false)
+    }
+  }
   const projectName = (pid: number | null | undefined) =>
     pid == null ? '' : (projects.find((p) => p.id === pid)?.name ?? `#${pid}`)
 
@@ -70,7 +116,71 @@ export default function AgentView() {
           {agent?.display_name || id}
         </h1>
         <span className="font-mono text-xs text-[var(--color-muted)]">{id}</span>
+        {/* Contact actions. Hidden on your own page (no self-DM/nudge). */}
+        {agent && actor && id !== actor && (
+          <div className="ml-auto flex items-center gap-2">
+            {dm && (
+              <Link
+                to={`/channels/${dm.id}`}
+                className="rounded-md px-2.5 py-1 text-xs text-sky-400 ring-1 ring-inset ring-sky-500/40 hover:bg-sky-500/10"
+              >
+                Open DM
+              </Link>
+            )}
+            <button
+              onClick={() => setNudgeOpen((o) => !o)}
+              className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
+            >
+              Nudge
+            </button>
+          </div>
+        )}
       </div>
+
+      {/* Quick nudge composer: a direct message without leaving the agent page. */}
+      {nudgeOpen && agent && actor && id !== actor && (
+        <div className="border-b border-[var(--color-border)] bg-[var(--color-panel)]/40 px-5 py-2">
+          {nudgeError && (
+            <div className="mb-2 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
+              {nudgeError}
+            </div>
+          )}
+          <div className="flex items-end gap-2">
+            <AutoGrowTextarea
+              value={nudge}
+              onChange={(v) => {
+                setNudge(v)
+                setNudgeSent(false)
+              }}
+              onSubmit={sendNudge}
+              placeholder={`Message ${id} as ${actor}…`}
+              className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm outline-none focus:border-sky-500/50"
+            />
+            <button
+              onClick={sendNudge}
+              disabled={sending || !nudge.trim()}
+              className="rounded-md bg-sky-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+            >
+              Send
+            </button>
+            <button
+              onClick={() => {
+                setNudgeOpen(false)
+                setNudge('')
+                setNudgeError(null)
+              }}
+              className="rounded-md px-2 py-2 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+            >
+              Cancel
+            </button>
+          </div>
+          {nudgeSent && (
+            <p className="mt-1 text-[11px] text-emerald-300">
+              Message sent{dm ? '.' : ' — opening a DM channel.'}
+            </p>
+          )}
+        </div>
+      )}
 
       {error && (
         <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
