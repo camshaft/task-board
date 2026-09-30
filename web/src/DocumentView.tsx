@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { type CSSProperties, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { type DocumentComment, type DocumentVersion, ipfsUrl } from './api'
 import { DocStatusChip } from './Documents'
@@ -42,6 +42,15 @@ export default function DocumentView() {
   const contentRef = useRef<HTMLDivElement>(null)
   const [region, setRegion] = useState<RegionQuote | null>(null)
   const [contentNonce, setContentNonce] = useState(0)
+  // Inline anchored-comment pins: the wrapper the pins/popovers position against, the computed
+  // pins (one per anchored region present in the shown version, keyed by quoted text), which
+  // thread's popover is open, and the vertical offset of the pending-selection compose popover.
+  // `layout` is bumped on resize so pin offsets recompute against the new geometry.
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const [pins, setPins] = useState<{ key: string; top: number; count: number }[]>([])
+  const [openKey, setOpenKey] = useState<string | null>(null)
+  const [selTop, setSelTop] = useState<number | null>(null)
+  const [layout, setLayout] = useState(0)
   // Long threads collapse older top-level comments behind a "show N earlier" button, keeping the
   // latest few in view (their replies stay with them). Recent replies are what usually matter.
   const [showAllComments, setShowAllComments] = useState(false)
@@ -58,6 +67,12 @@ export default function DocumentView() {
     if (exact.length < 2) return
     const full = el.textContent ?? ''
     const idx = full.indexOf(exact)
+    // Anchor the inline compose popover to the selection's vertical position within the wrapper,
+    // and close any open thread so the two popovers never stack.
+    const wrap = wrapRef.current
+    const rng = sel.rangeCount > 0 ? sel.getRangeAt(0) : null
+    if (wrap && rng) setSelTop(rng.getBoundingClientRect().top - wrap.getBoundingClientRect().top)
+    setOpenKey(null)
     setRegion({
       type: 'text-quote',
       exact,
@@ -81,23 +96,34 @@ export default function DocumentView() {
     }
   }
 
+  // The bottom composer posts a doc-level comment or a reply (region-anchored comments now come
+  // from the inline selection popover, so this path never anchors).
   async function addComment() {
     const body = draft.trim()
     if (!body) return
-    // Anchor only top-level comments (not replies) to a selected region on the current version.
-    const anchored = replyTo == null ? region : null
+    await act(() => commentDocument(id, { body, author: actor, reply_to: replyTo ?? undefined }))
+    setDraft('')
+    setReplyTo(null)
+  }
+
+  // Post a comment anchored to the current text selection (from the inline SelectionComposer),
+  // scoped to the current version so the highlight matches what the author saw.
+  async function addAnchoredComment(body: string) {
     await act(() =>
       commentDocument(id, {
         body,
         author: actor,
-        reply_to: replyTo ?? undefined,
-        region: anchored ?? undefined,
-        version_id: anchored ? (doc?.current_version?.id ?? undefined) : undefined,
+        region: region ?? undefined,
+        version_id: doc?.current_version?.id ?? undefined,
       }),
     )
-    setDraft('')
-    setReplyTo(null)
     setRegion(null)
+    setSelTop(null)
+  }
+
+  // Post a reply from inside a thread popover (attaches to the region's top-level comment).
+  async function addReply(parentId: number, body: string) {
+    await act(() => commentDocument(id, { body, author: actor, reply_to: parentId }))
   }
 
   // Highlight every region-anchored comment's quote in the shown content via the CSS Custom
@@ -121,6 +147,40 @@ export default function DocumentView() {
       highlights.delete('tb-region')
     }
   }, [comments, contentNonce])
+
+  // Position an inline comment pin for every region-anchored top-level comment whose quote is
+  // present in the shown content. Grouped by quoted text so several comments on the same passage
+  // share one pin (its count includes replies). Offsets are measured against the wrapper, so the
+  // pins sit in the right gutter aligned to the highlighted line and scroll with the content.
+  useEffect(() => {
+    const el = contentRef.current
+    const wrap = wrapRef.current
+    if (!el || !wrap) return
+    const wrapTop = wrap.getBoundingClientRect().top
+    const byQuote = new Map<string, { top: number; count: number }>()
+    for (const c of comments) {
+      if (c.reply_to != null) continue
+      const q = asQuote(c.region)
+      if (!q) continue
+      const replies = comments.filter((x) => x.reply_to === c.id).length
+      const existing = byQuote.get(q.exact)
+      if (existing) {
+        existing.count += 1 + replies
+        continue
+      }
+      const r = findQuoteRange(el, q.exact, q.prefix)
+      if (!r) continue
+      byQuote.set(q.exact, { top: r.getBoundingClientRect().top - wrapTop, count: 1 + replies })
+    }
+    setPins([...byQuote.entries()].map(([key, v]) => ({ key, top: v.top, count: v.count })))
+  }, [comments, contentNonce, layout])
+
+  // Recompute pin geometry when the viewport resizes (line wrapping shifts vertical offsets).
+  useEffect(() => {
+    const onResize = () => setLayout((n) => n + 1)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   function requestChanges() {
     const note = window.prompt('What needs to change? (optional note)') ?? undefined
@@ -147,6 +207,17 @@ export default function DocumentView() {
   // Thread the comments: top-level ones in order, each followed by its (one-level) replies.
   const topLevel = comments.filter((c) => c.reply_to == null)
   const repliesOf = (cid: number) => comments.filter((c) => c.reply_to === cid)
+
+  // Anchored top-level comments grouped by quoted text — one inline pin + thread popover per
+  // region. Keyed by `exact` to match the pins computed in the position effect above.
+  const anchoredGroups = new Map<string, DocumentComment[]>()
+  for (const c of topLevel) {
+    const q = asQuote(c.region)
+    if (!q) continue
+    const arr = anchoredGroups.get(q.exact) ?? []
+    arr.push(c)
+    anchoredGroups.set(q.exact, arr)
+  }
   const versionNo = (vid: number | null) =>
     vid == null ? null : (doc?.versions.find((v) => v.id === vid)?.version_no ?? null)
 
@@ -303,20 +374,69 @@ export default function DocumentView() {
           {/* Current version, rendered inline by its content_type (markdown / image / pdf / code
               / download fallback). Content resolves through the IPFS gateway client-side. */}
           {doc.current_version && (
-            <div className="mb-6">
-              <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-                Current version
-                <span className="ml-2 font-mono text-[10px] normal-case tracking-normal">
-                  {doc.current_version.content_type ?? 'text/markdown'}
-                </span>
-              </h2>
-              <div ref={contentRef} onMouseUp={captureSelection}>
-                <DocContent
-                  key={doc.current_version.id}
-                  version={doc.current_version}
-                  onLoaded={() => setContentNonce((n) => n + 1)}
-                />
+            <div ref={wrapRef} className="relative mb-6 flex">
+              <div className="min-w-0 flex-1">
+                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Current version
+                  <span className="ml-2 font-mono text-[10px] normal-case tracking-normal">
+                    {doc.current_version.content_type ?? 'text/markdown'}
+                  </span>
+                </h2>
+                <div ref={contentRef} onMouseUp={captureSelection}>
+                  <DocContent
+                    key={doc.current_version.id}
+                    version={doc.current_version}
+                    onLoaded={() => setContentNonce((n) => n + 1)}
+                  />
+                </div>
               </div>
+              {/* Right gutter reserving space for the inline comment pins. */}
+              <div className="w-8 shrink-0" aria-hidden />
+              {/* One pin per anchored region present in this version; click toggles its thread. */}
+              {pins.map((p) => (
+                <button
+                  key={p.key}
+                  style={{ top: p.top }}
+                  onClick={() => setOpenKey(openKey === p.key ? null : p.key)}
+                  title="View inline comment thread"
+                  className={`absolute right-0 flex h-6 items-center gap-0.5 rounded-full border border-amber-500/40 bg-[var(--color-panel)] px-1.5 text-[11px] leading-none text-amber-300 shadow-sm hover:bg-amber-500/10 ${
+                    openKey === p.key ? 'ring-1 ring-amber-400' : ''
+                  }`}
+                >
+                  <span aria-hidden>💬</span>
+                  {p.count > 1 && <span className="font-mono">{p.count}</span>}
+                </button>
+              ))}
+              {openKey &&
+                (() => {
+                  const pin = pins.find((p) => p.key === openKey)
+                  const group = anchoredGroups.get(openKey)
+                  if (!pin || !group || group.length === 0) return null
+                  return (
+                    <ThreadPopover
+                      style={{ top: pin.top }}
+                      group={group}
+                      repliesOf={repliesOf}
+                      busy={busy}
+                      resolveExternal={extName}
+                      onResolve={(cid) => void act(() => resolveDocumentComment(id, cid, { actor }))}
+                      onReply={addReply}
+                      onClose={() => setOpenKey(null)}
+                    />
+                  )
+                })()}
+              {region && selTop != null && (
+                <SelectionComposer
+                  style={{ top: selTop }}
+                  quote={region}
+                  actor={actor}
+                  onSubmit={addAnchoredComment}
+                  onCancel={() => {
+                    setRegion(null)
+                    setSelTop(null)
+                  }}
+                />
+              )}
             </div>
           )}
 
@@ -575,25 +695,11 @@ export default function DocumentView() {
             )
           })()}
 
-          {/* Composer. Replies target the selected comment; a text selection over the content
-              anchors a top-level comment to that region; otherwise a doc-level comment. */}
-          {region && replyTo == null && (
-            <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs">
-              <span className="mt-0.5 shrink-0 text-amber-300">📌 on selection:</span>
-              <span className="min-w-0 flex-1 italic text-[var(--color-muted)] line-clamp-2">
-                “{region.exact}”
-              </span>
-              <button
-                onClick={() => setRegion(null)}
-                className="shrink-0 text-[var(--color-muted)] hover:text-rose-300"
-              >
-                clear
-              </button>
-            </div>
-          )}
-          {!region && replyTo == null && comments.length === 0 && (
+          {/* Composer. Replies target the selected comment; otherwise a doc-level comment. A text
+              selection over the content opens the inline SelectionComposer popover instead. */}
+          {replyTo == null && comments.length === 0 && (
             <p className="mt-3 text-[11px] text-[var(--color-muted)]">
-              Tip: select text in the content above to anchor a comment to it.
+              Tip: select text in the content above to comment on it inline.
             </p>
           )}
           <div className="mt-2 flex items-end gap-2">
@@ -602,11 +708,7 @@ export default function DocumentView() {
               onChange={setDraft}
               onSubmit={addComment}
               placeholder={
-                replyTo != null
-                  ? `Reply to #${replyTo} as ${actor}…`
-                  : region
-                    ? `Comment on selection as ${actor}…`
-                    : `Comment as ${actor}…`
+                replyTo != null ? `Reply to #${replyTo} as ${actor}…` : `Comment as ${actor}…`
               }
               className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm outline-none focus:border-sky-500/50"
             />
@@ -774,6 +876,7 @@ function CommentCard({
   onResolve,
   onReply,
   replying,
+  hideQuote,
 }: {
   c: DocumentComment
   versionNo: number | null
@@ -782,6 +885,7 @@ function CommentCard({
   onResolve: () => void
   onReply?: () => void
   replying?: boolean
+  hideQuote?: boolean
 }) {
   const resolved = c.status === 'resolved'
   return (
@@ -817,8 +921,9 @@ function CommentCard({
         </span>
       </div>
       {/* Region-anchored comment: show the quoted excerpt it targets, so the anchor is visible
-          even where the inline highlight can't match (e.g. an older version). */}
-      {asQuote(c.region) && (
+          even where the inline highlight can't match (e.g. an older version). Suppressed inside
+          the thread popover, which already shows the quote once in its header. */}
+      {!hideQuote && asQuote(c.region) && (
         <blockquote className="mb-1.5 border-l-2 border-amber-500/40 pl-2 text-xs italic text-[var(--color-muted)]">
           “{asQuote(c.region)!.exact}”
         </blockquote>
@@ -889,6 +994,180 @@ function findQuoteRange(container: HTMLElement, exact: string, prefix?: string):
     return null
   }
   return range
+}
+
+// The inline thread popover anchored beside a highlighted region: the region's comment(s) and
+// their replies, an inline reply box, and per-comment resolve — so a reader sees and continues
+// the conversation right where the text is, without scrolling to the feed below.
+function ThreadPopover({
+  group,
+  repliesOf,
+  busy,
+  resolveExternal,
+  onResolve,
+  onReply,
+  onClose,
+  style,
+}: {
+  group: DocumentComment[]
+  repliesOf: (cid: number) => DocumentComment[]
+  busy: boolean
+  resolveExternal: (id: string) => string
+  onResolve: (cid: number) => void
+  onReply: (parentId: number, body: string) => Promise<void>
+  onClose: () => void
+  style?: CSSProperties
+}) {
+  const [draft, setDraft] = useState('')
+  const [posting, setPosting] = useState(false)
+  const quote = asQuote(group[0].region)
+  const parentId = group[0].id
+
+  async function send() {
+    const body = draft.trim()
+    if (!body || posting) return
+    setPosting(true)
+    try {
+      await onReply(parentId, body)
+      setDraft('')
+    } finally {
+      setPosting(false)
+    }
+  }
+
+  return (
+    <div
+      style={style}
+      className="absolute right-8 z-20 w-80 max-w-[calc(100%-3rem)] rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] shadow-lg"
+    >
+      <div className="flex items-start gap-2 border-b border-[var(--color-border)] px-3 py-2">
+        {quote && (
+          <blockquote className="line-clamp-2 min-w-0 flex-1 border-l-2 border-amber-500/40 pl-2 text-xs italic text-[var(--color-muted)]">
+            “{quote.exact}”
+          </blockquote>
+        )}
+        <button
+          onClick={onClose}
+          aria-label="Close thread"
+          className="shrink-0 text-[var(--color-muted)] hover:text-rose-300"
+        >
+          ×
+        </button>
+      </div>
+      <div className="max-h-72 space-y-2 overflow-y-auto p-2">
+        {group.map((c) => (
+          <div key={c.id}>
+            <CommentCard
+              c={c}
+              versionNo={null}
+              busy={busy}
+              resolveExternal={resolveExternal}
+              onResolve={() => onResolve(c.id)}
+              hideQuote
+            />
+            {repliesOf(c.id).length > 0 && (
+              <ul className="mt-1.5 space-y-1.5 border-l border-[var(--color-border)] pl-3">
+                {repliesOf(c.id).map((r) => (
+                  <li key={r.id}>
+                    <CommentCard
+                      c={r}
+                      versionNo={null}
+                      busy={busy}
+                      resolveExternal={resolveExternal}
+                      onResolve={() => onResolve(r.id)}
+                      hideQuote
+                    />
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="flex items-end gap-2 border-t border-[var(--color-border)] p-2">
+        <AutoGrowTextarea
+          value={draft}
+          onChange={setDraft}
+          onSubmit={send}
+          placeholder="Reply…"
+          className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-xs outline-none focus:border-sky-500/50"
+        />
+        <button
+          onClick={send}
+          disabled={posting || !draft.trim()}
+          className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+        >
+          Reply
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// The inline compose popover shown at a fresh text selection: the quoted excerpt plus a small
+// composer, so a comment is written right at the passage instead of at the bottom of the page.
+function SelectionComposer({
+  quote,
+  actor,
+  onSubmit,
+  onCancel,
+  style,
+}: {
+  quote: RegionQuote
+  actor: string
+  onSubmit: (body: string) => Promise<void>
+  onCancel: () => void
+  style?: CSSProperties
+}) {
+  const [draft, setDraft] = useState('')
+  const [posting, setPosting] = useState(false)
+
+  async function send() {
+    const body = draft.trim()
+    if (!body || posting) return
+    setPosting(true)
+    try {
+      await onSubmit(body)
+    } finally {
+      setPosting(false)
+    }
+  }
+
+  return (
+    <div
+      style={style}
+      className="absolute right-8 z-20 w-80 max-w-[calc(100%-3rem)] rounded-md border border-amber-500/40 bg-[var(--color-panel)] shadow-lg"
+    >
+      <div className="border-b border-[var(--color-border)] px-3 py-2">
+        <blockquote className="line-clamp-2 border-l-2 border-amber-500/40 pl-2 text-xs italic text-[var(--color-muted)]">
+          “{quote.exact}”
+        </blockquote>
+      </div>
+      <div className="flex items-end gap-2 p-2">
+        <AutoGrowTextarea
+          value={draft}
+          onChange={setDraft}
+          onSubmit={send}
+          placeholder={`Comment on selection as ${actor}…`}
+          className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-xs outline-none focus:border-sky-500/50"
+        />
+        <button
+          onClick={send}
+          disabled={posting || !draft.trim()}
+          className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+        >
+          Comment
+        </button>
+        <button
+          onClick={onCancel}
+          aria-label="Cancel"
+          className="rounded-md px-1.5 py-1 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
+        >
+          ×
+        </button>
+      </div>
+    </div>
+  )
 }
 
 type DiffLine = { type: 'ctx' | 'add' | 'del'; text: string }
