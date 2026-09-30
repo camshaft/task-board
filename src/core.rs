@@ -3893,15 +3893,16 @@ pub async fn comment_document(
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
-    // Validate the document exists for a clean 404 (version_id/reply_to are FK-enforced).
-    if sqlx::query("SELECT 1 FROM documents WHERE id=?")
+    // Validate the document exists (for a clean 404; version_id/reply_to are FK-enforced) and grab
+    // its title so the notification names the document.
+    let Some(doc_row) = sqlx::query("SELECT title FROM documents WHERE id=?")
         .bind(document_id)
         .fetch_optional(&mut *tx)
         .await?
-        .is_none()
-    {
+    else {
         anyhow::bail!("no document {document_id}");
-    }
+    };
+    let title: Option<String> = doc_row.try_get("title")?;
     let region_str = region.map(|r| r.to_string());
     // `author` = the fleet agent that wrote/ingested the comment; `external_author`, when set, is
     // the external_identities id it's attributed to (an ingested human) — same as task comments.
@@ -3921,10 +3922,10 @@ pub async fn comment_document(
     .await?
     .try_get("id")?;
     auto_subscribe_document(&mut tx, author, document_id).await?;
-    // Carry document_id in the payload so a drained notification identifies which document the
-    // comment is on (the inbox row itself doesn't surface document_id), letting the owner navigate
-    // straight to it to respond.
-    let mut data = json!({ "document_id": document_id, "comment_id": cid, "version_id": version_id, "body": body, "reply_to": reply_to });
+    // Carry document_id + title in the payload so a drained notification identifies which document
+    // the comment is on (the inbox row itself doesn't surface document_id), letting the owner
+    // navigate straight to it to respond. The commenter is the event actor.
+    let mut data = json!({ "document_id": document_id, "title": title, "comment_id": cid, "version_id": version_id, "body": body, "reply_to": reply_to });
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
     }
@@ -4820,9 +4821,13 @@ mod tests {
         // alice (the owner) is still notified, despite having no subscription row.
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
         assert_eq!(alice["count"].as_i64(), Some(1), "owner notified without a subscription: {alice}");
-        assert_eq!(alice["notifications"][0]["type"], json!("document.comment"));
-        // The payload identifies the document so the owner can navigate to it to respond.
-        assert_eq!(alice["notifications"][0]["data"]["document_id"], json!(did));
+        let n = &alice["notifications"][0];
+        assert_eq!(n["type"], json!("document.comment"));
+        // The payload is self-describing — which document, its title — and names the commenter as
+        // the event actor, so the owner can act without a lookup (task #300 + #313).
+        assert_eq!(n["data"]["document_id"], json!(did));
+        assert_eq!(n["data"]["title"], json!("Spec"));
+        assert_eq!(n["actor"], json!("bob"), "the commenter is surfaced as the event actor");
 
         // The commenter (actor) is not notified of their own comment.
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
