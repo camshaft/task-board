@@ -1,5 +1,6 @@
 // Small presentational helpers shared across the app.
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { api } from './api'
 import type { AgentStatus, TaskStatus } from './api'
 
 export const TASK_COLUMNS: TaskStatus[] = [
@@ -122,6 +123,40 @@ export function useCoarsePointer() {
 // used for every comment/message composer so multi-line input isn't cramped in a fixed box.
 // On desktop (fine pointer) Enter submits (matching the old <input> composers); on touch devices
 // Enter inserts a newline and you submit via the send button (task 435). Shift+Enter always newlines.
+// @-mention candidates (agents), fetched ONCE and shared across every composer — lazily, on the
+// first '@' typed anywhere, so an idle board pays nothing. A failed fetch clears the promise so a
+// later '@' retries. (task 474)
+type MentionCandidate = { id: string; label: string }
+let mentionAgentsCache: MentionCandidate[] | null = null
+let mentionAgentsPromise: Promise<MentionCandidate[]> | null = null
+function loadMentionAgents(): Promise<MentionCandidate[]> {
+  if (mentionAgentsCache) return Promise.resolve(mentionAgentsCache)
+  if (!mentionAgentsPromise) {
+    mentionAgentsPromise = api
+      .listAgents()
+      .then((as) => {
+        const mapped = as.map((a) => ({ id: a.id, label: a.display_name || a.id }))
+        mentionAgentsCache = mapped
+        return mapped
+      })
+      .catch(() => {
+        mentionAgentsPromise = null // allow a retry on the next '@'
+        return []
+      })
+  }
+  return mentionAgentsPromise
+}
+
+// The @mention token being typed immediately before the caret, if any: an '@' at a token boundary
+// (start-of-text or after whitespace) followed by mention-id chars ([A-Za-z0-9_-], matching the
+// server's extract_mentions) up to the caret. Returns the '@' index + the partial query.
+function activeMention(value: string, caret: number): { start: number; query: string } | null {
+  const m = /(?:^|\s)@([A-Za-z0-9_-]*)$/.exec(value.slice(0, caret))
+  if (!m) return null
+  const query = m[1]
+  return { start: caret - query.length - 1, query }
+}
+
 export function AutoGrowTextarea({
   value,
   onChange,
@@ -141,6 +176,22 @@ export function AutoGrowTextarea({
 }) {
   const ref = useRef<HTMLTextAreaElement>(null)
   const coarsePointer = useCoarsePointer()
+  // @mention typeahead state (task 474). `mention` is the active partial token; `sel` the
+  // highlighted candidate. Agents load lazily into `agents` on the first '@'.
+  const [agents, setAgents] = useState<MentionCandidate[]>(mentionAgentsCache ?? [])
+  const [mention, setMention] = useState<{ start: number; query: string } | null>(null)
+  const [sel, setSel] = useState(0)
+
+  const candidates = mention
+    ? agents
+        .filter((a) => {
+          const q = mention.query.toLowerCase()
+          return a.id.toLowerCase().includes(q) || a.label.toLowerCase().includes(q)
+        })
+        .slice(0, 8)
+    : []
+  const open = candidates.length > 0
+
   // Resize to fit content on every value change (including a reset to '' after submit, which
   // shrinks it back). Measuring requires clearing the height first so scrollHeight can drop.
   useLayoutEffect(() => {
@@ -149,22 +200,104 @@ export function AutoGrowTextarea({
     el.style.height = 'auto'
     el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
   }, [value, maxHeight])
+
+  function recompute(v: string, caret: number) {
+    const m = activeMention(v, caret)
+    setMention(m)
+    setSel(0)
+    if (m && agents.length === 0) loadMentionAgents().then(setAgents)
+  }
+
+  function accept(a: MentionCandidate) {
+    if (!mention) return
+    const before = value.slice(0, mention.start)
+    const after = value.slice(mention.start + 1 + mention.query.length)
+    const insert = `@${a.id} `
+    onChange(before + insert + after)
+    setMention(null)
+    const pos = before.length + insert.length
+    requestAnimationFrame(() => {
+      const el = ref.current
+      if (el) {
+        el.focus()
+        el.selectionStart = el.selectionEnd = pos
+      }
+    })
+  }
+
   return (
-    <textarea
-      ref={ref}
-      rows={1}
-      value={value}
-      disabled={disabled}
-      placeholder={placeholder}
-      onChange={(e) => onChange(e.target.value)}
-      onKeyDown={(e) => {
-        // Touch devices: let Enter insert a newline (submit via the send button) — task 435.
-        if (e.key === 'Enter' && !e.shiftKey && !coarsePointer && onSubmit) {
-          e.preventDefault()
-          onSubmit()
-        }
-      }}
-      className={`resize-none ${className ?? ''}`}
-    />
+    // The wrapper takes the flex sizing every caller puts on the composer (flex-1 in a flex row);
+    // the textarea fills it (w-full). This keeps the mention dropdown positioned relative to the
+    // composer without changing any call site's layout.
+    <div className="relative flex-1 min-w-0">
+      <textarea
+        ref={ref}
+        rows={1}
+        value={value}
+        disabled={disabled}
+        placeholder={placeholder}
+        onChange={(e) => {
+          onChange(e.target.value)
+          recompute(e.target.value, e.target.selectionStart)
+        }}
+        onBlur={() => setMention(null)}
+        onKeyDown={(e) => {
+          // When the mention dropdown is open it captures navigation/accept keys FIRST, so Enter
+          // picks a candidate rather than submitting.
+          if (open) {
+            if (e.key === 'ArrowDown') {
+              e.preventDefault()
+              setSel((s) => (s + 1) % candidates.length)
+              return
+            }
+            if (e.key === 'ArrowUp') {
+              e.preventDefault()
+              setSel((s) => (s - 1 + candidates.length) % candidates.length)
+              return
+            }
+            if (e.key === 'Enter' || e.key === 'Tab') {
+              e.preventDefault()
+              accept(candidates[Math.min(sel, candidates.length - 1)])
+              return
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault()
+              setMention(null)
+              return
+            }
+          }
+          // Touch devices: let Enter insert a newline (submit via the send button) — task 435.
+          if (e.key === 'Enter' && !e.shiftKey && !coarsePointer && onSubmit) {
+            e.preventDefault()
+            onSubmit()
+          }
+        }}
+        className={`w-full resize-none ${className ?? ''}`}
+      />
+      {open && (
+        <ul className="absolute bottom-full left-0 z-20 mb-1 max-h-48 w-64 overflow-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-sm shadow-lg">
+          {candidates.map((a, i) => (
+            <li key={a.id}>
+              <button
+                type="button"
+                // mousedown (not click) so we accept before the textarea's blur closes the list.
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  accept(a)
+                }}
+                className={`flex w-full flex-col items-start px-2 py-1 text-left ${
+                  i === sel ? 'bg-sky-500/20' : 'hover:bg-[var(--color-panel)]'
+                }`}
+              >
+                <span className="font-mono text-xs text-sky-300">@{a.id}</span>
+                {a.label !== a.id && (
+                  <span className="text-[11px] text-[var(--color-muted)]">{a.label}</span>
+                )}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   )
 }
