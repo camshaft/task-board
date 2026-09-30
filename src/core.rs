@@ -1676,7 +1676,12 @@ pub async fn get_task_limited(
             .and_then(|v| v.as_str())
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(|| json!({}));
+        // Surface metadata.monitor_exempt as a derived top-level bool (default false) so the nudge
+        // daemon + the #506 holding-work watchdog can read it from a list/get scan (task from
+        // board-pm; consumed by v-fleet-tooling). metadata stays the source of truth.
+        let monitor_exempt = meta.get("monitor_exempt").and_then(|v| v.as_bool()).unwrap_or(false);
         m.insert("metadata".into(), meta);
+        m.insert("monitor_exempt".into(), Value::Bool(monitor_exempt));
 
         // Collapse the raw blocked_on_* columns into one nested object (null when not blocked).
         let blocked_on = m.get("blocked_on_kind").and_then(|v| v.as_str()).map(|kind| {
@@ -1808,8 +1813,12 @@ pub async fn list_tasks(
     include_archived: bool,
 ) -> anyhow::Result<Value> {
     let mut q = String::from(
+        // json_extract surfaces metadata.monitor_exempt as a lean derived column (1/0/null) so a
+        // list scan can read it without pulling full metadata; normalized to a bool below (#517
+        // sibling; consumed by v-fleet-tooling's nudge daemon + #506 watchdog).
         "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at, \
-         blocked_on_kind, blocked_on_ref FROM tasks",
+         blocked_on_kind, blocked_on_ref, json_extract(metadata, '$.monitor_exempt') AS monitor_exempt \
+         FROM tasks",
     );
     let mut conds: Vec<&str> = Vec::new();
     // Soft-archived tasks are hidden by default (like list_documents); include_archived shows them.
@@ -1890,7 +1899,19 @@ pub async fn list_tasks(
         query = query.bind(k).bind(v);
     }
     let rows = query.fetch_all(pool).await?;
-    Ok(Value::Array(rows.iter().map(|r| row_to_json_ref(r, "task")).collect()))
+    // Normalize the json_extract result (1/0/null) into a real bool `monitor_exempt` (default false).
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let mut v = row_to_json_ref(r, "task");
+            if let Value::Object(ref mut m) = v {
+                let exempt = matches!(m.get("monitor_exempt"), Some(x) if x.as_i64() == Some(1) || x.as_bool() == Some(true));
+                m.insert("monitor_exempt".into(), Value::Bool(exempt));
+            }
+            v
+        })
+        .collect();
+    Ok(Value::Array(out))
 }
 
 pub async fn comment_task(
@@ -6457,6 +6478,40 @@ mod tests {
         // create_task warns on the submitted description too.
         let ct = create_task(&pool, pid, "title", Some("blocks #9"), None, None, Some("a"), None, None, None).await?;
         assert_eq!(ct["ref_warnings"].as_array().unwrap()[0]["resolves_to"], json!("task_9"));
+        Ok(())
+    }
+
+    /// metadata.monitor_exempt surfaces as a derived top-level bool on both get_task and list_tasks
+    /// (default false), so the nudge daemon + #506 watchdog can read it from a list scan without
+    /// pulling full metadata; metadata stays the source of truth (board-pm; v-fleet-tooling).
+    #[tokio::test]
+    async fn monitor_exempt_surfaces_as_derived_bool() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        create_task(&pool, pid, "plain", None, None, None, Some("a"), None, None, None).await?;
+        let exempt = create_task(&pool, pid, "exempt", None, None, None, Some("a"), None, None, None).await?;
+        let eid = exempt["id"].as_i64().unwrap();
+
+        // Default: not exempt.
+        assert_eq!(get_task(&pool, eid).await?["monitor_exempt"], json!(false));
+
+        // Set metadata.monitor_exempt via the update_task metadata merge.
+        update_task(&pool, eid, None, None, None, None, None, Some("a"), Some(json!({ "monitor_exempt": true })), None, None)
+            .await?;
+
+        let got = get_task(&pool, eid).await?;
+        assert_eq!(got["monitor_exempt"], json!(true), "get_task reflects the derived flag");
+        assert_eq!(got["metadata"]["monitor_exempt"], json!(true), "metadata stays the source of truth");
+
+        // list_tasks surfaces the derived bool per row.
+        let list =
+            list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
+        let arr = list.as_array().unwrap();
+        let by_title = |t: &str| arr.iter().find(|x| x["title"] == json!(t)).unwrap().clone();
+        assert_eq!(by_title("exempt")["monitor_exempt"], json!(true));
+        assert_eq!(by_title("plain")["monitor_exempt"], json!(false));
         Ok(())
     }
 
