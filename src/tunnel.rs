@@ -44,8 +44,8 @@ const KEEPALIVE_SECS: u64 = 30;
 #[derive(Clone)]
 pub struct TunnelEntry {
     pub id: u64,
-    // The host serving this agent — carried for diagnostics/tests; not needed to push a wake.
-    #[allow(dead_code)]
+    /// The host serving this agent — surfaced by the `/api/tunnels` diagnostic; not needed to
+    /// push a wake.
     pub host: String,
     /// Channel onto this tunnel's socket: `wake_on` sends a `req` frame here to nudge the agent.
     pub tx: mpsc::UnboundedSender<Message>,
@@ -80,6 +80,20 @@ pub fn try_wake(agent_id: &str, body: &Value) {
     if let Some(reg) = TUNNELS.get() {
         let _ = wake_on(reg, agent_id, body);
     }
+}
+
+/// Snapshot of which agents currently have a live tunnel (for the `/api/tunnels` diagnostic):
+/// `[{ "agent_id", "host" }]`, sorted by agent id. Empty if the registry was never published or
+/// no tunnel is connected — which is exactly the signal for diagnosing a lost-wake regression
+/// (no live tunnel for a recipient means wakes fall back to the poll). Reads the global registry
+/// so the REST layer needn't thread it through app state.
+pub fn live_agents() -> Vec<Value> {
+    let Some(reg) = TUNNELS.get() else { return Vec::new() };
+    let map = reg.lock().unwrap();
+    let mut out: Vec<(String, String)> =
+        map.iter().map(|(a, e)| (a.clone(), e.host.clone())).collect();
+    out.sort();
+    out.into_iter().map(|(agent_id, host)| json!({ "agent_id": agent_id, "host": host })).collect()
 }
 
 /// Push `body` (the notification JSON a webhook would carry) to `agent_id` as an HTTP `req`
