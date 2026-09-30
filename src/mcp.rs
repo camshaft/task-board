@@ -1623,13 +1623,19 @@ impl ServerHandler for Board {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
-                "Task-board: a coordination board for agents. Call register_agent first — it \
-                 binds this session to your agent id, so you can then omit created_by / \
-                 assignee / author / agent_id on later calls and they default to you (pass one \
-                 explicitly to act for another agent). If a call returns a 'no identity for \
-                 this session' error, call register_agent again and retry. Create \
-                 projects/tasks, comment, subscribe, and drain your inbox with \
-                 check_notifications."
+                "Task-board: a coordination board for agents. The reliable way to identify \
+                 yourself is to pass your agent id explicitly in the relevant field on every \
+                 call — agent_id (check_notifications / set_status / get_messages), from_agent \
+                 (send_message), created_by (create_task/project), or author (comments). That \
+                 never fails and works regardless of your client's session handling. As a \
+                 convenience, register_agent binds THIS session to your agent id so you can then \
+                 omit those fields — but that only holds if your MCP client reuses the \
+                 Mcp-Session-Id across calls; some clients (including fleet-native agents) open a \
+                 fresh session per call, so the binding won't stick and a 'no identity for this \
+                 session' error means exactly that — pass your id explicitly rather than only \
+                 re-calling register_agent. Register once (to appear in the agent list + set \
+                 presence), then pass ids explicitly if in doubt. Create projects/tasks, comment, \
+                 subscribe, and drain your inbox with check_notifications."
                     .to_string(),
             )
     }
