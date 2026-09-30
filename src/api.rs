@@ -143,6 +143,7 @@ pub fn router(state: AppState) -> Router {
         .route("/reviews/trend", get(review_trend))
         .route("/reviews/{review_id}", get(get_review))
         .route("/reviews/{review_id}/status", post(set_review_status))
+        .route("/reviews/{review_id}/vetted", post(set_review_vetted))
         .route("/reviews/{review_id}/log", post(append_review_log))
         .route("/ipfs/add", post(ipfs_add))
         .route("/ipfs/{cid}", get(ipfs_cat))
@@ -286,6 +287,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/reviews/trend", summary: "Improvement trend derived from review logs (no stored counter): findings-per-review with an earlier-vs-later trend, overall + sliced by kind and by producing area, counterbalanced by an escaped-defect signal (post-approval findings, re-opens, lineage follow-ups). A slice where findings fell while escaped defects rose is flagged.", query: "kind=str&area=str", body: None },
     Endpoint { method: "GET", path: "/api/reviews/{review_id}", summary: "Fetch one review with its full append-only log (findings are the entries of type `finding`).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/reviews/{review_id}/status", summary: "Transition a review's A2 status (open/in_review/changes_requested/approved/closed). Same status = idempotent no-op. Emits review.status_changed (+ opened_for_review / terminal).", query: "", body: Some("SetReviewStatusBody") },
+    Endpoint { method: "POST", path: "/api/reviews/{review_id}/vetted", summary: "Set/clear a review's vetted gate (adversarial review run + addressed). Audit-only per D17: records the actor + logs the change (a decision entry), emits review.vetted_changed. Same value = idempotent no-op.", query: "", body: Some("SetReviewVettedBody") },
     Endpoint { method: "POST", path: "/api/reviews/{review_id}/log", summary: "Append a log entry (comment / finding / decision / ...). Pass external_id for idempotent ingest (a bridge replaying an upstream item returns appended:false).", query: "", body: Some("AppendReviewLogBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
@@ -361,6 +363,7 @@ fn body_schemas() -> Value {
         SetChannelAutoJoinBody,
         CreateReviewBody,
         SetReviewStatusBody,
+        SetReviewVettedBody,
         AppendReviewLogBody,
     )
 }
@@ -1556,6 +1559,27 @@ async fn set_review_status(
 ) -> ApiResult {
     Ok(Json(
         core::set_review_status(&st.pool, review_id, &b.status, b.actor.as_deref(), b.note.as_deref())
+            .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetReviewVettedBody {
+    /// true = mark the review vetted (adversarial review run + addressed); false = clear it.
+    vetted: bool,
+    /// The agent setting the flag (recorded for audit).
+    actor: Option<String>,
+    /// An optional note recorded on the audit log entry.
+    note: Option<String>,
+}
+
+async fn set_review_vetted(
+    State(st): State<AppState>,
+    Path(review_id): Path<i64>,
+    Json(b): Json<SetReviewVettedBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_review_vetted(&st.pool, review_id, b.vetted, b.actor.as_deref(), b.note.as_deref())
             .await?,
     ))
 }

@@ -930,6 +930,19 @@ pub struct SetReviewStatusArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetReviewVettedArgs {
+    pub review_id: i64,
+    /// true = mark the review vetted (adversarial review run + addressed); false = clear it.
+    pub vetted: bool,
+    /// The agent setting the flag (defaults to this session's identity). Recorded for audit.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// An optional note recorded on the audit log entry.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AppendReviewLogArgs {
     pub review_id: i64,
     /// The entry type: submitted / revised / finding / finding_resolved / comment / state_change /
@@ -1979,6 +1992,18 @@ impl Board {
     ) -> Result<CallToolResult, McpError> {
         let actor = self.me_opt(s(&a.actor));
         core::set_review_status(&self.pool, a.review_id, &a.status, actor.as_deref(), s(&a.note))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Set (or clear) a review's `vetted` flag - the adversarial-review gate (adversarial review was run AND addressed). Records who set it and durably logs the change (a decision entry, vetted from->to + actor), emits review.vetted_changed. Setting it to its current value is an idempotent no-op. Per D17 this is audit-only, not identity-gated: the board records the actor rather than blocking a caller. The concluding status transition stays with set_review_status.")]
+    async fn set_review_vetted(
+        &self,
+        Parameters(a): Parameters<SetReviewVettedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::set_review_vetted(&self.pool, a.review_id, a.vetted, actor.as_deref(), s(&a.note))
             .await
             .map_err(err)
             .and_then(ok)
