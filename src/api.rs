@@ -140,6 +140,7 @@ pub fn router(state: AppState) -> Router {
         .route("/secret-requests/{id}/fulfill", post(fulfill_secret))
         .route("/secret-requests/{id}/cancel", post(cancel_secret_request))
         .route("/reviews", get(list_reviews).post(create_review))
+        .route("/reviews/trend", get(review_trend))
         .route("/reviews/{review_id}", get(get_review))
         .route("/reviews/{review_id}/status", post(set_review_status))
         .route("/reviews/{review_id}/log", post(append_review_log))
@@ -282,6 +283,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/secret-requests/{id}/cancel", summary: "Cancel (delete) a pending secret request. Idempotent.", query: "", body: Some("CancelSecretBody") },
     Endpoint { method: "GET", path: "/api/reviews", summary: "List reviews (newest-touched first), optionally filtered by status/kind/assignee. Without logs.", query: "status=str&kind=str&assignee=str", body: None },
     Endpoint { method: "POST", path: "/api/reviews", summary: "Create a review over an artifact (document|code|design|agent-session|task). Starts in `open` unless a status is seeded; records a `submitted` log entry. Pass external_link for idempotent ingest (a review already linked on (source, external_id) is returned created:false).", query: "", body: Some("CreateReviewBody") },
+    Endpoint { method: "GET", path: "/api/reviews/trend", summary: "Improvement trend derived from review logs (no stored counter): findings-per-review with an earlier-vs-later trend, overall + sliced by kind and by producing area, counterbalanced by an escaped-defect signal (post-approval findings, re-opens, lineage follow-ups). A slice where findings fell while escaped defects rose is flagged.", query: "kind=str&area=str", body: None },
     Endpoint { method: "GET", path: "/api/reviews/{review_id}", summary: "Fetch one review with its full append-only log (findings are the entries of type `finding`).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/reviews/{review_id}/status", summary: "Transition a review's A2 status (open/in_review/changes_requested/approved/closed). Same status = idempotent no-op. Emits review.status_changed (+ opened_for_review / terminal).", query: "", body: Some("SetReviewStatusBody") },
     Endpoint { method: "POST", path: "/api/reviews/{review_id}/log", summary: "Append a log entry (comment / finding / decision / ...). Pass external_id for idempotent ingest (a bridge replaying an upstream item returns appended:false).", query: "", body: Some("AppendReviewLogBody") },
@@ -1505,6 +1507,21 @@ async fn list_reviews(
 
 async fn get_review(State(st): State<AppState>, Path(review_id): Path<i64>) -> ApiResult {
     found(core::get_review(&st.pool, review_id).await?)
+}
+
+#[derive(Deserialize)]
+struct ReviewTrendQuery {
+    kind: Option<String>,
+    area: Option<String>,
+}
+
+async fn review_trend(
+    State(st): State<AppState>,
+    Query(q): Query<ReviewTrendQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::review_improvement_trend(&st.pool, q.kind.as_deref(), q.area.as_deref()).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
