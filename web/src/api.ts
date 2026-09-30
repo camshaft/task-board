@@ -567,6 +567,17 @@ export const api = {
     const qs = p.toString()
     return req<ReviewTrend>('GET', `/reviews/trend${qs ? `?${qs}` : ''}`)
   },
+  setReviewStatus: (id: number, b: { status: ReviewStatus; actor?: string; note?: string }) =>
+    req<Review>('POST', `/reviews/${id}/status`, b),
+  appendReviewLog: (
+    id: number,
+    b: { entry_type: string; body?: string; author?: string; task_id?: number; external_id?: string },
+  ) =>
+    req<{ review_id: number; entry_id: number; appended: boolean; entry_type: string }>(
+      'POST',
+      `/reviews/${id}/log`,
+      b,
+    ),
 
   listExternalIdentities: (source?: string) =>
     req<ExternalIdentity[]>(

@@ -1,8 +1,24 @@
+import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import { type ReviewStatus } from './api'
+import { useBoardContext } from './Layout'
 import { Markdown } from './markdown'
 import { ReviewStatusChip, REVIEW_STATUS_FLOW, reviewSourceLink } from './Reviews'
-import { useReview, useTask } from './resources'
-import { relTime, StatusChip } from './ui'
+import { appendReviewLog, setReviewStatus, useReview, useTask } from './resources'
+import { AutoGrowTextarea, relTime, StatusChip } from './ui'
+
+// Sensible next A2 transitions per current status (the backend accepts any valid status; this is
+// UX guidance). changes_requested / approved are person-owned decisions (design D17) — the UI
+// confirms them so it never implies an agent glibly self-approving; real authz belongs on the
+// endpoint (flagged to v-task-board).
+const NEXT_STATUS: Record<string, ReviewStatus[]> = {
+  open: ['in_review', 'closed'],
+  in_review: ['changes_requested', 'approved', 'closed'],
+  changes_requested: ['in_review', 'closed'],
+  approved: ['in_review', 'closed'],
+  closed: ['in_review'],
+}
+const PERSON_OWNED: ReviewStatus[] = ['changes_requested', 'approved']
 
 // One review (/reviews/:reviewId): the lifecycle state, the source artifact (linked per source),
 // the vetted gate, the append-only log timeline, and the child/proposal tasks its findings track.
@@ -10,12 +26,63 @@ import { relTime, StatusChip } from './ui'
 // TREND (findings-per-review) is its own surface (needs the trend query, task 376).
 export default function ReviewView() {
   const { reviewId } = useParams()
+  const { actor } = useBoardContext()
   const id = Number(reviewId)
   const { data: review, error, loading } = useReview(id)
 
   const log = review?.log ?? []
   // Child/proposal tasks tracked by this review's findings (distinct task ids across the log).
   const linkedTaskIds = [...new Set(log.map((e) => e.task_id).filter((t): t is number => t != null))]
+
+  const [busy, setBusy] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+  // Inline composer: append a comment or a finding (with an optional linked task).
+  const [entryType, setEntryType] = useState<'comment' | 'finding'>('comment')
+  const [entryBody, setEntryBody] = useState('')
+  const [findingTask, setFindingTask] = useState('')
+
+  async function transition(to: ReviewStatus) {
+    if (busy) return
+    if (PERSON_OWNED.includes(to)) {
+      if (
+        !window.confirm(
+          `Set this review to "${to.replace(/_/g, ' ')}"? This is a reviewer decision — make it as yourself (${actor}), not on an agent's behalf.`,
+        )
+      )
+        return
+    }
+    const note = window.prompt('Add a note to this transition? (optional)') ?? undefined
+    setBusy(true)
+    setActionError(null)
+    try {
+      await setReviewStatus(id, { status: to, actor, note: note || undefined })
+    } catch (e) {
+      setActionError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function submitEntry() {
+    const body = entryBody.trim()
+    if (!body || busy) return
+    const taskId = entryType === 'finding' && findingTask.trim() ? Number(findingTask.trim()) : undefined
+    if (taskId !== undefined && !Number.isFinite(taskId)) {
+      setActionError('Linked task must be a numeric task id.')
+      return
+    }
+    setBusy(true)
+    setActionError(null)
+    try {
+      await appendReviewLog(id, { entry_type: entryType, body, author: actor, task_id: taskId })
+      setEntryBody('')
+      setFindingTask('')
+    } catch (e) {
+      setActionError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   return (
     <main className="flex min-w-0 flex-1 flex-col">
@@ -61,6 +128,36 @@ export default function ReviewView() {
               </span>
             ))}
           </div>
+
+          {/* Transition controls. Person-owned decisions (changes_requested / approved) confirm
+              first, as yourself — the affordance shouldn't imply an agent self-approving (D17). */}
+          {(NEXT_STATUS[review.status] ?? []).length > 0 && (
+            <div className="mb-5 flex flex-wrap items-center gap-2">
+              <span className="text-xs text-[var(--color-muted)]">Transition to</span>
+              {(NEXT_STATUS[review.status] ?? []).map((to) => (
+                <button
+                  key={to}
+                  onClick={() => transition(to)}
+                  disabled={busy}
+                  className={`rounded-md px-2.5 py-1 text-xs ring-1 ring-inset disabled:opacity-40 ${
+                    to === 'approved'
+                      ? 'text-emerald-300 ring-emerald-500/40 hover:bg-emerald-500/10'
+                      : to === 'changes_requested'
+                        ? 'text-amber-300 ring-amber-500/40 hover:bg-amber-500/10'
+                        : 'text-sky-400 ring-sky-500/40 hover:bg-sky-500/10'
+                  }`}
+                >
+                  {to.replace(/_/g, ' ')}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {actionError && (
+            <div className="mb-4 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
+              {actionError}
+            </div>
+          )}
 
           <dl className="mb-5 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
             <dt className="text-[var(--color-muted)]">Kind</dt>
@@ -137,6 +234,55 @@ export default function ReviewView() {
               <li className="text-sm text-[var(--color-muted)]">No log entries yet.</li>
             )}
           </ul>
+
+          {/* Composer: append a comment or a finding (a finding may link the task tracking it). */}
+          <div className="mt-4 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-3">
+            <div className="mb-2 flex items-center gap-2 text-xs">
+              <span className="text-[var(--color-muted)]">Add</span>
+              {(['comment', 'finding'] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setEntryType(t)}
+                  className={`rounded-md px-2 py-0.5 ring-1 ring-inset ${
+                    entryType === t
+                      ? 'bg-sky-500/15 text-sky-200 ring-sky-500/40'
+                      : 'text-[var(--color-muted)] ring-[var(--color-border)] hover:bg-[var(--color-panel-2)]'
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-end gap-2">
+              <AutoGrowTextarea
+                value={entryBody}
+                onChange={setEntryBody}
+                onSubmit={submitEntry}
+                placeholder={
+                  entryType === 'finding'
+                    ? `Describe the finding as ${actor}…`
+                    : `Comment as ${actor}…`
+                }
+                className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm outline-none focus:border-sky-500/50"
+              />
+              {entryType === 'finding' && (
+                <input
+                  value={findingTask}
+                  onChange={(e) => setFindingTask(e.target.value)}
+                  placeholder="task # (optional)"
+                  inputMode="numeric"
+                  className="w-28 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-2 font-mono text-xs outline-none focus:border-sky-500/50"
+                />
+              )}
+              <button
+                onClick={submitEntry}
+                disabled={busy || !entryBody.trim()}
+                className="rounded-md bg-sky-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+              >
+                {entryType === 'finding' ? 'Add finding' : 'Comment'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </main>
