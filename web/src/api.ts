@@ -569,6 +569,10 @@ export const api = {
   },
   setReviewStatus: (id: number, b: { status: ReviewStatus; actor?: string; note?: string }) =>
     req<Review>('POST', `/reviews/${id}/status`, b),
+  // The adversarial-review gate (task 428). Server records the actor + logs a `decision` entry and
+  // emits review.vetted_changed; same-value is an idempotent no-op. Returns the updated review.
+  setReviewVetted: (id: number, b: { vetted: boolean; actor?: string; note?: string }) =>
+    req<Review>('POST', `/reviews/${id}/vetted`, b),
   appendReviewLog: (
     id: number,
     b: { entry_type: string; body?: string; author?: string; task_id?: number; external_id?: string },

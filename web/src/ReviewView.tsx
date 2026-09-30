@@ -4,7 +4,7 @@ import { type ReviewStatus } from './api'
 import { useBoardContext } from './Layout'
 import { Markdown } from './markdown'
 import { ReviewStatusChip, REVIEW_STATUS_FLOW, reviewSourceLink } from './Reviews'
-import { appendReviewLog, setReviewStatus, useReview, useTask } from './resources'
+import { appendReviewLog, setReviewStatus, setReviewVetted, useReview, useTask } from './resources'
 import { AutoGrowTextarea, relTime, StatusChip } from './ui'
 
 // Sensible next A2 transitions per current status (the backend accepts any valid status; this is
@@ -22,8 +22,8 @@ const PERSON_OWNED: ReviewStatus[] = ['changes_requested', 'approved']
 
 // One review (/reviews/:reviewId): the lifecycle state, the source artifact (linked per source),
 // the vetted gate, the append-only log timeline, and the child/proposal tasks its findings track.
-// Read-only for now — status transitions and inline commenting are a follow-up; the improvement
-// TREND (findings-per-review) is its own surface (needs the trend query, task 376).
+// Interactive: status transitions, the vetted-gate toggle, and an inline comment/finding composer.
+// The improvement TREND (findings-per-review) is its own surface (needs the trend query, task 376).
 export default function ReviewView() {
   const { reviewId } = useParams()
   const { actor } = useBoardContext()
@@ -56,6 +56,28 @@ export default function ReviewView() {
     setActionError(null)
     try {
       await setReviewStatus(id, { status: to, actor, note: note || undefined })
+    } catch (e) {
+      setActionError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // The adversarial-review gate (task 428). Like the person-owned transitions, this is a reviewer
+  // decision — confirm as yourself so the affordance never implies an agent self-vetting (D17).
+  async function toggleVetted(next: boolean) {
+    if (busy || !review) return
+    if (
+      !window.confirm(
+        `${next ? 'Mark this review vetted' : 'Clear the vetted gate on this review'}? This is a reviewer decision — make it as yourself (${actor}), not on an agent's behalf.`,
+      )
+    )
+      return
+    const note = window.prompt('Add a note to this decision? (optional)') ?? undefined
+    setBusy(true)
+    setActionError(null)
+    try {
+      await setReviewVetted(id, { vetted: next, actor, note: note || undefined })
     } catch (e) {
       setActionError((e as Error).message)
     } finally {
@@ -152,6 +174,26 @@ export default function ReviewView() {
               ))}
             </div>
           )}
+
+          {/* Vetted gate: the adversarial-review sign-off. A reviewer decision like the person-owned
+              transitions, so it confirms as yourself (D17). Toggles the current state. */}
+          <div className="mb-5 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-[var(--color-muted)]">Vetted gate</span>
+            <button
+              onClick={() => toggleVetted(!review.vetted)}
+              disabled={busy}
+              className={`rounded-md px-2.5 py-1 text-xs ring-1 ring-inset disabled:opacity-40 ${
+                review.vetted
+                  ? 'text-zinc-300 ring-zinc-500/40 hover:bg-zinc-500/10'
+                  : 'text-emerald-300 ring-emerald-500/40 hover:bg-emerald-500/10'
+              }`}
+            >
+              {review.vetted ? 'Clear vetted' : 'Mark vetted'}
+            </button>
+            <span className="text-[11px] text-[var(--color-muted)]">
+              {review.vetted ? 'Passed adversarial review.' : 'Not yet signed off.'}
+            </span>
+          </div>
 
           {actionError && (
             <div className="mb-4 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
