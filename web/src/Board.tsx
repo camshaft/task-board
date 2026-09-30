@@ -248,7 +248,11 @@ export default function Board() {
                       <Link to={`tasks/${t.id}`} className="block p-3 text-left">
                         <div className="mb-2 flex items-start gap-2">
                           <PriorityDot priority={t.priority} />
-                          <span className="text-sm leading-snug">{t.title}</span>
+                          {/* min-w-0 + break-words so a super-long / unbroken title wraps inside
+                              the fixed-width column instead of forcing a horizontal scrollbar (task 518). */}
+                          <span className="min-w-0 flex-1 break-words text-sm leading-snug">
+                            {t.title}
+                          </span>
                         </div>
                         <div className="flex items-center justify-between text-xs text-[var(--color-muted)]">
                           <span className="font-mono">#{t.id}</span>

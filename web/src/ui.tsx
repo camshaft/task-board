@@ -198,6 +198,10 @@ export function AutoGrowTextarea({
     const el = ref.current
     if (!el) return
     el.style.height = 'auto'
+    // Only scroll once the content actually exceeds maxHeight; otherwise hide the y-overflow so a
+    // single-line composer never shows a stray scrollbar (macOS/Chrome renders one at the exact
+    // content height from sub-pixel rounding — the operator's top scrollbar complaint, task 518).
+    el.style.overflowY = el.scrollHeight > maxHeight ? 'auto' : 'hidden'
     el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
   }, [value, maxHeight])
 
