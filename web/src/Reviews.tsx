@@ -40,7 +40,7 @@ export function reviewSourceLink(source: string | null, targetRef: string | null
     return source ? <span className="text-[var(--color-muted)]">{source}</span> : null
   }
   const ext = (href: string, label: string) => (
-    <a href={href} target="_blank" rel="noreferrer" className={cls}>
+    <a href={href} className={cls}>
       {label}
     </a>
   )

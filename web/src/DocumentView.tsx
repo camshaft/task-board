@@ -465,8 +465,6 @@ export default function DocumentView() {
                   )}
                   <a
                     href={ipfsUrl(v.cid, v.content_type)}
-                    target="_blank"
-                    rel="noreferrer"
                     className="min-w-0 flex-1 truncate font-mono text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
                     title={`open ${v.cid}`}
                   >
@@ -794,8 +792,6 @@ function DocContent({ version, onLoaded }: { version: DocumentVersion; onLoaded?
   const raw = (
     <a
       href={url}
-      target="_blank"
-      rel="noreferrer"
       className="font-mono text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
     >
       open raw ({version.cid})

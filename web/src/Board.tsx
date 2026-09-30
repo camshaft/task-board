@@ -138,8 +138,6 @@ export default function Board() {
         {repo && (
           <a
             href={repo}
-            target="_blank"
-            rel="noreferrer"
             className="max-w-[16rem] truncate text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
             title={repo}
           >
