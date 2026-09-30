@@ -231,7 +231,40 @@ fn merge_metadata(base_str: Option<&str>, incoming: Value) -> String {
             base.insert(k, v);
         }
     }
+    // Coerce a hand-authored metadata.repos into the structured [{"repo": <name>}] list that fleet
+    // spin-up expects (task 476): a CSV / space / newline string, or a list of bare name strings,
+    // becomes the object-list form. A value already in the object-list form is left untouched, so
+    // this is idempotent. Defense at the write source, so a raw register_agent/update_agent can't
+    // store a shape that spin-up silently drops (the membrain-cdk incident).
+    if let Some(coerced) = coerce_repos_metadata(base.get("repos")) {
+        base.insert("repos".into(), coerced);
+    }
     Value::Object(base).to_string()
+}
+
+/// If `repos` is a delimited string or a list containing bare name strings, return the structured
+/// `[{"repo": <name>}]` form; otherwise `None` (already structured / absent / unrecognized — leave
+/// as-is). See [`merge_metadata`] (task 476).
+fn coerce_repos_metadata(repos: Option<&Value>) -> Option<Value> {
+    match repos? {
+        Value::String(s) => Some(Value::Array(
+            s.split([',', '\n', '\t', ' '])
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| json!({ "repo": t }))
+                .collect(),
+        )),
+        Value::Array(items) if items.iter().any(Value::is_string) => Some(Value::Array(
+            items
+                .iter()
+                .map(|it| match it {
+                    Value::String(name) => json!({ "repo": name }),
+                    other => other.clone(),
+                })
+                .collect(),
+        )),
+        _ => None,
+    }
 }
 
 pub async fn register_agent(
@@ -7721,6 +7754,30 @@ mod tests {
         );
         assert!(extract_mentions("no mentions here").is_empty());
         assert_eq!(extract_mentions("email a@b.com is not a mention start"), vec!["b"]);
+    }
+
+    /// #476: register_agent/update_agent coerce a hand-authored metadata.repos (a CSV/space/newline
+    /// string, or a list of bare names) into the structured [{"repo": name}] form fleet spin-up
+    /// expects; an already-structured list is left as-is; other metadata keys are untouched.
+    #[test]
+    fn coerce_repos_metadata_normalizes_unstructured_forms() {
+        assert_eq!(
+            coerce_repos_metadata(Some(&json!("Membrain, MembrainCDK\nElasticShuffleCDK"))),
+            Some(json!([{ "repo": "Membrain" }, { "repo": "MembrainCDK" }, { "repo": "ElasticShuffleCDK" }]))
+        );
+        assert_eq!(
+            coerce_repos_metadata(Some(&json!(["a", "b"]))),
+            Some(json!([{ "repo": "a" }, { "repo": "b" }]))
+        );
+        // Already structured, absent, or an unrelated type => no change (None).
+        assert_eq!(coerce_repos_metadata(Some(&json!([{ "repo": "a" }]))), None);
+        assert_eq!(coerce_repos_metadata(None), None);
+        assert_eq!(coerce_repos_metadata(Some(&json!(42))), None);
+        // merge_metadata applies the coercion on write and leaves other keys intact.
+        let out = merge_metadata(Some(r#"{"role":"x"}"#), json!({ "repos": "a b" }));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["repos"], json!([{ "repo": "a" }, { "repo": "b" }]));
+        assert_eq!(v["role"], json!("x"));
     }
 
     /// Enabling a channel's auto_join backfills every registered agent as a member, a later-
