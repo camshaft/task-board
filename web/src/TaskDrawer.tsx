@@ -276,8 +276,27 @@ export function TaskDrawer() {
           <>
             <header className="flex items-start gap-3 border-b border-[var(--color-border)] p-5">
               <div className="min-w-0 flex-1">
-                <div className="mb-1 text-xs text-[var(--color-muted)]">
-                  task #{task.id}
+                <div className="mb-1 flex flex-wrap items-center gap-2 text-xs text-[var(--color-muted)]">
+                  <span>task #{task.id}</span>
+                  {/* Liveness-monitor exemption (task 520 family / #506 guard): surfaced + toggleable
+                      here. Amber when exempt (visible); a subtle "monitored" affordance otherwise.
+                      Toggling merges metadata.monitor_exempt server-side. */}
+                  <button
+                    onClick={() => void save({ metadata: { monitor_exempt: !task.monitor_exempt } })}
+                    disabled={busy}
+                    title={
+                      task.monitor_exempt
+                        ? 'Exempt from the liveness monitor / nudge daemon. Click to put it back under monitoring.'
+                        : 'Under the liveness monitor / nudge daemon. Click to mark it exempt (e.g. a long-running or intentionally-idle task).'
+                    }
+                    className={`rounded px-1.5 py-0.5 ring-1 ring-inset transition disabled:opacity-40 ${
+                      task.monitor_exempt
+                        ? 'bg-amber-500/15 text-amber-300 ring-amber-500/30'
+                        : 'text-[var(--color-muted)] ring-[var(--color-border)] hover:bg-[var(--color-panel-2)]'
+                    }`}
+                  >
+                    {task.monitor_exempt ? 'monitor exempt' : 'monitored'}
+                  </button>
                 </div>
                 {editTitle === null ? (
                   <h2
