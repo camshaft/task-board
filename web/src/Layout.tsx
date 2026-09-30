@@ -8,12 +8,16 @@ import {
   type WikiResolver,
 } from './markdown'
 import { createProject, eventHref, useAgents, useEvents, useProjects, useWiki } from './resources'
+import { type ThemePref, useTheme } from './theme'
 import { relTime } from './ui'
 
-// The only thing nested routes still need handed down is the current actor (per-user
-// localStorage identity, not a server resource). All server data comes from the store hooks.
+// Handed down to nested routes: the current actor (per-user localStorage identity, not a server
+// resource) + its setter, and the theme preference + setter (the settings page drives both). All
+// server data comes from the store hooks.
 export interface BoardContext {
   actor: string
+  setActor: (id: string) => void
+  theme: { pref: ThemePref; setPref: (p: ThemePref) => void }
 }
 
 export function useBoardContext() {
@@ -39,6 +43,7 @@ export default function Layout() {
   const { projectId } = useParams()
   const selectedProject = projectId != null ? Number(projectId) : null
   const [actor, setActor] = useActor()
+  const theme = useTheme() // single theme source of truth; applied app-wide, shared via context
   useLiveUpdates() // one SSE connection makes every subscribed panel live
   const { data: projects = [], error: projectsError } = useProjects()
   const { data: events = [] } = useEvents()
@@ -137,15 +142,19 @@ export default function Layout() {
         >
           API docs
         </a>
-        <div className="ml-auto flex items-center gap-2 text-sm">
-          <label className="text-[var(--color-muted)]">you are</label>
-          <input
-            defaultValue={actor}
-            onBlur={(e) => setActor(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
-            className="w-32 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 font-mono text-xs outline-none focus:border-sky-500/50"
-          />
-        </div>
+        {/* Identity + settings entry point: a link to the settings page (home for the actor
+            identity, theme, and future per-user prefs) replacing the old inline "you are" input. */}
+        <Link
+          to="/settings"
+          title="Settings"
+          className="ml-auto flex items-center gap-1.5 rounded-md px-2 py-1 text-sm text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-sky-300"
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
+          <span className="hidden font-mono text-xs sm:inline">{actor}</span>
+        </Link>
       </header>
 
       {projectsError && (
@@ -239,7 +248,7 @@ export default function Layout() {
             [[wiki-links]] in any markdown below resolve against the live wiki. */}
         <WikiLinkContext.Provider value={resolveWikiLink}>
           <AgentMentionContext.Provider value={resolveMention}>
-            <Outlet context={{ actor } satisfies BoardContext} />
+            <Outlet context={{ actor, setActor, theme } satisfies BoardContext} />
           </AgentMentionContext.Provider>
         </WikiLinkContext.Provider>
 

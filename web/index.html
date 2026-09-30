@@ -5,6 +5,24 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>task-board</title>
+    <!-- Set the theme before first paint so there's no flash (task 520). Mirrors theme.ts:
+         explicit light/dark from localStorage, else the OS prefers-color-scheme. -->
+    <script>
+      (function () {
+        try {
+          var p = localStorage.getItem('tb-theme')
+          var t =
+            p === 'light' || p === 'dark'
+              ? p
+              : matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark'
+          document.documentElement.dataset.theme = t
+        } catch (e) {
+          document.documentElement.dataset.theme = 'dark'
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>
