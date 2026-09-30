@@ -16,8 +16,34 @@ import {
   useProjects,
   useWiki,
 } from './resources'
+import { useConnectionHealth } from './store'
 import { type ThemePref, useTheme } from './theme'
 import { relTime } from './ui'
+
+// A thin top banner shown while the backend is unreachable (e.g. the 502 window during a backend
+// deploy) or the live stream is down. The board keeps its last-good content and auto-retries in
+// the background (see store.ts); this just tells the user what's happening instead of leaving a
+// silently stale/blank screen. (task 549)
+function ConnectionBanner() {
+  const { retrying, streamDown } = useConnectionHealth()
+  if (!retrying && !streamDown) return null
+  const msg = retrying
+    ? 'Reconnecting to the server...'
+    : 'Live updates paused, reconnecting...'
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex items-center justify-center gap-2 bg-amber-500/15 px-4 py-1 text-center text-xs text-amber-300"
+    >
+      <span
+        className="inline-block size-1.5 animate-pulse rounded-full bg-amber-400"
+        aria-hidden
+      />
+      {msg}
+    </div>
+  )
+}
 
 // Handed down to nested routes: the current actor (per-user localStorage identity, not a server
 // resource) + its setter, and the theme preference + setter (the settings page drives both). All
@@ -96,6 +122,7 @@ export default function Layout() {
 
   return (
     <div className="flex h-full flex-col">
+      <ConnectionBanner />
       <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[var(--color-border)] px-4 py-3 sm:px-5">
         <button
           onClick={() => setSidebarOpen((v) => !v)}
