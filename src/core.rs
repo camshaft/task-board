@@ -262,6 +262,15 @@ pub async fn register_agent(
         .bind(&ts)
         .execute(&mut *tx)
         .await?;
+        // A newly-registered agent auto-joins every fleet-wide broadcast channel (auto_join=1),
+        // so an announcement reaches it without a manual invite. Only on first registration —
+        // a re-register (presence refresh) does not re-add a channel the agent has left.
+        let auto_channels =
+            sqlx::query("SELECT id FROM channels WHERE auto_join=1").fetch_all(&mut *tx).await?;
+        for c in &auto_channels {
+            let cid: i64 = c.try_get("id")?;
+            join_channel(&mut tx, cid, agent_id).await?;
+        }
     }
     let row = sqlx::query("SELECT * FROM agents WHERE id=?")
         .bind(agent_id)
@@ -2128,6 +2137,62 @@ pub async fn set_channel_props(pool: &Pool, channel_id: i64, props: Value) -> an
         .await?;
     tx.commit().await?;
     Ok(json!({ "channel_id": channel_id, "metadata": meta_val }))
+}
+
+/// Set (or clear) a channel's `auto_join` flag — a fleet-wide broadcast channel every agent
+/// belongs to. Enabling BACKFILLS: it joins every currently-registered agent, so the channel
+/// immediately has everyone as a member; each agent registered later auto-joins on register (see
+/// register_agent). Idempotent (re-enabling just re-runs the idempotent backfill; disabling leaves
+/// existing members in place, it only stops future auto-joins).
+pub async fn set_channel_auto_join(
+    pool: &Pool,
+    channel_id: i64,
+    auto_join: bool,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    if sqlx::query("SELECT 1 FROM channels WHERE id=?")
+        .bind(channel_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no channel {channel_id}");
+    }
+    sqlx::query("UPDATE channels SET auto_join=?, updated_at=? WHERE id=?")
+        .bind(auto_join as i64)
+        .bind(&ts)
+        .bind(channel_id)
+        .execute(&mut *tx)
+        .await?;
+    if auto_join {
+        // Backfill every registered agent as a member (idempotent).
+        let agents = sqlx::query("SELECT id FROM agents").fetch_all(&mut *tx).await?;
+        for a in &agents {
+            let id: String = a.try_get("id")?;
+            join_channel(&mut tx, channel_id, &id).await?;
+        }
+    }
+    // Silent audit event (no fan-out) so the change lands in the log + SSE tail.
+    emit(
+        &mut tx,
+        &mut hooks,
+        "channel.updated",
+        actor,
+        None,
+        None,
+        Some(channel_id),
+        None,
+        json!({ "auto_join": auto_join }),
+        Recipients::Explicit(BTreeSet::new()),
+    )
+    .await?;
+    let out = channel_row_json(&mut tx, channel_id).await?.unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
 }
 
 /// Derive a task title from a thread's root body: its first non-empty line, trimmed and
@@ -6466,6 +6531,41 @@ mod tests {
         );
         assert!(extract_mentions("no mentions here").is_empty());
         assert_eq!(extract_mentions("email a@b.com is not a mention start"), vec!["b"]);
+    }
+
+    /// Enabling a channel's auto_join backfills every registered agent as a member, a later-
+    /// registered agent auto-joins on register, and disabling stops future auto-joins.
+    #[tokio::test]
+    async fn channel_auto_join_backfills_and_new_agents_join() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "a", None, None, None, None, None).await?;
+        register_agent(&pool, "b", None, None, None, None, None).await?;
+        let ch = create_channel(&pool, "announcements", None, Some("owner"), None).await?;
+        let cid = ch["id"].as_i64().unwrap();
+        let members = |v: &Value| -> Vec<String> {
+            v["members"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+        };
+
+        // Before enabling, a and b (registered before the channel existed) are not members.
+        assert!(!members(&get_channel(&pool, cid).await?).contains(&"a".to_string()));
+
+        // Enable: backfill joins every registered agent.
+        set_channel_auto_join(&pool, cid, true, Some("owner")).await?;
+        let m = members(&get_channel(&pool, cid).await?);
+        assert!(m.contains(&"a".to_string()) && m.contains(&"b".to_string()), "backfilled: {m:?}");
+
+        // A newly-registered agent auto-joins.
+        register_agent(&pool, "c", None, None, None, None, None).await?;
+        assert!(members(&get_channel(&pool, cid).await?).contains(&"c".to_string()), "c auto-joined");
+
+        // Disabling stops future auto-joins (existing members stay).
+        set_channel_auto_join(&pool, cid, false, Some("owner")).await?;
+        register_agent(&pool, "d", None, None, None, None, None).await?;
+        let m2 = members(&get_channel(&pool, cid).await?);
+        assert!(!m2.contains(&"d".to_string()), "d did not auto-join after disable: {m2:?}");
+        assert!(m2.contains(&"c".to_string()), "existing member c retained");
+        Ok(())
     }
 
     /// Clearing an assignee (assignee="") unsets the owner and emits task.unassigned carrying the

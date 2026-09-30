@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS channels (
     -- regardless of who opens it first. This is how DMs reuse the channel data model.
     dm_key      TEXT UNIQUE,
     metadata    TEXT NOT NULL DEFAULT '{}',
+    -- When 1, every agent is a member: existing agents are joined when the flag is set, and each
+    -- newly-registered agent auto-joins on register. For a fleet-wide broadcast channel.
+    auto_join   INTEGER NOT NULL DEFAULT 0,
     created_by  TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
@@ -427,6 +430,19 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     // stays queryable but drops out of list_tasks by default. Orthogonal to status; nullable.
     if !tasks_has("archived_at") {
         sqlx::query("ALTER TABLE tasks ADD COLUMN archived_at TEXT").execute(&pool).await?;
+    }
+
+    // Back-fill channels.auto_join (fleet-wide broadcast channels): a legacy channels table opens
+    // without it, defaulting every channel to opt-in membership.
+    let channels_have_auto_join = sqlx::query("PRAGMA table_info(channels)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "auto_join");
+    if !channels_have_auto_join {
+        sqlx::query("ALTER TABLE channels ADD COLUMN auto_join INTEGER NOT NULL DEFAULT 0")
+            .execute(&pool)
+            .await?;
     }
 
     // Back-fill tasks.parent_id (added when tasks gained nesting/epics). Nullable, self-
