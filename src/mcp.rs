@@ -698,6 +698,12 @@ pub struct BannedPhraseArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LintTextArgs {
+    /// The text to dry-run against the live content gate (banned-phrase list + ASCII-only rule).
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestSecretArgs {
     /// The secret's name (e.g. the durable filename it will land as).
     pub name: String,
@@ -1705,6 +1711,16 @@ impl Board {
     #[tool(description = "List the fleet banned-phrases list (the phrases the pre-submit content lint checks docs and comments against).")]
     async fn list_banned_phrases(&self) -> Result<CallToolResult, McpError> {
         core::list_banned_phrases(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(
+        description = "Dry-run the pre-submit content lint on arbitrary text WITHOUT writing anything. Returns {clean, banned_phrases:[..], non_ascii:[{char, codepoint, line, column}, ..]} against the authoritative live banned-phrases list + ASCII-only rule. Use this to pre-check content before publishing (especially before a publish_version by CID, which the write-path gate does not scan) instead of a hand-maintained local list that drifts from the source of truth."
+    )]
+    async fn lint_text(
+        &self,
+        Parameters(a): Parameters<LintTextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::lint_text(&self.pool, &a.text).await.map_err(err).and_then(ok)
     }
 
     #[tool(description = "Remove a phrase from the fleet banned-phrases list.")]
