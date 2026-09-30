@@ -72,8 +72,13 @@ export function useChannel(id: number) {
   return useResource<Channel>(keys.channel(id), () => api.getChannel(id))
 }
 
-export function useChannelPosts(id: number) {
-  return useResource<ChannelPost[]>(keys.channelPosts(id), () => api.getChannelPosts(id))
+// The latest `limit` posts, returned in chat order (oldest→newest). Fetches newest-first
+// (order=desc) so a busy channel shows its RECENT tail, not the oldest N; reversed for display.
+// Older history loads on demand via getChannelPosts({ order:'desc', before_seq }) in the view.
+export function useChannelPosts(id: number, limit = 100) {
+  return useResource<ChannelPost[]>(keys.channelPosts(id), () =>
+    api.getChannelPosts(id, { order: 'desc', limit }).then((ps) => ps.reverse()),
+  )
 }
 
 // Bridged external identities, keyed by id → display name for attribution rendering. Reference

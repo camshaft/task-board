@@ -430,10 +430,18 @@ export const api = {
     created_by?: string
     metadata?: Record<string, unknown>
   }) => req<Channel>('POST', '/channels', b),
-  getChannelPosts: (id: number, q: { since_seq?: number; limit?: number } = {}) => {
+  // order='desc' returns the LATEST `limit` posts newest-first (for the initial chat view — render
+  // reversed). `before_seq` (with desc) pages backward: the posts immediately older than that seq.
+  // Default asc + `since_seq` is the forward/live poll. Bounds compose: seq>since_seq, seq<before_seq.
+  getChannelPosts: (
+    id: number,
+    q: { since_seq?: number; limit?: number; order?: 'asc' | 'desc'; before_seq?: number } = {},
+  ) => {
     const p = new URLSearchParams()
     if (q.since_seq != null) p.set('since_seq', String(q.since_seq))
     if (q.limit != null) p.set('limit', String(q.limit))
+    if (q.order) p.set('order', q.order)
+    if (q.before_seq != null) p.set('before_seq', String(q.before_seq))
     const qs = p.toString()
     return req<ChannelPost[]>('GET', `/channels/${id}/posts${qs ? `?${qs}` : ''}`)
   },

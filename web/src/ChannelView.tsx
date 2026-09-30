@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { type ChannelPost } from './api'
+import { api, type ChannelPost } from './api'
 import { channelLabel } from './Channels'
 import { useBoardContext } from './Layout'
 import { Markdown } from './markdown'
@@ -27,6 +27,16 @@ export default function ChannelView() {
   const [replyTo, setReplyTo] = useState<number | null>(null)
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+  // Older history paged in on demand (the resource holds only the latest window). `noMoreEarlier`
+  // is set once a backward page returns fewer than a full batch.
+  const [earlier, setEarlier] = useState<ChannelPost[]>([])
+  const [loadingEarlier, setLoadingEarlier] = useState(false)
+  const [noMoreEarlier, setNoMoreEarlier] = useState(false)
+
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const initedScroll = useRef(false)
+  const atBottom = useRef(true)
+  const preserveHeight = useRef<number | null>(null)
 
   const author = (p: ChannelPost) => p.data.from ?? p.actor ?? 'anon'
 
@@ -60,11 +70,66 @@ export default function ChannelView() {
     }
   }
 
+  // The latest window (posts) plus any older pages (earlier), merged + deduped in chat order.
+  const merged = (() => {
+    const m = new Map<number, ChannelPost>()
+    for (const p of earlier) m.set(p.seq, p)
+    for (const p of posts) m.set(p.seq, p)
+    return [...m.values()].sort((a, b) => a.seq - b.seq)
+  })()
+
+  // Page backward from the oldest post currently held (contract: order=desc + before_seq).
+  async function loadEarlier() {
+    if (loadingEarlier || merged.length === 0) return
+    setLoadingEarlier(true)
+    setActionError(null)
+    const el = scrollRef.current
+    if (el) preserveHeight.current = el.scrollHeight // keep the viewport steady across the prepend
+    try {
+      const older = await api.getChannelPosts(id, {
+        order: 'desc',
+        before_seq: merged[0].seq,
+        limit: 100,
+      })
+      if (older.length < 100) setNoMoreEarlier(true)
+      setEarlier((prev) => {
+        const m = new Map<number, ChannelPost>()
+        for (const p of prev) m.set(p.seq, p)
+        for (const p of older) m.set(p.seq, p)
+        return [...m.values()].sort((a, b) => a.seq - b.seq)
+      })
+    } catch (e) {
+      setActionError((e as Error).message)
+      preserveHeight.current = null
+    } finally {
+      setLoadingEarlier(false)
+    }
+  }
+
+  // Keep the recent tail visible: jump to the bottom on first load; on later changes, stay pinned
+  // to the bottom only if the user is already there (a new live message), and preserve the scroll
+  // position when older history is prepended.
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (!el || merged.length === 0) return
+    if (preserveHeight.current != null) {
+      el.scrollTop += el.scrollHeight - preserveHeight.current
+      preserveHeight.current = null
+      return
+    }
+    if (!initedScroll.current) {
+      el.scrollTop = el.scrollHeight
+      initedScroll.current = true
+      return
+    }
+    if (atBottom.current) el.scrollTop = el.scrollHeight
+  }, [merged.length])
+
   // Thread one level: top-level posts (no reply_to) in order, each followed by replies whose
   // reply_to points at its seq. Any reply whose parent isn't present renders at top level.
-  const bySeq = new Set(posts.map((p) => p.seq))
-  const topLevel = posts.filter((p) => p.data.reply_to == null || !bySeq.has(p.data.reply_to))
-  const repliesOf = (seq: number) => posts.filter((p) => p.data.reply_to === seq)
+  const bySeq = new Set(merged.map((p) => p.seq))
+  const topLevel = merged.filter((p) => p.data.reply_to == null || !bySeq.has(p.data.reply_to))
+  const repliesOf = (seq: number) => merged.filter((p) => p.data.reply_to === seq)
 
   // A DM (private, no name): title with the other member if the channel carries members.
   const otherMember = channel?.members?.find((m) => m !== actor)
@@ -112,7 +177,25 @@ export default function ChannelView() {
         </div>
       )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+      <div
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget
+          atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+        }}
+        className="min-h-0 flex-1 overflow-y-auto px-5 py-3"
+      >
+        {merged.length > 0 && !noMoreEarlier && (
+          <div className="mb-2 flex justify-center">
+            <button
+              onClick={loadEarlier}
+              disabled={loadingEarlier}
+              className="rounded-md border border-[var(--color-border)] px-3 py-1 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-300 disabled:opacity-40"
+            >
+              {loadingEarlier ? 'Loading…' : 'Load earlier messages'}
+            </button>
+          </div>
+        )}
         <ul className="space-y-2">
           {topLevel.map((p) => (
             <li key={p.seq}>
@@ -128,7 +211,7 @@ export default function ChannelView() {
               )}
             </li>
           ))}
-          {posts.length === 0 && (
+          {merged.length === 0 && (
             <li className="text-sm text-[var(--color-muted)]">No messages yet.</li>
           )}
         </ul>
