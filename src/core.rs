@@ -1908,6 +1908,38 @@ pub async fn subscribe_classed(
     Ok(json!({ "subscriber": subscriber, "target_type": tt, "target_id": tid, "event_classes": event_classes }))
 }
 
+/// Subscribe an agent to a channel THREAD (#438). The thread root is a channel post's event seq;
+/// subsequent in-thread posts (reply_to = this root) are delivered to the subscriber AND wake them,
+/// so a reactive agent that joined a thread answers later follow-ups without a re-mention. The root
+/// seq is globally unique, so it alone keys the subscription. Idempotent (INSERT OR IGNORE) so a
+/// bridge daemon can safely re-register the same root each tick.
+pub async fn subscribe_thread(pool: &Pool, subscriber: &str, thread_root: i64) -> anyhow::Result<Value> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO subscriptions(subscriber, target_type, target_id, created_at) \
+         VALUES(?,'thread',?,?)",
+    )
+    .bind(subscriber)
+    .bind(thread_root)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(json!({ "subscriber": subscriber, "target_type": "thread", "target_id": thread_root }))
+}
+
+/// Unsubscribe an agent from a channel thread (#438). Used when a bridge evicts a cold thread from
+/// its active set, so a stale thread stops waking the agent.
+pub async fn unsubscribe_thread(pool: &Pool, subscriber: &str, thread_root: i64) -> anyhow::Result<Value> {
+    let n = sqlx::query(
+        "DELETE FROM subscriptions WHERE subscriber=? AND target_type='thread' AND target_id=?",
+    )
+    .bind(subscriber)
+    .bind(thread_root)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(json!({ "removed": n }))
+}
+
 pub async fn unsubscribe(
     pool: &Pool,
     subscriber: &str,
@@ -2237,7 +2269,10 @@ pub async fn post_to_channel_meta(
         Some(channel_id),
         None,
         data,
-        Recipients::FromChannel(channel_id),
+        // Deliver to channel members AND, when this post replies to a thread root, to that thread's
+        // subscribers (#438) — so an agent that joined the thread is woken on in-thread follow-ups
+        // without a re-mention. reply_to=None is identical to a plain channel fan-out.
+        Recipients::FromChannelThread(channel_id, reply_to),
     )
     .await?;
 
@@ -2708,7 +2743,7 @@ async fn mirror_task_comment_to_thread(
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
     }
-    emit(tx, hooks, "channel.post", Some(from), None, None, Some(channel_id), None, data, Recipients::FromChannel(channel_id))
+    emit(tx, hooks, "channel.post", Some(from), None, None, Some(channel_id), None, data, Recipients::FromChannelThread(channel_id, Some(root_seq)))
         .await?;
     sqlx::query("UPDATE channels SET updated_at=? WHERE id=?")
         .bind(now_iso())

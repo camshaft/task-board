@@ -418,6 +418,12 @@ pub struct SubscribeArgs {
     /// tasks; a gap-ticket owner uses task/project + ["done", "blocked"]. (Ignored by unsubscribe.)
     #[serde(default)]
     pub event_classes: Option<Vec<String>>,
+    /// Subscribe to a channel THREAD (#438): the thread ROOT is a channel post's event seq. Delivers
+    /// subsequent in-thread posts (reply_to = this root) to you AND wakes you, so a reactive agent
+    /// that joined a thread answers later in-thread follow-ups without a re-mention. When set, this
+    /// takes precedence over the other targets. (unsubscribe(thread_root) leaves the thread.)
+    #[serde(default)]
+    pub thread_root: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1355,15 +1361,16 @@ impl Board {
     }
 
     // --- Subscriptions ---
-    #[tool(description = "Subscribe an agent to a task, a project, a channel, a document, OR the whole board so it's notified of activity there. Give exactly one of task_id / project_id / channel_id / document_id, or set `board: true` for the whole-board firehose. Subscribing to a channel joins it. Pass `event_classes` (e.g. [\"created\"]) to make it a filtered, delivery-gated subscription that only delivers + wakes on those event classes — the low-noise alternative to the full firehose; omit for every event. Idempotent: re-subscribing the same target updates the class set.")]
+    #[tool(description = "Subscribe an agent to a task, a project, a channel, a document, OR the whole board so it's notified of activity there. Give exactly one of task_id / project_id / channel_id / document_id, or set `board: true` for the whole-board firehose. Subscribing to a channel joins it. Pass `event_classes` (e.g. [\"created\"]) to make it a filtered, delivery-gated subscription that only delivers + wakes on those event classes — the low-noise alternative to the full firehose; omit for every event. Idempotent: re-subscribing the same target updates the class set. Pass `thread_root` (a channel post's event seq) to subscribe to a THREAD (#438): you are then delivered + woken on in-thread follow-ups (reply_to = that root) without a re-mention.")]
     async fn subscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let sub = self.me_req(a.subscriber.as_deref())?;
         let board = a.board.unwrap_or(false);
-        match a.event_classes.as_deref() {
-            Some(ec) if !ec.is_empty() => {
+        match (a.thread_root, a.event_classes.as_deref()) {
+            (Some(root), _) => core::subscribe_thread(&self.pool, &sub, root).await,
+            (None, Some(ec)) if !ec.is_empty() => {
                 core::subscribe_classed(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, board, ec).await
             }
             _ => core::subscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, board).await,
@@ -1372,16 +1379,18 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "Stop notifying an agent about a task, project, channel (leaving a channel), document, or the whole board (board: true).")]
+    #[tool(description = "Stop notifying an agent about a task, project, channel (leaving a channel), document, the whole board (board: true), or a thread (thread_root = the root post seq, to leave a joined thread).")]
     async fn unsubscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let sub = self.me_req(a.subscriber.as_deref())?;
-        core::unsubscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, a.board.unwrap_or(false))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        match a.thread_root {
+            Some(root) => core::unsubscribe_thread(&self.pool, &sub, root).await,
+            None => core::unsubscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, a.board.unwrap_or(false)).await,
+        }
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "Mute a task for yourself: detach from its event fan-out so comments / status changes on it stop notifying (and waking) you — even on a task you created or are assigned (unsubscribe can't do that, since the creator is always in the fan-out). Use it to stand down cleanly from a task you opened. Direct messages still reach you; restore with unmute_task.")]

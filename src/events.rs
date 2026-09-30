@@ -42,6 +42,11 @@ pub enum Recipients {
     FromProject(i64),
     /// Derive from the channel (its subscribers = its members). For channel posts and DMs.
     FromChannel(i64),
+    /// Channel members PLUS the subscribers of a thread root (#438): (channel_id, reply_to). For a
+    /// channel post that replies to a thread root R, anyone subscribed to thread R also receives it
+    /// and is woken — so a reactive agent that joined a thread answers later in-thread follow-ups
+    /// without being re-mentioned. reply_to=None behaves exactly like FromChannel.
+    FromChannelThread(i64, Option<i64>),
     /// Derive from the document (its subscribers). For document publishes and review activity.
     FromDocument(i64),
     /// Union of a document's and a task's recipients — for a doc<->task attachment, so both a
@@ -138,6 +143,31 @@ async fn recipients_for_channel(
         if subscription_delivers(event_type, data, s.try_get("event_classes")?) {
             recips.insert(s.try_get::<String, _>("subscriber")?);
         }
+    }
+    if let Some(actor) = actor {
+        recips.remove(actor);
+    }
+    Ok(recips)
+}
+
+/// Agents subscribed to a specific thread root (target_type='thread', target_id = the root post
+/// seq) — for delivering in-thread channel-post follow-ups (#438), minus the actor. Thread
+/// subscriptions are NOT event-class filtered: they are a channel-post/thread mechanism, distinct
+/// from the task-centric #462 classes, so they always deliver the thread's posts.
+async fn thread_subscribers(
+    tx: &mut Transaction<'_, Sqlite>,
+    root_seq: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut recips: BTreeSet<String> = BTreeSet::new();
+    let subs = sqlx::query(
+        "SELECT subscriber FROM subscriptions WHERE target_type='thread' AND target_id=?",
+    )
+    .bind(root_seq)
+    .fetch_all(&mut **tx)
+    .await?;
+    for s in subs {
+        recips.insert(s.try_get::<String, _>("subscriber")?);
     }
     if let Some(actor) = actor {
         recips.remove(actor);
@@ -282,6 +312,9 @@ pub async fn emit(
     .await?
     .try_get("seq")?;
 
+    // Recipients delivered via a THREAD subscription (#438), tracked separately from channel
+    // members so their per-recipient wake payload can carry a `thread_subscribed` marker.
+    let mut thread_recips: BTreeSet<String> = BTreeSet::new();
     let mut recips = match recipients {
         Recipients::Explicit(set) => set,
         Recipients::FromTask => match task_id {
@@ -290,6 +323,15 @@ pub async fn emit(
         },
         Recipients::FromProject(pid) => recipients_for_project(tx, pid, actor, r#type, &data).await?,
         Recipients::FromChannel(cid) => recipients_for_channel(tx, cid, actor, r#type, &data).await?,
+        Recipients::FromChannelThread(cid, reply_to) => {
+            let mut set = recipients_for_channel(tx, cid, actor, r#type, &data).await?;
+            if let Some(root) = reply_to {
+                let ts = thread_subscribers(tx, root, actor).await?;
+                thread_recips = ts.clone();
+                set.extend(ts);
+            }
+            set
+        }
         Recipients::FromDocument(did) => recipients_for_document(tx, did, actor, r#type, &data).await?,
         Recipients::FromDocumentAndTask(did, tid) => {
             let mut set = recipients_for_document(tx, did, actor, r#type, &data).await?;
@@ -392,6 +434,13 @@ pub async fn emit(
             if let Value::Object(ref mut m) = wake {
                 m.insert("recipient".into(), Value::String(r.clone()));
                 m.insert("subscribed".into(), Value::Bool(is_subscribed));
+                // Thread-delivery marker (#438): this recipient got the post via a thread
+                // subscription, not plain channel membership — the hook a reactive agent's kickoff
+                // keys on to treat an in-thread follow-up as actionable (the post's data.reply_to
+                // carries the thread root). Absent on ordinary deliveries.
+                if thread_recips.contains(r) {
+                    m.insert("thread_subscribed".into(), Value::Bool(true));
+                }
             }
             crate::tunnel::try_wake(r, &wake);
         }
@@ -599,6 +648,45 @@ mod tests {
         let n2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE recipient='triage'")
             .fetch_one(&pool).await?;
         assert_eq!(n2, 1, "no new inbox row for the filtered-out event (delivery-gated)");
+        Ok(())
+    }
+
+    /// #438: a thread subscriber (not a channel member) is delivered + woken on an in-thread
+    /// follow-up (a channel post with reply_to = the subscribed root), NOT on a post under a
+    /// different root, and unsubscribe_thread stops delivery.
+    #[tokio::test]
+    async fn thread_subscription_wakes_on_in_thread_followup() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        crate::core::register_agent(&pool, "frank", None, None, None, None, Some("http://x/wake")).await?;
+        // Frank joins thread root seq=100 (he is NOT a member of channel 7).
+        crate::core::subscribe_thread(&pool, "frank", 100).await?;
+
+        let post = |root: i64| {
+            let pool = pool.clone();
+            async move {
+                let mut tx = pool.begin().await?;
+                let mut hooks: Vec<WebhookDelivery> = Vec::new();
+                emit(&mut tx, &mut hooks, "channel.post", Some("human"), None, None, Some(7), None,
+                    json!({ "body": "x", "reply_to": root }), Recipients::FromChannelThread(7, Some(root))).await?;
+                tx.commit().await?;
+                Ok::<_, anyhow::Error>(hooks)
+            }
+        };
+
+        // Follow-up under the subscribed root reaches frank, woken.
+        let hooks = post(100).await?;
+        let h = hooks.iter().find(|h| h.agent_id == "frank").expect("delivered in-thread follow-up");
+        assert!(h.subscribed, "thread subscriber is woken on an in-thread follow-up");
+
+        // A post under a DIFFERENT root does not reach frank.
+        let hooks = post(999).await?;
+        assert!(hooks.iter().all(|h| h.agent_id != "frank"), "not woken on a different thread's post");
+
+        // unsubscribe_thread stops delivery on the subscribed root.
+        crate::core::unsubscribe_thread(&pool, "frank", 100).await?;
+        let hooks = post(100).await?;
+        assert!(hooks.iter().all(|h| h.agent_id != "frank"), "unsubscribe_thread stops thread delivery");
         Ok(())
     }
 }
