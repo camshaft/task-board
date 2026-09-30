@@ -462,10 +462,12 @@ pub async fn set_status(
 }
 
 /// List agents as a lightweight ROSTER by default (task #418): each entry is a compact
-/// {id, display_name, status} — basically name + id, plus tiny presence — so a scoped read stays
-/// well under a caller's token cap (the full roster with every agent's charter overflowed it).
-/// Fetch a single agent's full record (charter, metadata) with get_agent, or pass `verbose` for
-/// the full objects. Optional filters: `status` (exact), `q` (substring over id + display_name),
+/// {id, display_name, status, metadata} — name + id + tiny presence + the small metadata bag — so a
+/// scoped read stays well under a caller's token cap (the full roster with every agent's charter
+/// overflowed it; the charter is the only heavy field, so it is the one dropped). Metadata is kept
+/// because callers filter on it (e.g. the fleet watchdog on metadata.native, task 477). Fetch a
+/// single agent's full record (incl charter) with get_agent, or pass `verbose` for the full
+/// objects. Optional filters: `status` (exact), `q` (substring over id + display_name),
 /// and `meta_key`/`meta_value` (equality on a scalar metadata field, e.g. area/host — for routing
 /// a task to an owning vertical). Always bounded by `limit` (default 200, max 1000) + `offset`.
 #[allow(clippy::too_many_arguments)]
@@ -521,11 +523,15 @@ pub async fn list_agents(
             if verbose {
                 return agent_json(r);
             }
-            // Compact roster projection: id + display_name + status. get_agent for the rest.
+            // Compact roster projection: id + display_name + status + metadata. `metadata` is a
+            // small structured bag consumers filter on (e.g. the fleet watchdog selects agents by
+            // metadata.native, task 477); the large `charter` is what the compaction (#418) drops,
+            // so this stays well under the token cap while keeping the roster useful for filtering.
+            // get_agent (or verbose=true) still returns everything.
             let full = agent_json(r);
             let mut m = Map::new();
             if let Value::Object(o) = &full {
-                for k in ["id", "display_name", "status"] {
+                for k in ["id", "display_name", "status", "metadata"] {
                     if let Some(v) = o.get(k) {
                         m.insert(k.to_string(), v.clone());
                     }
@@ -7195,15 +7201,20 @@ mod tests {
         set_status(&pool, "v-runtime", "offline", None).await?;
         set_status(&pool, "concierge", "offline", None).await?; // register defaults to online
 
-        // Default: compact projection, no charter/metadata (the roster stays small).
+        // Default: compact projection — id/display_name/status + the small metadata bag (consumers
+        // filter on it, e.g. the fleet watchdog on metadata.native, task 477), but NOT the large
+        // charter (the compaction that keeps the roster under the token cap, #418).
         let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
         let arr = roster.as_array().unwrap();
         assert_eq!(arr.len(), 3);
         for a in arr {
             assert!(a.get("id").is_some() && a.get("status").is_some());
-            assert!(a.get("charter").is_none(), "roster must omit charter: {a}");
-            assert!(a.get("metadata").is_none(), "roster must omit metadata: {a}");
+            assert!(a.get("charter").is_none(), "roster must omit the heavy charter: {a}");
+            assert!(a.get("metadata").is_some(), "roster must include metadata for filtering: {a}");
         }
+        // The metadata bag is the real object, so a consumer can filter on it (e.g. metadata.area).
+        let compiler = arr.iter().find(|a| a["id"] == json!("v-compiler")).unwrap();
+        assert_eq!(compiler["metadata"]["area"], json!("compiler"));
 
         // verbose -> full objects (charter present).
         let full = list_agents(&pool, None, None, None, None, true, None, None).await?;
