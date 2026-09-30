@@ -309,6 +309,47 @@ CREATE TABLE IF NOT EXISTS secret_requests (
     submitted_at    TEXT,
     expires_at      TEXT
 );
+-- REVIEWS (Document #5, increment 1): a typed review over an artifact (a board document, a GitHub
+-- pull request, a design, an agent-session, or a task) with a lifecycle and a single generic
+-- append-only log. `kind` classifies the artifact; `source`/`target_ref` point at it (metadata —
+-- the board doesn't dereference `target_ref`). `status` is the A2 lifecycle state. `vetted` marks
+-- adversarial review as run+addressed (the person-review gate). `metadata` carries the producing
+-- agent id, a predecessor review id (escaped-defect lineage), and tags. Idempotent external ingest
+-- reuses the external_links pattern (board_kind='review'), like create_task (#270).
+CREATE TABLE IF NOT EXISTS reviews (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    source      TEXT,
+    target_ref  TEXT,
+    status      TEXT NOT NULL DEFAULT 'open',
+    title       TEXT,
+    vetted      INTEGER NOT NULL DEFAULT 0,
+    created_by  TEXT,
+    assignee    TEXT,
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+-- The review's single append-only event log: every event is one entry (submitted, revised, a
+-- finding raised/resolved, a comment, a state change, an adversarial-review run, the concluding
+-- decision). A finding is an entry of entry_type='finding' (not a separate collection); an
+-- actionable finding links a child `task_id`. `external_id` makes a log append idempotent for a
+-- bridge that replays the same source item (e.g. a GitHub conversation comment). Reading the log
+-- in order reconstructs the review timeline; any count/trend is derived from it, not stored.
+CREATE TABLE IF NOT EXISTS review_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id   INTEGER NOT NULL REFERENCES reviews(id),
+    entry_type  TEXT NOT NULL,
+    body        TEXT,
+    author      TEXT,
+    external_id TEXT,
+    task_id     INTEGER REFERENCES tasks(id),
+    created_at  TEXT NOT NULL
+);
+-- Timeline reads (WHERE review_id=? ORDER BY id) and the idempotent-append lookup
+-- (WHERE review_id=? AND external_id=?) both key on review_id first.
+CREATE INDEX IF NOT EXISTS idx_review_log_review ON review_log(review_id, external_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);

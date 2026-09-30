@@ -827,6 +827,92 @@ pub struct AttachDocumentArgs {
     pub actor: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateReviewArgs {
+    /// What is being reviewed: document | code | design | agent-session | task.
+    pub kind: String,
+    /// The source classifying where the artifact lives (e.g. board-document, github-pull-request,
+    /// code-amazon-change-request, url, agent-session, task). Metadata — the board doesn't fetch it.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// A pointer to the artifact within its source (a doc id, a PR url, a change-request id, ...).
+    #[serde(default)]
+    pub target_ref: Option<String>,
+    /// A short title for the review (usually the artifact's title).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Initial A2 lifecycle status; defaults to `open`. One of open / in_review /
+    /// changes_requested / approved / closed.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The agent that created/produced the review (defaults to this session's identity).
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// The reviewer(s) assigned. A single agent id in increment 1.
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// Arbitrary properties: producing agent id, a predecessor review id, tags, ...
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+    /// Optional external reference for idempotent ingest (a bridge). If a review is already linked
+    /// on (source, external_id) it's returned with `created:false` instead of a duplicate;
+    /// otherwise the review is created and the link recorded atomically (`created:true`).
+    #[serde(default)]
+    pub external_link: Option<core::ExternalRef>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetReviewArgs {
+    pub review_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListReviewsArgs {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetReviewStatusArgs {
+    pub review_id: i64,
+    /// The new A2 status: open / in_review / changes_requested / approved / closed. Re-applying
+    /// the current status is an idempotent no-op.
+    pub status: String,
+    /// The agent making the transition (defaults to this session's identity).
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// An optional note recorded on the state-change log entry (e.g. why changes were requested).
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AppendReviewLogArgs {
+    pub review_id: i64,
+    /// The entry type: submitted / revised / finding / finding_resolved / comment / state_change /
+    /// adversarial_review / decision. A `finding` is just an entry of this type (not a separate
+    /// collection); an actionable finding links the child task it spawned via `task_id`.
+    pub entry_type: String,
+    /// The entry text (the comment, the finding description, the decision rationale, ...).
+    #[serde(default)]
+    pub body: Option<String>,
+    /// The author of this entry (defaults to this session's identity).
+    #[serde(default)]
+    pub author: Option<String>,
+    /// For an actionable `finding`: the id of the child task tracking the fix.
+    #[serde(default)]
+    pub task_id: Option<i64>,
+    /// Optional external id for idempotent ingest (a bridge replaying an upstream comment/finding).
+    /// If an entry with this external_id already exists on the review it's returned with
+    /// `appended:false` instead of a duplicate.
+    #[serde(default)]
+    pub external_id: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1755,6 +1841,87 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    // --- Reviews (a typed review over an artifact, with an A2 lifecycle + an append-only log) ---
+    #[tool(
+        description = "Create a review over an artifact (a board document, a GitHub pull request, a design, an agent-session, or a task). `kind` classifies the artifact; `source`+`target_ref` point at it (metadata — the board never dereferences target_ref). Starts in the `open` lifecycle state unless you seed another (open / in_review / changes_requested / approved / closed). Records an initial `submitted` log entry and emits review.created. For a bridge, pass `external_link` for idempotent ingest: an artifact already linked on (source, external_id) is returned with `created:false` instead of a duplicate. Returns the review incl. its log and a `created` flag."
+    )]
+    async fn create_review(
+        &self,
+        Parameters(a): Parameters<CreateReviewArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let created_by = self.me_opt(s(&a.created_by));
+        core::create_review(
+            &self.pool,
+            &a.kind,
+            s(&a.source),
+            s(&a.target_ref),
+            s(&a.title),
+            s(&a.status),
+            created_by.as_deref(),
+            s(&a.assignee),
+            a.metadata.map(Value::Object),
+            a.external_link,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(description = "Get one review with its full append-only log (oldest-first). Findings are the log entries of type `finding`.")]
+    async fn get_review(
+        &self,
+        Parameters(a): Parameters<GetReviewArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_review(&self.pool, a.review_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "List reviews (newest-touched first), optionally filtered by status, kind, and/or assignee. Returns reviews without their logs — fetch one with get_review for the timeline.")]
+    async fn list_reviews(
+        &self,
+        Parameters(a): Parameters<ListReviewsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_reviews(&self.pool, s(&a.status), s(&a.kind), s(&a.assignee))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Transition a review's lifecycle status: open / in_review / changes_requested / approved / closed. Re-applying the current status is an idempotent no-op. Records a state_change log entry and emits review.status_changed, plus review.opened_for_review when entering in_review and review.terminal when entering approved/closed. approved and closed are the concluding states, but a reopen back to in_review/open is permitted."
+    )]
+    async fn set_review_status(
+        &self,
+        Parameters(a): Parameters<SetReviewStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::set_review_status(&self.pool, a.review_id, &a.status, actor.as_deref(), s(&a.note))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Append an entry to a review's log — a comment, a finding (with an optional child `task_id` tracking the fix), a finding_resolved, an adversarial_review note, a revision, or a decision. `entry_type` is one of submitted / revised / finding / finding_resolved / comment / state_change / adversarial_review / decision. Emits review.log_appended. For a bridge, pass `external_id` for idempotent ingest: an entry already logged under that external_id is returned with `appended:false` instead of a duplicate."
+    )]
+    async fn append_review_log(
+        &self,
+        Parameters(a): Parameters<AppendReviewLogArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let author = self.me_opt(s(&a.author));
+        core::append_review_log(
+            &self.pool,
+            a.review_id,
+            &a.entry_type,
+            s(&a.body),
+            author.as_deref(),
+            a.task_id,
+            s(&a.external_id),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 }
 
