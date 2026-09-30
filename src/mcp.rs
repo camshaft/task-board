@@ -497,6 +497,35 @@ pub struct BannedPhraseArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestSecretArgs {
+    /// The secret's name (e.g. the durable filename it will land as).
+    pub name: String,
+    /// Age recipient public keys (non-secret) the browser encrypts the value to. For a
+    /// host-bound secret include the recovery/user keys too, not just the host key.
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    /// Human instructions shown on the submit page — what the value is and where to obtain it.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Advisory placement hint for the fulfiller (the durable path + any wiring note).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// The agent to directly notify on submit + whose token gates the ciphertext pull.
+    #[serde(default)]
+    pub fulfiller: Option<String>,
+    /// The requesting agent (defaults to this session's identity).
+    #[serde(default)]
+    pub requested_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FulfillSecretArgs {
+    pub id: i64,
+    /// The fulfiller capability token returned when the request was created.
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetChannelPropsArgs {
     pub channel_id: i64,
     /// Key/value properties to merge into the channel's metadata — e.g. the outbound
@@ -1290,6 +1319,42 @@ impl Board {
         Parameters(a): Parameters<BannedPhraseArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::remove_banned_phrase(&self.pool, &a.phrase).await.map_err(err).and_then(ok)
+    }
+
+    // --- Secret requests (ephemeral secret-request broker) ---
+    #[tool(
+        description = "Request a named secret. The board is an ephemeral request broker, never a secret store: this files a request carrying the (non-secret) age recipient pubkeys + instructions and returns a single-use `submit_url` (relative to the board's base) you hand to an operator. The operator opens it, and the value is encrypted IN THE BROWSER to the recipients and posted as ciphertext — the board never sees plaintext. The named `fulfiller` is notified on submit and pulls the ciphertext once (with the returned `fulfiller_token`) to relocate it into durable storage, after which the request is deleted. Use for a token/credential a service needs, without handling the value yourself."
+    )]
+    async fn request_secret(
+        &self,
+        Parameters(a): Parameters<RequestSecretArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let requested_by = self.me_opt(s(&a.requested_by));
+        core::create_secret_request(
+            &self.pool,
+            &a.name,
+            &a.recipients,
+            s(&a.instructions),
+            s(&a.target),
+            s(&a.fulfiller),
+            requested_by.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(description = "List secret requests as metadata only (never the ciphertext or tokens) — for visibility into what's requested/submitted/awaiting fulfillment.")]
+    async fn list_secret_requests(&self) -> Result<CallToolResult, McpError> {
+        core::list_secret_requests(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Fulfill a secret request (fulfiller-token-gated): call this after you've pulled the ciphertext and relocated the secret into its durable home. The board then deletes the request row + its transient ciphertext. Idempotent.")]
+    async fn fulfill_secret(
+        &self,
+        Parameters(a): Parameters<FulfillSecretArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::fulfill_secret(&self.pool, a.id, &a.token).await.map_err(err).and_then(ok)
     }
 
     #[tool(

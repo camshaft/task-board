@@ -280,6 +280,32 @@ CREATE TABLE IF NOT EXISTS banned_phrases (
     created_by TEXT,
     created_at TEXT NOT NULL
 );
+-- SECRET REQUESTS: the board is an ephemeral secret-REQUEST broker, never a secret store. An agent
+-- files a named request carrying the (non-secret) age recipient pubkeys + human instructions; an
+-- operator opens a single-use capability link and submits the value ENCRYPTED IN THE BROWSER, so
+-- the board only ever holds ciphertext, and only transiently. A fulfiller pulls the ciphertext once
+-- (fulfiller-token-gated), relocates it to durable storage, then the row is deleted. `ciphertext`
+-- is NULL except in the submit->fulfill window; the row is hard-deleted on fulfill/cancel and a
+-- stuck submitted row is purged after `expires_at`. Nothing here is content-addressed or put on the
+-- firehose. `recipients` is a JSON array of age recipient pubkey strings; `target` is an advisory
+-- placement hint the fulfiller owns; `submit_used` enforces the single-use submit link.
+CREATE TABLE IF NOT EXISTS secret_requests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    requested_by    TEXT,
+    fulfiller       TEXT,
+    status          TEXT NOT NULL DEFAULT 'requested',
+    recipients      TEXT NOT NULL DEFAULT '[]',
+    instructions    TEXT,
+    target          TEXT,
+    submit_token    TEXT NOT NULL,
+    fulfiller_token TEXT NOT NULL,
+    submit_used     INTEGER NOT NULL DEFAULT 0,
+    ciphertext      TEXT,
+    created_at      TEXT NOT NULL,
+    submitted_at    TEXT,
+    expires_at      TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
