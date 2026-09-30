@@ -326,6 +326,13 @@ pub struct SetTaskPropsArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetTaskArgs {
     pub task_id: i64,
+    /// How many of the most-recent comments to inline (chronological within the slice). Omit for
+    /// the default recent slice; pass 0 for metadata-only (no comments); pass a larger number to
+    /// page in more history, or a negative number for the whole thread. The response always carries
+    /// `comment_count` (total) and `comments_truncated`, so you know when there is more to fetch.
+    /// Bounding this keeps a long, busy task from overflowing the read/context cap (#511).
+    #[serde(default)]
+    pub comments_limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1309,12 +1316,14 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Get one task with its comments and subscribers.")]
+    #[tool(description = "Get one task with its subscribers and a bounded slice of its most-recent comments. By default only the most recent comments are inlined (with comment_count + comments_truncated so you know when there is more) to stay under the read/context cap on a long thread; set comments_limit to page in more, 0 for metadata-only, or a negative number for the whole thread.")]
     async fn get_task(
         &self,
         Parameters(a): Parameters<GetTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_task(&self.pool, a.task_id).await.map_err(err).and_then(ok)
+        // Agent-facing default: bound to the most-recent slice unless the caller asks otherwise.
+        let limit = a.comments_limit.unwrap_or(core::DEFAULT_TASK_COMMENTS);
+        core::get_task_limited(&self.pool, a.task_id, Some(limit)).await.map_err(err).and_then(ok)
     }
 
     #[tool(description = "Soft-archive a task: it's hidden from list_tasks by default (still visible with include_archived: true), but its comments, subscribers, links, and history are preserved and it still resolves by id. Archiving is orthogonal to status — an archived task keeps whatever status it had. Reversible with restore_task. Use to retire settled or superseded tasks from the active board. Notifies the task's subscribers.")]
