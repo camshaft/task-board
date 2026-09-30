@@ -97,6 +97,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{task_id}/comments", post(comment_task))
         .route("/tasks/{task_id}/props", patch(set_task_props))
         .route("/tasks/{task_id}/move", post(move_task))
+        .route("/tasks/{task_id}/archive", post(archive_task))
+        .route("/tasks/{task_id}/restore", post(restore_task))
         .route("/tasks/{task_id}/mute", post(mute_task))
         .route("/tasks/{task_id}/unmute", post(unmute_task))
         .route("/subscriptions", post(subscribe).delete(unsubscribe))
@@ -185,13 +187,15 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") },
-    Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str", body: None },
+    Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/archive", summary: "Soft-archive a task: hide it from the default list_tasks view (still fetchable by id and with include_archived). Orthogonal to status; reversible with restore.", query: "", body: Some("ArchiveTaskBody") },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/restore", summary: "Restore an archived task so it reappears in the default list_tasks view.", query: "", body: Some("ArchiveTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/mute", summary: "Mute a task for an agent: detach them from its event fan-out (stop FYI notifications).", query: "", body: Some("MuteTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/unmute", summary: "Unmute a task for an agent (rejoin its fan-out).", query: "", body: Some("MuteTaskBody") },
     Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, document, or the whole board (board=true).", query: "", body: Some("SubscribeBody") },
@@ -259,6 +263,7 @@ fn body_schemas() -> Value {
         CreateTaskBody,
         UpdateTaskBody,
         MoveTaskBody,
+        ArchiveTaskBody,
         MuteTaskBody,
         CommentBody,
         SubscribeBody,
@@ -668,6 +673,8 @@ struct ListTasksQuery {
     meta_key: Option<String>,
     /// The value `meta_key` must equal (matched against `json_extract(metadata, '$.'||key)`).
     meta_value: Option<String>,
+    /// Include archived tasks. Archived tasks are hidden by default; set true to list them too.
+    include_archived: Option<bool>,
 }
 
 async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQuery>) -> ApiResult {
@@ -685,6 +692,7 @@ async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQue
             query.blocked_on_ref.as_deref(),
             query.meta_key.as_deref(),
             query.meta_value.as_deref(),
+            query.include_archived.unwrap_or(false),
         )
         .await?,
     ))
@@ -848,6 +856,32 @@ async fn move_task(
 ) -> ApiResult {
     Ok(Json(
         core::move_task(&st.pool, task_id, b.to_project_id, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ArchiveTaskBody {
+    /// The agent performing the archive/restore (for the event actor).
+    actor: Option<String>,
+}
+
+async fn archive_task(
+    State(st): State<AppState>,
+    Path(task_id): Path<i64>,
+    Json(b): Json<ArchiveTaskBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_task_archived(&st.pool, task_id, true, b.actor.as_deref()).await?,
+    ))
+}
+
+async fn restore_task(
+    State(st): State<AppState>,
+    Path(task_id): Path<i64>,
+    Json(b): Json<ArchiveTaskBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_task_archived(&st.pool, task_id, false, b.actor.as_deref()).await?,
     ))
 }
 
