@@ -108,6 +108,12 @@ export default function Layout() {
           Docs
         </Link>
         <Link
+          to="/reviews"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        >
+          Reviews
+        </Link>
+        <Link
           to="/wiki"
           className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
         >

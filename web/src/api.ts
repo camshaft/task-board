@@ -246,6 +246,43 @@ export interface Meta {
   agent_statuses: AgentStatus[]
 }
 
+// A review over an artifact (BUILD 6 / task 377). The A2 `status` drives the lifecycle header;
+// the append-only `log` (present on getReview, omitted from the list) is the timeline. `source`
+// names the artifact kind (board_doc / github_pr / code_amazon_cr / url / …) and `target_ref`
+// locates it — rendered per source. `vetted` is the adversarial-review gate.
+export type ReviewStatus = 'open' | 'in_review' | 'changes_requested' | 'approved' | 'closed'
+
+export interface ReviewLogEntry {
+  id: number
+  review_id: number
+  // submitted / revised / finding / finding_resolved / comment / state_change /
+  // adversarial_review / decision
+  entry_type: string
+  body: string | null
+  author: string | null
+  external_id: string | null
+  // For an actionable `finding`: the child task tracking the fix.
+  task_id: number | null
+  created_at: string
+}
+
+export interface Review {
+  id: number
+  kind: string
+  source: string | null
+  target_ref: string | null
+  status: ReviewStatus
+  title: string | null
+  vetted: boolean
+  created_by: string | null
+  assignee: string | null
+  metadata: Record<string, unknown>
+  created_at: string
+  updated_at: string
+  // Present on getReview (the timeline); omitted from listReviews.
+  log?: ReviewLogEntry[]
+}
+
 // A secret request as safe metadata (never the ciphertext or the capability tokens). The board
 // is an ephemeral request broker: this drives the submit page, which encrypts the value to
 // `recipients` in the browser and posts only ciphertext.
@@ -481,6 +518,17 @@ export const api = {
   // Resolve-or-create the private 1:1 DM channel for a pair (idempotent, order-independent).
   // Resolving is silent — no event fires until an actual message is posted.
   openDm: (b: { agent_a: string; agent_b: string }) => req<Channel>('POST', '/dms', b),
+
+  // Reviews (task 377). listReviews omits each review's log; getReview includes the full log.
+  listReviews: (q: { status?: string; kind?: string; assignee?: string } = {}) => {
+    const p = new URLSearchParams()
+    if (q.status) p.set('status', q.status)
+    if (q.kind) p.set('kind', q.kind)
+    if (q.assignee) p.set('assignee', q.assignee)
+    const qs = p.toString()
+    return req<{ reviews: Review[] }>('GET', `/reviews${qs ? `?${qs}` : ''}`).then((r) => r.reviews)
+  },
+  getReview: (id: number) => req<Review>('GET', `/reviews/${id}`),
 
   listExternalIdentities: (source?: string) =>
     req<ExternalIdentity[]>(

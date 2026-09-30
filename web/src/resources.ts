@@ -14,6 +14,7 @@ import {
   type EventRow,
   type ExternalIdentity,
   type Project,
+  type Review,
   type Task,
   type TaskSummary,
 } from './api'
@@ -44,6 +45,8 @@ const keys = {
   channel: (id: number) => `channel:${id}`,
   channelPosts: (id: number) => `channelPosts:${id}`,
   externalIdentities: 'externalIdentities',
+  reviews: 'reviews',
+  review: (id: number) => `review:${id}`,
 }
 
 export function useProjects() {
@@ -154,6 +157,15 @@ export function useDocumentComments(documentId: number) {
   return useResource<DocumentComment[]>(keys.documentComments(documentId), () =>
     api.getDocumentComments(documentId),
   )
+}
+
+// Reviews (task 377). The list omits each review's log; useReview fetches one with its timeline.
+export function useReviews() {
+  return useResource<Review[]>(keys.reviews, () => api.listReviews())
+}
+
+export function useReview(id: number) {
+  return useResource<Review>(keys.review(id), () => api.getReview(id))
 }
 
 /**

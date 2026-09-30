@@ -11,6 +11,8 @@ import Documents from './Documents.tsx'
 import DocumentView from './DocumentView.tsx'
 import Home from './Home.tsx'
 import Layout from './Layout.tsx'
+import ReviewView from './ReviewView.tsx'
+import Reviews from './Reviews.tsx'
 import Search from './Search.tsx'
 import SecretSubmit from './SecretSubmit.tsx'
 import Wiki from './Wiki.tsx'
@@ -37,6 +39,8 @@ createRoot(document.getElementById('root')!).render(
           <Route path="documents" element={<Documents />} />
           <Route path="documents/:documentId" element={<DocumentView />} />
           <Route path="wiki" element={<Wiki />} />
+          <Route path="reviews" element={<Reviews />} />
+          <Route path="reviews/:reviewId" element={<ReviewView />} />
           <Route path="agents" element={<Agents />} />
           <Route path="agents/:agentId" element={<AgentView />} />
           <Route path="channels" element={<Channels />} />
