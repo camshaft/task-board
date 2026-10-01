@@ -3221,6 +3221,11 @@ pub async fn list_awaiting(
                 "version_no": dr.try_get::<Option<i64>, _>("version_no")?,
                 "updated_at": dr.try_get::<Option<String>, _>("updated_at")?,
                 "path": dr.try_get::<Option<String>, _>("path")?,
+                // Defensive: carry an empty questions[] on a document row too, so a client that
+                // iterates/reduces row.questions without first switching on `kind` degrades
+                // gracefully instead of hitting undefined (task_876 -- the deploy-window where the
+                // doc-row-aware view has not shipped yet).
+                "questions": [],
             }));
         }
     }
