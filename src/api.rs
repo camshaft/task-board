@@ -392,8 +392,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "GET", path: "/api/comments/{comment_id}", summary: "Read one comment by id, with its type (plain/question/answer), parsed payload, lifecycle state, and reply_to/supersedes links.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task (kind yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list), routed to a principal; blocking by default. Returns the question comment.", query: "", body: Some("PoseQuestionBody") },
-    Endpoint { method: "POST", path: "/api/comments/{comment_id}/answer", summary: "Answer an open question. A framed answer (shape matching the kind) marks it answered; a text answer to a non-text kind is the out-of-frame escape (answered-outside-frame). Returns the answer comment.", query: "", body: Some("AnswerQuestionBody") },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task (kind yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list), routed to a principal; blocking by default. Optionally carry an inline response_schema (validated generically) plus a ui descriptor. Returns the question comment.", query: "", body: Some("PoseQuestionBody") },
+    Endpoint { method: "POST", path: "/api/comments/{comment_id}/answer", summary: "Answer an open question. For a kind-based question a framed answer (shape matching the kind) marks it answered and a text answer to a non-text kind is the out-of-frame escape; for a schema-driven question the value is validated against its response_schema generically. Returns the answer comment.", query: "", body: Some("AnswerQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/decline", summary: "Decline an open question with feedback (an explicit refusal, distinct from an out-of-frame answer).", query: "", body: Some("DeclineQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/supersede", summary: "Supersede an open question with a replacement (doc_33 A6): the old is kept immutable + linked, the new copies its payload with a new prompt. Asker-only.", query: "", body: Some("SupersedeQuestionBody") },
@@ -1217,6 +1217,10 @@ struct PoseQuestionBody {
     default: Option<Value>,
     /// Non-blocking only: wait this many seconds before proceeding on the default (requires default).
     wait_period_seconds: Option<i64>,
+    /// Optional inline JSON Schema the framed answer must satisfy (the schema-driven model); answers are then validated against it generically rather than by kind.
+    response_schema: Option<Value>,
+    /// Optional UI descriptor stored verbatim (element name, props, element-schema CID); resolved by the client, not the board.
+    ui: Option<Value>,
     actor: Option<String>,
 }
 
@@ -1226,7 +1230,7 @@ async fn pose_question(
     Json(b): Json<PoseQuestionBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::pose_question(
+        core::pose_question_full(
             &st.pool,
             task_id,
             &b.kind,
@@ -1236,6 +1240,8 @@ async fn pose_question(
             b.blocking.unwrap_or(true),
             b.default,
             b.wait_period_seconds,
+            b.response_schema,
+            b.ui,
             b.actor.as_deref(),
         )
         .await?,

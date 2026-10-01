@@ -3215,6 +3215,26 @@ fn validate_answer_value(kind: &str, value: &Value, options: &Value) -> anyhow::
     Ok(())
 }
 
+/// Compile an inline JSON Schema, erroring if it is not itself a valid schema. The schema-driven
+/// answer model (doc_33 v15) lets a question carry its own response schema so the backend validates
+/// answers generically -- no backend change is needed to add a new question type.
+fn compile_response_schema(schema: &Value) -> anyhow::Result<jsonschema::Validator> {
+    jsonschema::validator_for(schema).map_err(|e| anyhow::anyhow!("not a valid JSON Schema: {e}"))
+}
+
+/// Validate a value against an inline JSON Schema, folding any schema violations into one error.
+fn validate_value_against_schema(schema: &Value, value: &Value) -> anyhow::Result<()> {
+    let validator = compile_response_schema(schema)?;
+    let violations: Vec<String> = validator
+        .iter_errors(value)
+        .map(|e| e.to_string())
+        .collect();
+    if !violations.is_empty() {
+        anyhow::bail!("{}", violations.join("; "));
+    }
+    Ok(())
+}
+
 /// Classify a principal id as a team / agent / person, erroring if it is none. "operator" is the
 /// seeded team, so it classifies as "team".
 async fn principal_kind(
@@ -3319,10 +3339,13 @@ pub async fn recompute_question_block(
 
 /// Pose a question as a type=question comment on a task (doc_33 A4). Carries the kind, options,
 /// routed-to principal, blocking flag, and (non-blocking only) an optional default + wait period.
-/// A blocking question contributes to the task's derived question-block until it resolves. Emits
-/// question.posed to the routed-to principal's agents. Returns the question comment.
+/// Optionally carries an inline `response_schema` (a JSON Schema the framed answer must satisfy --
+/// the schema-driven model of doc_33 v15) and a pass-through `ui` descriptor (element + props +
+/// element-schema CID, stored verbatim and resolved by the client, not here). A blocking question
+/// contributes to the task's derived question-block until it resolves. Emits question.posed to the
+/// routed-to principal's agents. Returns the question comment.
 #[allow(clippy::too_many_arguments)]
-pub async fn pose_question(
+pub async fn pose_question_full(
     pool: &Pool,
     task_id: i64,
     kind: &str,
@@ -3332,6 +3355,8 @@ pub async fn pose_question(
     blocking: bool,
     default: Option<Value>,
     wait_period_seconds: Option<i64>,
+    response_schema: Option<Value>,
+    ui: Option<Value>,
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
     check_bare_refs(prompt)?;
@@ -3368,6 +3393,17 @@ pub async fn pose_question(
             anyhow::bail!("`wait_period_seconds` requires a `default` (the answer the asker proceeds on after waiting)");
         }
     }
+    if let Some(schema) = response_schema.as_ref() {
+        compile_response_schema(schema)
+            .map_err(|e| anyhow::anyhow!("invalid `response_schema`: {e}"))?;
+    }
+    if let Some(u) = ui.as_ref() {
+        if !u.is_object() {
+            anyhow::bail!(
+                "`ui` must be a JSON object (an element descriptor: element name, props, element-schema CID)"
+            );
+        }
+    }
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
@@ -3381,8 +3417,12 @@ pub async fn pose_question(
     let project_id: i64 = task_row.try_get("project_id")?;
     let routed_kind = principal_kind(&mut tx, routed_to).await?;
     if let Some(ref d) = default {
-        validate_answer_value(kind, d, &options)
-            .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?;
+        match response_schema.as_ref() {
+            Some(schema) => validate_value_against_schema(schema, d)
+                .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?,
+            None => validate_answer_value(kind, d, &options)
+                .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?,
+        }
     }
     let mut payload = Map::new();
     payload.insert("kind".into(), json!(kind));
@@ -3396,6 +3436,12 @@ pub async fn pose_question(
     }
     if let Some(w) = wait_period_seconds {
         payload.insert("wait_period_seconds".into(), json!(w));
+    }
+    if let Some(schema) = response_schema {
+        payload.insert("response_schema".into(), schema);
+    }
+    if let Some(u) = ui {
+        payload.insert("ui".into(), u);
     }
     let payload_str = Value::Object(payload).to_string();
     let cid: i64 = sqlx::query(
@@ -3427,6 +3473,39 @@ pub async fn pose_question(
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     get_comment(pool, cid).await
+}
+
+/// Back-compat 10-arg `pose_question` for the kind-only path (no inline response schema / UI
+/// descriptor). Tests pose kind-based questions through this; MCP/REST call `pose_question_full`.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub async fn pose_question(
+    pool: &Pool,
+    task_id: i64,
+    kind: &str,
+    prompt: &str,
+    options: Option<Value>,
+    routed_to: &str,
+    blocking: bool,
+    default: Option<Value>,
+    wait_period_seconds: Option<i64>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    pose_question_full(
+        pool,
+        task_id,
+        kind,
+        prompt,
+        options,
+        routed_to,
+        blocking,
+        default,
+        wait_period_seconds,
+        None,
+        None,
+        actor,
+    )
+    .await
 }
 
 /// Load an OPEN question comment within a tx, returning (task_id, author, payload). Errors if the
@@ -3506,12 +3585,6 @@ pub async fn answer_question(
     value: Value,
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
-    if !ANSWER_SHAPES.contains(&shape) {
-        anyhow::bail!(
-            "unknown answer shape '{shape}' (expected one of: {})",
-            ANSWER_SHAPES.join(", ")
-        );
-    }
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
@@ -3522,19 +3595,48 @@ pub async fn answer_question(
         .get("blocking")
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
-    let expected = kind_expected_shape(kind);
-    let (new_state, out_of_frame) = if shape == expected {
-        validate_answer_value(kind, &value, &options)?;
-        ("answered", false)
-    } else if shape == "text" {
-        if value.as_str().map(|s| s.trim().is_empty()).unwrap_or(true) {
-            anyhow::bail!("an out-of-frame text answer must be non-empty text");
+    let (new_state, out_of_frame) = if let Some(schema) = payload.get("response_schema") {
+        // Schema-driven (doc_33 v15): the submitted value is validated against the question's own
+        // inline response schema. A `text` shape is the free-text escape -- but free text that
+        // still satisfies the frame is recorded as a framed answer, and any non-`text` shape MUST
+        // satisfy the schema (an invalid framed answer is never silently accepted out of frame).
+        if shape == "text" {
+            if value.as_str().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                anyhow::bail!("an out-of-frame text answer must be non-empty text");
+            }
+            if validate_value_against_schema(schema, &value).is_ok() {
+                ("answered", false)
+            } else {
+                ("answered_outside_frame", true)
+            }
+        } else {
+            validate_value_against_schema(schema, &value).map_err(|e| {
+                anyhow::anyhow!("answer does not satisfy the question's response schema: {e}")
+            })?;
+            ("answered", false)
         }
-        ("answered_outside_frame", true)
     } else {
-        anyhow::bail!(
-            "answer shape '{shape}' does not match question kind '{kind}' (expected '{expected}'); use shape=text for an out-of-frame answer"
-        );
+        // Legacy kind-based path.
+        if !ANSWER_SHAPES.contains(&shape) {
+            anyhow::bail!(
+                "unknown answer shape '{shape}' (expected one of: {})",
+                ANSWER_SHAPES.join(", ")
+            );
+        }
+        let expected = kind_expected_shape(kind);
+        if shape == expected {
+            validate_answer_value(kind, &value, &options)?;
+            ("answered", false)
+        } else if shape == "text" {
+            if value.as_str().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                anyhow::bail!("an out-of-frame text answer must be non-empty text");
+            }
+            ("answered_outside_frame", true)
+        } else {
+            anyhow::bail!(
+                "answer shape '{shape}' does not match question kind '{kind}' (expected '{expected}'); use shape=text for an out-of-frame answer"
+            );
+        }
     };
     debug_assert!(
         QUESTION_STATES.contains(&new_state),
@@ -9452,6 +9554,203 @@ mod tests {
 
     /// Slice 2 (task_628): the question lifecycle ops -- pose/answer/decline/cancel with validation,
     /// the open-only guard, the out-of-frame text escape, and the blocking-question terminal path.
+    #[tokio::test]
+    async fn schema_driven_questions_validate_generically() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "rev", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("asker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // An invalid response_schema is rejected at pose time.
+        assert!(
+            pose_question_full(
+                &pool,
+                tid,
+                "fill_in_the_blank",
+                "age?",
+                None,
+                "rev",
+                true,
+                None,
+                None,
+                Some(json!({"type": 123})),
+                None,
+                Some("asker"),
+            )
+            .await
+            .is_err(),
+            "a non-schema response_schema is rejected"
+        );
+        // A ui descriptor must be a JSON object.
+        assert!(
+            pose_question_full(
+                &pool,
+                tid,
+                "fill_in_the_blank",
+                "age?",
+                None,
+                "rev",
+                true,
+                None,
+                None,
+                Some(json!({"type": "string"})),
+                Some(json!("not-an-object")),
+                Some("asker"),
+            )
+            .await
+            .is_err(),
+            "a non-object ui descriptor is rejected"
+        );
+
+        // Object response schema: a framed (non-text) answer must satisfy it.
+        let obj_schema = json!({
+            "type": "object",
+            "required": ["approved"],
+            "properties": {"approved": {"type": "boolean"}},
+            "additionalProperties": false
+        });
+        let q = pose_question_full(
+            &pool,
+            tid,
+            "fill_in_the_blank",
+            "approve?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some(obj_schema.clone()),
+            Some(json!({"element": "approval", "element_schema_cid": "bafyxyz"})),
+            Some("asker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+        assert_eq!(q["payload"]["response_schema"], obj_schema);
+        assert_eq!(q["payload"]["ui"]["element"], json!("approval"));
+
+        // A framed answer that violates the schema is rejected (never silently out-of-frame).
+        assert!(answer_question(
+            &pool,
+            qid,
+            "choice",
+            json!({"approved": "yes"}),
+            Some("rev")
+        )
+        .await
+        .is_err());
+        // A valid framed answer resolves it.
+        let a =
+            answer_question(&pool, qid, "choice", json!({"approved": true}), Some("rev")).await?;
+        assert_eq!(a["type"], json!("answer"));
+        assert_eq!(get_comment(&pool, qid).await?["state"], json!("answered"));
+
+        // A free-text answer that cannot satisfy an object frame is the out-of-frame escape.
+        let q2 = pose_question_full(
+            &pool,
+            tid,
+            "fill_in_the_blank",
+            "approve 2?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some(obj_schema.clone()),
+            None,
+            Some("asker"),
+        )
+        .await?;
+        let q2id = q2["id"].as_i64().unwrap();
+        let a2 = answer_question(
+            &pool,
+            q2id,
+            "text",
+            json!("cannot decide, escalating"),
+            Some("rev"),
+        )
+        .await?;
+        assert_eq!(a2["payload"]["shape"], json!("text"));
+        assert_eq!(
+            get_comment(&pool, q2id).await?["state"],
+            json!("answered_outside_frame")
+        );
+
+        // String response schema: a text answer that satisfies it is framed, not the escape.
+        let q3 = pose_question_full(
+            &pool,
+            tid,
+            "fill_in_the_blank",
+            "secret value?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some(json!({"type": "string", "minLength": 1})),
+            None,
+            Some("asker"),
+        )
+        .await?;
+        let q3id = q3["id"].as_i64().unwrap();
+        let a3 = answer_question(&pool, q3id, "text", json!("age1xyz"), Some("rev")).await?;
+        assert_eq!(a3["type"], json!("answer"));
+        assert_eq!(get_comment(&pool, q3id).await?["state"], json!("answered"));
+
+        // A non-blocking schema-driven question validates its default against the schema.
+        assert!(
+            pose_question_full(
+                &pool,
+                tid,
+                "fill_in_the_blank",
+                "pick?",
+                None,
+                "rev",
+                false,
+                Some(json!({"approved": "nope"})),
+                None,
+                Some(obj_schema.clone()),
+                None,
+                Some("asker"),
+            )
+            .await
+            .is_err(),
+            "a default that violates the response_schema is rejected"
+        );
+        let q4 = pose_question_full(
+            &pool,
+            tid,
+            "fill_in_the_blank",
+            "pick ok?",
+            None,
+            "rev",
+            false,
+            Some(json!({"approved": false})),
+            None,
+            Some(obj_schema.clone()),
+            None,
+            Some("asker"),
+        )
+        .await?;
+        assert_eq!(q4["payload"]["default"]["approved"], json!(false));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn question_ops_lifecycle() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;

@@ -40,6 +40,7 @@ base64 = "0.22"
 listenfd = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+jsonschema = "0.58.3"
 
 [dev-dependencies]
 tempfile = "3"
