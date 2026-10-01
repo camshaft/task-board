@@ -6542,9 +6542,57 @@ fn count_prose_words(line: &str) -> i64 {
         .count() as i64
 }
 
+/// The doc_7 A8 main-body prose word count: whitespace-token prose from the top of the body down to
+/// the first "Appendix" heading, excluding fenced code and heading/list markers, counting link text
+/// not the URL (see [`count_prose_words`]). This is the SINGLE source for both the A8 body-length
+/// warn in [`grade_document`] and the count surfaced on document reads + the grade response
+/// (task_933), so the number an author/reviewer sees never diverges from the number the gate uses.
+pub fn main_body_word_count(content: &str) -> i64 {
+    let lines: Vec<&str> = content.lines().collect();
+    // Fenced-code map (same rule as grade_document): a fence line, or a line inside a block, is excluded.
+    let mut in_code = vec![false; lines.len()];
+    let mut fenced = false;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code[i] = true;
+            fenced = !fenced;
+        } else {
+            in_code[i] = fenced;
+        }
+    }
+    // The main body ends at the first "Appendix" heading (any level), skipping fenced code.
+    let mut bound = usize::MAX;
+    for (i, l) in lines.iter().enumerate() {
+        if in_code[i] {
+            continue;
+        }
+        let t = l.trim_start();
+        if t.starts_with('#') {
+            let level = t.chars().take_while(|&c| c == '#').count();
+            if t[level..].trim().eq_ignore_ascii_case("Appendix") {
+                bound = i + 1;
+                break;
+            }
+        }
+    }
+    let mut words = 0i64;
+    for (i, l) in lines.iter().enumerate() {
+        if i + 1 >= bound {
+            break;
+        }
+        if in_code[i] {
+            continue;
+        }
+        words += count_prose_words(l);
+    }
+    words
+}
+
 /// Grade a design document against the mechanical doc_7 A8 rubric. `title` is graded separately from
 /// `content` (the Document title is its own field, A1). Returns
-/// `{clean, has_hard_fail, findings:[{check, severity, line, message}]}`.
+/// `{clean, has_hard_fail, findings:[{check, severity, line, message}], main_body_word_count,
+/// main_body_word_budget}`.
 pub async fn grade_document(
     pool: &Pool,
     content: &str,
@@ -6789,17 +6837,10 @@ pub async fn grade_document(
     }
 
     // 8. body-length (warn): prose words from the top to the first Appendix heading, over budget.
+    // Computed via the shared main_body_word_count so the warn, the exposed count, and the UI badge
+    // are one number (task_933).
     let budget = body_length_budget_words.unwrap_or(DEFAULT_BODY_BUDGET_WORDS);
-    let mut words = 0i64;
-    for (i, l) in lines.iter().enumerate() {
-        if i + 1 >= bound {
-            break;
-        }
-        if in_code[i] {
-            continue;
-        }
-        words += count_prose_words(l);
-    }
+    let words = main_body_word_count(content);
     if words > budget {
         findings.push(gd_finding(
             "body-length",
@@ -6814,6 +6855,11 @@ pub async fn grade_document(
         "clean": findings.is_empty(),
         "has_hard_fail": has_hard_fail,
         "findings": findings,
+        // Surfaced so an author/reviewer sees the A8 main-body count against the budget without
+        // hand-counting, even when it is UNDER budget (no body-length finding) -- task_933. Same
+        // `words` the body-length warn uses, so the shown number matches the gate.
+        "main_body_word_count": words,
+        "main_body_word_budget": budget,
     }))
 }
 
@@ -7980,6 +8026,12 @@ async fn document_content_value(
         let text = String::from_utf8(bytes).map_err(|_| {
             anyhow::anyhow!("document {document_id} v{vn} content is not valid UTF-8")
         })?;
+        // Surface the doc_7 A8 main-body word count against the budget so the doc view can show it
+        // without hand-counting (task_933). Same `main_body_word_count` the conformance gate uses, so
+        // the shown number matches the gate; computed for any text doc (the UI shows it for design
+        // docs). Harmless for a doc with no Appendix -- it counts the whole body.
+        out["main_body_word_count"] = json!(main_body_word_count(&text));
+        out["main_body_word_budget"] = json!(DEFAULT_BODY_BUDGET_WORDS);
         out["content"] = json!(text);
     } else {
         out["content"] = Value::Null;
@@ -20283,7 +20335,31 @@ mod tests {
                 f["check"].is_string() && f["severity"].is_string() && f["message"].is_string()
             );
         }
+
+        // The A8 main-body count is exposed on the response (always, even when under budget) and
+        // equals the shared counter -- one source for the badge and the gate (task_933).
+        assert_eq!(
+            g["main_body_word_count"].as_i64(),
+            Some(main_body_word_count(clean_doc)),
+            "grade response exposes the A8 main-body count: {g}"
+        );
+        assert_eq!(g["main_body_word_budget"], json!(DEFAULT_BODY_BUDGET_WORDS));
         Ok(())
+    }
+
+    /// main_body_word_count counts main-body prose only: it excludes fenced code and everything from
+    /// the first `## Appendix` heading onward, and counts link text not URLs (task_933 / doc_7 A8).
+    #[test]
+    fn main_body_word_count_excludes_code_and_appendix() {
+        let doc = "# Title\n\
+            \none two three\n\
+            \n```\nignored code words here\n```\n\
+            \nsee [the docs](http://example.com/x) now\n\
+            \n## Appendix\n\
+            \nappendix words are not counted here at all\n";
+        // Body prose: "Title"(1) + "one two three"(3) + "see the docs now"(4, URL dropped,
+        // link text kept) = 8. Code block + Appendix excluded.
+        assert_eq!(main_body_word_count(doc), 8);
     }
 
     /// check_cid_content (task 564) gates a publish-by-CID by fetching + scanning the bytes, but
