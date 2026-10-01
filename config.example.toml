@@ -31,3 +31,17 @@ mcp_allowed_hosts = []
 # (the default), the board stays CID-only: callers must supply a bare CID. Typically the
 # loopback Kubo API on the host running the board.
 #   ipfs_api_url = "http://127.0.0.1:5001"
+
+# Authenticated DB-snapshot download endpoint (GET /api/admin/db-snapshot). Off by default: the
+# endpoint 404s unless db_snapshot_enabled = true. When on, it serves a point-in-time-CONSISTENT
+# copy of the SQLite database (produced via VACUUM INTO, so never a torn mid-write byte stream)
+# behind HTTP Basic auth -- the daemon owns db_path, so an authed GET is the extraction primitive
+# for host migration + DR without stopping the daemon or a cross-user root file-copy.
+#
+# SECURITY: the whole fleet's data lives in that file (including secret-broker records), so this is
+# a full-exfil surface. Keep it loopback/LAN-bound and OFF any public tunnel at the proxy, and
+# deliver db_snapshot_password via your secret manager (agenix), never in a plaintext role file.
+# Both the user and password are required when enabled (otherwise the endpoint returns 503).
+#   db_snapshot_enabled = true
+#   db_snapshot_user = "ops"
+#   db_snapshot_password = "set-via-agenix"
