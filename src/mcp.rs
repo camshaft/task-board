@@ -1159,6 +1159,26 @@ pub struct CancelQuestionArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SupersedeQuestionArgs {
+    pub comment_id: i64,
+    /// The prompt for the replacement question (the old one is kept immutable + linked).
+    pub new_prompt: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListTasksBlockingMeArgs {
+    /// The principal to view for (defaults to you). A team-routed question surfaces for its members.
+    #[serde(default)]
+    pub viewer: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub include_archived: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DocumentActorArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -2750,6 +2770,47 @@ impl Board {
             &self.pool,
             a.comment_id,
             self.me_opt(s(&a.actor)).as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Supersede an open question you posed (doc_33 A6): correct or restate it with a replacement. The old question is kept immutable (state -> superseded, linked via superseded_by); the new one is a fresh open question copying the old payload (routing/kind/options/blocking/default) with the new prompt. Only the asker may supersede. A blocking question stays blocked across the swap. Returns the new question comment; notifies the routed-to principal."
+    )]
+    async fn supersede_question(
+        &self,
+        Parameters(a): Parameters<SupersedeQuestionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::supersede_question(
+            &self.pool,
+            a.comment_id,
+            &a.new_prompt,
+            self.me_opt(s(&a.actor)).as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "List tasks with an open BLOCKING question routed to you (or to `viewer`) -- the question-based 'waiting on me' view (doc_33 A5). A question routed to a team you belong to surfaces here too. Complements the scalar blocked_on 'waiting on me' from list_tasks; union the two for a full picture."
+    )]
+    async fn list_tasks_blocking_me(
+        &self,
+        Parameters(a): Parameters<ListTasksBlockingMeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(viewer) = self.me_opt(a.viewer.as_deref()) else {
+            return Err(err(anyhow::anyhow!(
+                "no viewer: pass `viewer` or call with a session identity"
+            )));
+        };
+        core::list_tasks_blocking_me(
+            &self.pool,
+            &viewer,
+            a.project_id,
+            a.include_archived.unwrap_or(false),
         )
         .await
         .map_err(err)

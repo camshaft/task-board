@@ -2935,9 +2935,6 @@ async fn open_blocking_questions_json(pool: &Pool, task_id: i64) -> anyhow::Resu
 /// team that (transitively) has the viewer as a member. The inverse of `resolve_principal_ids`
 /// (which expands a principal DOWNWARD into its members) -- used to match a question's `routed_to`
 /// (which may name a team) against a concrete viewer. Cycle-guarded upward walk over `team_members`.
-// allow(dead_code): only reachable through list_tasks_blocking_me, which is itself landed ahead of
-// its mcp/api wiring (see that fn). Drop both allows when the "waiting on me" tool/endpoint lands.
-#[allow(dead_code)]
 async fn principals_routing_to(pool: &Pool, viewer: &str) -> anyhow::Result<BTreeSet<String>> {
     let mut out: BTreeSet<String> = BTreeSet::from([viewer.to_string()]);
     let mut visited: BTreeSet<String> = BTreeSet::new();
@@ -2967,9 +2964,6 @@ async fn principals_routing_to(pool: &Pool, viewer: &str) -> anyhow::Result<BTre
 /// works for any principal (agent-to-agent included), not just the operator. Honors `project_id` +
 /// `include_archived` and returns the same row shape (+ monitor_exempt / assignee reachability) as
 /// `list_tasks`, so a caller can union this array with a scalar-blocked `list_tasks` result directly.
-// allow(dead_code): landed ahead of its caller (same pattern as resolve_principal_ids). v-task-board
-// wires it into an MCP tool + REST endpoint as a shared append-point; drop this allow when wired.
-#[allow(dead_code)]
 pub async fn list_tasks_blocking_me(
     pool: &Pool,
     viewer: &str,
@@ -3223,11 +3217,10 @@ pub async fn open_blocking_questions(
     tx: &mut Transaction<'_, Sqlite>,
     task_id: i64,
 ) -> anyhow::Result<Vec<(i64, String)>> {
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT id, COALESCE(json_extract(payload,'$.routed_to'),'') AS routed_to FROM comments \
-         WHERE task_id=? AND type='question' AND state='open' \
-           AND json_extract(payload,'$.blocking') IN (1,'true',true) ORDER BY id",
-    )
+         WHERE task_id=? AND {OPEN_BLOCKING_QUESTION} ORDER BY id"
+    ))
     .bind(task_id)
     .fetch_all(&mut **tx)
     .await?;
@@ -3680,10 +3673,6 @@ pub async fn cancel_question(
 /// replacement -- the terminal recompute sees the fresh open blocking question and emits no spurious
 /// unblock. Best-effort notifies the routed-to agents (one event carries both ids). Returns the NEW
 /// question comment.
-// allow(dead_code): landed ahead of its mcp/api wiring (same pattern as the other ops before slice
-// 2 wired them). v-task-board wires supersede_question into an MCP tool + REST endpoint (the one
-// shared append-point); drop this allow when wired.
-#[allow(dead_code)]
 pub async fn supersede_question(
     pool: &Pool,
     comment_id: i64,
