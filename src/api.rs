@@ -265,6 +265,10 @@ pub fn router(state: AppState) -> Router {
             post(submit_for_review),
         )
         .route(
+            "/documents/{document_id}/submit-to-operator-review",
+            post(submit_to_operator_review),
+        )
+        .route(
             "/documents/{document_id}/request-changes",
             post(request_changes),
         )
@@ -445,6 +449,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents/{document_id}/comments", summary: "Comment on a document, optionally region-anchored to a version.", query: "", body: Some("CommentDocumentBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/comments/{comment_id}/resolve", summary: "Mark a document comment resolved.", query: "", body: Some("ResolveCommentBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-review", summary: "Submit a document for review (status -> in_review).", query: "", body: Some("DocumentActorBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-to-operator-review", summary: "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator sees it. Rejected unless a template attestation (template_followed or template_waiver_reason) is given AND a design-conformance review has run against the current version with zero open findings.", query: "", body: Some("SubmitToOperatorReviewBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/request-changes", summary: "Request changes on a document (status -> changes_requested).", query: "", body: Some("RequestChangesBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/approve", summary: "Approve a document (stamps the current version, status -> approved).", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/attach", summary: "Attach a document to a task (notifies both sides).", query: "", body: Some("AttachDocumentBody") },
@@ -488,6 +493,7 @@ fn body_schemas() -> Value {
         CommentDocumentBody,
         ResolveCommentBody,
         DocumentActorBody,
+        SubmitToOperatorReviewBody,
         RequestChangesBody,
         AttachDocumentBody,
         IpfsAddBody,
@@ -2544,6 +2550,32 @@ async fn submit_for_review(
 ) -> ApiResult {
     Ok(Json(
         core::submit_for_review(&st.pool, document_id, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SubmitToOperatorReviewBody {
+    actor: Option<String>,
+    /// The doc template you read and followed. Required unless `template_waiver_reason` is given.
+    template_followed: Option<String>,
+    /// If no template applies, a non-empty reason why. Required only when `template_followed` is absent.
+    template_waiver_reason: Option<String>,
+}
+
+async fn submit_to_operator_review(
+    State(st): State<AppState>,
+    Path(DocRef(document_id)): Path<DocRef>,
+    Json(b): Json<SubmitToOperatorReviewBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::submit_to_operator_review(
+            &st.pool,
+            document_id,
+            b.actor.as_deref(),
+            b.template_followed.as_deref(),
+            b.template_waiver_reason.as_deref(),
+        )
+        .await?,
     ))
 }
 

@@ -6048,6 +6048,166 @@ pub async fn approve_document(
     .await
 }
 
+/// Submit a document into the operator's review queue (status -> `operator_review`). This is the
+/// single gated chokepoint before the operator (cameron) first sees a doc (task_623, operator
+/// directive doc_32 comment 97): the submit is REJECTED unless BOTH hold --
+///   1. Template attestation (operator requirement, task_622): the author names the doc template
+///      they read and followed (`template_followed`, e.g. the design-doc template) OR gives a
+///      non-empty `template_waiver_reason`. The STRENGTH of a waiver is a judgment call left to the
+///      conformance reviewer, not checked mechanically here.
+///   2. Design-conformance pass: a conformance review over this doc (`source='board_doc'`,
+///      `target_ref=<id>`) has (a) a terminal `adversarial_review` summary entry whose JSON body
+///      records `reviewed_version` == the doc's CURRENT version_no -- version-pinning forces a fresh
+///      review after any edit, so a stale pass can't satisfy the gate -- and (b) zero OPEN
+///      actionable findings: no `finding` log entry whose linked child task is not done/cancelled
+///      (board-pm: the child-task status is the source of truth, the conformance review stays
+///      append-only and is never flipped).
+///
+/// Fail-closed: any missing or mismatched signal rejects the transition with an actionable message,
+/// so a doc can never reach the operator un-reviewed. The template attestation is stamped into the
+/// doc metadata (durable) and carried on the emitted event. Emits
+/// `document.submitted_for_operator_review` to the doc's subscribers.
+pub async fn submit_to_operator_review(
+    pool: &Pool,
+    document_id: i64,
+    actor: Option<&str>,
+    template_followed: Option<&str>,
+    template_waiver_reason: Option<&str>,
+) -> anyhow::Result<Value> {
+    // 1. Template attestation: one of the two must be non-empty after trimming.
+    let template_followed = template_followed.map(str::trim).filter(|s| !s.is_empty());
+    let template_waiver_reason = template_waiver_reason
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if template_followed.is_none() && template_waiver_reason.is_none() {
+        anyhow::bail!(
+            "submit_to_operator_review requires `template_followed` (the doc template you read and followed, e.g. the design-doc template) or, when none applies, a non-empty `template_waiver_reason`"
+        );
+    }
+
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+
+    let Some(row) = sqlx::query(
+        "SELECT project_id, title, archived_at, current_version_id, metadata FROM documents WHERE id=?",
+    )
+    .bind(document_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let project_id: Option<i64> = row.try_get("project_id")?;
+    let title: Option<String> = row.try_get("title")?;
+    let archived_at: Option<String> = row.try_get("archived_at")?;
+    let current_version_id: Option<i64> = row.try_get("current_version_id")?;
+    let meta_str: String = row.try_get("metadata")?;
+    if archived_at.is_some() {
+        anyhow::bail!(
+            "document {document_id} is archived; restore it before submitting for operator review"
+        );
+    }
+    let Some(cvid) = current_version_id else {
+        anyhow::bail!("document {document_id} has no published version to review");
+    };
+    let current_version_no: i64 =
+        sqlx::query("SELECT version_no FROM document_versions WHERE id=?")
+            .bind(cvid)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("version_no")?;
+
+    // 2a. Conformance ran against the CURRENT version: a terminal `adversarial_review` summary entry
+    // on a review over this doc whose JSON body records `reviewed_version` == current_version_no.
+    let target_ref = document_id.to_string();
+    let summaries = sqlx::query(
+        "SELECT rl.body AS body FROM review_log rl JOIN reviews r ON r.id = rl.review_id \
+         WHERE r.source='board_doc' AND r.target_ref=? AND rl.entry_type='adversarial_review'",
+    )
+    .bind(&target_ref)
+    .fetch_all(&mut *tx)
+    .await?;
+    let ran_current = summaries.iter().any(|s| {
+        s.try_get::<Option<String>, _>("body")
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+            .and_then(|v| v.get("reviewed_version").and_then(|r| r.as_i64()))
+            .is_some_and(|rev| rev == current_version_no)
+    });
+    if !ran_current {
+        anyhow::bail!(
+            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review summary entry records reviewed_version={current_version_no}. A conformance review must run (or re-run) on the current version before the doc can reach the operator"
+        );
+    }
+
+    // 2b. Zero OPEN actionable findings: a `finding` log entry links a child task; the finding is
+    // OPEN while that task is not done/cancelled (the child-task status is the source of truth, so
+    // the append-only conformance review is never flipped).
+    let open_findings: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM review_log rl \
+         JOIN reviews r ON r.id = rl.review_id \
+         JOIN tasks t ON t.id = rl.task_id \
+         WHERE r.source='board_doc' AND r.target_ref=? AND rl.entry_type='finding' \
+           AND rl.task_id IS NOT NULL AND t.status NOT IN ('done','cancelled','canceled')",
+    )
+    .bind(&target_ref)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("n")?;
+    if open_findings > 0 {
+        anyhow::bail!(
+            "document {document_id} has {open_findings} open conformance finding(s): close every finding's child task (done/cancelled) before submitting for operator review"
+        );
+    }
+
+    // Passed. Stamp the template attestation into the doc metadata (durable) and advance status.
+    let mut meta: Value = serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({}));
+    if let Value::Object(ref mut m) = meta {
+        m.insert("template_followed".into(), json!(template_followed));
+        m.insert(
+            "template_waiver_reason".into(),
+            json!(template_waiver_reason),
+        );
+        m.insert("operator_review_submitted_at".into(), json!(ts));
+    }
+    sqlx::query(
+        "UPDATE documents SET status='operator_review', metadata=?, updated_at=? WHERE id=?",
+    )
+    .bind(meta.to_string())
+    .bind(&ts)
+    .bind(document_id)
+    .execute(&mut *tx)
+    .await?;
+
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.submitted_for_operator_review",
+        actor,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        json!({
+            "document_id": document_id,
+            "title": title,
+            "status": "operator_review",
+            "template_followed": template_followed,
+            "template_waiver_reason": template_waiver_reason,
+        }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = document_json(&mut tx, document_id)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
 /// Soft-archive (retire) a document, or restore it. Archiving stamps `archived_at` so the doc is
 /// hidden from list_documents / list_wiki by default, but keeps its versions, comments, links, and
 /// the append-only event log intact — reversible, and consistent with the board's audit model
@@ -14004,6 +14164,185 @@ mod tests {
         assert!(request_stand_down(&pool, "ghost", Some("x"), None)
             .await
             .is_err());
+        Ok(())
+    }
+
+    /// submit_to_operator_review is the single gated chokepoint before the operator sees a doc. It
+    /// is fail-closed: rejected without a template attestation, without a conformance summary on the
+    /// CURRENT version, or with an open actionable finding; it passes only when all three clear, and
+    /// re-publishing a version re-closes the gate until a fresh summary pins the new version.
+    #[tokio::test]
+    async fn submit_to_operator_review_gate() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Docs", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let d = create_document(
+            &pool,
+            "Design: Thing",
+            Some(pid),
+            "bafyv1",
+            Some("v1"),
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        let dref = did.to_string();
+
+        // No template attestation and no waiver -> rejected before any state is touched.
+        assert!(
+            submit_to_operator_review(&pool, did, Some("author"), None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            submit_to_operator_review(&pool, did, Some("author"), Some("  "), Some(""))
+                .await
+                .is_err(),
+            "whitespace-only attestations don't count"
+        );
+
+        // A conformance review exists over the doc, but no summary has run against the current
+        // version yet -> rejected even with a template.
+        let r = create_review(
+            &pool,
+            "design_conformance",
+            Some("board_doc"),
+            Some(dref.as_str()),
+            Some("conformance"),
+            None,
+            Some("reviewer"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        assert!(submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("design-doc-template"),
+            None
+        )
+        .await
+        .is_err());
+
+        // Summary pins reviewed_version=1 (the current version), but there is an OPEN actionable
+        // finding (its child task is not done) -> still rejected.
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 1, "conformance": "pass" }).to_string()),
+            Some("reviewer"),
+            None,
+            None,
+        )
+        .await?;
+        let child = create_task(
+            &pool,
+            pid,
+            "fix the thing",
+            None,
+            None,
+            None,
+            Some("reviewer"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let child_id = child["id"].as_i64().unwrap();
+        append_review_log(
+            &pool,
+            rid,
+            "finding",
+            Some("the thing is wrong"),
+            Some("reviewer"),
+            Some(child_id),
+            None,
+        )
+        .await?;
+        assert!(submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("design-doc-template"),
+            None
+        )
+        .await
+        .is_err());
+
+        // Close the finding's child task -> all three conditions clear -> passes, status advances,
+        // and the template attestation is stamped on the doc.
+        update_task(
+            &pool,
+            child_id,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("reviewer"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("design-doc-template"),
+            None,
+        )
+        .await?;
+        assert_eq!(out["status"], json!("operator_review"));
+        assert_eq!(
+            out["metadata"]["template_followed"],
+            json!("design-doc-template")
+        );
+
+        // Version-pinning: publishing a new version re-closes the gate (the summary pinned v1, not
+        // the current v2), even on the waiver path. A fresh summary on v2 reopens it.
+        publish_version(&pool, did, "bafyv2", Some("v2"), Some("author"), None, None).await?;
+        assert!(submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            None,
+            Some("no template fits an experiment note")
+        )
+        .await
+        .is_err());
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 2, "conformance": "pass" }).to_string()),
+            Some("reviewer"),
+            None,
+            None,
+        )
+        .await?;
+        let out2 = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            None,
+            Some("no template fits an experiment note"),
+        )
+        .await?;
+        assert_eq!(out2["status"], json!("operator_review"));
+        assert!(out2["metadata"]["template_followed"].is_null());
+        assert_eq!(
+            out2["metadata"]["template_waiver_reason"],
+            json!("no template fits an experiment note")
+        );
         Ok(())
     }
 
