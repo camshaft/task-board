@@ -6,7 +6,7 @@
 import {
   api,
   type Agent,
-  type AwaitingTask,
+  type AwaitingItem,
   type Channel,
   type ChannelPost,
   type Document,
@@ -96,7 +96,7 @@ export function useTasksBlockingMe(viewer: string) {
 // blocked_on=viewer tasks UNION tasks with an open routed blocking question, team-expanded,
 // assignee-independent. Supersedes useTasksBlockingMe.
 export function useAwaiting(viewer: string) {
-  return useResource<AwaitingTask[]>(keys.awaiting(viewer), () => api.listAwaiting(viewer))
+  return useResource<AwaitingItem[]>(keys.awaiting(viewer), () => api.listAwaiting(viewer))
 }
 
 // Channels: public list, or a member's list (incl. private/DMs) when `member` is given.

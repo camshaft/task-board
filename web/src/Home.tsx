@@ -90,34 +90,54 @@ export default function Home() {
             </Link>
           </h2>
           <p className="mb-2 text-xs text-[var(--color-muted)]">
-            Tasks blocked on <span className="font-mono">{actor}</span> and open questions routed to
-            you.
+            Tasks blocked on <span className="font-mono">{actor}</span>, open questions routed to
+            you, and documents pending your approval.
           </p>
           <ul className="space-y-1.5">
-            {waitingOnMe.map((t) => (
-              <li key={t.task_id}>
-                <Link
-                  to={`/tasks/${t.task_id}`}
-                  className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 hover:border-amber-500/50"
-                >
-                  <StatusChip status={t.status} />
-                  <span className="min-w-0 flex-1 truncate text-sm">{t.task_title}</span>
-                  {t.questions.length > 0 && (
+            {waitingOnMe.map((t) =>
+              t.kind === 'document' ? (
+                <li key={`doc-${t.document_id}`}>
+                  <Link
+                    to={`/documents/${t.document_id}`}
+                    className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 hover:border-amber-500/50"
+                  >
                     <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">
-                      {t.questions.length} q
+                      doc
                     </span>
-                  )}
-                  {t.project_id != null && (
+                    <span className="min-w-0 flex-1 truncate text-sm">{t.title}</span>
                     <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
-                      {projectName(t.project_id)}
+                      v{t.version_no} pending
                     </span>
-                  )}
-                  <span className="font-mono text-[11px] text-[var(--color-muted)]">
-                    task_{t.task_id}
-                  </span>
-                </Link>
-              </li>
-            ))}
+                    <span className="font-mono text-[11px] text-[var(--color-muted)]">
+                      doc_{t.document_id}
+                    </span>
+                  </Link>
+                </li>
+              ) : (
+                <li key={`task-${t.task_id}`}>
+                  <Link
+                    to={`/tasks/${t.task_id}`}
+                    className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 hover:border-amber-500/50"
+                  >
+                    <StatusChip status={t.status} />
+                    <span className="min-w-0 flex-1 truncate text-sm">{t.task_title}</span>
+                    {t.questions.length > 0 && (
+                      <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">
+                        {t.questions.length} q
+                      </span>
+                    )}
+                    {t.project_id != null && (
+                      <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
+                        {projectName(t.project_id)}
+                      </span>
+                    )}
+                    <span className="font-mono text-[11px] text-[var(--color-muted)]">
+                      task_{t.task_id}
+                    </span>
+                  </Link>
+                </li>
+              ),
+            )}
           </ul>
         </section>
       )}

@@ -56,11 +56,13 @@ export interface TaskSummary {
   // monitor / nudge daemon (task 520 family / #506 guard).
   monitor_exempt?: boolean
 }
-// One row of the unified "awaiting you" queue (task_860): a task awaiting a principal's decision --
-// either blocked_on that principal (blocked_on_principal, with blocked_on_note) or carrying open
-// blocking questions routed to it (questions, full question comment objects), or both. Keyed
-// independent of assignee (owner-held tasks are not assigned to the principal) and team-expanded.
-export interface AwaitingTask {
+// One row of the unified "awaiting you" queue (task_860 + task_873): a flat, discriminated queue of
+// everything awaiting a principal's decision. A `task` item is a task blocked_on the principal
+// (blocked_on_principal + note) and/or carrying open blocking questions routed to it; a `document`
+// item is a doc awaiting the operator's approval (status=operator_review), emitted only when the
+// viewer resolves to the operator. Keyed independent of assignee, team-expanded.
+export interface AwaitingTaskItem {
+  kind: 'task'
   task_id: number
   task_title: string
   project_id: number | null
@@ -70,6 +72,19 @@ export interface AwaitingTask {
   blocked_on_note: string | null
   questions: Comment[]
 }
+export interface AwaitingDocItem {
+  kind: 'document'
+  document_id: number
+  title: string
+  // Review status (operator_review for a doc awaiting the operator's approval).
+  status: string
+  // The doc's current (pending-approval) version number.
+  version_no: number
+  updated_at?: string
+  // Slash-separated wiki path when filed, else null.
+  path: string | null
+}
+export type AwaitingItem = AwaitingTaskItem | AwaitingDocItem
 
 // Operator-questions (task_628 / doc_33). A comment is a plain note, a structured question, or an
 // answer replying to one. The backend stores `payload` + `state` + `type` + `reply_to` verbatim and
@@ -600,7 +615,7 @@ export const api = {
     const p = new URLSearchParams({ viewer })
     if (q.project_id != null) p.set('project_id', String(q.project_id))
     if (q.include_archived) p.set('include_archived', 'true')
-    return req<AwaitingTask[]>('GET', `/tasks/awaiting?${p.toString()}`)
+    return req<AwaitingItem[]>('GET', `/tasks/awaiting?${p.toString()}`)
   },
   getTask: (id: number) => req<Task>('GET', `/tasks/${id}`),
   createTask: (b: {
