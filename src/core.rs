@@ -3696,6 +3696,71 @@ pub async fn seed_ui_elements(
     Ok(manifest)
 }
 
+/// Build the agent-facing ui-element catalog (task_820, Solution B): join the authored element set
+/// (`elements_json`, the committed ui-elements.json) with the name->CID manifest
+/// (`manifest_json`, the committed ui-element-cids.json) into one record per element carrying what an
+/// agent needs to author a CID-keyed structured question in a single read -- `name`, `cid` (the value
+/// stamped as `ui.element_schema_cid`), `title`, `description`, and `props_schema` (the `ui.props`
+/// contract). The frontend-only `component` mapping is deliberately NOT surfaced (doc_728 A2). This
+/// is the content published at the reserved `system/ui-elements` path and served by the MCP resource.
+///
+/// Single-sourced + no-skew (doc_728 A4): both inputs are the same bytes the fleet already ships, so
+/// regenerating the catalog is a pure function of them. An element present in ui-elements.json but
+/// missing from the manifest is an error (the two have drifted and must be reseeded together) rather
+/// than a silently CID-less catalog entry an agent could not actually use.
+pub fn build_ui_element_catalog(
+    elements_json: &[u8],
+    manifest_json: &[u8],
+) -> anyhow::Result<Value> {
+    let elements: Value = serde_json::from_slice(elements_json)
+        .map_err(|e| anyhow::anyhow!("parsing ui-elements json: {e}"))?;
+    let manifest: Value = serde_json::from_slice(manifest_json)
+        .map_err(|e| anyhow::anyhow!("parsing ui-element-cids manifest json: {e}"))?;
+    let elements = elements
+        .get("elements")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("ui-elements json has no `elements` object"))?;
+    let manifest = manifest
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("manifest json is not a name->cid object"))?;
+
+    // Deterministic order: BTreeMap sorts the element names, matching the seeder's manifest order.
+    let mut records: Vec<Value> = Vec::with_capacity(elements.len());
+    for (name, def) in elements
+        .iter()
+        .collect::<std::collections::BTreeMap<_, _>>()
+    {
+        let cid = manifest.get(name).and_then(Value::as_str).ok_or_else(|| {
+            anyhow::anyhow!(
+                "element '{name}' is in ui-elements.json but has no CID in the manifest; \
+                 reseed (--seed-ui-elements) so the catalog and manifest stay in lockstep"
+            )
+        })?;
+        let mut rec = serde_json::Map::new();
+        rec.insert("name".into(), json!(name));
+        rec.insert("cid".into(), json!(cid));
+        if let Some(t) = def.get("title") {
+            rec.insert("title".into(), t.clone());
+        }
+        if let Some(d) = def.get("description") {
+            rec.insert("description".into(), d.clone());
+        }
+        if let Some(ps) = def.get("props_schema") {
+            rec.insert("props_schema".into(), ps.clone());
+        }
+        records.push(Value::Object(rec));
+    }
+
+    Ok(json!({
+        "generated_from": ["ui-elements.json", "ui-element-cids.json"],
+        "note": "Resolve a UI element by name, stamp its cid as ui.element_schema_cid on a CID-keyed \
+                 pose_question, set ui.props per props_schema, and supply an inline response_schema \
+                 (see each element's description for its answer shape). The component field is \
+                 frontend-only and is not served.",
+        "elements": records,
+    }))
+}
+
 /// Classify a principal id as a team / agent / person, erroring if it is none. "operator" is the
 /// seeded team, so it classifies as "team".
 async fn principal_kind(
@@ -10432,6 +10497,42 @@ mod tests {
             parse_ui_element_set(br#"{"elements": {"bad": {"props_schema": {"type": 123}}}}"#)
                 .is_err()
         );
+    }
+
+    /// build_ui_element_catalog (task_820) joins ui-elements.json with the name->CID manifest into
+    /// one agent-facing record per element (name, cid, title, description, props_schema), excludes
+    /// the frontend-only `component`, orders by name, and errors if an element lacks a manifest CID.
+    #[test]
+    fn build_ui_element_catalog_joins_elements_with_cids() {
+        let elements = br#"{
+            "version": 1,
+            "elements": {
+                "yes-no": { "title": "Yes / no", "description": "a boolean", "component": "YesNo", "props_schema": {"type": "object"} },
+                "text": { "title": "Fill in", "description": "free text", "component": "TextInput", "props_schema": {"type": "object"} }
+            }
+        }"#;
+        let manifest = br#"{"text": "QmText", "yes-no": "QmYesNo"}"#;
+        let cat = build_ui_element_catalog(elements, manifest).expect("catalog builds");
+        let els = cat["elements"].as_array().unwrap();
+        assert_eq!(els.len(), 2);
+        // Sorted by name: text before yes-no.
+        assert_eq!(els[0]["name"], json!("text"));
+        assert_eq!(els[0]["cid"], json!("QmText"));
+        assert_eq!(els[0]["title"], json!("Fill in"));
+        assert_eq!(els[0]["description"], json!("free text"));
+        assert!(els[0]["props_schema"].is_object());
+        assert!(
+            els[0].get("component").is_none(),
+            "frontend-only component is not surfaced"
+        );
+        assert_eq!(els[1]["name"], json!("yes-no"));
+        assert_eq!(els[1]["cid"], json!("QmYesNo"));
+        // Drift: an element with no manifest CID is a hard error, not a CID-less entry.
+        let no_cid = br#"{"elements": {"yes-no": {"props_schema": {"type": "object"}}}}"#;
+        let err = build_ui_element_catalog(no_cid, br#"{}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no CID in the manifest"), "got: {err}");
     }
 
     #[tokio::test]
