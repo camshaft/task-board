@@ -622,7 +622,11 @@ pub struct CommentTaskArgs {
 #[serde(deny_unknown_fields)]
 pub struct SubscribeArgs {
     /// The agent to (un)subscribe. Defaults to the agent this session registered as.
-    #[serde(default)]
+    /// `agent_id`/`actor` are accepted as aliases, since those are the identity field names
+    /// other board tools use — so a call that passes agent_id (a common habit) still names the
+    /// subscriber, instead of being rejected with a misleading "no identity for this session"
+    /// error (task 901).
+    #[serde(default, alias = "agent_id", alias = "actor")]
     pub subscriber: Option<String>,
     #[serde(default)]
     pub task_id: Option<i64>,
@@ -3823,6 +3827,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doc.author.as_deref(), Some("v-task-board"));
+    }
+
+    /// subscribe / unsubscribe (both Parameters<SubscribeArgs>) accept the fleet-habit identity
+    /// field (agent_id / actor) as an alias for subscriber, so a call that passes agent_id names
+    /// the subscriber instead of being rejected with a misleading "no identity for this session"
+    /// error (task 901). Native subscriber still works; absent stays None (defaults to the session).
+    #[test]
+    fn subscribe_subscriber_accepts_agent_id_and_actor_aliases() {
+        let via_agent_id =
+            from_value::<SubscribeArgs>(json!({"task_id": 1, "agent_id": "v-foo"})).unwrap();
+        assert_eq!(via_agent_id.subscriber.as_deref(), Some("v-foo"));
+        let via_actor =
+            from_value::<SubscribeArgs>(json!({"task_id": 1, "actor": "v-foo"})).unwrap();
+        assert_eq!(via_actor.subscriber.as_deref(), Some("v-foo"));
+        let native =
+            from_value::<SubscribeArgs>(json!({"task_id": 1, "subscriber": "v-bar"})).unwrap();
+        assert_eq!(native.subscriber.as_deref(), Some("v-bar"));
+        assert!(from_value::<SubscribeArgs>(json!({"task_id": 1}))
+            .unwrap()
+            .subscriber
+            .is_none());
     }
 
     // The board advertises tools/list_changed so a client refetches its tool list after a
