@@ -1090,11 +1090,17 @@ pub struct UpdateDocumentArgs {
 pub struct ListDocumentsArgs {
     #[serde(default)]
     pub project_id: Option<i64>,
+    /// Status filter. Accepts a single status OR a comma-separated set (match any), and the
+    /// operator vocabulary (pending-review -> operator_review, published -> approved).
     #[serde(default)]
     pub status: Option<String>,
     /// A value in the document's metadata.tags array.
     #[serde(default)]
     pub tag: Option<String>,
+    /// Exclude documents carrying this tag (e.g. exclude_tag="charter" to hide charters). The
+    /// primitive the UI composes default-hide from.
+    #[serde(default)]
+    pub exclude_tag: Option<String>,
     /// Only documents attached to this task.
     #[serde(default)]
     pub task_id: Option<i64>,
@@ -2713,20 +2719,28 @@ impl Board {
     }
 
     #[tool(
-        description = "List documents for discovery, filtered by any combination of project, status (draft / in_review / approved / changes_requested), tag (a value in metadata.tags), task_id (docs attached to that task), and author. Filters AND together. Archived (retired) documents are hidden unless include_archived=true."
+        description = "List documents for discovery, filtered by any combination of project, status, tag (a value in metadata.tags), exclude_tag (hide docs with that tag), task_id (docs attached to that task), and author. Filters AND together. `status` accepts a single value OR a comma-separated set (match any) and the operator vocabulary draft / pending-review / published (mapped to the stored draft / operator_review / approved). Archived (retired) documents are hidden unless include_archived=true. For the default-hide pattern (e.g. hide charters unless pending-review), compose exclude_tag with a tag+status query."
     )]
     async fn list_documents(
         &self,
         Parameters(a): Parameters<ListDocumentsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_documents(
+        let statuses = a
+            .status
+            .as_deref()
+            .map(core::parse_status_filter)
+            .unwrap_or_default();
+        core::list_documents_filtered(
             &self.pool,
-            a.project_id,
-            s(&a.status),
-            s(&a.tag),
-            a.task_id,
-            s(&a.author),
-            a.include_archived,
+            &core::DocListFilter {
+                project_id: a.project_id,
+                statuses,
+                tag: s(&a.tag),
+                exclude_tag: s(&a.exclude_tag),
+                task_id: a.task_id,
+                author: s(&a.author),
+                include_archived: a.include_archived,
+            },
         )
         .await
         .map_err(err)
