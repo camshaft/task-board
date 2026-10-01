@@ -7334,7 +7334,8 @@ pub struct DocListFilter<'a> {
 pub async fn list_documents_filtered(pool: &Pool, f: &DocListFilter<'_>) -> anyhow::Result<Value> {
     let mut q = String::from(
         "SELECT id, title, slug, path, project_id, status, current_version_id, approved_version_id, \
-         created_by, updated_at, archived_at, deprecated_at, superseded_by FROM documents",
+         created_by, updated_at, archived_at, deprecated_at, superseded_by, \
+         json_extract(metadata, '$.description') AS description FROM documents",
     );
     let mut conds: Vec<String> = Vec::new();
     if !f.include_archived {
@@ -7507,7 +7508,8 @@ pub async fn list_wiki(
         " AND archived_at IS NULL"
     };
     let cols = "id, title, slug, path, project_id, status, current_version_id, \
-                approved_version_id, created_by, updated_at, archived_at";
+                approved_version_id, created_by, updated_at, archived_at, \
+                json_extract(metadata, '$.description') AS description";
     let rows = match prefix
         .map(|p| p.trim().trim_matches('/'))
         .filter(|p| !p.is_empty())
@@ -11528,6 +11530,71 @@ mod tests {
 
         // Muting a missing task is an error.
         assert!(mute_task(&pool, "owner", 999_999).await.is_err());
+        Ok(())
+    }
+
+    /// The list and wiki index queries project metadata.description (null when absent), so a
+    /// metadata-first index -- the memory session-start recall list (doc_102 A2) and the ui-element
+    /// resource (task_820) -- can show name + description without reading each body (task_824).
+    #[tokio::test]
+    async fn list_and_wiki_project_metadata_description() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // A document WITH a metadata.description, filed at a path.
+        let d1 = create_document(
+            &pool,
+            "Mem One",
+            None,
+            "bafyM1",
+            None,
+            Some("a"),
+            Some(json!({ "description": "a one-line memory summary" })),
+            None,
+            None,
+        )
+        .await?;
+        set_document_path(&pool, d1["id"].as_i64().unwrap(), "agents/a/mem-one", None).await?;
+        // A document WITHOUT a description.
+        let d2 = create_document(
+            &pool,
+            "Mem Two",
+            None,
+            "bafyM2",
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        set_document_path(&pool, d2["id"].as_i64().unwrap(), "agents/a/mem-two", None).await?;
+
+        // list_wiki (the path-prefix index) projects description: present and null.
+        let wiki = list_wiki(&pool, Some("agents/a"), false).await?;
+        let w = wiki.as_array().unwrap();
+        let one = w
+            .iter()
+            .find(|x| x["path"] == json!("agents/a/mem-one"))
+            .unwrap();
+        assert_eq!(one["description"], json!("a one-line memory summary"));
+        let two = w
+            .iter()
+            .find(|x| x["path"] == json!("agents/a/mem-two"))
+            .unwrap();
+        assert!(
+            two["description"].is_null(),
+            "absent description projects as null, not a missing key"
+        );
+
+        // list_documents projects it too (same json_extract fragment).
+        let docs = list_documents(&pool, None, None, None, None, Some("a"), false).await?;
+        let one_d = docs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["title"] == json!("Mem One"))
+            .unwrap();
+        assert_eq!(one_d["description"], json!("a one-line memory summary"));
         Ok(())
     }
 
