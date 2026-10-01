@@ -42,6 +42,10 @@ OPTIONS:
     --dedup-projects   One-shot maintenance: merge case-insensitive duplicate projects
                        (keep the earliest, repoint tasks/subs/events), then exit. Back up
                        the DB first. Does not start the server.
+    --seed-ui-elements <path>
+                       One-shot: pin each UI element's props_schema from the given
+                       ui-elements.json into the CAS and print the name->CID manifest to
+                       stdout, then exit. Needs ipfs_api_url. Does not start the server.
     -h, --help         Print this help.
 ";
 
@@ -50,6 +54,7 @@ struct CliArgs {
     config: Option<String>,
     web_dir: Option<String>,
     dedup_projects: bool,
+    seed_ui_elements: Option<String>,
 }
 
 impl CliArgs {
@@ -57,6 +62,7 @@ impl CliArgs {
         let mut config = None;
         let mut web_dir = None;
         let mut dedup_projects = false;
+        let mut seed_ui_elements = None;
         let mut it = args;
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -73,6 +79,12 @@ impl CliArgs {
                     );
                 }
                 "--dedup-projects" => dedup_projects = true,
+                "--seed-ui-elements" => {
+                    seed_ui_elements = Some(
+                        it.next()
+                            .ok_or_else(|| anyhow::anyhow!("--seed-ui-elements needs a path"))?,
+                    );
+                }
                 "-h" | "--help" => {
                     print!("{USAGE}");
                     std::process::exit(0);
@@ -84,6 +96,7 @@ impl CliArgs {
             config,
             web_dir,
             dedup_projects,
+            seed_ui_elements,
         })
     }
 }
@@ -109,6 +122,22 @@ async fn main() -> anyhow::Result<()> {
         None => config::Config::defaults(web_dir),
     };
     let _ = WEBHOOK_TIMEOUT.set(cfg.webhook_timeout);
+
+    // One-shot: pin the UI element schemas into the CAS and print the name->CID manifest, then exit
+    // without serving (task_755). The CID of each element's props_schema is its canonical build-time
+    // identifier (doc_33 v16); redirect stdout to commit the manifest the web build + the CID-keyed
+    // question model consume. Needs ipfs_api_url (the CAS to pin into); touches no DB.
+    if let Some(path) = &args.seed_ui_elements {
+        let Some(ipfs_url) = cfg.ipfs_api_url.as_deref() else {
+            anyhow::bail!("--seed-ui-elements needs ipfs_api_url configured (the CAS to pin into)");
+        };
+        let json = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("reading ui-elements file {path}: {e}"))?;
+        let set = core::parse_ui_element_set(&json)?;
+        let manifest = core::seed_ui_elements(ipfs_url, &set).await?;
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+        return Ok(());
+    }
 
     let pool = db::init(&cfg.db_path).await?;
     tracing::info!("db ready at {}", cfg.db_path);
