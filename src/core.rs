@@ -8632,12 +8632,21 @@ pub async fn approve_document(
 /// so a doc can never reach the operator un-reviewed. The template attestation is stamped into the
 /// doc metadata (durable) and carried on the emitted event. Emits
 /// `document.submitted_for_operator_review` to the doc's subscribers.
+/// Does an author's `template_followed` attestation name the design-doc template? (task_888 scope
+/// key, librarian's A8 call.) A case-insensitive mention of "design" -- the design-doc template is
+/// the only attestation that subjects the body to doc_7 A8's required-sections structure; a
+/// runbook/guide/charter template, or a `template_waiver_reason`, is not structurally gated.
+fn is_design_doc_template(template_followed: &str) -> bool {
+    template_followed.to_ascii_lowercase().contains("design")
+}
+
 pub async fn submit_to_operator_review(
     pool: &Pool,
     document_id: i64,
     actor: Option<&str>,
     template_followed: Option<&str>,
     template_waiver_reason: Option<&str>,
+    ipfs_api_url: Option<&str>,
 ) -> anyhow::Result<Value> {
     // 1. Template attestation: one of the two must be non-empty after trimming.
     let template_followed = template_followed.map(str::trim).filter(|s| !s.is_empty());
@@ -8648,6 +8657,49 @@ pub async fn submit_to_operator_review(
         anyhow::bail!(
             "submit_to_operator_review requires `template_followed` (the doc template you read and followed, e.g. the design-doc template) or, when none applies, a non-empty `template_waiver_reason`"
         );
+    }
+
+    // 1b. Structural pre-submit gate (task_888, librarian's A8 scope call): ONLY when the author
+    // attests the DESIGN-DOC template -- a template_waiver_reason or a non-design template skips it
+    // (a runbook has no `## Solutions` and must not be blocked for lacking one). Block on doc_7 A8's
+    // required-sections-in-order structural hard-fail so a non-conforming design doc never costs the
+    // operator a reject+restructure round-trip (doc_95); A8's warn-level checks (body length,
+    // caps-for-emphasis) stay advisory, and ASCII is enforced by the content scanner. Misattestation
+    // (naming the design template to dodge structure) is caught by the reviewer's template-match
+    // check (A8 judgment angle 2). Runs BEFORE the transaction so the body read (which uses the pool)
+    // cannot deadlock the single-connection pool; best-effort -- a body that can't be fetched (no
+    // version yet, no backend, backend hiccup) skips the gate and the normal checks below produce the
+    // authoritative error.
+    if template_followed.is_some_and(is_design_doc_template) {
+        if let Some(url) = ipfs_api_url {
+            if let Ok(content) = read_document_content(pool, Some(url), document_id, None).await {
+                if let Some(text) = content.get("content").and_then(Value::as_str) {
+                    let grade = grade_document(pool, text, "", None).await?;
+                    let structural: Vec<&str> = grade
+                        .get("findings")
+                        .and_then(Value::as_array)
+                        .map(|fs| {
+                            fs.iter()
+                                .filter(|f| {
+                                    f.get("check").and_then(Value::as_str)
+                                        == Some("required-sections")
+                                })
+                                .filter_map(|f| f.get("message").and_then(Value::as_str))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !structural.is_empty() {
+                        anyhow::bail!(
+                            "document {document_id} does not meet the design-doc structure (doc_7 A8 \
+                             required sections), so it cannot reach the operator: {}. Fix the section \
+                             structure, or -- if this is not a design doc -- submit with a \
+                             template_waiver_reason instead of attesting the design-doc template",
+                            structural.join("; ")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     let ts = now_iso();
@@ -18521,12 +18573,12 @@ mod tests {
 
         // No template attestation and no waiver -> rejected before any state is touched.
         assert!(
-            submit_to_operator_review(&pool, did, Some("author"), None, None)
+            submit_to_operator_review(&pool, did, Some("author"), None, None, None)
                 .await
                 .is_err()
         );
         assert!(
-            submit_to_operator_review(&pool, did, Some("author"), Some("  "), Some(""))
+            submit_to_operator_review(&pool, did, Some("author"), Some("  "), Some(""), None)
                 .await
                 .is_err(),
             "whitespace-only attestations don't count"
@@ -18553,6 +18605,7 @@ mod tests {
             did,
             Some("author"),
             Some("design-doc-template"),
+            None,
             None
         )
         .await
@@ -18599,6 +18652,7 @@ mod tests {
             did,
             Some("author"),
             Some("design-doc-template"),
+            None,
             None
         )
         .await
@@ -18626,6 +18680,7 @@ mod tests {
             Some("author"),
             Some("design-doc-template"),
             None,
+            None,
         )
         .await?;
         assert_eq!(out["status"], json!("operator_review"));
@@ -18642,7 +18697,8 @@ mod tests {
             did,
             Some("author"),
             None,
-            Some("no template fits an experiment note")
+            Some("no template fits an experiment note"),
+            None
         )
         .await
         .is_err());
@@ -18662,6 +18718,7 @@ mod tests {
             Some("author"),
             None,
             Some("no template fits an experiment note"),
+            None,
         )
         .await?;
         assert_eq!(out2["status"], json!("operator_review"));
@@ -18729,13 +18786,116 @@ mod tests {
         )
         .await?;
 
-        let out =
-            submit_to_operator_review(&pool, did, Some("author"), Some("doc_7 incl A8"), None)
-                .await?;
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("doc_7 incl A8"),
+            None,
+            None,
+        )
+        .await?;
         assert_eq!(
             out["status"],
             json!("operator_review"),
             "metadata.reviewed_version + the board-document convention satisfy the gate"
+        );
+        Ok(())
+    }
+
+    /// is_design_doc_template keys the A8 structural gate: it recognizes the design-doc template
+    /// (case-insensitive, substring) and only that -- a runbook/ADR/waiver attestation does not trip
+    /// it, so those docs are never blocked for lacking a `## Solutions` section (task_888).
+    #[test]
+    fn is_design_doc_template_matches_design_only() {
+        assert!(is_design_doc_template("design-doc template"));
+        assert!(is_design_doc_template("Design Doc Template (doc_7 A8)"));
+        assert!(is_design_doc_template("followed the DESIGN template"));
+        assert!(!is_design_doc_template("runbook template"));
+        assert!(!is_design_doc_template("ADR template"));
+        assert!(!is_design_doc_template("one-pager"));
+    }
+
+    /// Stand up a fake Kubo `/api/v0/cat` that always returns the given body with 200, so the
+    /// structural pre-submit gate can fetch a document's content without a live CAS (task_888).
+    async fn spawn_fake_cat(body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/api/v0/cat",
+            axum::routing::post(move || async move { body }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The A8 structural pre-submit gate (task_888): a design-doc-attested doc whose body is missing
+    /// the required H2 sections is rejected BEFORE the transaction with the design-doc-structure
+    /// error -- but attesting a NON-design template skips the structural check (it falls through to
+    /// the ordinary conformance check instead), so a runbook is never blocked for lacking them.
+    #[tokio::test]
+    async fn submit_gate_blocks_nonconforming_design_doc_but_skips_non_design_template(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Docs", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        // A body with NO required sections -- grade_document emits required-sections hard-fails.
+        let url =
+            spawn_fake_cat("# Zoom\n\nSome prose but none of the required H2 sections.\n").await;
+        let d = create_document(
+            &pool,
+            "Design: Zoom",
+            Some(pid),
+            "bafycat",
+            Some("v1"),
+            Some("author"),
+            None,
+            Some("text/markdown"),
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // Design-doc attestation + non-conforming body -> blocked on the structure, pre-transaction.
+        let err = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("design-doc template"),
+            None,
+            Some(&url),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("design-doc structure"),
+            "design attestation + missing sections must be blocked by the A8 structural gate; got: {err}"
+        );
+
+        // Same doc + backend, but a NON-design template: the structural check is skipped, so this
+        // fails LATER on the conformance check (no review has run), not on structure.
+        let err2 = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("runbook template"),
+            None,
+            Some(&url),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !err2.contains("design-doc structure"),
+            "a non-design template must skip the structural gate; got: {err2}"
+        );
+        assert!(
+            err2.contains("conformance review"),
+            "with structure skipped it should fall through to the conformance check; got: {err2}"
         );
         Ok(())
     }
