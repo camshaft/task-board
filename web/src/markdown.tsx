@@ -20,7 +20,7 @@ import { api, ipfsUrl, type DocumentVersion } from './api'
 
 // Markdown renderer: a real CommonMark parser (remark/unified via react-markdown + remark-gfm),
 // extended with a small remark plugin for the board's own non-standard inline/block syntax
-// ([[wiki-links]], ![[transclusion embeds]], @mentions, typed-ref / bare-#N / owner/repo#N
+// ([[wiki-links]], ![[transclusion embeds]], @mentions, typed-ref #task_N / owner/repo#N
 // linkify). The custom syntax is lowered to standard hast `a` (inline refs) or `div` (embed
 // blocks) elements carrying a `boardKind` discriminant in their properties, so TypeScript's
 // `Components` map only ever needs real tag-name keys — see AnchorRenderer / DivRenderer below.
@@ -63,20 +63,18 @@ const WIKILINK_RE = /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g
 // so it never matches inside a longer path or URL (e.g. ".com/owner/repo#5").
 const GITHUB_REF_RE = /(?<![\w./@-])([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*)#(\d+)\b/g
 
-// Internal typed resource id: task_472 / doc_23 / project_16 / channel_123 → the board deep-link
-// (task 504). This is the canonical id the API returns and accepts in URLs. The lookbehind
-// rejects a leading word char / hyphen so "subtask_5" / "todoc_3" don't match; \b after the
-// digits rejects "task_12ab".
-const TYPED_REF_RE = /(?<![\w-])(task|doc|project|channel)_(\d+)\b/g
+// Internal typed resource id: #task_472 (canonical, task_869) or the hashless task_472 (tolerated) /
+// doc_23 / project_16 / channel_123 → the board deep-link (task 504). The optional leading '#' is
+// the canonical form cameron chose; the hashless form still deep-links for back-compat. The
+// lookbehind rejects a leading word char / hyphen so "subtask_5" / "todoc_3" don't match (and a '#'
+// is neither, so "#task_5" matches with the '#' captured as group 1); \b after the digits rejects
+// "task_12ab".
+const TYPED_REF_RE = /(?<![\w-])(#?)(task|doc|project|channel)_(\d+)\b/g
 
-// Bare task reference (#123) → the task redirect route (which resolves the task's project). The
-// lookbehind rejects a leading word char / another # / & so "abc#1", "##", and numeric HTML
-// entities like "&#123;" don't match; \b after the digits rejects "#12ab". Still resolves to task
-// N, but carries the ambiguity affordance (task 517 layer 2): amber dotted underline + help
-// cursor + a tooltip nudging the typed form. Message mirrors the backend's layer-1 ref_warnings
-// text. Note GITHUB_REF_RE above always wins on "owner/repo#N" since the '#' there is preceded by
-// a word char, which this pattern's lookbehind already excludes — no explicit ordering needed.
-const BARE_REF_RE = /(?<![\w#&])#(\d+)\b/g
+// NOTE (task_869): a BARE "#N" (e.g. "#123") is NO LONGER linkified. cameron hard-rejected the bare
+// form at write time (it is ambiguous versus a GitHub owner/repo#N and the canonical #task_N), so
+// new content cannot contain it; any surviving bare "#N" in old content renders as plain text rather
+// than a misleading auto-link. The canonical board-task form is #task_N, matched above.
 
 // @agent mention → the agent's page, but ONLY when it names a known agent (per the app-wide
 // resolver, checked at render time in MentionRef); an unknown @word stays plain text (no dead
@@ -97,13 +95,6 @@ const REF_ROUTE: Record<string, string> = {
 const LINK_CLS = 'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
 const RED_LINK_CLS =
   'text-rose-400/90 underline decoration-dotted underline-offset-2 hover:text-rose-300'
-// A bare #N still resolves to a board task (no break, per #504), but it's ambiguous versus the
-// typed task_N / external owner/repo#N forms. Mark it with an amber dotted underline + help
-// cursor (the title tooltip carries the nudge) so it reads as "resolvable, but prefer the typed
-// form", visually distinct from the confident sky links — the display-time half of task 517
-// (layer 2), complementing the backend's author-time ref_warnings (layer 1).
-const AMBIGUOUS_REF_CLS =
-  'text-amber-300/90 underline decoration-dotted decoration-amber-400/60 underline-offset-2 cursor-help hover:text-amber-200'
 
 // remark plugin: recognizes a paragraph consisting of exactly one text node matching EMBED_RE and
 // replaces it with a block-level embed node, lowered to a hast <div boardKind="embed-block" ...>
@@ -139,12 +130,13 @@ function remarkEmbedBlocks() {
 }
 
 // remark plugin: lowers the board's custom inline tokens ([[wiki-links]], owner/repo#N,
-// task_N/doc_N/..., bare #N, @mentions) to hast <a boardKind="..." ...> elements (see above) so
+// #task_N/task_N/doc_N/..., @mentions) to hast <a boardKind="..." ...> elements (see above) so
 // AnchorRenderer below can dispatch each to its own small component. Order matters only in that
 // each pattern's own lookbehind/word-boundary guards already make them mutually exclusive on
-// overlapping text (e.g. GITHUB_REF_RE's "owner/repo#N" is never reachable by BARE_REF_RE, whose
-// lookbehind rejects a word-char-preceded '#') — native CommonMark constructs (links, emphasis,
-// code spans, autolinks) are handled by remark-parse / remark-gfm and never reach this plugin.
+// overlapping text (e.g. GITHUB_REF_RE's "owner/repo#N" is never reachable by TYPED_REF_RE, whose
+// lookbehind rejects a word-char-preceded token) — native CommonMark constructs (links, emphasis,
+// code spans, autolinks) are handled by remark-parse / remark-gfm and never reach this plugin. A
+// bare "#N" is intentionally NOT lowered (task_869): it is no longer an auto-link.
 function remarkBoardRefs() {
   return (tree: MdastRoot) => {
     findAndReplace(tree, [
@@ -174,19 +166,12 @@ function remarkBoardRefs() {
       ],
       [
         TYPED_REF_RE,
-        (full: string, kind: string, num: string) => ({
+        (full: string, _hash: string, kind: string, num: string) => ({
           type: 'boardRef',
           data: {
             hName: 'a',
             hProperties: { boardKind: 'typed-ref', kind, num: Number(num), raw: full },
           },
-        }),
-      ],
-      [
-        BARE_REF_RE,
-        (full: string, num: string) => ({
-          type: 'boardRef',
-          data: { hName: 'a', hProperties: { boardKind: 'bare-ref', num: Number(num), raw: full } },
         }),
       ],
       [
@@ -273,7 +258,7 @@ type BoardAnchorProps = ComponentProps<'a'> &
   }
 
 // Dispatches every `a` element: the board's own lowered ref kinds (wiki-link / github-ref /
-// typed-ref / bare-ref / mention), plus the three cases a native markdown link or remark-gfm
+// typed-ref / mention), plus the three cases a native markdown link or remark-gfm
 // bare-URL autolink can produce (external, in-app absolute path, intra-doc fragment) — ported
 // unchanged from the old inline() link branch.
 function AnchorRenderer(props: BoardAnchorProps) {
@@ -303,17 +288,6 @@ function AnchorRenderer(props: BoardAnchorProps) {
   if (boardKind === 'typed-ref' && kind != null) {
     return (
       <Link to={`/${REF_ROUTE[kind]}/${num}`} className={LINK_CLS}>
-        {raw}
-      </Link>
-    )
-  }
-  if (boardKind === 'bare-ref') {
-    return (
-      <Link
-        to={`/tasks/${num}`}
-        title={`bare #${num} is ambiguous: it resolves to board task_${num}. Write task_${num} for a board task, or owner/repo#${num} for an external GitHub reference.`}
-        className={AMBIGUOUS_REF_CLS}
-      >
         {raw}
       </Link>
     )

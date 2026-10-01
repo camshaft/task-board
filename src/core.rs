@@ -145,12 +145,61 @@ pub fn check_bare_refs(text: &str) -> anyhow::Result<()> {
     let stripped = strip_code_regions(text);
     if let Some(&n) = detect_bare_task_refs(&stripped).first() {
         anyhow::bail!(
-            "ambiguous bare reference \"#{n}\": write task_{n} for a board task, camshaft/task-board#{n} \
-             (or <owner>/<repo>#{n}) for a GitHub PR/issue, or -- if {n} is a plain number such as a \
-             board message or sequence ordinal -- drop the # and write \"{n}\""
+            "ambiguous bare reference \"#{n}\": write #task_{n} for a board task (the canonical typed \
+             form, task_869), camshaft/task-board#{n} (or <owner>/<repo>#{n}) for a GitHub PR/issue, \
+             or -- if {n} is a plain number such as a board message or sequence ordinal -- drop the # \
+             and write \"{n}\""
         );
     }
     Ok(())
+}
+
+/// Detect typed refs written WITHOUT the canonical leading '#' -- `task_N` / `doc_N` / `project_N` /
+/// `channel_N` -- so the lint can WARN that `#task_N` is now the canonical form (task_869, cameron).
+/// Advisory only: a plain `task_N` is unambiguous about which tracker, so it is tolerated (never
+/// hard-rejected, unlike a bare `#N`); the warning just nudges toward the hash form. A ref already
+/// carrying the '#' (`#task_N`) is skipped. Returns each distinct `(kind, n)` in first-seen order.
+/// Pure text scan; callers strip code regions first so a ref inside code is not flagged.
+pub fn detect_soft_typed_refs(text: &str) -> Vec<(&'static str, i64)> {
+    const KINDS: &[&str] = &["task", "doc", "project", "channel"];
+    let b = text.as_bytes();
+    let mut out: Vec<(&'static str, i64)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        // Only an identifier-start position: the char before must not be a word char / '-' / '#'
+        // (the '#' exclusion is what skips an already-canonical "#task_N").
+        let boundary_ok = i == 0 || {
+            let p = b[i - 1];
+            !(p == b'_' || p == b'-' || p == b'#' || p.is_ascii_alphanumeric())
+        };
+        if boundary_ok {
+            if let Some(&kind) = KINDS.iter().find(|kw| {
+                let kb = kw.as_bytes();
+                b[i..].starts_with(kb) && b.get(i + kb.len()) == Some(&b'_')
+            }) {
+                let dstart = i + kind.len() + 1;
+                let mut j = dstart;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                // Require digits ending at a word boundary (so "task_12ab" is not a ref).
+                let bounded = j > dstart
+                    && b.get(j)
+                        .is_none_or(|&n| !(n == b'_' || n.is_ascii_alphanumeric()));
+                if bounded {
+                    if let Ok(num) = text[dstart..j].parse::<i64>() {
+                        if num > 0 && !out.iter().any(|&(k, n)| k == kind && n == num) {
+                            out.push((kind, num));
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 /// If `data` carries an `external_author` (an external_identities id, e.g. an ingested Slack
@@ -6159,16 +6208,29 @@ pub async fn lint_text(pool: &Pool, text: &str) -> anyhow::Result<Value> {
     // here so lint_text is a complete PRE-SEND lint (task 616): an agent (or a client wrapping its
     // board MCP calls) can lint a composed body before the write and fix a bare ref with no server
     // round-trip + lost-body recompose. Each hit carries the ready-to-paste typed forms.
-    let bare_refs: Vec<Value> = detect_bare_task_refs(&strip_code_regions(text))
+    let stripped = strip_code_regions(text);
+    let bare_refs: Vec<Value> = detect_bare_task_refs(&stripped)
         .into_iter()
         .map(|n| {
             json!({
                 "ref": format!("#{n}"),
                 "suggestions": [
-                    format!("task_{n}"),
+                    format!("#task_{n}"),
                     format!("camshaft/task-board#{n}"),
                     format!("{n} (drop the # if it is a plain ordinal, e.g. a board message or sequence number)"),
                 ],
+            })
+        })
+        .collect();
+    // Advisory nudges (task_869): a hashless typed ref (task_N / doc_N / ...) is tolerated but no
+    // longer canonical -- suggest the #-prefixed form. These do NOT affect `clean` (never a hard
+    // reject, unlike a bare #N); a client can surface them as a soft hint.
+    let soft_refs: Vec<Value> = detect_soft_typed_refs(&stripped)
+        .into_iter()
+        .map(|(kind, n)| {
+            json!({
+                "ref": format!("{kind}_{n}"),
+                "suggestion": format!("#{kind}_{n}"),
             })
         })
         .collect();
@@ -6177,6 +6239,7 @@ pub async fn lint_text(pool: &Pool, text: &str) -> anyhow::Result<Value> {
         "banned_phrases": banned,
         "non_ascii": non_ascii,
         "bare_refs": bare_refs,
+        "soft_refs": soft_refs,
     }))
 }
 
@@ -11119,6 +11182,27 @@ mod tests {
         assert!(detect_bare_task_refs("#12ab").is_empty());
         assert!(detect_bare_task_refs("a # b").is_empty());
         assert!(detect_bare_task_refs("task_5 is fine").is_empty());
+    }
+
+    /// detect_soft_typed_refs finds hashless typed refs (task_N / doc_N / project_N / channel_N) for
+    /// the task_869 advisory nudge, de-duped in first-seen order, and skips the already-canonical
+    /// "#task_N", a longer identifier ("subtask_5"), and a non-boundary digit tail ("task_12ab").
+    #[test]
+    fn detect_soft_typed_refs_finds_hashless_typed_refs() {
+        assert_eq!(
+            detect_soft_typed_refs("see task_7 and doc_12 and task_7 again"),
+            vec![("task", 7), ("doc", 12)]
+        );
+        assert_eq!(
+            detect_soft_typed_refs("project_3 then channel_9"),
+            vec![("project", 3), ("channel", 9)]
+        );
+        // Already canonical -> not nudged.
+        assert!(detect_soft_typed_refs("#task_7 is canonical").is_empty());
+        // Not a typed ref: a longer identifier, a wrong digit tail, or no kind match.
+        assert!(detect_soft_typed_refs("subtask_5 and mydoc_3").is_empty());
+        assert!(detect_soft_typed_refs("task_12ab is not a ref").is_empty());
+        assert!(detect_soft_typed_refs("just prose, no refs").is_empty());
     }
 
     /// check_bare_refs hard-fails on a bare "#N" OUTSIDE code, but allows it inside inline code /
@@ -18620,21 +18704,28 @@ mod tests {
         assert_eq!(
             refs.len(),
             1,
-            "only the bare #190 flagged, not task_7: {bare}"
+            "only the bare #190 hard-flagged, not task_7: {bare}"
         );
         assert_eq!(refs[0]["ref"], json!("#190"));
         let sugg = refs[0]["suggestions"].as_array().unwrap();
         assert!(
-            sugg.iter().any(|s| s == &json!("task_190"))
+            sugg.iter().any(|s| s == &json!("#task_190"))
                 && sugg.iter().any(|s| s == &json!("camshaft/task-board#190")),
-            "suggestions carry the typed forms: {bare}"
+            "suggestions carry the canonical #task_N form: {bare}"
         );
+        // task_869: a hashless typed ref is an ADVISORY soft_ref (does not affect clean), nudging
+        // the canonical #-prefixed form; it is never hard-flagged like a bare #N.
+        let soft = bare["soft_refs"].as_array().unwrap();
+        assert_eq!(soft.len(), 1, "task_7 surfaced as a soft_ref: {bare}");
+        assert_eq!(soft[0]["ref"], json!("task_7"));
+        assert_eq!(soft[0]["suggestion"], json!("#task_7"));
+        // A fully canonical body (#task_7) is clean with no soft_ref, and #190-in-code is not flagged.
+        let canonical = lint_text(&pool, "the `#190` token and #task_7").await?;
+        assert_eq!(canonical["clean"], json!(true), "canonical: {canonical}");
+        assert!(canonical["bare_refs"].as_array().unwrap().is_empty());
         assert!(
-            lint_text(&pool, "the `#190` token and task_7").await?["bare_refs"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "a #N inside code is not flagged"
+            canonical["soft_refs"].as_array().unwrap().is_empty(),
+            "an already-#-prefixed typed ref is not nudged: {canonical}"
         );
 
         // A banned phrase plus two non-ASCII chars: all reported, clean=false, and no early bail

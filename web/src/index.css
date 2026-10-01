@@ -41,7 +41,7 @@ html[data-theme='light'] {
   --color-sky-300: #0369a1; /* sky-700 — links / accents / hovers */
   --color-sky-400: #0369a1; /* sky-700 — primary link/accent text (>=4.5:1 on white) */
   --color-emerald-300: #047857; /* emerald-700 */
-  --color-amber-300: #b45309; /* amber-700 — monitor-exempt + bare-#N ambiguity affordance */
+  --color-amber-300: #b45309; /* amber-700 — monitor-exempt + status affordances */
   --color-rose-300: #be123c; /* rose-700 — errors / adversarial */
   --color-violet-300: #6d28d9; /* violet-700 — decisions */
   --color-slate-300: #334155; /* slate-700 */
