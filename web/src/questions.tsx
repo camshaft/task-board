@@ -106,6 +106,7 @@ type FormSpec =
   | { shape: 'choice'; multi: boolean; options: QuestionOption[]; min?: number; max?: number; scalar?: boolean }
   | { shape: 'text'; placeholder?: string }
   | { shape: 'ranked'; options: QuestionOption[]; maxRanked?: number }
+  | { shape: 'list'; min?: number; max?: number; placeholder?: string; itemLabel?: string }
   | { shape: 'age'; recipient: string }
 
 // Does a response schema expect an array value (vs a scalar)? Used to decide a single-select's
@@ -142,6 +143,14 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
         return { shape: 'text', placeholder: asText(p.placeholder) }
       case 'rank':
         return { shape: 'ranked', options: asOptions(p.options), maxRanked: asCount(p.max_ranked) }
+      case 'string-list':
+        return {
+          shape: 'list',
+          min: asCount(p.min_items),
+          max: asCount(p.max_items),
+          placeholder: asText(p.placeholder),
+          itemLabel: asText(p.item_label),
+        }
       case 'age-request': {
         const recipient = asText(p.recipient)
         // With a recipient we can encrypt in-browser; without one, fall back to the free-text escape.
@@ -270,6 +279,8 @@ function AnswerForm({
   const [multi, setMulti] = useState<string[]>([])
   const [text, setText] = useState('')
   const [order, setOrder] = useState<string[]>(options.map((o) => o.id))
+  // string-list rows (start with one empty row the operator types into).
+  const [items, setItems] = useState<string[]>([''])
   const [freeText, setFreeText] = useState('')
   const [showFree, setShowFree] = useState(false)
 
@@ -297,6 +308,16 @@ function AnswerForm({
 
   const maxRanked = spec?.shape === 'ranked' ? spec.maxRanked : undefined
   const rankedSubmit = maxRanked != null ? order.slice(0, maxRanked) : order
+
+  // string-list: the submittable value is the trimmed, non-empty rows; valid within [min, max].
+  const listMin = spec?.shape === 'list' ? (spec.min ?? 1) : 1
+  const listMax = spec?.shape === 'list' ? spec.max : undefined
+  const cleanedItems = items.map((s) => s.trim()).filter((s) => s.length > 0)
+  const listOk = cleanedItems.length >= listMin && (listMax == null || cleanedItems.length <= listMax)
+  const setItem = (i: number, v: string) => setItems((xs) => xs.map((x, j) => (j === i ? v : x)))
+  const addItem = () => setItems((xs) => [...xs, ''])
+  const removeItem = (i: number) =>
+    setItems((xs) => (xs.length <= 1 ? [''] : xs.filter((_, j) => j !== i)))
 
   return (
     <div className="mt-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-2.5">
@@ -422,6 +443,59 @@ function AnswerForm({
           <button disabled={busy} className={BTN} onClick={() => onSubmit('ranked', rankedSubmit)}>
             Submit ranking
           </button>
+        </div>
+      )}
+
+      {spec?.shape === 'list' && (
+        <div className="space-y-1.5">
+          {(listMin > 1 || listMax != null) && (
+            <p className="text-xs text-[var(--color-muted)]">
+              {listMax != null
+                ? `Add ${listMin === listMax ? `exactly ${listMin}` : `${listMin}–${listMax}`} ${spec.itemLabel ?? 'item'}${listMax === 1 ? '' : 's'}.`
+                : `Add at least ${listMin} ${spec.itemLabel ?? 'item'}${listMin === 1 ? '' : 's'}.`}
+            </p>
+          )}
+          {items.map((v, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <input
+                type="text"
+                value={v}
+                onChange={(e) => setItem(i, e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && (listMax == null || items.length < listMax)) {
+                    e.preventDefault()
+                    addItem()
+                  }
+                }}
+                placeholder={spec.placeholder ?? `${spec.itemLabel ?? 'Item'} ${i + 1}`}
+                className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
+              />
+              <button
+                disabled={busy || (items.length <= 1 && !v)}
+                onClick={() => removeItem(i)}
+                className="px-1 text-[var(--color-muted)] hover:text-rose-300 disabled:opacity-30"
+                aria-label="Remove row"
+              >
+                x
+              </button>
+            </div>
+          ))}
+          <div className="flex items-center gap-3">
+            <button
+              disabled={busy || (listMax != null && items.length >= listMax)}
+              onClick={addItem}
+              className={BTN_GHOST}
+            >
+              + Add {spec.itemLabel ?? 'item'}
+            </button>
+            <button
+              disabled={busy || !listOk}
+              className={BTN}
+              onClick={() => onSubmit('list', cleanedItems)}
+            >
+              Submit list
+            </button>
+          </div>
         </div>
       )}
 
