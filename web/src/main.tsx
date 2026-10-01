@@ -10,6 +10,7 @@ import ChannelView from './ChannelView.tsx'
 import Channels from './Channels.tsx'
 import Documents from './Documents.tsx'
 import DocumentView from './DocumentView.tsx'
+import ErrorBoundary from './ErrorBoundary.tsx'
 import Home from './Home.tsx'
 import Layout from './Layout.tsx'
 import People from './People.tsx'
@@ -58,33 +59,35 @@ function NotFound() {
 // routes — the board for a project, and the task drawer layered over it.
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <BrowserRouter basename={basename}>
-      <Routes>
-        {/* Standalone secret-submission page — no board chrome; reached via a capability link. */}
-        <Route path="secret-requests/:id" element={<SecretSubmit />} />
-        <Route element={<Layout />}>
-          <Route index element={<Home />} />
-          <Route path="awaiting" element={<Awaiting />} />
-          <Route path="search" element={<Search />} />
-          <Route path="settings" element={<Settings />} />
-          <Route path="documents" element={<Documents />} />
-          <Route path="documents/:documentId" element={<DocumentView />} />
-          <Route path="wiki" element={<Wiki />} />
-          <Route path="reviews" element={<Reviews />} />
-          <Route path="reviews/:reviewId" element={<ReviewView />} />
-          <Route path="agents" element={<Agents />} />
-          <Route path="agents/:agentId" element={<AgentView />} />
-          <Route path="people" element={<People />} />
-          <Route path="channels" element={<Channels />} />
-          <Route path="channels/:channelId" element={<ChannelView />} />
-          {/* Bare task deep-link: resolves the task's project and redirects to the nested URL. */}
-          <Route path="tasks/:taskId" element={<TaskRedirect />} />
-          <Route path="projects/:projectId" element={<Board />}>
-            <Route path="tasks/:taskId" element={<TaskDrawer />} />
+    <ErrorBoundary>
+      <BrowserRouter basename={basename}>
+        <Routes>
+          {/* Standalone secret-submission page — no board chrome; reached via a capability link. */}
+          <Route path="secret-requests/:id" element={<SecretSubmit />} />
+          <Route element={<Layout />}>
+            <Route index element={<Home />} />
+            <Route path="awaiting" element={<Awaiting />} />
+            <Route path="search" element={<Search />} />
+            <Route path="settings" element={<Settings />} />
+            <Route path="documents" element={<Documents />} />
+            <Route path="documents/:documentId" element={<DocumentView />} />
+            <Route path="wiki" element={<Wiki />} />
+            <Route path="reviews" element={<Reviews />} />
+            <Route path="reviews/:reviewId" element={<ReviewView />} />
+            <Route path="agents" element={<Agents />} />
+            <Route path="agents/:agentId" element={<AgentView />} />
+            <Route path="people" element={<People />} />
+            <Route path="channels" element={<Channels />} />
+            <Route path="channels/:channelId" element={<ChannelView />} />
+            {/* Bare task deep-link: resolves the task's project and redirects to the nested URL. */}
+            <Route path="tasks/:taskId" element={<TaskRedirect />} />
+            <Route path="projects/:projectId" element={<Board />}>
+              <Route path="tasks/:taskId" element={<TaskDrawer />} />
+            </Route>
+            <Route path="*" element={<NotFound />} />
           </Route>
-          <Route path="*" element={<NotFound />} />
-        </Route>
-      </Routes>
-    </BrowserRouter>
+        </Routes>
+      </BrowserRouter>
+    </ErrorBoundary>
   </StrictMode>,
 )
