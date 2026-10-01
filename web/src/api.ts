@@ -517,8 +517,27 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   return res.json() as Promise<T>
 }
 
+// A client-side crash report (task_879). POSTed to /api/crash-reports, where the backend dedups
+// by signature (build + top stack frames) and files/bumps an investigation task. All fields but
+// `message` are optional so a bare onerror with nothing else still reports.
+export interface CrashReport {
+  kind: 'error' | 'unhandledrejection'
+  message: string
+  stack?: string
+  component_stack?: string
+  url?: string
+  build?: string
+  user_agent?: string
+  occurred_at?: string
+}
+
 export const api = {
   meta: () => req<Meta>('GET', '/meta'),
+
+  // Fire-and-forget UI crash telemetry; the backend returns the task it filed/bumped. Callers
+  // (the crash reporter) swallow failures so reporting a crash can never itself crash the app.
+  createCrashReport: (b: CrashReport) =>
+    req<{ task_id: number; created: boolean; occurrences: number }>('POST', '/crash-reports', b),
 
   // Absolute URL of the SSE activity feed, resolved against the same base as every request
   // so it works at the origin root or behind a sub-path proxy. Consumed by useLiveUpdates.
