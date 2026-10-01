@@ -411,7 +411,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "DELETE", path: "/api/people/{id}", summary: "Delete a person and drop their team memberships.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/teams", summary: "List teams (addressable groups whose members are people OR other teams).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/teams", summary: "Create or upsert a team by stable string id (e.g. operator).", query: "", body: Some("CreateTeamBody") },
-    Endpoint { method: "GET", path: "/api/teams/{team_id}", summary: "Get a team with its direct members and its fully-resolved person set (nested teams expanded, cycle-guarded).", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/teams/{team_id}", summary: "Get a team with its direct members and its fully-resolved person AND agent sets (resolved_people + resolved_agents, kept separate; nested teams expanded, cycle-guarded).", query: "", body: None },
     Endpoint { method: "DELETE", path: "/api/teams/{team_id}", summary: "Delete a team and drop its memberships (its members and its membership in parent teams).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/teams/{team_id}/members", summary: "Add a person or team as a member (idempotent). Rejects a sub-team add that would create a membership cycle.", query: "", body: Some("TeamMemberBody") },
     Endpoint { method: "DELETE", path: "/api/teams/{team_id}/members", summary: "Remove a member (person or team) from a team (idempotent).", query: "", body: Some("TeamMemberBody") },
@@ -1755,9 +1755,9 @@ async fn delete_team(State(st): State<AppState>, Path(team_id): Path<String>) ->
 
 #[derive(Deserialize, JsonSchema)]
 struct TeamMemberBody {
-    /// The member's id: a person id (member_kind="person") or a team id (member_kind="team").
+    /// The member's id: a person id, a team id, or an agent id (per member_kind).
     member_id: String,
-    /// "person" or "team".
+    /// "person", "team", or "agent" (team-scoped agents, task 542).
     member_kind: String,
     created_by: Option<String>,
 }
