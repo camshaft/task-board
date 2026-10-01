@@ -1015,7 +1015,9 @@ pub struct CreateDocumentArgs {
     /// Optionally attach the document to a project.
     #[serde(default)]
     pub project_id: Option<i64>,
-    /// Short note describing this version.
+    /// A one-line change-note for this version: what changed and what to look for. The operator
+    /// reads it as the review caption (shown on the version list + diff), so a clear note makes
+    /// approval review fast and accurate. For v1, a short note on what the document is.
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -1044,6 +1046,9 @@ pub struct PublishVersionArgs {
     /// Supply exactly one of `cid` / `content`.
     #[serde(default)]
     pub content: Option<String>,
+    /// A one-line change-note for THIS revision: what changed since the previous version and what
+    /// to look for. The operator reads it as the review caption (version list + diff), so always
+    /// fill it on a publish -- a blank change-note makes the operator's review slower.
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -2642,7 +2647,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Publish a new immutable version of a document. Pass `cid` (bare content id; the board does not resolve it) or, with no local IPFS, raw `content` to content-address server-side (requires a configured IPFS backend). Appends the version, advances the current pointer, and returns the updated document. A new version drops an approved/changes_requested doc back to in_review. When you pass raw `content`, the board also re-indexes the document's [[wiki-link]] outbound links and ![[embed]] transclusions (a CID-only publish leaves prior edges untouched, since the board never fetches the bytes)."
+        description = "Publish a new immutable version of a document. Pass `cid` (bare content id; the board does not resolve it) or, with no local IPFS, raw `content` to content-address server-side (requires a configured IPFS backend). Always fill `summary` with a one-line change-note for THIS revision (what changed + what to look for): the operator reads it as the review caption on the version list + diff, so a blank summary slows their approval review. Appends the version, advances the current pointer, and returns the updated document. A new version drops an approved/changes_requested doc back to in_review. When you pass raw `content`, the board also re-indexes the document's [[wiki-link]] outbound links and ![[embed]] transclusions (a CID-only publish leaves prior edges untouched, since the board never fetches the bytes)."
     )]
     async fn publish_version(
         &self,

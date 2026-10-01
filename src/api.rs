@@ -2512,6 +2512,8 @@ struct CreateDocumentBody {
     /// exactly one of `cid` / `content`.
     content: Option<String>,
     project_id: Option<i64>,
+    /// A one-line change-note for this version (what changed + what to look for); the operator reads
+    /// it as the review caption on the version list + diff. For v1, a short note on what the doc is.
     summary: Option<String>,
     created_by: Option<String>,
     metadata: Option<Value>,
@@ -2745,6 +2747,9 @@ struct PublishVersionBody {
     /// Raw content for the new version, content-addressed server-side when no `cid` is given.
     /// Supply exactly one of `cid` / `content`.
     content: Option<String>,
+    /// A one-line change-note for THIS revision: what changed since the previous version and what to
+    /// look for. The operator reads it as the review caption (version list + diff), so always fill
+    /// it on a publish -- a blank change-note makes the operator's review slower.
     summary: Option<String>,
     created_by: Option<String>,
     /// MIME type of this version's bytes (default text/markdown). The board records only the label.
