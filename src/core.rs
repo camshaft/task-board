@@ -2369,7 +2369,37 @@ pub async fn get_task_limited(
         m.remove("blocked_on_kind");
         m.remove("blocked_on_ref");
         m.remove("blocked_on_note");
+        let scalar_blocked = blocked_on.is_some();
         m.insert("blocked_on".into(), blocked_on.unwrap_or(Value::Null));
+
+        // Derived question-block (task_628 slice 3, doc_33 A5): a task is effectively blocked when it
+        // has a scalar blocked_on OR >=1 OPEN BLOCKING question. These fields are DERIVED (never
+        // stored) so they stay consistent as questions are answered/declined/superseded. `routed_to`
+        // is a general principal (agent / team / operator / external), so this covers agent-to-agent
+        // questions as-is (cameron, task_628 comment 2628) -- no operator special-casing.
+        let blocking_questions = open_blocking_questions_json(pool, task_id).await?;
+        let question_blocked = !blocking_questions.is_empty();
+        // question_blocked_on: the union of the open blocking questions' routed_to, as RAW principal
+        // ids (NOT doc_26-expanded), mirroring the scalar blocked_on target. Sorted + deduped.
+        let mut question_blocked_on: BTreeSet<String> = BTreeSet::new();
+        for q in &blocking_questions {
+            if let Some(rt) = q.get("routed_to").and_then(|v| v.as_str()) {
+                question_blocked_on.insert(rt.to_string());
+            }
+        }
+        m.insert(
+            "blocking_questions".into(),
+            Value::Array(blocking_questions),
+        );
+        m.insert("question_blocked".into(), Value::Bool(question_blocked));
+        m.insert(
+            "question_blocked_on".into(),
+            json!(question_blocked_on.into_iter().collect::<Vec<_>>()),
+        );
+        m.insert(
+            "effectively_blocked".into(),
+            Value::Bool(scalar_blocked || question_blocked),
+        );
 
         // Comments, bounded by `comments_limit` (#511). Always report the total so a caller knows
         // whether there is more than what was inlined.
@@ -2856,6 +2886,141 @@ pub async fn get_comment(pool: &Pool, comment_id: i64) -> anyhow::Result<Value> 
         anyhow::bail!("no comment {comment_id}");
     };
     Ok(comment_row_json(&row))
+}
+
+// --- task_628 slice 3: derived question-block (read-side) ---
+
+/// The predicate for a comment that currently BLOCKS its task: an OPEN question whose payload marks
+/// it blocking. Pinned by the slice-1 contract (doc_33 A5). SQLite `json_extract` yields the integer
+/// 1 for a JSON `true` and the string `'true'` for a JSON `"true"`, so `IN (1,'true')` matches both
+/// shapes (a bare `true` keyword is just 1 in SQLite). Shared by the get_task surfacing and the
+/// "waiting on me" view so the two never drift; slice 2's recompute uses the same predicate.
+const OPEN_BLOCKING_QUESTION: &str =
+    "type='question' AND state='open' AND json_extract(payload,'$.blocking') IN (1,'true')";
+
+/// The OPEN BLOCKING questions on a task, oldest-first (by comment id), each as
+/// `{comment_id, kind, routed_to, blocking, prompt}` (task_628 slice 3). `prompt` is the question's
+/// body so a reader sees what is asked without a second fetch; `routed_to` is the raw principal the
+/// question is posed to (any agent / team / operator). Empty when the task has no open blocking
+/// question. The ordering is stable so a client can diff the list across polls.
+async fn open_blocking_questions_json(pool: &Pool, task_id: i64) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(&format!(
+        "SELECT id, body, payload FROM comments \
+         WHERE task_id=? AND {OPEN_BLOCKING_QUESTION} ORDER BY id"
+    ))
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let id: i64 = r.try_get("id")?;
+        let body: String = r.try_get("body").unwrap_or_default();
+        let payload: Value = r
+            .try_get::<String, _>("payload")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}));
+        out.push(json!({
+            "comment_id": id,
+            "kind": payload.get("kind").cloned().unwrap_or(Value::Null),
+            "routed_to": payload.get("routed_to").cloned().unwrap_or(Value::Null),
+            "blocking": true,
+            "prompt": body,
+        }));
+    }
+    Ok(out)
+}
+
+/// The set of principal ids whose doc_26 expansion INCLUDES `viewer`: the viewer itself plus every
+/// team that (transitively) has the viewer as a member. The inverse of `resolve_principal_ids`
+/// (which expands a principal DOWNWARD into its members) -- used to match a question's `routed_to`
+/// (which may name a team) against a concrete viewer. Cycle-guarded upward walk over `team_members`.
+// allow(dead_code): only reachable through list_tasks_blocking_me, which is itself landed ahead of
+// its mcp/api wiring (see that fn). Drop both allows when the "waiting on me" tool/endpoint lands.
+#[allow(dead_code)]
+async fn principals_routing_to(pool: &Pool, viewer: &str) -> anyhow::Result<BTreeSet<String>> {
+    let mut out: BTreeSet<String> = BTreeSet::from([viewer.to_string()]);
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut stack = vec![viewer.to_string()];
+    while let Some(member) = stack.pop() {
+        if !visited.insert(member.clone()) {
+            continue; // already expanded this member -> cycle guard
+        }
+        for r in sqlx::query("SELECT team_id FROM team_members WHERE member_id=?")
+            .bind(&member)
+            .fetch_all(pool)
+            .await?
+        {
+            let team: String = r.try_get("team_id")?;
+            if out.insert(team.clone()) {
+                stack.push(team); // this team may itself be a member of parent teams
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The "waiting on me" view for derived question-blocks (task_628 slice 3, doc_33 A5): tasks with an
+/// open blocking question routed (doc_26-expanded) to `viewer`. The analogue of the scalar
+/// `list_tasks(blocked_on_kind='agent', blocked_on_ref=viewer)` view -- a question routed to a TEAM
+/// surfaces for every (transitive) member, one routed directly to the viewer matches as-is, and it
+/// works for any principal (agent-to-agent included), not just the operator. Honors `project_id` +
+/// `include_archived` and returns the same row shape (+ monitor_exempt / assignee reachability) as
+/// `list_tasks`, so a caller can union this array with a scalar-blocked `list_tasks` result directly.
+// allow(dead_code): landed ahead of its caller (same pattern as resolve_principal_ids). v-task-board
+// wires it into an MCP tool + REST endpoint as a shared append-point; drop this allow when wired.
+#[allow(dead_code)]
+pub async fn list_tasks_blocking_me(
+    pool: &Pool,
+    viewer: &str,
+    project_id: Option<i64>,
+    include_archived: bool,
+) -> anyhow::Result<Value> {
+    // Precompute (in Rust, since team expansion is not expressible in SQL) the principals whose
+    // routed_to would surface for this viewer, then match them with a plain IN (...) in the EXISTS.
+    let routed = principals_routing_to(pool, viewer).await?;
+    let placeholders = std::iter::repeat_n("?", routed.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut conds: Vec<String> = Vec::new();
+    if !include_archived {
+        conds.push("archived_at IS NULL".into());
+    }
+    if project_id.is_some() {
+        conds.push("project_id=?".into());
+    }
+    conds.push(format!(
+        "EXISTS (SELECT 1 FROM comments c WHERE c.task_id = tasks.id AND c.{OPEN_BLOCKING_QUESTION} \
+         AND json_extract(c.payload,'$.routed_to') IN ({placeholders}))"
+    ));
+    let q = format!(
+        "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at, \
+         blocked_on_kind, blocked_on_ref, json_extract(metadata, '$.monitor_exempt') AS monitor_exempt \
+         FROM tasks WHERE {} ORDER BY id",
+        conds.join(" AND "),
+    );
+    // Bind order mirrors the cond order: project_id (if any), then the routed principals.
+    let mut query = sqlx::query(&q);
+    if let Some(pid) = project_id {
+        query = query.bind(pid);
+    }
+    for p in &routed {
+        query = query.bind(p);
+    }
+    let rows = query.fetch_all(pool).await?;
+    let mut out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let mut v = row_to_json_ref(r, "task");
+            if let Value::Object(ref mut m) = v {
+                let exempt = matches!(m.get("monitor_exempt"), Some(x) if x.as_i64() == Some(1) || x.as_bool() == Some(true));
+                m.insert("monitor_exempt".into(), Value::Bool(exempt));
+            }
+            v
+        })
+        .collect();
+    annotate_assignee_reachability(pool, &mut out).await?;
+    Ok(Value::Array(out))
 }
 
 /// Merge arbitrary key/value properties into a task's metadata (JSON). Returns the
@@ -7826,6 +7991,153 @@ mod tests {
 
         // Unknown comment id errors.
         assert!(get_comment(&pool, 99999).await.is_err());
+        Ok(())
+    }
+
+    /// task_628 slice 3: get_task's DERIVED question-block (effectively_blocked / question_blocked /
+    /// blocking_questions sorted by comment id / question_blocked_on raw ids) and the principal-
+    /// general "waiting on me" view (list_tasks_blocking_me), including team-routed questions
+    /// surfacing for members and answered questions dropping out of the block.
+    #[tokio::test]
+    async fn derived_question_block_and_waiting_on_me() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "asker", None, None, None, None, None).await?;
+        register_agent(&pool, "bob", None, None, None, None, None).await?;
+        register_agent(&pool, "carol", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("asker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("asker"),
+            None,
+            Some("asker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Writes a plain comment then promotes it to a question (the ops slice writes these directly;
+        // the read-side under test only cares about the stored columns).
+        async fn pose(pool: &Pool, tid: i64, body: &str, payload: &str) -> anyhow::Result<i64> {
+            let cid = comment_task(pool, tid, body, Some("asker"), None, None).await?["comment_id"]
+                .as_i64()
+                .unwrap();
+            sqlx::query("UPDATE comments SET type='question', state='open', payload=? WHERE id=?")
+                .bind(payload)
+                .bind(cid)
+                .execute(pool)
+                .await?;
+            Ok(cid)
+        }
+        fn ids(v: &Value) -> Vec<i64> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_i64().unwrap())
+                .collect()
+        }
+
+        // No questions yet -> not effectively blocked, empty derived fields.
+        let before = get_task(&pool, tid).await?;
+        assert_eq!(before["effectively_blocked"], json!(false));
+        assert_eq!(before["question_blocked"], json!(false));
+        assert_eq!(before["blocking_questions"].as_array().unwrap().len(), 0);
+        assert_eq!(before["question_blocked_on"], json!([]));
+
+        // A NON-blocking question does not block, nor does an ANSWERED one. A blocking open question
+        // routed to agent "bob" does.
+        pose(
+            &pool,
+            tid,
+            "fyi?",
+            r#"{"kind":"yes_no","routed_to":"bob","blocking":false}"#,
+        )
+        .await?;
+        let c_bob = pose(
+            &pool,
+            tid,
+            "ship it?",
+            r#"{"kind":"yes_no","routed_to":"bob","blocking":true}"#,
+        )
+        .await?;
+
+        let got = get_task(&pool, tid).await?;
+        assert_eq!(got["effectively_blocked"], json!(true));
+        assert_eq!(got["question_blocked"], json!(true));
+        let bq = got["blocking_questions"].as_array().unwrap();
+        assert_eq!(bq.len(), 1, "only the open blocking question counts");
+        assert_eq!(bq[0]["comment_id"], json!(c_bob));
+        assert_eq!(bq[0]["kind"], json!("yes_no"));
+        assert_eq!(bq[0]["routed_to"], json!("bob"));
+        assert_eq!(bq[0]["blocking"], json!(true));
+        assert_eq!(bq[0]["prompt"], json!("ship it?"));
+        assert_eq!(got["question_blocked_on"], json!(["bob"]));
+
+        // "waiting on me": bob sees it; carol (uninvolved) does not.
+        assert_eq!(
+            ids(&list_tasks_blocking_me(&pool, "bob", None, false).await?),
+            vec![tid]
+        );
+        assert!(list_tasks_blocking_me(&pool, "carol", None, false)
+            .await?
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // A second blocking question routed to a TEAM carol belongs to: union is sorted by raw id,
+        // sorted-by-comment-id ordering holds, and carol now surfaces (team expansion).
+        create_team(&pool, "qa", Some("QA"), Some("asker"), None).await?;
+        add_team_member(&pool, "qa", "carol", "agent", Some("asker")).await?;
+        let c_team = pose(
+            &pool,
+            tid,
+            "qa sign-off?",
+            r#"{"kind":"yes_no","routed_to":"qa","blocking":true}"#,
+        )
+        .await?;
+
+        let got2 = get_task(&pool, tid).await?;
+        let bq2 = got2["blocking_questions"].as_array().unwrap();
+        assert_eq!(bq2.len(), 2);
+        assert_eq!(bq2[0]["comment_id"], json!(c_bob), "sorted by comment id");
+        assert_eq!(bq2[1]["comment_id"], json!(c_team));
+        assert_eq!(got2["question_blocked_on"], json!(["bob", "qa"]));
+        assert_eq!(
+            ids(&list_tasks_blocking_me(&pool, "carol", None, false).await?),
+            vec![tid]
+        );
+        assert_eq!(
+            ids(&list_tasks_blocking_me(&pool, "bob", None, false).await?),
+            vec![tid]
+        );
+        // An unrelated principal sees nothing.
+        assert!(list_tasks_blocking_me(&pool, "dave", None, false)
+            .await?
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // Answering bob's question drops it from the derived block + bob's view; the task stays
+        // effectively blocked on the still-open qa question.
+        sqlx::query("UPDATE comments SET state='answered' WHERE id=?")
+            .bind(c_bob)
+            .execute(&pool)
+            .await?;
+        let got3 = get_task(&pool, tid).await?;
+        assert_eq!(got3["blocking_questions"].as_array().unwrap().len(), 1);
+        assert_eq!(got3["question_blocked_on"], json!(["qa"]));
+        assert_eq!(got3["effectively_blocked"], json!(true));
+        assert!(list_tasks_blocking_me(&pool, "bob", None, false)
+            .await?
+            .as_array()
+            .unwrap()
+            .is_empty());
         Ok(())
     }
 
