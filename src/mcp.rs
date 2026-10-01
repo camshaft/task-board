@@ -1101,6 +1101,11 @@ pub struct GetDocumentCommentsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetCommentArgs {
+    pub comment_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DocumentActorArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -2602,6 +2607,19 @@ impl Board {
         Parameters(a): Parameters<GetDocumentCommentsArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_document_comments(&self.pool, a.document_id, a.version_id, s(&a.status))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Read one comment by its id, with its type (plain/question/answer), parsed payload, lifecycle state, and reply_to/supersedes links. For a machine read of a question/answer comment outside its task thread."
+    )]
+    async fn get_comment(
+        &self,
+        Parameters(a): Parameters<GetCommentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_comment(&self.pool, a.comment_id)
             .await
             .map_err(err)
             .and_then(ok)
