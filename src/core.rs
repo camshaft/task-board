@@ -5669,15 +5669,13 @@ pub async fn check_cid_content(
     if !is_text_content_type(content_type) {
         return Ok(());
     }
-    let bytes = crate::ipfs::cat(url, cid, DOCUMENT_READ_CAP_BYTES)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
+    let bytes = crate::ipfs::cat(url, cid).await.map_err(|e| {
+        anyhow::anyhow!(
             "could not fetch CID {cid} to content-scan it before publishing ({e}); ensure it is \
              pinned/reachable on the board's IPFS, or pass acknowledge_banned=true to publish \
              without the content scan"
         )
-        })?;
+    })?;
     if let Ok(text) = String::from_utf8(bytes) {
         check_content(pool, &text, acknowledge).await?;
     }
@@ -7005,9 +7003,6 @@ pub async fn update_document(
     Ok(out)
 }
 
-/// Cap on a from-session document-body read, matching the REST IPFS gateway cap.
-pub const DOCUMENT_READ_CAP_BYTES: usize = 25 * 1024 * 1024;
-
 /// Whether a content_type is text-shaped, i.e. safe to return as a UTF-8 string from the read
 /// path. Binary types (image/pdf/...) are not inlined; the caller fetches their bytes by CID.
 pub fn is_text_content_type(ct: &str) -> bool {
@@ -7090,7 +7085,7 @@ pub async fn read_document_content(
         "content_type": ct,
     });
     if is_text_content_type(&ct) {
-        let bytes = crate::ipfs::cat(url, &cid, DOCUMENT_READ_CAP_BYTES).await?;
+        let bytes = crate::ipfs::cat(url, &cid).await?;
         let text = String::from_utf8(bytes).map_err(|_| {
             anyhow::anyhow!("document {document_id} v{vn} content is not valid UTF-8")
         })?;

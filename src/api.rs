@@ -2365,9 +2365,6 @@ struct IpfsCatQuery {
     content_type: Option<String>,
 }
 
-/// Cap on a single read-gateway response, so the board never buffers a runaway blob.
-const IPFS_READ_CAP_BYTES: usize = 25 * 1024 * 1024;
-
 /// `GET /api/ipfs/{cid}` — read content back by CID through the configured IPFS backend. The
 /// READ half of the scoped CID-only exception (see `ipfs_add`): it lets the same-origin web app
 /// fetch a document's bytes to render them, with no separate IPFS gateway or CORS. Deliberately
@@ -2389,7 +2386,7 @@ async fn ipfs_cat(
             "give a valid `cid` (a bare content id)"
         )));
     }
-    let bytes = ipfs::cat(url, &cid, IPFS_READ_CAP_BYTES).await?;
+    let bytes = ipfs::cat(url, &cid).await?;
     let ct = q
         .content_type
         .as_deref()
