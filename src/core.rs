@@ -5005,7 +5005,9 @@ pub async fn comment_document(
         None,
         Some(document_id),
         data,
-        Recipients::FromDocument(document_id),
+        // A comment on a doc also reaches the people working any task the doc is attached to --
+        // their assignee/creator/subscribers -- not only doc watchers (task 581).
+        Recipients::FromDocumentAndAttachedTasks(document_id),
     )
     .await?;
     let out = sqlx::query(
@@ -9956,6 +9958,55 @@ mod tests {
         assert!(check_cid_content(&pool, Some("http://127.0.0.1:1"), "Qm-x", "text/markdown", true).await.is_ok());
         // Non-text content is out of scope for the banned-phrase/ASCII gate: skipped before any fetch.
         assert!(check_cid_content(&pool, Some("http://127.0.0.1:1"), "Qm-x", "image/png", false).await.is_ok());
+        Ok(())
+    }
+
+    /// A comment on a document notifies the people working any task the doc is attached to -- the
+    /// task's assignee/creator -- not only doc watchers (task 581), so design-doc feedback reaches
+    /// the owner of the related work even if they never subscribed to the doc itself.
+    #[tokio::test]
+    async fn doc_comment_notifies_attached_task_owner() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "owner", None, None, None, None, None).await?;
+        register_agent(&pool, "assignee", None, None, None, None, None).await?;
+        register_agent(&pool, "commenter", None, None, None, None, None).await?;
+        let doc =
+            create_document(&pool, "Design", None, "Qm-cid", None, Some("owner"), None, None, None).await?;
+        let did = doc["id"].as_i64().unwrap();
+        let p = create_project(&pool, "P", None, Some("owner"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, Some("assignee"), None, Some("owner"), None, None, None)
+            .await?;
+        let tid = t["id"].as_i64().unwrap();
+        attach_document(&pool, did, tid, Some("owner")).await?;
+        // Drain prior notifications so we isolate the comment's fan-out.
+        check_notifications(&pool, "owner", true, 50, None).await?;
+        check_notifications(&pool, "assignee", true, 50, None).await?;
+
+        comment_document(&pool, did, None, Some("commenter"), "please revise section 2", None, None, None)
+            .await?;
+
+        // The attached task's assignee hears the doc comment even though they never subscribed to
+        // the doc; the doc owner hears it too (doc recipient).
+        let assignee_inbox = check_notifications(&pool, "assignee", true, 50, None).await?;
+        assert!(
+            assignee_inbox["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["type"] == json!("document.comment")),
+            "attached-task assignee hears the doc comment: {assignee_inbox}"
+        );
+        let owner_inbox = check_notifications(&pool, "owner", true, 50, None).await?;
+        assert!(
+            owner_inbox["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["type"] == json!("document.comment")),
+            "doc owner hears the doc comment: {owner_inbox}"
+        );
         Ok(())
     }
 

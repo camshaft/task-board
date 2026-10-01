@@ -52,6 +52,11 @@ pub enum Recipients {
     /// Union of a document's and a task's recipients — for a doc<->task attachment, so both a
     /// doc watcher and a task watcher learn about the link. (document_id, task_id)
     FromDocumentAndTask(i64, i64),
+    /// A document's recipients PLUS the recipients of every task the document is ATTACHED to, so a
+    /// comment on a design doc reaches the people working the related task(s) — their assignee,
+    /// creator, and (class-matching) subscribers — not only doc watchers (task 581). Used for
+    /// document.comment.
+    FromDocumentAndAttachedTasks(i64),
     /// An explicit set — e.g. a silent project.created.
     Explicit(BTreeSet<String>),
 }
@@ -336,6 +341,18 @@ pub async fn emit(
         Recipients::FromDocumentAndTask(did, tid) => {
             let mut set = recipients_for_document(tx, did, actor, r#type, &data).await?;
             set.extend(recipients_for_task(tx, tid, actor, r#type, &data).await?);
+            set
+        }
+        Recipients::FromDocumentAndAttachedTasks(did) => {
+            let mut set = recipients_for_document(tx, did, actor, r#type, &data).await?;
+            let attached = sqlx::query("SELECT task_id FROM document_attachments WHERE document_id=?")
+                .bind(did)
+                .fetch_all(&mut **tx)
+                .await?;
+            for row in attached {
+                let tid: i64 = row.try_get("task_id")?;
+                set.extend(recipients_for_task(tx, tid, actor, r#type, &data).await?);
+            }
             set
         }
     };
