@@ -5626,6 +5626,417 @@ pub async fn lint_text(pool: &Pool, text: &str) -> anyhow::Result<Value> {
     }))
 }
 
+// --- Design-doc conformance grading (doc_7 A8, task 625 / task 622) ------------------------------
+//
+// grade_document runs the mechanical half of the design-doc conformance rubric and returns
+// structured findings. The board is the single source of truth (operator steer, task_625): the
+// board's own submit path and any client (fleet check-doc, the task_374 reviewer) call this one
+// implementation behind the HTTP boundary -- no parallel fleet-side checker that could disagree.
+//
+// The check SET derives from and cites doc_7 appendix A8 (reference spec: task_625 comment 2614);
+// the tunable A8 parameters are the named consts below, so a later A8 revision is a one-line change.
+// Severities: "hard_fail" (mature, low-false-positive) vs "warn" (promote once the FP rate is proven
+// low on real docs). One fuzzy A8 sub-check -- the opening-paragraph-reads-as-a-whole-doc-summary
+// heuristic -- is intentionally NOT implemented yet: it needs real-doc FP tuning and has no reliable
+// deterministic form; every other A8 check is deterministic and implemented here.
+
+/// The required design-doc H2 sections, in order (doc_7 A8). The main body must contain exactly
+/// these before "## Appendix". Tunable: update here if A8 refines.
+const REQUIRED_SECTIONS: &[&str] = &[
+    "Background",
+    "Problem Statement",
+    "Requirements / Goals / Non-Goals",
+    "Solutions",
+    "Recommendation",
+];
+/// Title/heading length ceiling (doc_7 A8): a title or heading must be under this many characters.
+const HEADING_MAX_LEN: usize = 60;
+/// Default main-body prose budget in words (doc_7 A8; board-pm's locked basis, task_625 comment 2543).
+const DEFAULT_BODY_BUDGET_WORDS: i64 = 700;
+/// Line-leading status/provenance/placeholder markers that do not belong in a doc body (doc_7 A8 #6).
+const PROVENANCE_PREFIXES: &[&str] = &[
+    "draft",
+    "status:",
+    "written by",
+    "fact-checked by",
+    "fact checked by",
+    "published:",
+    "not yet published",
+    "not yet fact-checked",
+    "not yet fact checked",
+    "todo",
+    "tbd",
+    "placeholder",
+];
+
+fn gd_finding(check: &str, severity: &str, line: Option<i64>, message: String) -> Value {
+    json!({ "check": check, "severity": severity, "line": line, "message": message })
+}
+
+/// An ASCII replacement hint for a non-ASCII char (doc_7 A8 #1 names the fix, not just the fault).
+fn ascii_replacement(ch: char) -> &'static str {
+    match ch {
+        '\u{2014}' | '\u{2013}' => "'-' (a hyphen)",
+        '\u{2018}' | '\u{2019}' => "a straight apostrophe '",
+        '\u{201C}' | '\u{201D}' => "a straight quote \"",
+        '\u{2026}' => "'...' (three dots)",
+        '\u{00A0}' => "a normal space",
+        '\u{2192}' | '\u{2190}' | '\u{2194}' => "an ASCII arrow like -> / <- / <->",
+        _ => "an ASCII equivalent (or drop it)",
+    }
+}
+
+/// Collapse internal runs of whitespace to a single space and trim, for stable heading matching.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A markdown table separator row, e.g. `|---|---|` or `:--- | ---:` (the reliable table signal).
+fn is_table_separator(l: &str) -> bool {
+    let s: String = l.chars().filter(|c| !c.is_whitespace()).collect();
+    s.contains('|') && s.contains('-') && s.chars().all(|c| c == '|' || c == '-' || c == ':')
+}
+
+/// True if the line contains a markdown image `![alt](url)`.
+fn has_markdown_image(l: &str) -> bool {
+    l.find("![").map(|i| l[i..].contains("](")).unwrap_or(false)
+}
+
+/// Strip a leading list marker (`-`, `*`, `+`, or `N.`) from an already-trimmed line.
+fn strip_list_marker(s: &str) -> &str {
+    let t = s.trim_start();
+    for m in ["- ", "* ", "+ "] {
+        if let Some(r) = t.strip_prefix(m) {
+            return r.trim_start();
+        }
+    }
+    // ordered list: leading digits then '.' or ')'
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        let after = &t[digits.len()..];
+        if let Some(r) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
+            return r.trim_start();
+        }
+    }
+    t
+}
+
+/// Remove markdown link URLs, keeping the link text: `[text](url)` -> `text` (doc_7 A8 #8 counts
+/// link text, not the URL). A pragmatic pass -- good enough for the warn-level word budget.
+fn remove_link_urls(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        match rest.find("](") {
+            Some(pos) => {
+                out.push_str(&rest[..pos]); // keeps "[text" (brackets stripped below)
+                let after = &rest[pos + 2..];
+                match after.find(')') {
+                    Some(close) => rest = &after[close + 1..],
+                    None => {
+                        break;
+                    }
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out.replace(['[', ']', '!'], " ")
+}
+
+/// Count prose words on one main-body line: strip heading/list markers and link URLs, then count
+/// whitespace tokens that carry a letter/digit and are not a bare URL (doc_7 A8 #8).
+fn count_prose_words(line: &str) -> i64 {
+    let s = line.trim();
+    let s = s.trim_start_matches('#').trim_start();
+    let s = strip_list_marker(s);
+    remove_link_urls(s)
+        .split_whitespace()
+        .filter(|w| w.chars().any(|c| c.is_alphanumeric()) && !w.starts_with("http"))
+        .count() as i64
+}
+
+/// Grade a design document against the mechanical doc_7 A8 rubric. `title` is graded separately from
+/// `content` (the Document title is its own field, A1). Returns
+/// `{clean, has_hard_fail, findings:[{check, severity, line, message}]}`.
+pub async fn grade_document(
+    pool: &Pool,
+    content: &str,
+    title: &str,
+    body_length_budget_words: Option<i64>,
+) -> anyhow::Result<Value> {
+    let mut findings: Vec<Value> = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Fenced-code map: a line inside (or on the fence of) a ``` / ~~~ block is excluded from the
+    // prose/heading/marker checks.
+    let mut in_code = vec![false; lines.len()];
+    let mut fenced = false;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code[i] = true;
+            fenced = !fenced;
+        } else {
+            in_code[i] = fenced;
+        }
+    }
+
+    // Headings (level + text + 1-based line), skipping fenced code.
+    struct H {
+        line: usize,
+        level: usize,
+        text: String,
+    }
+    let mut headings: Vec<H> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if in_code[i] {
+            continue;
+        }
+        let t = l.trim_start();
+        if t.starts_with('#') {
+            let level = t.chars().take_while(|&c| c == '#').count();
+            let text = t[level..].trim().to_string();
+            headings.push(H {
+                line: i + 1,
+                level,
+                text,
+            });
+        }
+    }
+    // The main body ends at the first "Appendix" heading (any level), if present.
+    let bound = headings
+        .iter()
+        .find(|h| h.text.eq_ignore_ascii_case("Appendix"))
+        .map(|h| h.line)
+        .unwrap_or(usize::MAX);
+
+    // 1. ascii-only (hard-fail): every non-ASCII char, with the ASCII replacement.
+    for (ch, line, _col) in scan_non_ascii(content) {
+        findings.push(gd_finding(
+            "ascii-only",
+            "hard_fail",
+            Some(line as i64),
+            format!(
+                "non-ASCII character {ch:?} (U+{:04X}); replace it with {}",
+                ch as u32,
+                ascii_replacement(ch)
+            ),
+        ));
+    }
+
+    // 2. required-sections (hard-fail): exactly the required H2s, in order, before "## Appendix".
+    let required_norm: Vec<String> = REQUIRED_SECTIONS.iter().map(|s| normalize_ws(s)).collect();
+    let body_h2: Vec<&H> = headings
+        .iter()
+        .filter(|h| h.level == 2 && h.line < bound)
+        .collect();
+    let body_h2_norm: Vec<String> = body_h2.iter().map(|h| normalize_ws(&h.text)).collect();
+    for (req, req_disp) in required_norm.iter().zip(REQUIRED_SECTIONS.iter()) {
+        if !body_h2_norm.iter().any(|t| t.eq_ignore_ascii_case(req)) {
+            findings.push(gd_finding(
+                "required-sections",
+                "hard_fail",
+                None,
+                format!(
+                    "missing required section '## {req_disp}'; the main body must contain these H2 sections in order: {}",
+                    REQUIRED_SECTIONS.join(", ")
+                ),
+            ));
+        }
+    }
+    // Order: the required sections that ARE present must appear in canonical order.
+    let present_idxs: Vec<usize> = body_h2_norm
+        .iter()
+        .filter_map(|t| required_norm.iter().position(|r| r.eq_ignore_ascii_case(t)))
+        .collect();
+    if present_idxs.windows(2).any(|w| w[0] >= w[1]) {
+        findings.push(gd_finding(
+            "required-sections",
+            "hard_fail",
+            None,
+            format!(
+                "required sections are out of order; they must appear as: {}",
+                REQUIRED_SECTIONS.join(", ")
+            ),
+        ));
+    }
+    // Extra (non-required) H2 sections before the Appendix.
+    for h in &body_h2 {
+        let nt = normalize_ws(&h.text);
+        if !required_norm.iter().any(|r| r.eq_ignore_ascii_case(&nt)) {
+            findings.push(gd_finding(
+                "required-sections",
+                "hard_fail",
+                Some(h.line as i64),
+                format!(
+                    "unexpected section '## {}' before '## Appendix'; the main body may contain only the required sections ({})",
+                    h.text,
+                    REQUIRED_SECTIONS.join(", ")
+                ),
+            ));
+        }
+    }
+
+    // 3. banned-phrases (hard-fail): reuse the authoritative live scanner.
+    for p in scan_banned_phrases(pool, content).await? {
+        findings.push(gd_finding(
+            "banned-phrases",
+            "hard_fail",
+            None,
+            format!("banned phrase \"{p}\" found; rewrite to remove it (it is on the fleet banned-phrases list)"),
+        ));
+    }
+
+    // 4. title/heading rules.
+    let title_chars = title.chars().count();
+    if title_chars >= HEADING_MAX_LEN {
+        findings.push(gd_finding(
+            "title-heading-rules",
+            "hard_fail",
+            None,
+            format!("the title is {title_chars} characters; keep it under {HEADING_MAX_LEN} -- shorten it"),
+        ));
+    }
+    let title_norm = normalize_ws(title);
+    for h in &headings {
+        let hlen = h.text.chars().count();
+        if hlen >= HEADING_MAX_LEN {
+            findings.push(gd_finding(
+                "title-heading-rules",
+                "hard_fail",
+                Some(h.line as i64),
+                format!(
+                    "heading '{}' is {hlen} characters; keep headings under {HEADING_MAX_LEN}",
+                    h.text
+                ),
+            ));
+        }
+        if !title_norm.is_empty() && normalize_ws(&h.text).eq_ignore_ascii_case(&title_norm) {
+            findings.push(gd_finding(
+                "title-heading-rules",
+                "hard_fail",
+                Some(h.line as i64),
+                "the document title is repeated as a heading in the body; the title lives in the Document title field -- remove the in-body repetition".to_string(),
+            ));
+        }
+        if matches!(h.text.chars().last(), Some('.') | Some('!') | Some('?')) {
+            findings.push(gd_finding(
+                "title-heading-rules",
+                "warn",
+                Some(h.line as i64),
+                format!("heading '{}' reads as a sentence (ends with punctuation); headings should be short labels", h.text),
+            ));
+        }
+    }
+
+    // 5. body-hygiene (hard-fail): no tables or images in the main body (before the Appendix).
+    for (i, l) in lines.iter().enumerate() {
+        let line1 = i + 1;
+        if line1 >= bound || in_code[i] {
+            continue;
+        }
+        if is_table_separator(l) {
+            findings.push(gd_finding(
+                "body-hygiene",
+                "hard_fail",
+                Some(line1 as i64),
+                "a markdown table appears in the main body; move tabular detail to the Appendix"
+                    .to_string(),
+            ));
+        }
+        if has_markdown_image(l) {
+            findings.push(gd_finding(
+                "body-hygiene",
+                "hard_fail",
+                Some(line1 as i64),
+                "an image appears in the main body; move images to the Appendix".to_string(),
+            ));
+        }
+    }
+
+    // 6. status-provenance (warn): a line LEADING with a status/provenance/placeholder marker.
+    for (i, l) in lines.iter().enumerate() {
+        if in_code[i] {
+            continue;
+        }
+        let lower = l.trim_start().to_lowercase();
+        if PROVENANCE_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+            findings.push(gd_finding(
+                "status-provenance",
+                "warn",
+                Some((i + 1) as i64),
+                format!("line {} leads with a status/provenance/placeholder marker; drop editorial lines from the doc body", i + 1),
+            ));
+        }
+    }
+
+    // 7. caps-emphasis (warn): an all-caps word (4+ letters) that ALSO appears lowercase elsewhere
+    // (so a genuine acronym, which never appears lowercase, is not flagged).
+    let mut lower_words: BTreeSet<String> = BTreeSet::new();
+    let mut caps_tokens: Vec<(String, usize)> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if in_code[i] {
+            continue;
+        }
+        for tok in l
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|t| t.len() >= 4)
+        {
+            if tok.chars().all(|c| c.is_ascii_uppercase()) {
+                caps_tokens.push((tok.to_string(), i + 1));
+            } else if tok.chars().any(|c| c.is_ascii_lowercase()) {
+                lower_words.insert(tok.to_lowercase());
+            }
+        }
+    }
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    for (tok, line) in &caps_tokens {
+        if lower_words.contains(&tok.to_lowercase()) && flagged.insert(tok.clone()) {
+            findings.push(gd_finding(
+                "caps-emphasis",
+                "warn",
+                Some(*line as i64),
+                format!("'{tok}' looks capitalized for emphasis (it also appears in lowercase); use normal case or markdown emphasis"),
+            ));
+        }
+    }
+
+    // 8. body-length (warn): prose words from the top to the first Appendix heading, over budget.
+    let budget = body_length_budget_words.unwrap_or(DEFAULT_BODY_BUDGET_WORDS);
+    let mut words = 0i64;
+    for (i, l) in lines.iter().enumerate() {
+        if i + 1 >= bound {
+            break;
+        }
+        if in_code[i] {
+            continue;
+        }
+        words += count_prose_words(l);
+    }
+    if words > budget {
+        findings.push(gd_finding(
+            "body-length",
+            "warn",
+            None,
+            format!("the main body is about {words} prose words, over the ~{budget}-word budget; tighten it or move detail to the Appendix"),
+        ));
+    }
+
+    let has_hard_fail = findings.iter().any(|f| f["severity"] == "hard_fail");
+    Ok(json!({
+        "clean": findings.is_empty(),
+        "has_hard_fail": has_hard_fail,
+        "findings": findings,
+    }))
+}
+
 // --- External links (bridged mappings: channel-map, issue↔task, thread↔task) ---
 
 /// The board entity kinds an external link may target.
@@ -16438,6 +16849,65 @@ mod tests {
         // check_non_ascii (the bailing path) agrees on the first offender: same source of truth.
         assert!(check_non_ascii("ok \u{2014} no", false).is_err());
         assert!(check_non_ascii("all ascii here", false).is_ok());
+        Ok(())
+    }
+
+    // task 625: grade_document scores the mechanical doc_7 A8 rubric. A conformant doc is clean; a
+    // doc that trips multiple checks reports each with the right severity and has_hard_fail=true.
+    #[tokio::test]
+    async fn grade_document_scores_the_a8_rubric() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        add_banned_phrase(&pool, "robust", None, Some("t")).await?;
+
+        // Conformant: required sections in order, ascii, short headings, no body table/image, under
+        // budget. The table in the Appendix is allowed (it is past the main-body bound).
+        let clean_doc = "Intro paragraph with a little context.\n\
+            \n## Background\nSome context.\n\
+            \n## Problem Statement\nThe problem.\n\
+            \n## Requirements / Goals / Non-Goals\nThe requirements.\n\
+            \n## Solutions\nThe options.\n\
+            \n## Recommendation\nThe pick.\n\
+            \n## Appendix\ncol | col\n--- | ---\na | b\n";
+        let g = grade_document(&pool, clean_doc, "A Concise Design Title", None).await?;
+        assert_eq!(g["clean"], json!(true), "clean doc should pass: {g}");
+        assert_eq!(g["has_hard_fail"], json!(false));
+        assert_eq!(g["findings"].as_array().unwrap().len(), 0);
+
+        // Trips: ascii (em dash), banned-phrase, missing required section, a table in the body,
+        // a status/provenance line, and a caps-for-emphasis word.
+        let dirty = "Status: draft\n\
+            \n## Background\n\
+            This uses an em dash \u{2014} and the word robust. It is REALLY so, and it really matters.\n\
+            \n## Problem Statement\nA table in the body:\ncol | col\n--- | ---\nx | y\n\
+            \n## Solutions\nOptions; the Requirements section is missing.\n\
+            \n## Recommendation\nPick.\n\
+            \n## Appendix\nend\n";
+        let d = grade_document(&pool, dirty, "T", None).await?;
+        assert_eq!(d["clean"], json!(false), "dirty doc should fail: {d}");
+        assert_eq!(d["has_hard_fail"], json!(true));
+        let checks: std::collections::BTreeSet<String> = d["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["check"].as_str().unwrap().to_string())
+            .collect();
+        for expect in [
+            "ascii-only",
+            "banned-phrases",
+            "required-sections",
+            "body-hygiene",
+            "status-provenance",
+            "caps-emphasis",
+        ] {
+            assert!(checks.contains(expect), "expected a {expect} finding: {d}");
+        }
+        // Every finding carries the required fields.
+        for f in d["findings"].as_array().unwrap() {
+            assert!(
+                f["check"].is_string() && f["severity"].is_string() && f["message"].is_string()
+            );
+        }
         Ok(())
     }
 
