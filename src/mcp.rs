@@ -1106,6 +1106,59 @@ pub struct GetCommentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PoseQuestionArgs {
+    pub task_id: i64,
+    /// One of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list.
+    pub kind: String,
+    /// The question prompt.
+    pub prompt: String,
+    /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list.
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
+    /// The principal (person, team, or agent id) the question routes to; "operator" is the seeded team.
+    pub routed_to: String,
+    /// Whether the question blocks its task while open (default true). A non-blocking question lets the asker proceed, optionally on a `default`.
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub blocking: Option<bool>,
+    /// Non-blocking only: the presumed answer the asker proceeds on (in the kind's answer value shape).
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+    /// Non-blocking only: wait this many seconds for an answer before proceeding on the default (requires `default`).
+    #[serde(default)]
+    pub wait_period_seconds: Option<i64>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnswerQuestionArgs {
+    /// The question comment id to answer.
+    pub comment_id: i64,
+    /// The answer shape: bool / choice / text / ranked. Use text for an out-of-frame answer to a non-text kind.
+    pub shape: String,
+    /// The answer value: a boolean (bool); an array of option ids (choice: 1 for multiple_choice, N for select_all); a string (text); or the option ids in order (ranked).
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeclineQuestionArgs {
+    pub comment_id: i64,
+    /// Why the question is declined; delivered to the asker and recorded on the task.
+    pub feedback: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CancelQuestionArgs {
+    pub comment_id: i64,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DocumentActorArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -2623,6 +2676,84 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(
+        description = "Pose a structured question on a task (doc_33): a typed, answerable question comment of a given kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list), routed to a person/team/agent. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Returns the question comment; notifies the routed-to principal."
+    )]
+    async fn pose_question(
+        &self,
+        Parameters(a): Parameters<PoseQuestionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::pose_question(
+            &self.pool,
+            a.task_id,
+            &a.kind,
+            &a.prompt,
+            a.options,
+            &a.routed_to,
+            a.blocking.unwrap_or(true),
+            a.default,
+            a.wait_period_seconds,
+            self.me_opt(s(&a.actor)).as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Answer an open question (doc_33). A framed answer (shape matching the kind: bool / choice / text / ranked) marks it answered; a text answer to a non-text kind is the universal out-of-frame escape and marks it answered-outside-frame. Records a reply answer comment, clears the task's question-block if it was the last blocking one, and notifies the asker. Returns the answer comment."
+    )]
+    async fn answer_question(
+        &self,
+        Parameters(a): Parameters<AnswerQuestionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::answer_question(
+            &self.pool,
+            a.comment_id,
+            &a.shape,
+            a.value,
+            self.me_opt(s(&a.actor)).as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Decline an open question (doc_33): an explicit refusal with feedback, distinct from an out-of-frame answer. Records the feedback as a reply comment, moves the question to declined, clears the task's question-block if it was the last blocking one, and notifies the asker."
+    )]
+    async fn decline_question(
+        &self,
+        Parameters(a): Parameters<DeclineQuestionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::decline_question(
+            &self.pool,
+            a.comment_id,
+            &a.feedback,
+            self.me_opt(s(&a.actor)).as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Cancel an open question you posed (doc_33): the asking agent withdraws a question it no longer needs. Only the asker may cancel. Moves it to cancelled, clears the task's question-block if it was the last blocking one, and notifies the routed-to principal."
+    )]
+    async fn cancel_question(
+        &self,
+        Parameters(a): Parameters<CancelQuestionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::cancel_question(
+            &self.pool,
+            a.comment_id,
+            self.me_opt(s(&a.actor)).as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(

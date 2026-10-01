@@ -155,6 +155,10 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
         .route("/tasks/{task_id}/comments", post(comment_task))
         .route("/comments/{comment_id}", get(get_comment))
+        .route("/tasks/{task_id}/questions", post(pose_question))
+        .route("/comments/{comment_id}/answer", post(answer_question))
+        .route("/comments/{comment_id}/decline", post(decline_question))
+        .route("/comments/{comment_id}/cancel", post(cancel_question))
         .route("/tasks/{task_id}/props", patch(set_task_props))
         .route("/tasks/{task_id}/move", post(move_task))
         .route("/tasks/{task_id}/archive", post(archive_task))
@@ -379,6 +383,10 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "GET", path: "/api/comments/{comment_id}", summary: "Read one comment by id, with its type (plain/question/answer), parsed payload, lifecycle state, and reply_to/supersedes links.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task (kind yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list), routed to a principal; blocking by default. Returns the question comment.", query: "", body: Some("PoseQuestionBody") },
+    Endpoint { method: "POST", path: "/api/comments/{comment_id}/answer", summary: "Answer an open question. A framed answer (shape matching the kind) marks it answered; a text answer to a non-text kind is the out-of-frame escape (answered-outside-frame). Returns the answer comment.", query: "", body: Some("AnswerQuestionBody") },
+    Endpoint { method: "POST", path: "/api/comments/{comment_id}/decline", summary: "Decline an open question with feedback (an explicit refusal, distinct from an out-of-frame answer).", query: "", body: Some("DeclineQuestionBody") },
+    Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/archive", summary: "Soft-archive a task: hide it from the default list_tasks view (still fetchable by id and with include_archived). Orthogonal to status; reversible with restore.", query: "", body: Some("ArchiveTaskBody") },
@@ -496,6 +504,10 @@ fn body_schemas() -> Value {
         ResolveCommentBody,
         DocumentActorBody,
         SubmitToOperatorReviewBody,
+        PoseQuestionBody,
+        AnswerQuestionBody,
+        DeclineQuestionBody,
+        CancelQuestionBody,
         RequestChangesBody,
         AttachDocumentBody,
         IpfsAddBody,
@@ -1166,6 +1178,96 @@ async fn comment_task(
 
 async fn get_comment(State(st): State<AppState>, Path(comment_id): Path<i64>) -> ApiResult {
     Ok(Json(core::get_comment(&st.pool, comment_id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PoseQuestionBody {
+    /// One of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list.
+    kind: String,
+    prompt: String,
+    /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list.
+    options: Option<Value>,
+    /// The principal (person/team/agent id) the question routes to; "operator" is the seeded team.
+    routed_to: String,
+    /// Whether the question blocks its task while open (default true).
+    blocking: Option<bool>,
+    /// Non-blocking only: the presumed answer the asker proceeds on.
+    default: Option<Value>,
+    /// Non-blocking only: wait this many seconds before proceeding on the default (requires default).
+    wait_period_seconds: Option<i64>,
+    actor: Option<String>,
+}
+
+async fn pose_question(
+    State(st): State<AppState>,
+    Path(TaskRef(task_id)): Path<TaskRef>,
+    Json(b): Json<PoseQuestionBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::pose_question(
+            &st.pool,
+            task_id,
+            &b.kind,
+            &b.prompt,
+            b.options,
+            &b.routed_to,
+            b.blocking.unwrap_or(true),
+            b.default,
+            b.wait_period_seconds,
+            b.actor.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AnswerQuestionBody {
+    /// bool / choice / text / ranked. Use text for an out-of-frame answer to a non-text kind.
+    shape: String,
+    /// The answer value per shape (boolean; array of option ids; string; or ids in order).
+    value: Value,
+    actor: Option<String>,
+}
+
+async fn answer_question(
+    State(st): State<AppState>,
+    Path(comment_id): Path<i64>,
+    Json(b): Json<AnswerQuestionBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::answer_question(&st.pool, comment_id, &b.shape, b.value, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DeclineQuestionBody {
+    feedback: String,
+    actor: Option<String>,
+}
+
+async fn decline_question(
+    State(st): State<AppState>,
+    Path(comment_id): Path<i64>,
+    Json(b): Json<DeclineQuestionBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::decline_question(&st.pool, comment_id, &b.feedback, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CancelQuestionBody {
+    actor: Option<String>,
+}
+
+async fn cancel_question(
+    State(st): State<AppState>,
+    Path(comment_id): Path<i64>,
+    Json(b): Json<CancelQuestionBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::cancel_question(&st.pool, comment_id, b.actor.as_deref()).await?,
+    ))
 }
 
 async fn set_task_props(

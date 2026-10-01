@@ -2858,6 +2858,651 @@ pub async fn get_comment(pool: &Pool, comment_id: i64) -> anyhow::Result<Value> 
     Ok(comment_row_json(&row))
 }
 
+// --- Operator-question comment types: core operations (doc_33 / task_628, slice 2 + 5) ---
+
+/// The launch question kinds (doc_33 A2); the set is extensible by adding a kind here + its shape.
+pub const QUESTION_KINDS: &[&str] = &[
+    "yes_no",
+    "multiple_choice",
+    "select_all",
+    "fill_in_the_blank",
+    "rank_list",
+];
+/// The answer-shape discriminators (doc_33 A2): choice covers single + multi select, so four shapes
+/// cover the five kinds. The out-of-frame escape is NOT a shape -- it is a `text` answer whose
+/// question state becomes `answered_outside_frame`.
+pub const ANSWER_SHAPES: &[&str] = &["choice", "bool", "text", "ranked"];
+/// Question lifecycle states (doc_33 A2); `open` is the only non-terminal one.
+pub const QUESTION_STATES: &[&str] = &[
+    "open",
+    "answered",
+    "answered_outside_frame",
+    "declined",
+    "cancelled",
+    "superseded",
+];
+
+/// The framed answer shape a kind expects (doc_33 A2).
+fn kind_expected_shape(kind: &str) -> &'static str {
+    match kind {
+        "yes_no" => "bool",
+        "multiple_choice" | "select_all" => "choice",
+        "fill_in_the_blank" => "text",
+        "rank_list" => "ranked",
+        _ => "text",
+    }
+}
+/// Whether a kind carries an id/label options list.
+fn kind_needs_options(kind: &str) -> bool {
+    matches!(kind, "multiple_choice" | "select_all" | "rank_list")
+}
+
+/// Extract the option id strings from an options array ([{id,label}, ...]).
+fn option_ids(options: &Value) -> Vec<String> {
+    options
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| o.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Validate + normalize a question's options for its kind: kinds that need options require a
+/// non-empty array of {id, label} with unique non-empty ids; other kinds carry no options.
+fn normalize_question_options(kind: &str, options: Option<Value>) -> anyhow::Result<Value> {
+    if !kind_needs_options(kind) {
+        return Ok(json!([]));
+    }
+    let arr = match options {
+        Some(Value::Array(a)) if !a.is_empty() => a,
+        _ => anyhow::bail!(
+            "kind '{kind}' requires a non-empty `options` array of {{id, label}} pairs"
+        ),
+    };
+    let mut seen = BTreeSet::new();
+    for o in &arr {
+        let id = o
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("every option needs a non-empty string `id`"))?;
+        if !seen.insert(id.to_string()) {
+            anyhow::bail!("duplicate option id '{id}'");
+        }
+        if o.get("label")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            anyhow::bail!("option '{id}' needs a non-empty string `label`");
+        }
+    }
+    Ok(Value::Array(arr))
+}
+
+/// Validate a FRAMED answer `value` against the question `kind` + its `options`. The out-of-frame
+/// text escape is validated separately by the caller.
+fn validate_answer_value(kind: &str, value: &Value, options: &Value) -> anyhow::Result<()> {
+    let ids: BTreeSet<String> = option_ids(options).into_iter().collect();
+    match kind {
+        "yes_no" => {
+            if !value.is_boolean() {
+                anyhow::bail!("a yes_no answer must be a boolean");
+            }
+        }
+        "fill_in_the_blank" => {
+            if value.as_str().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                anyhow::bail!("a fill_in_the_blank answer must be non-empty text");
+            }
+        }
+        "multiple_choice" | "select_all" => {
+            let arr = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("a {kind} answer must be an array of option ids"))?;
+            if kind == "multiple_choice" && arr.len() != 1 {
+                anyhow::bail!("a multiple_choice answer must be exactly one option id");
+            }
+            let mut chosen = BTreeSet::new();
+            for v in arr {
+                let id = v
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("each chosen option must be a string id"))?;
+                if !ids.contains(id) {
+                    anyhow::bail!("'{id}' is not one of the question's option ids");
+                }
+                if !chosen.insert(id.to_string()) {
+                    anyhow::bail!("duplicate chosen option '{id}'");
+                }
+            }
+        }
+        "rank_list" => {
+            let arr = value.as_array().ok_or_else(|| {
+                anyhow::anyhow!("a rank_list answer must be the option ids in order")
+            })?;
+            let mut got = BTreeSet::new();
+            for v in arr {
+                let id = v
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("each ranked entry must be a string id"))?;
+                if !ids.contains(id) {
+                    anyhow::bail!("'{id}' is not one of the question's option ids");
+                }
+                if !got.insert(id.to_string()) {
+                    anyhow::bail!("option '{id}' appears twice in the ranking");
+                }
+            }
+            if got != ids {
+                anyhow::bail!("a rank_list answer must rank every option exactly once");
+            }
+        }
+        other => anyhow::bail!("unknown question kind '{other}'"),
+    }
+    Ok(())
+}
+
+/// Classify a principal id as a team / agent / person, erroring if it is none. "operator" is the
+/// seeded team, so it classifies as "team".
+async fn principal_kind(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+) -> anyhow::Result<&'static str> {
+    if sqlx::query("SELECT 1 FROM teams WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some()
+    {
+        return Ok("team");
+    }
+    if sqlx::query("SELECT 1 FROM agents WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some()
+    {
+        return Ok("agent");
+    }
+    if sqlx::query("SELECT 1 FROM people WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some()
+    {
+        return Ok("person");
+    }
+    anyhow::bail!("no principal '{id}' (not a known team, agent, or person)")
+}
+
+/// The notification recipients for a question routed to `routed_to`: the agents that can act on it
+/// (a team expands to its member agents; an agent is itself; a person has no board inbox and is
+/// surfaced via the queue, not pinged) -- mirroring how a blocked_on=team fan-out notifies agents.
+async fn resolve_routed_to_agents(
+    tx: &mut Transaction<'_, Sqlite>,
+    routed_to: &str,
+    kind: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    Ok(match kind {
+        "team" => resolve_team_principals_tx(tx, routed_to).await?.1,
+        "agent" => BTreeSet::from([routed_to.to_string()]),
+        _ => BTreeSet::new(),
+    })
+}
+
+/// The task's OPEN BLOCKING question comments, as (comment_id, routed_to) rows. The derived
+/// question-block (slice 3) and the terminal recompute both read through this. A question is
+/// blocking iff payload.blocking is truthy.
+pub async fn open_blocking_questions(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: i64,
+) -> anyhow::Result<Vec<(i64, String)>> {
+    let rows = sqlx::query(
+        "SELECT id, COALESCE(json_extract(payload,'$.routed_to'),'') AS routed_to FROM comments \
+         WHERE task_id=? AND type='question' AND state='open' \
+           AND json_extract(payload,'$.blocking') IN (1,'true',true) ORDER BY id",
+    )
+    .bind(task_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<i64, _>("id").unwrap_or_default(),
+                r.try_get::<String, _>("routed_to").unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+/// After a BLOCKING question on `task_id` reaches a terminal state, recompute the task's derived
+/// question-block: if no open blocking question remains, the task is no longer question-blocked, so
+/// emit task.unblocked to its watchers (reusing the task notification path). Callers invoke this
+/// only when the just-resolved question was blocking, so a surviving open blocking question keeps
+/// the task blocked and emits nothing.
+pub async fn recompute_question_block(
+    tx: &mut Transaction<'_, Sqlite>,
+    hooks: &mut Vec<WebhookDelivery>,
+    task_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<()> {
+    if open_blocking_questions(tx, task_id).await?.is_empty() {
+        emit(
+            tx,
+            hooks,
+            "task.unblocked",
+            actor,
+            Some(task_id),
+            None,
+            None,
+            None,
+            json!({ "task_id": task_id, "reason": "all_blocking_questions_resolved" }),
+            Recipients::FromTask,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Pose a question as a type=question comment on a task (doc_33 A4). Carries the kind, options,
+/// routed-to principal, blocking flag, and (non-blocking only) an optional default + wait period.
+/// A blocking question contributes to the task's derived question-block until it resolves. Emits
+/// question.posed to the routed-to principal's agents. Returns the question comment.
+#[allow(clippy::too_many_arguments)]
+pub async fn pose_question(
+    pool: &Pool,
+    task_id: i64,
+    kind: &str,
+    prompt: &str,
+    options: Option<Value>,
+    routed_to: &str,
+    blocking: bool,
+    default: Option<Value>,
+    wait_period_seconds: Option<i64>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    check_bare_refs(prompt)?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        anyhow::bail!("give a non-empty question prompt");
+    }
+    if !QUESTION_KINDS.contains(&kind) {
+        anyhow::bail!(
+            "unknown question kind '{kind}' (expected one of: {})",
+            QUESTION_KINDS.join(", ")
+        );
+    }
+    let routed_to = routed_to.trim();
+    if routed_to.is_empty() {
+        anyhow::bail!("give a `routed_to` principal (a person, team, or agent id)");
+    }
+    let options = normalize_question_options(kind, options)?;
+    if blocking {
+        if default.is_some() {
+            anyhow::bail!("a blocking question cannot carry a `default` -- a default is for a non-blocking question the asker proceeds on");
+        }
+        if wait_period_seconds.is_some() {
+            anyhow::bail!(
+                "`wait_period_seconds` applies only to a non-blocking question with a default"
+            );
+        }
+    }
+    if let Some(w) = wait_period_seconds {
+        if w < 0 {
+            anyhow::bail!("`wait_period_seconds` must be >= 0");
+        }
+        if default.is_none() {
+            anyhow::bail!("`wait_period_seconds` requires a `default` (the answer the asker proceeds on after waiting)");
+        }
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(task_row) = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no task {task_id}");
+    };
+    let project_id: i64 = task_row.try_get("project_id")?;
+    let routed_kind = principal_kind(&mut tx, routed_to).await?;
+    if let Some(ref d) = default {
+        validate_answer_value(kind, d, &options)
+            .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?;
+    }
+    let mut payload = Map::new();
+    payload.insert("kind".into(), json!(kind));
+    if kind_needs_options(kind) {
+        payload.insert("options".into(), options);
+    }
+    payload.insert("routed_to".into(), json!(routed_to));
+    payload.insert("blocking".into(), json!(blocking));
+    if let Some(d) = default {
+        payload.insert("default".into(), d);
+    }
+    if let Some(w) = wait_period_seconds {
+        payload.insert("wait_period_seconds".into(), json!(w));
+    }
+    let payload_str = Value::Object(payload).to_string();
+    let cid: i64 = sqlx::query(
+        "INSERT INTO comments(task_id, author, body, type, payload, state, created_at) \
+         VALUES(?,?,?,'question',?,'open',?) RETURNING id",
+    )
+    .bind(task_id)
+    .bind(actor)
+    .bind(prompt)
+    .bind(&payload_str)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    let recips = resolve_routed_to_agents(&mut tx, routed_to, routed_kind).await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "question.posed",
+        actor,
+        Some(task_id),
+        Some(project_id),
+        None,
+        None,
+        json!({ "comment_id": cid, "task_id": task_id, "kind": kind, "routed_to": routed_to, "blocking": blocking, "prompt": prompt }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    get_comment(pool, cid).await
+}
+
+/// Load an OPEN question comment within a tx, returning (task_id, author, payload). Errors if the
+/// comment is missing, not a question, or not open -- the open-only guard the mutating ops share.
+async fn load_open_question(
+    tx: &mut Transaction<'_, Sqlite>,
+    comment_id: i64,
+) -> anyhow::Result<(i64, Option<String>, Value)> {
+    let Some(q) =
+        sqlx::query("SELECT task_id, author, type, state, payload FROM comments WHERE id=?")
+            .bind(comment_id)
+            .fetch_optional(&mut **tx)
+            .await?
+    else {
+        anyhow::bail!("no comment {comment_id}");
+    };
+    let qtype: String = q.try_get("type")?;
+    if qtype != "question" {
+        anyhow::bail!("comment {comment_id} is not a question (type={qtype})");
+    }
+    let state: Option<String> = q.try_get("state")?;
+    if state.as_deref() != Some("open") {
+        anyhow::bail!(
+            "question {comment_id} is not open (state={}); only an open question can be answered, declined, or cancelled",
+            state.as_deref().unwrap_or("none")
+        );
+    }
+    let task_id: i64 = q.try_get("task_id")?;
+    let author: Option<String> = q.try_get("author")?;
+    let payload: Value =
+        serde_json::from_str(&q.try_get::<String, _>("payload")?).unwrap_or_else(|_| json!({}));
+    Ok((task_id, author, payload))
+}
+
+/// A short human-readable body for an answer comment, from its shape + value.
+fn answer_body_summary(shape: &str, value: &Value) -> String {
+    match shape {
+        "bool" => {
+            if value.as_bool() == Some(true) {
+                "yes".into()
+            } else {
+                "no".into()
+            }
+        }
+        "text" => value.as_str().unwrap_or("").to_string(),
+        "choice" => value
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        "ranked" => value
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" > ")
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Answer an open question (doc_33 A4). A framed answer (shape matching the kind) moves the question
+/// to `answered`; a `text` answer to a non-text kind is the universal out-of-frame escape and moves
+/// it to `answered_outside_frame`. Records a separate type=answer comment that replies to the
+/// question, clears the task's question-block if it was the last blocking one, and notifies the
+/// asker. Returns the answer comment.
+pub async fn answer_question(
+    pool: &Pool,
+    comment_id: i64,
+    shape: &str,
+    value: Value,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    if !ANSWER_SHAPES.contains(&shape) {
+        anyhow::bail!(
+            "unknown answer shape '{shape}' (expected one of: {})",
+            ANSWER_SHAPES.join(", ")
+        );
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let (task_id, author, payload) = load_open_question(&mut tx, comment_id).await?;
+    let kind = payload.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    let options = payload.get("options").cloned().unwrap_or_else(|| json!([]));
+    let blocking = payload
+        .get("blocking")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let expected = kind_expected_shape(kind);
+    let (new_state, out_of_frame) = if shape == expected {
+        validate_answer_value(kind, &value, &options)?;
+        ("answered", false)
+    } else if shape == "text" {
+        if value.as_str().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            anyhow::bail!("an out-of-frame text answer must be non-empty text");
+        }
+        ("answered_outside_frame", true)
+    } else {
+        anyhow::bail!(
+            "answer shape '{shape}' does not match question kind '{kind}' (expected '{expected}'); use shape=text for an out-of-frame answer"
+        );
+    };
+    debug_assert!(
+        QUESTION_STATES.contains(&new_state),
+        "answer must leave the question in a known lifecycle state"
+    );
+    let ans_payload = json!({ "shape": shape, "value": value }).to_string();
+    let body = answer_body_summary(shape, &value);
+    let aid: i64 = sqlx::query(
+        "INSERT INTO comments(task_id, author, body, type, payload, reply_to, created_at) \
+         VALUES(?,?,?,'answer',?,?,?) RETURNING id",
+    )
+    .bind(task_id)
+    .bind(actor)
+    .bind(&body)
+    .bind(&ans_payload)
+    .bind(comment_id)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    sqlx::query("UPDATE comments SET state=? WHERE id=?")
+        .bind(new_state)
+        .bind(comment_id)
+        .execute(&mut *tx)
+        .await?;
+    if blocking {
+        recompute_question_block(&mut tx, &mut hooks, task_id, actor).await?;
+    }
+    let mut recips = BTreeSet::new();
+    if let Some(a) = &author {
+        recips.insert(a.clone());
+    }
+    if let Some(act) = actor {
+        recips.remove(act);
+    }
+    emit(
+        &mut tx,
+        &mut hooks,
+        "question.answered",
+        actor,
+        Some(task_id),
+        None,
+        None,
+        None,
+        json!({ "question_comment_id": comment_id, "answer_comment_id": aid, "task_id": task_id, "shape": shape, "out_of_frame": out_of_frame, "state": new_state }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    get_comment(pool, aid).await
+}
+
+/// Decline an open question (doc_33 A4): an explicit refusal with feedback, distinct from an
+/// out-of-frame answer. Records the feedback as a type=answer comment, moves the question to
+/// `declined`, clears the task's question-block if it was the last blocking one, and notifies the
+/// asker. Returns the declining answer comment.
+pub async fn decline_question(
+    pool: &Pool,
+    comment_id: i64,
+    feedback: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    check_bare_refs(feedback)?;
+    let feedback = feedback.trim();
+    if feedback.is_empty() {
+        anyhow::bail!("give non-empty `feedback` when declining a question");
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let (task_id, author, payload) = load_open_question(&mut tx, comment_id).await?;
+    let blocking = payload
+        .get("blocking")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let ans_payload = json!({ "shape": "text", "value": feedback, "declined": true }).to_string();
+    let aid: i64 = sqlx::query(
+        "INSERT INTO comments(task_id, author, body, type, payload, reply_to, created_at) \
+         VALUES(?,?,?,'answer',?,?,?) RETURNING id",
+    )
+    .bind(task_id)
+    .bind(actor)
+    .bind(feedback)
+    .bind(&ans_payload)
+    .bind(comment_id)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    sqlx::query("UPDATE comments SET state='declined' WHERE id=?")
+        .bind(comment_id)
+        .execute(&mut *tx)
+        .await?;
+    if blocking {
+        recompute_question_block(&mut tx, &mut hooks, task_id, actor).await?;
+    }
+    let mut recips = BTreeSet::new();
+    if let Some(a) = &author {
+        recips.insert(a.clone());
+    }
+    if let Some(act) = actor {
+        recips.remove(act);
+    }
+    emit(
+        &mut tx,
+        &mut hooks,
+        "question.declined",
+        actor,
+        Some(task_id),
+        None,
+        None,
+        None,
+        json!({ "question_comment_id": comment_id, "answer_comment_id": aid, "task_id": task_id, "feedback": feedback }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    get_comment(pool, aid).await
+}
+
+/// Cancel an open question (doc_33 A4): the ASKER withdraws a question it no longer needs (e.g. it
+/// found the answer itself). Only the asking author may cancel. Moves the question to `cancelled`,
+/// clears the task's question-block if it was the last blocking one, and notifies the routed-to
+/// principal that it is withdrawn. Returns the cancelled question comment.
+pub async fn cancel_question(
+    pool: &Pool,
+    comment_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let (task_id, author, payload) = load_open_question(&mut tx, comment_id).await?;
+    if author.as_deref() != actor || actor.is_none() {
+        anyhow::bail!(
+            "only the asking agent can cancel a question (it was posed by {})",
+            author.as_deref().unwrap_or("someone else")
+        );
+    }
+    let blocking = payload
+        .get("blocking")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let routed_to = payload
+        .get("routed_to")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    sqlx::query("UPDATE comments SET state='cancelled' WHERE id=?")
+        .bind(comment_id)
+        .execute(&mut *tx)
+        .await?;
+    if blocking {
+        recompute_question_block(&mut tx, &mut hooks, task_id, actor).await?;
+    }
+    let recips = if routed_to.is_empty() {
+        BTreeSet::new()
+    } else {
+        let kind = principal_kind(&mut tx, routed_to).await.unwrap_or("agent");
+        resolve_routed_to_agents(&mut tx, routed_to, kind).await?
+    };
+    emit(
+        &mut tx,
+        &mut hooks,
+        "question.cancelled",
+        actor,
+        Some(task_id),
+        None,
+        None,
+        None,
+        json!({ "question_comment_id": comment_id, "task_id": task_id }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    get_comment(pool, comment_id).await
+}
+
 /// Merge arbitrary key/value properties into a task's metadata (JSON). Returns the
 /// merged metadata. Used for pipeline state (ipfs_cid, collection, stage, ...).
 pub async fn set_task_props(pool: &Pool, task_id: i64, props: Value) -> anyhow::Result<Value> {
@@ -7826,6 +8471,218 @@ mod tests {
 
         // Unknown comment id errors.
         assert!(get_comment(&pool, 99999).await.is_err());
+        Ok(())
+    }
+
+    /// Slice 2 (task_628): the question lifecycle ops -- pose/answer/decline/cancel with validation,
+    /// the open-only guard, the out-of-frame text escape, and the blocking-question terminal path.
+    #[tokio::test]
+    async fn question_ops_lifecycle() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "rev", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("asker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Routed-to must be a known principal.
+        assert!(pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "ship it?",
+            None,
+            "ghost",
+            true,
+            None,
+            None,
+            Some("asker")
+        )
+        .await
+        .is_err());
+        // multiple_choice requires options.
+        assert!(pose_question(
+            &pool,
+            tid,
+            "multiple_choice",
+            "which?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some("asker")
+        )
+        .await
+        .is_err());
+        // A blocking question cannot carry a default.
+        assert!(pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "x?",
+            None,
+            "rev",
+            true,
+            Some(json!(true)),
+            None,
+            Some("asker")
+        )
+        .await
+        .is_err());
+
+        // Pose a blocking yes_no question routed to an agent.
+        let q = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "ship it?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some("asker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+        assert_eq!(q["type"], json!("question"));
+        assert_eq!(q["state"], json!("open"));
+        assert_eq!(q["payload"]["kind"], json!("yes_no"));
+        assert_eq!(q["payload"]["blocking"], json!(true));
+
+        // Wrong-shape framed answer is rejected; a text answer is accepted as the out-of-frame escape.
+        assert!(
+            answer_question(&pool, qid, "choice", json!(["x"]), Some("rev"))
+                .await
+                .is_err()
+        );
+        let a = answer_question(
+            &pool,
+            qid,
+            "text",
+            json!("neither -- hold for Q3"),
+            Some("rev"),
+        )
+        .await?;
+        assert_eq!(a["type"], json!("answer"));
+        assert_eq!(a["reply_to"], json!(qid));
+        assert_eq!(a["payload"]["shape"], json!("text"));
+        // The question moved to answered-outside-frame (the escape), not plain answered.
+        assert_eq!(
+            get_comment(&pool, qid).await?["state"],
+            json!("answered_outside_frame")
+        );
+        // Open-only guard: answering again is rejected.
+        assert!(
+            answer_question(&pool, qid, "bool", json!(true), Some("rev"))
+                .await
+                .is_err()
+        );
+
+        // multiple_choice: options validated; a framed single-choice answer resolves it.
+        let opts = json!([{"id":"a","label":"A"},{"id":"b","label":"B"}]);
+        let q2 = pose_question(
+            &pool,
+            tid,
+            "multiple_choice",
+            "a or b?",
+            Some(opts),
+            "rev",
+            true,
+            None,
+            None,
+            Some("asker"),
+        )
+        .await?;
+        let q2id = q2["id"].as_i64().unwrap();
+        assert!(
+            answer_question(&pool, q2id, "choice", json!(["zzz"]), Some("rev"))
+                .await
+                .is_err(),
+            "unknown option id rejected"
+        );
+        assert!(
+            answer_question(&pool, q2id, "choice", json!(["a", "b"]), Some("rev"))
+                .await
+                .is_err(),
+            "multiple_choice takes exactly one"
+        );
+        let a2 = answer_question(&pool, q2id, "choice", json!(["a"]), Some("rev")).await?;
+        assert_eq!(a2["payload"]["value"], json!(["a"]));
+        assert_eq!(get_comment(&pool, q2id).await?["state"], json!("answered"));
+
+        // decline: an explicit refusal with feedback moves it to declined.
+        let q3 = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "do X?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some("asker"),
+        )
+        .await?;
+        let q3id = q3["id"].as_i64().unwrap();
+        let d = decline_question(&pool, q3id, "not my call", Some("rev")).await?;
+        assert_eq!(d["payload"]["declined"], json!(true));
+        assert_eq!(get_comment(&pool, q3id).await?["state"], json!("declined"));
+
+        // cancel: only the asking author may withdraw it.
+        let q4 = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "still need?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some("asker"),
+        )
+        .await?;
+        let q4id = q4["id"].as_i64().unwrap();
+        assert!(
+            cancel_question(&pool, q4id, Some("rev")).await.is_err(),
+            "non-author cannot cancel"
+        );
+        cancel_question(&pool, q4id, Some("asker")).await?;
+        assert_eq!(get_comment(&pool, q4id).await?["state"], json!("cancelled"));
+
+        // Non-blocking with a default + wait period is accepted.
+        let q5 = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "proceed?",
+            None,
+            "rev",
+            false,
+            Some(json!(true)),
+            Some(3600),
+            Some("asker"),
+        )
+        .await?;
+        assert_eq!(q5["payload"]["blocking"], json!(false));
+        assert_eq!(q5["payload"]["default"], json!(true));
+        assert_eq!(q5["payload"]["wait_period_seconds"], json!(3600));
         Ok(())
     }
 
