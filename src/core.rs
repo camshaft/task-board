@@ -1855,6 +1855,33 @@ pub async fn update_task(
     let old_blocked_kind: Option<String> = old.try_get("blocked_on_kind").ok().flatten();
     let old_blocked_ref: Option<String> = old.try_get("blocked_on_ref").ok().flatten();
 
+    // task_902: a `blocked_on` object expresses the intent to block. Previously, if a caller set a
+    // blocked_on but did NOT also pass status="blocked" in the same call, the blocked_on was
+    // silently DISCARDED (the not-blocked branch below clears it) and the call still returned
+    // success -- so an agent that set blocked_on without status (or wrote "marking blocked" in prose
+    // and forgot the call) left the task mis-stated: not actually blocked, no blocked_on. Reconcile
+    // the status up front so the two can never diverge: when a blocked_on is being SET (an object,
+    // not null-to-clear), omitting status auto-sets it to blocked (honoring the intent), while an
+    // EXPLICIT non-blocked status is a contradiction and hard-errors rather than dropping the
+    // blocker. This runs before the status column is written below, so the auto-set persists.
+    let blocked_on_is_set = matches!(&blocked_on, Some(v) if v.is_object());
+    let status = if blocked_on_is_set {
+        match status {
+            Some("blocked") => status,
+            Some(other) => anyhow::bail!(
+                "blocked_on was given but status is '{other}': setting a blocker means the task is \
+                 blocked. Pass status=\"blocked\" (or omit status to set it automatically), or omit \
+                 blocked_on if the task is not actually blocked."
+            ),
+            // Already blocked and just re-pointing the blocker: leave status untouched (no spurious
+            // status_changed event). Otherwise honor the intent and move it to blocked.
+            None if old_status == "blocked" => None,
+            None => Some("blocked"),
+        }
+    } else {
+        status
+    };
+
     // Build a dynamic UPDATE from the provided fields, preserving column order.
     let mut set_clauses: Vec<String> = Vec::new();
     let fields: [(&str, Option<&str>); 5] = [
@@ -17697,6 +17724,105 @@ mod tests {
             get_task(&pool, tid).await?["blocked_on"].is_null(),
             "unblocking clears blocked_on"
         );
+        Ok(())
+    }
+
+    /// task_902: a blocked_on and status=blocked can never silently diverge. Providing a blocked_on
+    /// WITHOUT status auto-sets status=blocked (so the task is truly blocked, not mis-stated);
+    /// providing a blocked_on with an EXPLICIT non-blocked status hard-errors instead of discarding
+    /// the blocker and returning success (the old mis-statement bug).
+    #[tokio::test]
+    async fn blocked_on_without_status_auto_sets_blocked() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let mk = |title: &'static str| {
+            let pool = pool.clone();
+            async move {
+                create_task(
+                    &pool,
+                    pid,
+                    title,
+                    None,
+                    None,
+                    None,
+                    Some("u"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|t| t["id"].as_i64().unwrap())
+            }
+        };
+        let tid = mk("Ship it").await?;
+
+        // blocked_on with status OMITTED -> status auto-set to blocked AND the blocked_on persists.
+        update_task(
+            &pool,
+            tid,
+            None, // no status given -- the old behavior left it in_progress and dropped blocked_on
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            Some(json!({"kind": "operator", "note": "awaiting approval"})),
+        )
+        .await?;
+        let t = get_task(&pool, tid).await?;
+        assert_eq!(t["status"], json!("blocked"), "status auto-set to blocked");
+        assert_eq!(t["blocked_on"]["kind"], json!("operator"));
+        assert_eq!(t["blocked_on"]["note"], json!("awaiting approval"));
+
+        // blocked_on with an EXPLICIT non-blocked status -> hard error (not a silent drop).
+        let tid2 = mk("Other").await?;
+        let e = update_task(
+            &pool,
+            tid2,
+            Some("in_progress"),
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            Some(json!({"kind": "operator"})),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("blocked_on was given but status is 'in_progress'"),
+            "contradictory status+blocked_on hard-errors: {e}"
+        );
+        // The failed call left tid2 untouched: still not blocked, no blocked_on.
+        let t2 = get_task(&pool, tid2).await?;
+        assert_ne!(t2["status"], json!("blocked"));
+        assert!(t2["blocked_on"].is_null());
+
+        // Re-pointing the blocker on an ALREADY-blocked task with status omitted keeps it blocked.
+        update_task(
+            &pool,
+            tid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            Some(json!({"kind": "operator", "note": "still awaiting"})),
+        )
+        .await?;
+        let t = get_task(&pool, tid).await?;
+        assert_eq!(t["status"], json!("blocked"));
+        assert_eq!(t["blocked_on"]["note"], json!("still awaiting"));
         Ok(())
     }
 
