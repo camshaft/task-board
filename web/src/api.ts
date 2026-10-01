@@ -605,6 +605,9 @@ export const api = {
     req<Comment>('POST', `/comments/${commentId}/decline`, b),
   cancelQuestion: (commentId: number, b: { actor?: string } = {}) =>
     req<Comment>('POST', `/comments/${commentId}/cancel`, b),
+  // Re-pose an OPEN question with a new prompt (asker-only; the old is kept immutable + linked).
+  supersedeQuestion: (commentId: number, b: { new_prompt: string; actor?: string }) =>
+    req<Comment>('POST', `/comments/${commentId}/supersede`, b),
 
   // order='desc' returns the LATEST `limit` events, newest-first (for an activity feed); the
   // default 'asc' returns oldest-first above `since_seq` (for incremental tailing). Both compose

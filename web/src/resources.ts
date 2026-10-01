@@ -399,6 +399,16 @@ export async function cancelQuestion(
   return r
 }
 
+export async function supersedeQuestion(
+  taskId: number,
+  commentId: number,
+  b: Parameters<typeof api.supersedeQuestion>[1],
+) {
+  const r = await api.supersedeQuestion(commentId, b)
+  touched({ taskId, activity: true })
+  return r
+}
+
 export async function moveTask(id: number, b: Parameters<typeof api.moveTask>[1]) {
   const t = await api.moveTask(id, b)
   // A move touches TWO task lists — source and destination. The response only names the

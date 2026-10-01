@@ -16,6 +16,7 @@ import {
   createTask,
   declineQuestion,
   moveTask,
+  supersedeQuestion,
   reparentTask,
   updateTask,
   useExternalNameResolver,
@@ -202,6 +203,21 @@ export function TaskDrawer() {
     setBusy(true)
     try {
       await cancelQuestion(task.id, commentId, { actor })
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  async function supersedeQ(commentId: number) {
+    if (!task) return
+    const new_prompt = window.prompt(
+      'Re-pose this question with a new prompt (the old one is kept and linked):',
+    )
+    if (new_prompt == null || !new_prompt.trim()) return
+    setBusy(true)
+    try {
+      await supersedeQuestion(task.id, commentId, { new_prompt, actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -738,6 +754,7 @@ export function TaskDrawer() {
                                 onAnswer={(shape, value) => void answerQ(c.id, shape, value)}
                                 onDecline={() => void declineQ(c.id)}
                                 onCancel={() => void cancelQ(c.id)}
+                                onSupersede={() => void supersedeQ(c.id)}
                               />
                             ) : (
                               <>
