@@ -1,4 +1,5 @@
 import { Link } from 'react-router-dom'
+import { useScrollRestoration } from './scrollRestore'
 import { type Channel } from './api'
 import { useBoardContext } from './Layout'
 import { createChannel, useChannels } from './resources'
@@ -15,6 +16,7 @@ export function channelLabel(c: Channel): string {
 // The channels list (/channels): public channels plus the current actor's channels (incl.
 // private/DMs). Backed by the resource store, so it live-updates as channels/posts arrive.
 export default function Channels() {
+  const scrollRef = useScrollRestoration()
   const { actor } = useBoardContext()
   const { data: pub = [], loading } = useChannels()
   const { data: mine = [] } = useChannels(actor)
@@ -45,7 +47,7 @@ export default function Channels() {
           + channel
         </button>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
         {loading && channels.length === 0 && (
           <p className="text-sm text-[var(--color-muted)]">Loading…</p>
         )}

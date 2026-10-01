@@ -2,6 +2,7 @@ import { type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import ReviewTrend from './ReviewTrend'
 import { useReviews } from './resources'
+import { useScrollRestoration } from './scrollRestore'
 import { Identity, relTime } from './ui'
 
 // The reviews list + the shared review chrome (status chip, lifecycle order, per-source link)
@@ -66,6 +67,7 @@ export function reviewSourceLink(source: string | null, targetRef: string | null
 }
 
 export default function Reviews() {
+  const scrollRef = useScrollRestoration()
   const { data: reviews, error, loading } = useReviews()
 
   return (
@@ -77,7 +79,7 @@ export default function Reviews() {
           each with a lifecycle and an append-only log.
         </p>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
         <ReviewTrend />
         {error && <p className="text-sm text-rose-300">{error.message}</p>}
         {loading && !reviews && <p className="text-sm text-[var(--color-muted)]">Loading…</p>}
