@@ -173,6 +173,10 @@ pub fn router(state: AppState) -> Router {
         .route("/banned-phrases", get(list_banned_phrases).post(add_banned_phrase))
         .route("/banned-phrases/{phrase}", axum::routing::delete(remove_banned_phrase))
         .route("/identity-aliases", get(list_identity_aliases).post(set_identity_alias))
+        .route("/people", get(list_people).post(create_person))
+        .route("/teams", get(list_teams).post(create_team))
+        .route("/teams/{team_id}", get(get_team))
+        .route("/teams/{team_id}/members", post(add_team_member).delete(remove_team_member))
         .route("/secret-requests", get(list_secret_requests).post(create_secret_request))
         .route("/secret-requests/{id}", get(get_secret_request))
         .route("/secret-requests/{id}/submit", post(submit_secret))
@@ -327,6 +331,13 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
     Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/identity-aliases", summary: "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). A small config table consumers/UI use to resolve or display a floating name as the canonical identity across assignee, blocked_on, and @-mentions.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/people", summary: "List people (first-class human identities, multi-operator model doc_26). A separate registry from agents; resolved together with agents at read time.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/people", summary: "Create or upsert a person by stable string id (e.g. cameron).", query: "", body: Some("CreatePersonBody") },
+    Endpoint { method: "GET", path: "/api/teams", summary: "List teams (addressable groups whose members are people OR other teams).", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/teams", summary: "Create or upsert a team by stable string id (e.g. operator).", query: "", body: Some("CreateTeamBody") },
+    Endpoint { method: "GET", path: "/api/teams/{team_id}", summary: "Get a team with its direct members and its fully-resolved person set (nested teams expanded, cycle-guarded).", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/teams/{team_id}/members", summary: "Add a person or team as a member (idempotent). Rejects a sub-team add that would create a membership cycle.", query: "", body: Some("TeamMemberBody") },
+    Endpoint { method: "DELETE", path: "/api/teams/{team_id}/members", summary: "Remove a member (person or team) from a team (idempotent).", query: "", body: Some("TeamMemberBody") },
     Endpoint { method: "POST", path: "/api/identity-aliases", summary: "Upsert an identity alias (alias -> canonical). Idempotent on the alias (repoints an existing one); alias is stored lowercased.", query: "", body: Some("SetIdentityAliasBody") },
     Endpoint { method: "GET", path: "/api/secret-requests", summary: "List secret requests (metadata only — never the ciphertext or tokens). The board is an ephemeral request broker, not a secret store.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/secret-requests", summary: "File a named secret request (carries the age recipient pubkeys + instructions). Returns a single-use submit_url the operator opens to submit the value encrypted in-browser, plus the fulfiller_token.", query: "", body: Some("CreateSecretRequestBody") },
@@ -420,6 +431,9 @@ fn body_schemas() -> Value {
         SetReviewVettedBody,
         AppendReviewLogBody,
         SetIdentityAliasBody,
+        CreatePersonBody,
+        CreateTeamBody,
+        TeamMemberBody,
     )
 }
 
@@ -1510,6 +1524,82 @@ async fn list_identity_aliases(State(st): State<AppState>) -> ApiResult {
 async fn set_identity_alias(State(st): State<AppState>, Json(b): Json<SetIdentityAliasBody>) -> ApiResult {
     Ok(Json(
         core::set_identity_alias(&st.pool, &b.alias, &b.canonical, b.created_by.as_deref()).await?,
+    ))
+}
+
+// --- People / teams (multi-operator model, task 542 Phase 1) ---
+
+#[derive(Deserialize, JsonSchema)]
+struct CreatePersonBody {
+    /// Stable string handle for the person (e.g. "cameron"). Upserts if it already exists.
+    id: String,
+    display_name: Option<String>,
+    created_by: Option<String>,
+    metadata: Option<Value>,
+}
+
+async fn list_people(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_people(&st.pool).await?))
+}
+
+async fn create_person(State(st): State<AppState>, Json(b): Json<CreatePersonBody>) -> ApiResult {
+    Ok(Json(
+        core::create_person(&st.pool, &b.id, b.display_name.as_deref(), b.created_by.as_deref(), b.metadata)
+            .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CreateTeamBody {
+    /// Stable string handle for the team (e.g. "operator"). Upserts if it already exists.
+    id: String,
+    display_name: Option<String>,
+    created_by: Option<String>,
+    metadata: Option<Value>,
+}
+
+async fn list_teams(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_teams(&st.pool).await?))
+}
+
+async fn create_team(State(st): State<AppState>, Json(b): Json<CreateTeamBody>) -> ApiResult {
+    Ok(Json(
+        core::create_team(&st.pool, &b.id, b.display_name.as_deref(), b.created_by.as_deref(), b.metadata)
+            .await?,
+    ))
+}
+
+async fn get_team(State(st): State<AppState>, Path(team_id): Path<String>) -> ApiResult {
+    Ok(Json(core::get_team(&st.pool, &team_id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct TeamMemberBody {
+    /// The member's id: a person id (member_kind="person") or a team id (member_kind="team").
+    member_id: String,
+    /// "person" or "team".
+    member_kind: String,
+    created_by: Option<String>,
+}
+
+async fn add_team_member(
+    State(st): State<AppState>,
+    Path(team_id): Path<String>,
+    Json(b): Json<TeamMemberBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::add_team_member(&st.pool, &team_id, &b.member_id, &b.member_kind, b.created_by.as_deref())
+            .await?,
+    ))
+}
+
+async fn remove_team_member(
+    State(st): State<AppState>,
+    Path(team_id): Path<String>,
+    Json(b): Json<TeamMemberBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::remove_team_member(&st.pool, &team_id, &b.member_id, &b.member_kind).await?,
     ))
 }
 
