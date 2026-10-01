@@ -121,6 +121,21 @@ export interface ExternalIdentity {
   updated_at: string
 }
 
+// A link mapping a board entity (document / task / channel / ...) to an entity in a bridged
+// external system (e.g. a chorus doc URL on a document). Keyed by (source, external_id); the
+// human-facing URL, when present, lives in metadata.url. (task 707)
+export interface ExternalLink {
+  id: number
+  source: string
+  external_id: string
+  external_parent_id: string | null
+  board_kind: string
+  board_id: number
+  metadata: { url?: string } & Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
 export interface Task {
   id: number
   project_id: number
@@ -638,6 +653,17 @@ export const api = {
       'GET',
       `/external-identities${source ? `?source=${encodeURIComponent(source)}` : ''}`,
     ),
+
+  // External links bridging a board entity to an external system (task 707). Filter by any of
+  // source / board_kind / board_id; the doc view uses board_kind=document&board_id=<id>.
+  listExternalLinks: (q: { source?: string; board_kind?: string; board_id?: number } = {}) => {
+    const p = new URLSearchParams()
+    if (q.source) p.set('source', q.source)
+    if (q.board_kind) p.set('board_kind', q.board_kind)
+    if (q.board_id != null) p.set('board_id', String(q.board_id))
+    const qs = p.toString()
+    return req<ExternalLink[]>('GET', `/external-links${qs ? `?${qs}` : ''}`)
+  },
 
   // Identity aliases (task 532): the alias -> canonical map, resolved client-side for display.
   listIdentityAliases: () => req<IdentityAlias[]>('GET', '/identity-aliases'),
