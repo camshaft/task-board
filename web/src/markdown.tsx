@@ -142,8 +142,18 @@ function inline(
           )
         }
         if (href.startsWith('#')) {
+          // Intra-doc anchor (e.g. a main-body -> appendix link). Use an ABSOLUTE-path href
+          // (current path + search + the fragment), NOT the bare `#frag`: the app injects a
+          // <base href> for sub-path proxying, against which a bare fragment resolves to the base
+          // URL and navigates away from the document (task 706). Same path + fragment scrolls to
+          // the target heading's slug id without a reload, matching the heading anchor markers
+          // (which already set scroll-margin-top to clear the sticky header).
           return (
-            <a key={gen()} href={href} className={cls}>
+            <a
+              key={gen()}
+              href={`${window.location.pathname}${window.location.search}${href}`}
+              className={cls}
+            >
               {inline(m[1], gen, resolve, mentions)}
             </a>
           )
