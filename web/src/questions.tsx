@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import {
   type AnswerPayload,
   type Comment,
@@ -7,7 +8,7 @@ import {
   type QuestionState,
 } from './api'
 import { Markdown } from './markdown'
-import { AuthorLabel, relTime } from './ui'
+import { AuthorLabel, AutoGrowTextarea, relTime } from './ui'
 
 // Operator-questions UI (task_629, consumer of the task_628 backend). Slice 1 is read-only: render
 // a question comment (prompt, kind, options, routing, lifecycle state) and any answer replying to
@@ -125,19 +126,217 @@ function AnswerCard({
   )
 }
 
-// A question comment with its answers nested beneath it. Read-only for slice 1.
+const BTN = 'rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40'
+const BTN_GHOST =
+  'rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] ring-1 ring-inset ring-[var(--color-border)] hover:bg-[var(--color-panel-2)] disabled:opacity-40'
+
+// The interactive answer form for an OPEN question, keyed by kind. Submits { shape, value } matching
+// the backend's per-kind contract: yes_no -> bool; multiple_choice / select_all -> choice (array of
+// option ids); fill_in_the_blank -> text; rank_list -> ranked (ordered option ids). A free-text
+// escape is always available for an out-of-frame answer. Schema-driven questions carry an inline
+// response_schema that the backend validates; any rejection surfaces via the caller's error path.
+function AnswerForm({
+  q,
+  busy,
+  onSubmit,
+}: {
+  q: QuestionPayload
+  busy: boolean
+  onSubmit: (shape: string, value: unknown) => void
+}) {
+  const options = q.options ?? []
+  const [choice, setChoice] = useState('')
+  const [multi, setMulti] = useState<string[]>([])
+  const [text, setText] = useState('')
+  const [order, setOrder] = useState<string[]>(options.map((o) => o.id))
+  const [freeText, setFreeText] = useState('')
+  const [showFree, setShowFree] = useState(false)
+
+  const toggleMulti = (id: string) =>
+    setMulti((m) => (m.includes(id) ? m.filter((x) => x !== id) : [...m, id]))
+  const move = (i: number, d: -1 | 1) =>
+    setOrder((o) => {
+      const j = i + d
+      if (j < 0 || j >= o.length) return o
+      const next = [...o]
+      ;[next[i], next[j]] = [next[j], next[i]]
+      return next
+    })
+  const labelOf = (id: string) => options.find((o) => o.id === id)?.label ?? id
+
+  return (
+    <div className="mt-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-2.5">
+      {q.kind === 'yes_no' && (
+        <div className="flex gap-2">
+          <button disabled={busy} className={BTN} onClick={() => onSubmit('bool', true)}>
+            Yes
+          </button>
+          <button disabled={busy} className={BTN_GHOST} onClick={() => onSubmit('bool', false)}>
+            No
+          </button>
+        </div>
+      )}
+
+      {q.kind === 'multiple_choice' && (
+        <div className="space-y-1.5">
+          {options.map((o) => (
+            <label key={o.id} className="flex items-center gap-2 text-sm">
+              <input
+                type="radio"
+                name={`mc-answer`}
+                checked={choice === o.id}
+                onChange={() => setChoice(o.id)}
+              />
+              {o.label}
+            </label>
+          ))}
+          <button
+            disabled={busy || !choice}
+            className={BTN}
+            onClick={() => onSubmit('choice', [choice])}
+          >
+            Submit answer
+          </button>
+        </div>
+      )}
+
+      {q.kind === 'select_all' && (
+        <div className="space-y-1.5">
+          {options.map((o) => (
+            <label key={o.id} className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={multi.includes(o.id)}
+                onChange={() => toggleMulti(o.id)}
+              />
+              {o.label}
+            </label>
+          ))}
+          <button
+            disabled={busy || multi.length === 0}
+            className={BTN}
+            onClick={() => onSubmit('choice', multi)}
+          >
+            Submit answer
+          </button>
+        </div>
+      )}
+
+      {q.kind === 'fill_in_the_blank' && (
+        <div className="flex items-end gap-2">
+          <AutoGrowTextarea
+            value={text}
+            onChange={setText}
+            onSubmit={() => text.trim() && onSubmit('text', text.trim())}
+            placeholder="Your answer..."
+            className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
+          />
+          <button
+            disabled={busy || !text.trim()}
+            className={BTN}
+            onClick={() => onSubmit('text', text.trim())}
+          >
+            Submit
+          </button>
+        </div>
+      )}
+
+      {q.kind === 'rank_list' && (
+        <div className="space-y-1.5">
+          <ol className="space-y-1">
+            {order.map((id, i) => (
+              <li
+                key={id}
+                className="flex items-center gap-2 rounded border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm"
+              >
+                <span className="font-mono text-[var(--color-muted)]">{i + 1}.</span>
+                <span className="min-w-0 flex-1 truncate">{labelOf(id)}</span>
+                <button
+                  disabled={busy || i === 0}
+                  onClick={() => move(i, -1)}
+                  className="px-1 text-[var(--color-muted)] hover:text-sky-300 disabled:opacity-30"
+                  aria-label="Move up"
+                >
+                  ^
+                </button>
+                <button
+                  disabled={busy || i === order.length - 1}
+                  onClick={() => move(i, 1)}
+                  className="px-1 text-[var(--color-muted)] hover:text-sky-300 disabled:opacity-30"
+                  aria-label="Move down"
+                >
+                  v
+                </button>
+              </li>
+            ))}
+          </ol>
+          <button disabled={busy} className={BTN} onClick={() => onSubmit('ranked', order)}>
+            Submit ranking
+          </button>
+        </div>
+      )}
+
+      {/* Out-of-frame escape: answer in free text regardless of kind. */}
+      {q.kind !== 'fill_in_the_blank' && (
+        <div className="mt-2 border-t border-[var(--color-border)] pt-2">
+          {showFree ? (
+            <div className="flex items-end gap-2">
+              <AutoGrowTextarea
+                value={freeText}
+                onChange={setFreeText}
+                onSubmit={() => freeText.trim() && onSubmit('text', freeText.trim())}
+                placeholder="Answer in your own words..."
+                className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
+              />
+              <button
+                disabled={busy || !freeText.trim()}
+                className={BTN}
+                onClick={() => onSubmit('text', freeText.trim())}
+              >
+                Send
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setShowFree(true)}
+              className="text-xs text-sky-400 hover:text-sky-300"
+            >
+              Answer in your own words instead
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// A question comment with its answers nested beneath it, and -- when the question is open and the
+// caller passes action handlers -- an inline answer form plus decline / cancel controls (task_629
+// slice 2). Omitting the handlers (or on a terminal state) renders it read-only.
 export function QuestionComment({
   comment,
   answers,
   resolveExternal,
+  actor,
+  busy,
+  onAnswer,
+  onDecline,
+  onCancel,
 }: {
   comment: Comment
   answers: Comment[]
   resolveExternal: (id: string) => string
+  actor?: string
+  busy?: boolean
+  onAnswer?: (shape: string, value: unknown) => void
+  onDecline?: () => void
+  onCancel?: () => void
 }) {
   const q = asQuestion(comment.payload)
   const state = (comment.state ?? 'open') as string
   const blocking = q?.blocking === true
+  const isOpen = state === 'open'
+  const isAsker = actor != null && comment.author === actor
   return (
     <div>
       <div className="mb-1.5 flex flex-wrap items-center gap-2 text-xs text-[var(--color-muted)]">
@@ -199,6 +398,31 @@ export function QuestionComment({
               resolveExternal={resolveExternal}
             />
           ))}
+        </div>
+      )}
+
+      {/* Open question: inline answer form + decline / cancel controls (slice 2). */}
+      {isOpen && onAnswer && q && <AnswerForm q={q} busy={!!busy} onSubmit={onAnswer} />}
+      {isOpen && (onDecline || (isAsker && onCancel)) && (
+        <div className="mt-2 flex items-center gap-3 text-xs">
+          {onDecline && (
+            <button
+              disabled={busy}
+              onClick={onDecline}
+              className="text-amber-400 hover:text-amber-300 disabled:opacity-40"
+            >
+              Decline
+            </button>
+          )}
+          {isAsker && onCancel && (
+            <button
+              disabled={busy}
+              onClick={onCancel}
+              className="text-rose-400 hover:text-rose-300 disabled:opacity-40"
+            >
+              Cancel question
+            </button>
+          )}
         </div>
       )}
 

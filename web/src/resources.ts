@@ -357,6 +357,38 @@ export async function commentTask(id: number, b: Parameters<typeof api.commentTa
   return r
 }
 
+// Operator-questions actions (task_629). Each acts on a question comment and transitions its state,
+// so refresh the task the comment lives on (its comments array + the derived blocking fields).
+export async function answerQuestion(
+  taskId: number,
+  commentId: number,
+  b: Parameters<typeof api.answerQuestion>[1],
+) {
+  const r = await api.answerQuestion(commentId, b)
+  touched({ taskId, activity: true })
+  return r
+}
+
+export async function declineQuestion(
+  taskId: number,
+  commentId: number,
+  b: Parameters<typeof api.declineQuestion>[1],
+) {
+  const r = await api.declineQuestion(commentId, b)
+  touched({ taskId, activity: true })
+  return r
+}
+
+export async function cancelQuestion(
+  taskId: number,
+  commentId: number,
+  b: Parameters<typeof api.cancelQuestion>[1] = {},
+) {
+  const r = await api.cancelQuestion(commentId, b)
+  touched({ taskId, activity: true })
+  return r
+}
+
 export async function moveTask(id: number, b: Parameters<typeof api.moveTask>[1]) {
   const t = await api.moveTask(id, b)
   // A move touches TWO task lists — source and destination. The response only names the
