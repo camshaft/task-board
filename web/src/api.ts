@@ -57,6 +57,52 @@ export interface TaskSummary {
   monitor_exempt?: boolean
 }
 
+// Operator-questions (task_628 / doc_33). A comment is a plain note, a structured question, or an
+// answer replying to one. The backend stores `payload` + `state` + `type` + `reply_to` verbatim and
+// returns them inline on every task's comments array, so the UI renders questions without a second
+// fetch.
+export type CommentType = 'plain' | 'question' | 'answer'
+export type QuestionKind =
+  | 'yes_no'
+  | 'multiple_choice'
+  | 'select_all'
+  | 'fill_in_the_blank'
+  | 'rank_list'
+// `open` is the only non-terminal state.
+export type QuestionState =
+  | 'open'
+  | 'answered'
+  | 'answered_outside_frame'
+  | 'declined'
+  | 'cancelled'
+  | 'superseded'
+export interface QuestionOption {
+  id: string
+  label: string
+}
+export interface QuestionPayload {
+  kind: QuestionKind
+  // Present for multiple_choice / select_all / rank_list.
+  options?: QuestionOption[]
+  // Principal (person / team / agent) the question is routed to; "operator" is the seeded team.
+  routed_to?: string
+  blocking?: boolean
+  // default + wait_period_seconds apply to non-blocking questions only.
+  default?: unknown
+  wait_period_seconds?: number | null
+  // Inline JSON Schema (schema-driven questions): the source of truth for a usable answer form.
+  response_schema?: unknown
+  // Pass-through UI descriptor: an opaque element key, its props, and the CAS content id of the
+  // reusable element schema (resolved best-effort via GET /api/ipfs/{cid}). Progressive enhancement
+  // over the inline response_schema.
+  ui?: { element?: string; props?: Record<string, unknown>; element_schema_cid?: string }
+}
+export interface AnswerPayload {
+  // choice | bool | text | ranked (matches the question kind, or `text` for an out-of-frame answer).
+  shape?: string
+  value?: unknown
+}
+
 export interface Comment {
   id: number
   author: string | null
@@ -66,7 +112,16 @@ export interface Comment {
   // "slack:U123"); `author` is then the fleet agent that ingested it. origin_ref is the
   // source item's origin id for imported/synced comments.
   external_author?: string | null
+  external_author_name?: string | null
   origin_ref?: string | null
+  // Operator-questions fields (default type 'plain'); payload is a QuestionPayload on a question,
+  // an AnswerPayload on an answer.
+  type?: CommentType
+  state?: QuestionState | string | null
+  payload?: QuestionPayload | AnswerPayload | Record<string, unknown>
+  reply_to?: number | null
+  supersedes?: number | null
+  superseded_by?: number | null
 }
 
 // An identity alias (task 532): a name that resolves to a canonical identity (e.g. operator ->
