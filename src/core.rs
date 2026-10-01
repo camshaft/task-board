@@ -2077,7 +2077,7 @@ pub async fn list_tasks(
     }
     let rows = query.fetch_all(pool).await?;
     // Normalize the json_extract result (1/0/null) into a real bool `monitor_exempt` (default false).
-    let out: Vec<Value> = rows
+    let mut out: Vec<Value> = rows
         .iter()
         .map(|r| {
             let mut v = row_to_json_ref(r, "task");
@@ -2088,7 +2088,54 @@ pub async fn list_tasks(
             v
         })
         .collect();
+    // Reachability of each task's owner (task 340): annotate assignee_status + assignee_last_seen so
+    // an orchestrator can pick a live owner / spot a stale one without a second list_agents call.
+    annotate_assignee_reachability(pool, &mut out).await?;
     Ok(Value::Array(out))
+}
+
+/// Add `assignee_status` + `assignee_last_seen` to each task object, read from the assignee's agent
+/// row (task 340 part 2). One batched query over the distinct assignees (not a JOIN -- the list
+/// query's own `status` column would collide with `agents.status`). A task with no assignee, or an
+/// assignee that is not a registered agent, gets nulls -- which is itself the signal (pairs with the
+/// create/update `assignee_warning`): a null `assignee_status` on a non-null `assignee` means that
+/// owner is not a live board agent.
+async fn annotate_assignee_reachability(pool: &Pool, tasks: &mut [Value]) -> anyhow::Result<()> {
+    let assignees: std::collections::BTreeSet<String> = tasks
+        .iter()
+        .filter_map(|t| t.get("assignee").and_then(|a| a.as_str()).map(str::to_string))
+        .collect();
+    if assignees.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", assignees.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id, status, last_seen FROM agents WHERE id IN ({placeholders})");
+    let mut q = sqlx::query(&sql);
+    for a in &assignees {
+        q = q.bind(a);
+    }
+    let mut map: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
+        std::collections::BTreeMap::new();
+    for r in q.fetch_all(pool).await? {
+        let id: String = r.try_get("id")?;
+        map.insert(id, (r.try_get("status")?, r.try_get("last_seen")?));
+    }
+    for t in tasks.iter_mut() {
+        if let Value::Object(m) = t {
+            let (status, last_seen) = m
+                .get("assignee")
+                .and_then(|a| a.as_str())
+                .and_then(|a| map.get(a))
+                .cloned()
+                .unwrap_or((None, None));
+            m.insert("assignee_status".into(), status.map(Value::String).unwrap_or(Value::Null));
+            m.insert(
+                "assignee_last_seen".into(),
+                last_seen.map(Value::String).unwrap_or(Value::Null),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub async fn comment_task(
@@ -10137,6 +10184,29 @@ mod tests {
         )
         .await?;
         assert!(un.get("assignee_warning").is_none(), "unassign: no warning: {un}");
+        Ok(())
+    }
+
+    /// list_tasks annotates each task with its assignee's reachability (task 340 part 2): a live
+    /// registered assignee gets its presence status + last_seen; an unregistered assignee or no
+    /// assignee gets nulls (the signal that the owner is not a live board agent).
+    #[tokio::test]
+    async fn assignee_reachability_annotation() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "live-agent", None, None, None, None, None).await?;
+        set_status(&pool, "live-agent", "busy", None).await?;
+        let mut tasks = vec![
+            json!({ "id": 1, "assignee": "live-agent" }),
+            json!({ "id": 2, "assignee": "ghost-xyz" }),
+            json!({ "id": 3, "assignee": Value::Null }),
+        ];
+        annotate_assignee_reachability(&pool, &mut tasks).await?;
+        assert_eq!(tasks[0]["assignee_status"], json!("busy"), "live assignee status: {:?}", tasks[0]);
+        assert!(tasks[0]["assignee_last_seen"].is_string(), "live assignee has last_seen");
+        assert_eq!(tasks[1]["assignee_status"], Value::Null, "unregistered assignee -> null status");
+        assert_eq!(tasks[1]["assignee_last_seen"], Value::Null);
+        assert_eq!(tasks[2]["assignee_status"], Value::Null, "no assignee -> null status");
         Ok(())
     }
 }
