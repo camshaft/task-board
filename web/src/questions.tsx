@@ -99,11 +99,20 @@ function asText(v: unknown): string | undefined {
 // built-in form (an unknown CID or an element like age-request) -- the caller offers the free-text
 // out-of-frame escape instead.
 type FormSpec =
+  // `scalar` (single-choice only): submit the chosen id as a bare string rather than a 1-element
+  // array -- a CID-keyed single-select's response_schema is {type:string, enum:[ids]}, so a string
+  // is required; the legacy multiple_choice kind validates by kind and expects an array.
   | { shape: 'bool'; yesLabel: string; noLabel: string }
-  | { shape: 'choice'; multi: boolean; options: QuestionOption[]; min?: number; max?: number }
+  | { shape: 'choice'; multi: boolean; options: QuestionOption[]; min?: number; max?: number; scalar?: boolean }
   | { shape: 'text'; placeholder?: string }
   | { shape: 'ranked'; options: QuestionOption[]; maxRanked?: number }
   | { shape: 'age'; recipient: string }
+
+// Does a response schema expect an array value (vs a scalar)? Used to decide a single-select's
+// submitted value shape so it satisfies the question's inline response_schema.
+function isArraySchema(s: unknown): boolean {
+  return !!s && typeof s === 'object' && (s as Record<string, unknown>).type === 'array'
+}
 
 function formSpecFor(q: QuestionPayload): FormSpec | null {
   const name = elementNameForCid(q.ui?.element_schema_cid)
@@ -113,7 +122,14 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
       case 'yes-no':
         return { shape: 'bool', yesLabel: asText(p.yes_label) ?? 'Yes', noLabel: asText(p.no_label) ?? 'No' }
       case 'single-select':
-        return { shape: 'choice', multi: false, options: asOptions(p.options) }
+        // A CID-keyed single-select's response_schema is {type:string, enum}, so submit a scalar id
+        // (unless the author declared an array schema).
+        return {
+          shape: 'choice',
+          multi: false,
+          options: asOptions(p.options),
+          scalar: !isArraySchema(q.response_schema),
+        }
       case 'multi-select':
         return {
           shape: 'choice',
@@ -311,7 +327,7 @@ function AnswerForm({
           <button
             disabled={busy || !choice}
             className={BTN}
-            onClick={() => onSubmit('choice', [choice])}
+            onClick={() => onSubmit('choice', spec.scalar ? choice : [choice])}
           >
             Submit answer
           </button>
