@@ -396,6 +396,26 @@ export default function DocumentView() {
             </div>
           )}
 
+          {/* Deprecated / superseded banner (task 722/725): a deprecated doc stays visible but
+              carries this notice, linking to its replacement when superseded. */}
+          {doc.deprecated_at && (
+            <div className="mb-4 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+              <span className="font-semibold uppercase tracking-wide">Deprecated</span>
+              {doc.superseded_by != null && (
+                <>
+                  {' · superseded by '}
+                  <Link
+                    to={`/documents/${doc.superseded_by}`}
+                    className="underline decoration-dotted underline-offset-2 hover:text-amber-200"
+                  >
+                    document {doc.superseded_by}
+                  </Link>
+                </>
+              )}
+              <span className="ml-1 opacity-70"> · {relTime(doc.deprecated_at)}</span>
+            </div>
+          )}
+
           {/* Current version, rendered inline by its content_type (markdown / image / pdf / code
               / download fallback). Content resolves through the IPFS gateway client-side. */}
           {doc.current_version && (

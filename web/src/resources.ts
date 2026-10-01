@@ -185,6 +185,34 @@ export function useDocuments() {
   return useResource<DocumentSummary[]>(keys.documents, () => api.listDocuments())
 }
 
+// The documents list with filtering + default-hide (task 725). Keyed per filter under the
+// `documents:` prefix so touched() refreshes it on any document change.
+// - an explicit status and/or tag filter -> a single server query;
+// - showAll -> every (non-archived) document, charters included;
+// - default (no filter) -> hide charters UNLESS pending-review: the union of everything that is
+//   not a charter with the pending-review charters (the composition v-task-board recommended; the
+//   backend gives the exclude_tag / multi-status primitives, the default-hide rule lives here).
+export function useDocumentList(opts: { status?: string; tag?: string; showAll?: boolean } = {}) {
+  const status = opts.status || ''
+  const tag = opts.tag || ''
+  const showAll = !!opts.showAll
+  const key = `documents:${showAll ? 'all' : 'default'}:${status}:${tag}`
+  return useResource<DocumentSummary[]>(key, async () => {
+    if (status || tag) {
+      return api.listDocuments({ status: status || undefined, tag: tag || undefined })
+    }
+    if (showAll) {
+      return api.listDocuments({})
+    }
+    const [nonCharter, pendingCharters] = await Promise.all([
+      api.listDocuments({ exclude_tag: 'charter' }),
+      api.listDocuments({ tag: 'charter', status: 'pending-review' }),
+    ])
+    const seen = new Set(nonCharter.map((d) => d.id))
+    return [...nonCharter, ...pendingCharters.filter((d) => !seen.has(d.id))]
+  })
+}
+
 export function useWiki(prefix?: string) {
   return useResource<DocumentSummary[]>(keys.wiki(prefix), () => api.listWiki(prefix))
 }
@@ -267,7 +295,7 @@ export function touched(
     // change, or fresh doc all show there).
     invalidate(keys.document(opts.documentId))
     invalidate(keys.documentComments(opts.documentId))
-    invalidate(keys.documents)
+    invalidateMatching('documents') // the plain list + every filtered documents: list
     invalidateMatching('wiki:') // a path set/clear or new version reshapes the tree
   }
   if (opts.channelId != null) {
