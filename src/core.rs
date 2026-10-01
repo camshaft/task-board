@@ -145,8 +145,9 @@ pub fn check_bare_refs(text: &str) -> anyhow::Result<()> {
     let stripped = strip_code_regions(text);
     if let Some(&n) = detect_bare_task_refs(&stripped).first() {
         anyhow::bail!(
-            "ambiguous bare reference \"#{n}\": write task_{n} for a board task, or <owner>/<repo>#{n} \
-             (e.g. camshaft/task-board#{n}) for an external GitHub reference"
+            "ambiguous bare reference \"#{n}\": write task_{n} for a board task, camshaft/task-board#{n} \
+             (or <owner>/<repo>#{n}) for a GitHub PR/issue, or -- if {n} is a plain number such as a \
+             board message or sequence ordinal -- drop the # and write \"{n}\""
         );
     }
     Ok(())
@@ -9336,6 +9337,16 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.starts_with("ambiguous bare reference"), "got: {msg}");
         assert!(msg.contains("task_7"), "error names the typed form: {msg}");
+        assert!(
+            msg.contains("camshaft/task-board#7"),
+            "error names the GitHub form: {msg}"
+        );
+        // task 616: an agent writing a bare "#N" for a plain ordinal (e.g. a board message number)
+        // gets told to drop the #, since neither typed form fits that case.
+        assert!(
+            msg.contains("drop the #") && msg.contains("ordinal"),
+            "error covers the plain-ordinal case: {msg}"
+        );
         // Nothing was stored (rejected pre-write).
         assert_eq!(get_task(&pool, tid).await?["comment_count"], json!(0));
 
