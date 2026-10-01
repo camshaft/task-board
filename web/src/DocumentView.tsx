@@ -1395,6 +1395,9 @@ function DocDiff({
   // Annotate the approved / current versions in the picker so the default baseline reads clearly.
   const label = (v: DocumentVersion) =>
     `v${v.version_no}${v.id === approvedId ? ' (approved)' : ''}${v.id === currentId ? ' (current)' : ''}`
+  // The compare (newer) version's publish summary captions the diff -- "what changed in this
+  // revision / what to look for" when reviewing it (task 758; reuses the existing version summary).
+  const cmpVersion = sorted.find((v) => v.id === cmpId)
 
   return (
     <div className="mt-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-3">
@@ -1430,6 +1433,12 @@ function DocDiff({
           </span>
         )}
       </div>
+      {cmpVersion?.summary && baseId !== cmpId && (
+        <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1.5 text-xs">
+          <span className="text-[var(--color-muted)]">What changed in v{cmpVersion.version_no}: </span>
+          {cmpVersion.summary}
+        </div>
+      )}
       {loading ? (
         <p className="text-xs text-[var(--color-muted)]">Computing diff…</p>
       ) : result.error ? (
