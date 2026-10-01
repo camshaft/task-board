@@ -3409,6 +3409,18 @@ const WRITING_SKILL_DOC_ID: i64 = 7;
 /// If the MCP skills extension later lands with host support, the URI repoints to its manifest then.
 const WRITING_SKILL_URI: &str = "file://guides/doc-writing-style-guide";
 
+/// The reserved wiki path of the ui-element catalog document (task_820): the board doc holding the
+/// agent-facing name -> {cid, title, description, props_schema} records for every structured-question
+/// UI element (built by `--build-ui-catalog`). Resolved by path, not a fixed doc id, so re-creating
+/// the doc never breaks the resource.
+const UI_ELEMENTS_DOC_PATH: &str = "system/ui-elements";
+
+/// Stable resource URI for the ui-element catalog ([`UI_ELEMENTS_DOC_PATH`]). `file://` scheme to
+/// match Claude Code's `@`-mention resource picker (see [`WRITING_SKILL_URI`]); path mirrors the
+/// doc's wiki path. read_resource serves the catalog document's current-version content from its CID
+/// (doc_728 Solution B) so an agent resolves the live element->CID mapping in one resources/read.
+const UI_ELEMENTS_URI: &str = "file://system/ui-elements";
+
 #[tool_handler]
 impl ServerHandler for Board {
     fn get_info(&self) -> ServerConfig {
@@ -3461,7 +3473,7 @@ impl ServerHandler for Board {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        let resource = Resource::new(WRITING_SKILL_URI, "fleet-doc-writing-style-guide")
+        let writing_guide = Resource::new(WRITING_SKILL_URI, "fleet-doc-writing-style-guide")
             .with_title("Fleet Doc-Writing Style Guide")
             .with_description(
                 "How to write a fleet document and get it reviewed: the required outline \
@@ -3472,39 +3484,65 @@ impl ServerHandler for Board {
                  Document doc_7 is the authoritative source; this resource serves its current text.",
             )
             .with_mime_type("text/markdown");
-        Ok(ListResourcesResult::with_all_items(vec![resource]))
+        let ui_elements = Resource::new(UI_ELEMENTS_URI, "ui-element-catalog")
+            .with_title("Structured-question UI element catalog")
+            .with_description(
+                "Resolve the live UI-element -> CID mapping to author a structured (rich) \
+                 question. One JSON record per element -- name, cid (stamp it as \
+                 ui.element_schema_cid on a CID-keyed pose_question), title, description, and \
+                 props_schema (the ui.props contract). Supply an inline response_schema per the \
+                 element's description. Served from the system/ui-elements board document's current \
+                 version, so it stays current as elements are added -- no local checkout or build.",
+            )
+            .with_mime_type("application/json");
+        Ok(ListResourcesResult::with_all_items(vec![
+            writing_guide,
+            ui_elements,
+        ]))
     }
 
-    /// Read a discoverable resource's content. Resolves the writing-skill URI to the current
-    /// version's markdown of [`WRITING_SKILL_DOC_ID`], fetched server-side from its pinned CID (the
-    /// same read path as the read_document tool), so a client gets the guidance text in one call
-    /// regardless of its host. Any other URI is a resource-not-found.
+    /// Read a discoverable resource's content, fetched server-side from the backing document's pinned
+    /// CID (the same read path as the read_document tool), so a client gets it in one call regardless
+    /// of its host. The writing-skill URI serves [`WRITING_SKILL_DOC_ID`]'s current markdown; the
+    /// ui-elements URI serves the catalog document filed at [`UI_ELEMENTS_DOC_PATH`] as JSON
+    /// (task_820). Any other URI is a resource-not-found.
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
-        if request.uri != WRITING_SKILL_URI {
+        let (doc, uri, mime) = if request.uri == WRITING_SKILL_URI {
+            let doc = core::read_document_content(
+                &self.pool,
+                self.ipfs_api_url.as_deref(),
+                WRITING_SKILL_DOC_ID,
+                None,
+            )
+            .await
+            .map_err(err)?;
+            (doc, WRITING_SKILL_URI, "text/markdown")
+        } else if request.uri == UI_ELEMENTS_URI {
+            let doc = core::read_document_content_at_path(
+                &self.pool,
+                self.ipfs_api_url.as_deref(),
+                UI_ELEMENTS_DOC_PATH,
+            )
+            .await
+            .map_err(err)?;
+            (doc, UI_ELEMENTS_URI, "application/json")
+        } else {
             return Err(McpError::resource_not_found(
                 format!("no resource {}", request.uri),
                 None,
             ));
-        }
-        let doc = core::read_document_content(
-            &self.pool,
-            self.ipfs_api_url.as_deref(),
-            WRITING_SKILL_DOC_ID,
-            None,
-        )
-        .await
-        .map_err(err)?;
+        };
         let body = doc.get("content").and_then(Value::as_str).ok_or_else(|| {
-            McpError::internal_error("writing-skill document has no readable text content", None)
+            McpError::internal_error(format!("resource {uri} has no readable text content"), None)
         })?;
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(body, WRITING_SKILL_URI).with_mime_type("text/markdown")
-        ])
-        .into())
+        Ok(
+            ReadResourceResult::new(vec![ResourceContents::text(body, uri).with_mime_type(mime)])
+                .into(),
+        )
     }
 }
 
