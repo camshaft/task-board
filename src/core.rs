@@ -13748,6 +13748,89 @@ mod tests {
         Ok(())
     }
 
+    /// A cross-project move_task PRESERVES a task's external_link (source, external_id,
+    /// external_parent_id). external_links are keyed by the task's stable board_id, and move_task
+    /// only rewrites project_id — it must never touch the link. A bridge's IN comment-dedup and OUT
+    /// reflect both resolve through this link, so losing it on a move would duplicate comments and
+    /// lose the reflect target. Guards the prerequisite for routing mirrored tasks through the
+    /// uncategorized intake project (board-triage then move_task's them to their real project).
+    #[tokio::test]
+    async fn move_task_preserves_external_links() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "gh", None, None, None, None, None).await?;
+        let intake = create_project(&pool, "uncategorized", None, Some("gh"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let real = create_project(&pool, "real", None, Some("gh"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let link = ExternalRef {
+            source: "github".into(),
+            external_id: "camshaft/x#7".into(),
+            external_parent_id: Some("issue".into()),
+        };
+
+        // Mirror an external issue into the intake project.
+        let t = create_task(
+            &pool,
+            intake,
+            "mirrored issue",
+            None,
+            None,
+            None,
+            Some("gh"),
+            None,
+            None,
+            Some(link.clone()),
+        )
+        .await?;
+        assert_eq!(t["created"], json!(true));
+        let tid = t["id"].as_i64().unwrap();
+
+        // Triage moves it to its real project.
+        let moved = move_task(&pool, tid, real, Some("triage")).await?;
+        assert_eq!(moved["project_id"], json!(real));
+
+        // The external_link survives the move: still exactly one link, same (source, external_id,
+        // external_parent_id), still pointing at the same task.
+        let links = list_external_links(&pool, Some("github"), Some("task"), Some(tid)).await?;
+        let links = links.as_array().unwrap();
+        assert_eq!(links.len(), 1, "exactly one link survives the move");
+        assert_eq!(links[0]["source"], json!("github"));
+        assert_eq!(links[0]["external_id"], json!("camshaft/x#7"));
+        assert_eq!(links[0]["external_parent_id"], json!("issue"));
+        assert_eq!(links[0]["board_id"].as_i64().unwrap(), tid);
+
+        // And the behavioral consequence: a retrying bridge adapter re-ingesting the SAME
+        // (source, external_id) after the move still dedups to the moved task (created:false, no
+        // duplicate), so IN comment-dedup / OUT reflect keep resolving.
+        let again = create_task(
+            &pool,
+            real,
+            "mirrored issue RETRY",
+            None,
+            None,
+            None,
+            Some("gh"),
+            None,
+            None,
+            Some(link.clone()),
+        )
+        .await?;
+        assert_eq!(
+            again["created"],
+            json!(false),
+            "still dedups after the move"
+        );
+        assert_eq!(
+            again["id"].as_i64().unwrap(),
+            tid,
+            "resolves to the same moved task, no duplicate"
+        );
+        Ok(())
+    }
+
     /// list_tasks(unassigned=true) returns only tasks with no assignee, and that intent takes
     /// precedence over a contradictory assignee= equality filter.
     #[tokio::test]
