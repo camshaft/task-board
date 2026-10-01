@@ -78,6 +78,39 @@ export interface IdentityAlias {
   created_by?: string | null
 }
 
+// Multi-operator identity model (doc_26, task 542 / task 595). A Person is a first-class human
+// identity (a separate registry from agents); a Team is an addressable group whose members are
+// people or other teams. Both are keyed by a stable string handle (e.g. "cameron", "operator").
+export interface Person {
+  id: string
+  display_name: string | null
+  created_by: string | null
+  created_at: string
+  // Stored as a JSON string in the row (like Task.metadata); unused by the current UI.
+  metadata?: unknown
+}
+
+export interface Team {
+  id: string
+  display_name: string | null
+  created_by: string | null
+  created_at: string
+  metadata?: unknown
+}
+
+// A team's direct membership edge: a person id or a nested team id.
+export interface TeamMember {
+  member_id: string
+  member_kind: 'person' | 'team'
+}
+
+// GET /teams/{id}: the team row plus its direct members and the fully-resolved person set with
+// nested teams expanded (cycle-guarded server-side).
+export interface TeamDetail extends Team {
+  members: TeamMember[]
+  resolved_people: string[]
+}
+
 // A bridged human/actor (from listExternalIdentities), distinct from a fleet Agent.
 export interface ExternalIdentity {
   id: string
@@ -608,6 +641,25 @@ export const api = {
 
   // Identity aliases (task 532): the alias -> canonical map, resolved client-side for display.
   listIdentityAliases: () => req<IdentityAlias[]>('GET', '/identity-aliases'),
+
+  // Multi-operator people/teams (doc_26, task 542 Phase 1 backend / task 595 UI). People and teams
+  // are upserted by stable string id; a team member is a person or a nested team. The server
+  // cycle-guards nested-team resolution and rejects a sub-team add that would create a cycle.
+  listPeople: () => req<Person[]>('GET', '/people'),
+  createPerson: (b: { id: string; display_name?: string; created_by?: string }) =>
+    req<Person>('POST', '/people', b),
+  deletePerson: (id: string) =>
+    req<{ deleted: string }>('DELETE', `/people/${encodeURIComponent(id)}`),
+  listTeams: () => req<Team[]>('GET', '/teams'),
+  createTeam: (b: { id: string; display_name?: string; created_by?: string }) =>
+    req<Team>('POST', '/teams', b),
+  getTeam: (id: string) => req<TeamDetail>('GET', `/teams/${encodeURIComponent(id)}`),
+  deleteTeam: (id: string) =>
+    req<{ deleted: string }>('DELETE', `/teams/${encodeURIComponent(id)}`),
+  addTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team'; created_by?: string }) =>
+    req<TeamDetail>('POST', `/teams/${encodeURIComponent(teamId)}/members`, b),
+  removeTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team' }) =>
+    req<TeamDetail>('DELETE', `/teams/${encodeURIComponent(teamId)}/members`, b),
 
   getSecretRequest: (id: number) => req<SecretRequest>('GET', `/secret-requests/${id}`),
   submitSecret: (id: number, b: { token: string; ciphertext: string }) =>

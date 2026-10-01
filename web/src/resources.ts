@@ -14,7 +14,10 @@ import {
   type EventRow,
   type ExternalIdentity,
   type IdentityAlias,
+  type Person,
   type Project,
+  type Team,
+  type TeamDetail,
   type Review,
   type ReviewTrend,
   type Task,
@@ -48,6 +51,9 @@ const keys = {
   channelPosts: (id: number) => `channelPosts:${id}`,
   externalIdentities: 'externalIdentities',
   identityAliases: 'identityAliases',
+  people: 'people',
+  teams: 'teams',
+  team: (id: string) => `team:${id}`,
   reviews: 'reviews',
   review: (id: number) => `review:${id}`,
   reviewTrend: 'reviewTrend',
@@ -101,6 +107,20 @@ export function useExternalIdentities() {
 // resolved client-side for DISPLAY only (assignee labels, @-mentions) — stored data is untouched.
 export function useIdentityAliases() {
   return useResource<IdentityAlias[]>(keys.identityAliases, () => api.listIdentityAliases())
+}
+
+// Multi-operator people/teams (doc_26, task 595). People + teams are reference registries; a team
+// detail (useTeam) carries its direct members and the fully-resolved person set.
+export function usePeople() {
+  return useResource<Person[]>(keys.people, () => api.listPeople())
+}
+
+export function useTeams() {
+  return useResource<Team[]>(keys.teams, () => api.listTeams())
+}
+
+export function useTeam(id: string) {
+  return useResource<TeamDetail>(keys.team(id), () => api.getTeam(id))
 }
 
 // A resolver from an external identity id (e.g. "slack:U123") to its display name, falling back
@@ -421,6 +441,59 @@ export async function sendDirectMessage(b: Parameters<typeof api.sendMessage>[0]
   invalidateMatching('channels')
   touched({ activity: true })
   return r
+}
+
+// Multi-operator people/teams mutations (doc_26, task 595). People/teams are not yet on the SSE
+// stream, so these invalidate the affected keys directly: a person change refreshes the people
+// list (and could change any team's resolved_people, so refresh loaded team details too); a team
+// or membership change refreshes the teams list and that team's detail.
+export async function createPerson(b: Parameters<typeof api.createPerson>[0]) {
+  const p = await api.createPerson(b)
+  invalidate(keys.people)
+  return p
+}
+
+export async function deletePerson(id: string) {
+  const r = await api.deletePerson(id)
+  invalidate(keys.people)
+  invalidateMatching('team:') // a deleted person drops out of every team's membership/resolution
+  invalidate(keys.teams)
+  return r
+}
+
+export async function createTeam(b: Parameters<typeof api.createTeam>[0]) {
+  const t = await api.createTeam(b)
+  invalidate(keys.teams)
+  return t
+}
+
+export async function deleteTeam(id: string) {
+  const r = await api.deleteTeam(id)
+  invalidate(keys.teams)
+  invalidateMatching('team:') // the team itself + any parent team that nested it
+  return r
+}
+
+export async function addTeamMember(
+  teamId: string,
+  b: Parameters<typeof api.addTeamMember>[1],
+) {
+  const t = await api.addTeamMember(teamId, b)
+  invalidate(keys.team(teamId))
+  invalidateMatching('team:') // a nested-team add changes parent teams' resolved_people too
+  invalidate(keys.teams)
+  return t
+}
+
+export async function removeTeamMember(
+  teamId: string,
+  b: Parameters<typeof api.removeTeamMember>[1],
+) {
+  const t = await api.removeTeamMember(teamId, b)
+  invalidate(keys.team(teamId))
+  invalidateMatching('team:')
+  invalidate(keys.teams)
+  return t
 }
 
 // The compact event the SSE feed pushes (mirrors sse::StreamEvent on the server), plus the
