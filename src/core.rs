@@ -8040,6 +8040,30 @@ pub const RESERVED_MEMORY_TAG: &str = "agent-memory";
 /// `include_memory=true` on the filter.
 pub const RESERVED_MEMORY_PATH_PREFIXES: &[&str] = &["repos/", "agents/"];
 
+/// Document tags whose doc type is EXEMPT from the design-conformance review (task_944, librarian's
+/// sign-off): a tenet / canon is approved by the operator via plain approve_document, not graded
+/// against the doc_7 design-doc template, so submit_to_operator_review must not demand a conformance
+/// review it will never have. A doc carrying any of these tags skips the conformance-review
+/// requirement and can reach operator_review status as a one-tap doc row like a design doc.
+pub const CONFORMANCE_EXEMPT_TAGS: &[&str] = &["tenet", "canon"];
+
+/// True if the document's stored `metadata` JSON carries a [`CONFORMANCE_EXEMPT_TAGS`] tag, so its
+/// doc type is exempt from the design-conformance review requirement at operator-review submit.
+fn tags_exempt_from_conformance(meta_str: &str) -> bool {
+    serde_json::from_str::<Value>(meta_str)
+        .ok()
+        .as_ref()
+        .and_then(|m| m.get("tags"))
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter().filter_map(Value::as_str).any(|t| {
+                CONFORMANCE_EXEMPT_TAGS
+                    .iter()
+                    .any(|ex| t.eq_ignore_ascii_case(ex))
+            })
+        })
+}
+
 /// Filters for [`list_documents_filtered`] (task 694c). All optional; an empty `statuses` matches
 /// any status. `tag` includes docs carrying the tag; `exclude_tag` drops docs carrying it (the
 /// primitive the UI composes default-hide from, e.g. hide the "charter" tag).
@@ -8735,6 +8759,14 @@ pub async fn submit_to_operator_review(
             .await?
             .try_get("version_no")?;
 
+    // Conformance-exempt doc types (tenet / canon) skip checks 2a + 2b entirely (task_944,
+    // librarian's sign-off): a tenet is approved by the operator via plain approve_document, not
+    // graded against the design-doc template, so it must be able to reach operator_review status --
+    // and surface as a one-tap doc row like a design doc -- WITHOUT the conformance review it is
+    // exempt from. The template-attestation (check 1) and the structural A8 gate (1b, which only
+    // fires on a design-doc attestation) still apply; only the conformance-review demand is lifted.
+    let conformance_exempt = tags_exempt_from_conformance(&meta_str);
+
     // 2a. Conformance ran against the CURRENT version: a terminal `adversarial_review` entry on a
     // review over this doc records `reviewed_version` == current_version_no (task_868). The version
     // is read from the review's `metadata.reviewed_version` -- the structured source of truth set via
@@ -8766,7 +8798,7 @@ pub async fn submit_to_operator_review(
         let from_body = reviewed_version_of(s.try_get::<Option<String>, _>("body").ok().flatten());
         from_meta == Some(current_version_no) || from_body == Some(current_version_no)
     });
-    if !ran_current {
+    if !ran_current && !conformance_exempt {
         anyhow::bail!(
             "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body). A conformance review must run (or re-run) on the current version before the doc can reach the operator"
         );
@@ -8788,7 +8820,7 @@ pub async fn submit_to_operator_review(
     .fetch_one(&mut *tx)
     .await?
     .try_get("n")?;
-    if open_findings > 0 {
+    if open_findings > 0 && !conformance_exempt {
         anyhow::bail!(
             "document {document_id} has {open_findings} open conformance finding(s): close every finding's child task (done/cancelled) before submitting for operator review"
         );
@@ -18896,6 +18928,86 @@ mod tests {
         assert!(
             err2.contains("conformance review"),
             "with structure skipped it should fall through to the conformance check; got: {err2}"
+        );
+        Ok(())
+    }
+
+    /// tags_exempt_from_conformance recognizes the exempt doc types (tenet / canon), case-insensitive,
+    /// among other tags, and nothing else (task_944).
+    #[test]
+    fn tags_exempt_from_conformance_matches_tenet_and_canon() {
+        assert!(tags_exempt_from_conformance(r#"{"tags":["tenet"]}"#));
+        assert!(tags_exempt_from_conformance(r#"{"tags":["Canon"]}"#));
+        assert!(tags_exempt_from_conformance(
+            r#"{"tags":["draft","tenet"]}"#
+        ));
+        assert!(!tags_exempt_from_conformance(r#"{"tags":["design"]}"#));
+        assert!(!tags_exempt_from_conformance(r#"{"tags":[]}"#));
+        assert!(!tags_exempt_from_conformance("{}"));
+        assert!(!tags_exempt_from_conformance("not json"));
+    }
+
+    /// A conformance-EXEMPT doc (tag=tenet) reaches operator_review WITHOUT any conformance review
+    /// (task_944): the gate still requires a template attestation (here a waiver), but the
+    /// conformance-review demand that a tenet is exempt from is lifted, so it surfaces as a one-tap
+    /// doc row. A non-exempt doc with no review still fails the conformance check.
+    #[tokio::test]
+    async fn submit_gate_exempts_tenet_from_conformance_review() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Canon", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let d = create_document(
+            &pool,
+            "Tenet 14",
+            Some(pid),
+            "bafytenet",
+            Some("v1"),
+            Some("librarian"),
+            Some(json!({ "tags": ["tenet"] })),
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        // No conformance review exists -- a design doc would be blocked, but a tenet is exempt.
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("librarian"),
+            None,
+            Some("tenet: operator approves via plain approve_document, conformance-exempt"),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            out["status"],
+            json!("operator_review"),
+            "a tenet reaches operator_review without a conformance review"
+        );
+
+        // A non-exempt doc (no exempt tag) with no review is still blocked on conformance.
+        let d2 = create_document(
+            &pool,
+            "Design: Widget",
+            Some(pid),
+            "bafydesign",
+            Some("v1"),
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did2 = d2["id"].as_i64().unwrap();
+        let err =
+            submit_to_operator_review(&pool, did2, Some("author"), None, Some("no template"), None)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("conformance review"),
+            "a non-exempt doc with no review stays blocked on conformance; got: {err}"
         );
         Ok(())
     }
