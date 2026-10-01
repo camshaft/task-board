@@ -447,6 +447,14 @@ fn merge_metadata(base_str: Option<&str>, incoming: Value) -> String {
     if let Some(coerced) = coerce_repos_metadata(base.get("repos")) {
         base.insert("repos".into(), coerced);
     }
+    // Likewise coerce a hand-authored metadata.capabilities into a canonical deduped name list
+    // (task_903): a CSV / space / newline string, or a list of name strings, becomes a clean string
+    // array. The fleet materializer selects capabilities/<capability> mandate sets keyed on
+    // (role, repos, capabilities), so normalizing at the write source keeps the registry the single
+    // source of truth in the shape compose expects. Idempotent on an already-canonical list.
+    if let Some(coerced) = coerce_capabilities_metadata(base.get("capabilities")) {
+        base.insert("capabilities".into(), coerced);
+    }
     Value::Object(base).to_string()
 }
 
@@ -473,6 +481,32 @@ fn coerce_repos_metadata(repos: Option<&Value>) -> Option<Value> {
         )),
         _ => None,
     }
+}
+
+/// If `capabilities` is a delimited string or a list of name strings, return the canonical deduped
+/// list of trimmed non-empty capability names (first-seen order); otherwise `None` (absent, or a
+/// shape that is not a plain name list -- leave as-is, no data loss). Parallel to
+/// [`coerce_repos_metadata`] (task_903): the fleet materializer selects capabilities/<capability>
+/// mandate sets, so a hand-authored CSV or list is normalized at the write source. Idempotent -- a
+/// value already in canonical form round-trips unchanged.
+fn coerce_capabilities_metadata(capabilities: Option<&Value>) -> Option<Value> {
+    let names: Vec<&str> = match capabilities? {
+        Value::String(s) => s.split([',', '\n', '\t', ' ']).collect(),
+        // Only an all-string array is a name list; anything else (mixed/objects) is left untouched.
+        Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_string) => {
+            items.iter().filter_map(Value::as_str).collect()
+        }
+        _ => return None,
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let deduped: Vec<Value> = names
+        .into_iter()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .filter(|t| seen.insert(t.to_string()))
+        .map(|t| Value::String(t.to_string()))
+        .collect();
+    Some(Value::Array(deduped))
 }
 
 pub async fn register_agent(
@@ -15560,6 +15594,52 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["repos"], json!([{ "repo": "a" }, { "repo": "b" }]));
         assert_eq!(v["role"], json!("x"));
+    }
+
+    /// task_903: register_agent/update_agent coerce a hand-authored metadata.capabilities (a
+    /// CSV/space/newline string, or a list of names) into a canonical deduped name list, parallel to
+    /// repos. An all-string list is deduped+trimmed; a mixed/non-name shape and absent are left as-is;
+    /// other metadata keys (role, repos) are untouched and co-normalized.
+    #[test]
+    fn coerce_capabilities_metadata_normalizes_unstructured_forms() {
+        assert_eq!(
+            coerce_capabilities_metadata(Some(&json!(
+                "content-sharing, fleet-binary\ncontent-sharing"
+            ))),
+            Some(json!(["content-sharing", "fleet-binary"])),
+            "CSV/newline string -> deduped trimmed name list"
+        );
+        assert_eq!(
+            coerce_capabilities_metadata(Some(&json!(["a", "a", "b"]))),
+            Some(json!(["a", "b"])),
+            "string list is deduped"
+        );
+        // Idempotent on an already-canonical list.
+        assert_eq!(
+            coerce_capabilities_metadata(Some(&json!(["content-sharing", "fleet-binary"]))),
+            Some(json!(["content-sharing", "fleet-binary"]))
+        );
+        // Absent or a non-name-list shape => leave as-is (None): no data loss on a richer structure.
+        assert_eq!(coerce_capabilities_metadata(None), None);
+        assert_eq!(coerce_capabilities_metadata(Some(&json!(42))), None);
+        assert_eq!(coerce_capabilities_metadata(Some(&json!([]))), None);
+        assert_eq!(
+            coerce_capabilities_metadata(Some(&json!([{ "cap": "x" }]))),
+            None,
+            "a non-string-array is not touched"
+        );
+        // merge_metadata co-normalizes capabilities alongside role + repos, leaving role intact.
+        let out = merge_metadata(
+            Some(r#"{"role":"vertical"}"#),
+            json!({ "repos": "a b", "capabilities": "content-sharing fleet-binary" }),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["role"], json!("vertical"));
+        assert_eq!(v["repos"], json!([{ "repo": "a" }, { "repo": "b" }]));
+        assert_eq!(
+            v["capabilities"],
+            json!(["content-sharing", "fleet-binary"])
+        );
     }
 
     /// Enabling a channel's auto_join backfills every registered agent as a member, a later-

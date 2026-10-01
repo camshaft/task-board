@@ -96,9 +96,12 @@ pub struct RegisterAgentArgs {
     /// re-registering without it won't erase an existing charter.
     #[serde(default)]
     pub charter: Option<String>,
-    /// Arbitrary registry props (role, model, effort, interval, worktree, area, and
+    /// Arbitrary registry props (role, model, effort, interval, worktree, area,
     /// `repos: [{repo, branch}, ...]` — an agent may span several repos, each checked out
-    /// in its own workspace). MERGED into any existing bag, not replaced.
+    /// in its own workspace, and `capabilities: ["content-sharing", ...]` — the capability
+    /// mandate sets the fleet materializer selects for you, keyed on (role, repos, capabilities)).
+    /// A hand-authored `capabilities` CSV/space/newline string or name list is normalized to a
+    /// deduped string list. MERGED into any existing bag, not replaced.
     #[serde(default)]
     pub metadata: Option<JsonObject>,
     /// If set, every event delivered to your inbox is also POSTed here (best-effort).
@@ -1486,7 +1489,7 @@ impl Board {
 
     // --- Agents / presence ---
     #[tool(
-        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'agent:fixer-3'). `charter` is your role/mission (free-form). `metadata` is an optional dict of registry props (role, model, effort, interval, worktree, area, and `repos: [{repo, branch}, ...]` for the repos you work in — one workspace checkout each), MERGED into any existing bag. If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort)."
+        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'agent:fixer-3'). `charter` is your role/mission (free-form). `metadata` is an optional dict of registry props (role, model, effort, interval, worktree, area, `repos: [{repo, branch}, ...]` for the repos you work in — one workspace checkout each, and `capabilities: [\"content-sharing\", ...]` — the capability mandate sets the fleet materializer composes for you, keyed on (role, repos, capabilities); a CSV/list is normalized to a deduped string list), MERGED into any existing bag. If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort)."
     )]
     async fn register_agent(
         &self,
