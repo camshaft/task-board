@@ -760,9 +760,9 @@ pub struct TeamIdArgs {
 pub struct TeamMemberArgs {
     /// The team to add to / remove from.
     pub team_id: String,
-    /// The member's handle: a person id (member_kind "person") or a team id (member_kind "team").
+    /// The member's handle: a person id, a team id, or an agent id (per member_kind).
     pub member_id: String,
-    /// "person" or "team".
+    /// "person", "team", or "agent" (team-scoped agents, task 542).
     pub member_kind: String,
     #[serde(default)]
     pub created_by: Option<String>,
@@ -2067,7 +2067,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Get a team with its direct members and its fully-resolved person set (nested teams expanded, cycle-guarded): returns the team row + members:[{member_id, member_kind}] + resolved_people:[..]."
+        description = "Get a team with its direct members and its fully-resolved principal sets (nested teams expanded, cycle-guarded): returns the team row + members:[{member_id, member_kind}] + resolved_people:[..] + resolved_agents:[..] (people and agents are kept separate)."
     )]
     async fn get_team(
         &self,
@@ -2093,7 +2093,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Add a person or team as a member of a team (idempotent). member_kind is \"person\" or \"team\". Rejects a sub-team add that would create a membership cycle, a self-add, and a member that does not exist in its registry."
+        description = "Add a person, team, or agent as a member of a team (idempotent). member_kind is \"person\", \"team\", or \"agent\" (team-scoped agents). Rejects a sub-team add that would create a membership cycle, a self-add, and a member that does not exist in its registry. A team resolves to its people AND its agents."
     )]
     async fn add_team_member(
         &self,
@@ -2113,7 +2113,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Remove a member (person or team) from a team (idempotent). member_kind is \"person\" or \"team\"."
+        description = "Remove a member (person, team, or agent) from a team (idempotent). member_kind is \"person\", \"team\", or \"agent\"."
     )]
     async fn remove_team_member(
         &self,

@@ -1274,7 +1274,9 @@ pub async fn list_teams(pool: &Pool) -> anyhow::Result<Value> {
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
-/// A team plus its direct members and its fully-resolved person set (nested teams expanded).
+/// A team plus its direct members and its fully-resolved person AND agent sets (nested teams
+/// expanded). resolved_people and resolved_agents are kept separate (not a unified principals blob)
+/// so an existing consumer of resolved_people is unaffected (task 542 Phase 1c, doc_26 v9).
 pub async fn get_team(pool: &Pool, team_id: &str) -> anyhow::Result<Value> {
     let Some(row) = sqlx::query("SELECT * FROM teams WHERE id=?")
         .bind(team_id)
@@ -1293,35 +1295,39 @@ pub async fn get_team(pool: &Pool, team_id: &str) -> anyhow::Result<Value> {
     .iter()
     .map(row_to_json)
     .collect();
-    let people: Vec<Value> = resolve_team_people(pool, team_id)
-        .await?
-        .into_iter()
-        .map(Value::String)
-        .collect();
+    let (people_set, agents_set) = resolve_team_principals(pool, team_id).await?;
+    let people: Vec<Value> = people_set.into_iter().map(Value::String).collect();
+    let agents: Vec<Value> = agents_set.into_iter().map(Value::String).collect();
     if let Value::Object(ref mut m) = out {
         m.insert("members".into(), Value::Array(members));
         m.insert("resolved_people".into(), Value::Array(people));
+        m.insert("resolved_agents".into(), Value::Array(agents));
     }
     Ok(out)
 }
 
-/// Expand a team to the set of PERSON ids it contains, following nested teams. Cycle-guarded by a
-/// visited-set so a cyclic membership graph still terminates (doc_26 appendix A1).
-async fn resolve_team_people(pool: &Pool, team_id: &str) -> anyhow::Result<BTreeSet<String>> {
+/// Expand a team to the PRINCIPAL ids it contains, following nested teams: the PERSON ids and the
+/// AGENT ids (team-scoped agents, task 542 Phase 1c). Cycle-guarded by a visited-set so a cyclic
+/// membership graph still terminates (doc_26 appendix A1). Returns (people, agents).
+async fn resolve_team_principals(
+    pool: &Pool,
+    team_id: &str,
+) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
     let mut tx = pool.begin().await?;
-    let out = resolve_team_people_tx(&mut tx, team_id).await;
+    let out = resolve_team_principals_tx(&mut tx, team_id).await;
     tx.commit().await?;
     out
 }
 
-/// `resolve_team_people` against an open transaction, so a write path that already holds the
+/// `resolve_team_principals` against an open transaction, so a write path that already holds the
 /// (single) connection can expand a team WITHOUT grabbing a second pool connection -- grabbing one
 /// while the write tx is open deadlocks the pool.
-async fn resolve_team_people_tx(
+async fn resolve_team_principals_tx(
     tx: &mut Transaction<'_, Sqlite>,
     team_id: &str,
-) -> anyhow::Result<BTreeSet<String>> {
+) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
     let mut people: BTreeSet<String> = BTreeSet::new();
+    let mut agents: BTreeSet<String> = BTreeSet::new();
     let mut visited: BTreeSet<String> = BTreeSet::new();
     let mut stack = vec![team_id.to_string()];
     while let Some(tid) = stack.pop() {
@@ -1335,14 +1341,18 @@ async fn resolve_team_people_tx(
         {
             let mid: String = r.try_get("member_id")?;
             let kind: String = r.try_get("member_kind")?;
-            if kind == "team" {
-                stack.push(mid);
-            } else {
-                people.insert(mid);
+            match kind.as_str() {
+                "team" => stack.push(mid),
+                "agent" => {
+                    agents.insert(mid);
+                }
+                _ => {
+                    people.insert(mid); // "person"
+                }
             }
         }
     }
-    Ok(people)
+    Ok((people, agents))
 }
 
 /// Whether team `from` can reach team `target` through nested-team membership (team-only BFS,
@@ -1369,9 +1379,10 @@ async fn team_reaches_team(pool: &Pool, from: &str, target: &str) -> anyhow::Res
     Ok(false)
 }
 
-/// Add a person or team as a member of a team (idempotent). Validates the member exists in its
-/// registry; for a sub-team, rejects self-membership and any add that would create a cycle (so
-/// read-time expansion always terminates). Returns the updated team.
+/// Add a person, team, or agent as a member of a team (idempotent). Validates the member exists in
+/// its registry; for a sub-team, rejects self-membership and any add that would create a cycle (so
+/// read-time expansion always terminates). Returns the updated team. Team-scoped agents (task 542
+/// Phase 1c) are leaf members like people -- a team resolves to its people AND its agents.
 pub async fn add_team_member(
     pool: &Pool,
     team_id: &str,
@@ -1380,8 +1391,8 @@ pub async fn add_team_member(
     created_by: Option<&str>,
 ) -> anyhow::Result<Value> {
     let member_kind = member_kind.trim();
-    if member_kind != "person" && member_kind != "team" {
-        anyhow::bail!("member_kind must be \"person\" or \"team\"");
+    if member_kind != "person" && member_kind != "team" && member_kind != "agent" {
+        anyhow::bail!("member_kind must be \"person\", \"team\", or \"agent\"");
     }
     if sqlx::query("SELECT 1 FROM teams WHERE id=?")
         .bind(team_id)
@@ -1391,10 +1402,10 @@ pub async fn add_team_member(
     {
         anyhow::bail!("no team {team_id}");
     }
-    let member_table = if member_kind == "person" {
-        "people"
-    } else {
-        "teams"
+    let member_table = match member_kind {
+        "person" => "people",
+        "team" => "teams",
+        _ => "agents",
     };
     if sqlx::query(&format!("SELECT 1 FROM {member_table} WHERE id=?"))
         .bind(member_id)
@@ -1478,19 +1489,22 @@ pub async fn delete_team(pool: &Pool, id: &str) -> anyhow::Result<Value> {
     Ok(json!({ "deleted": id }))
 }
 
-/// Resolve an addressable principal id to the set of PERSON ids who can act on it (task 542): a
-/// team expands to its people (cycle-guarded); anything else (a person id, or an agent id) resolves
-/// to itself. The read-time primitive for team-aware addressing + visibility in later phases.
-// Exercised by tests now; the bin consumer lands in Phase 2 (team addressing / blocked_on kind=team).
+/// Resolve an addressable principal id to the set of principal ids who can act on it (task 542): a
+/// team expands to its people AND its agents (cycle-guarded); anything else (a person id, or an
+/// agent id) resolves to itself. The read-time primitive for team-aware addressing + visibility in
+/// later phases.
+// Exercised by tests now; the bin consumer lands in a later phase (team addressing / visibility).
 #[allow(dead_code)]
-pub async fn resolve_principal_people(pool: &Pool, id: &str) -> anyhow::Result<BTreeSet<String>> {
+pub async fn resolve_principal_ids(pool: &Pool, id: &str) -> anyhow::Result<BTreeSet<String>> {
     if sqlx::query("SELECT 1 FROM teams WHERE id=?")
         .bind(id)
         .fetch_optional(pool)
         .await?
         .is_some()
     {
-        resolve_team_people(pool, id).await
+        let (mut principals, agents) = resolve_team_principals(pool, id).await?;
+        principals.extend(agents);
+        Ok(principals)
     } else {
         Ok(BTreeSet::from([id.to_string()]))
     }
@@ -1963,11 +1977,15 @@ pub async fn update_task(
                 if kind == "agent" {
                     notify_blocked = Some((BTreeSet::from([target.clone()]), note.clone()));
                 } else if kind == "team" {
-                    // Fan out to every person the team resolves to (nested teams expanded). Resolve
-                    // on the open tx -- a second pool connection here would deadlock the pool.
-                    let people = resolve_team_people_tx(&mut tx, target).await?;
-                    if !people.is_empty() {
-                        notify_blocked = Some((people, note.clone()));
+                    // Fan out to every principal the team resolves to -- people AND agents (team-
+                    // scoped agents, task 542 Phase 1c; agents are the ids that poll an inbox, so a
+                    // team block reaches them too). Resolve on the open tx -- a second pool
+                    // connection here would deadlock the pool.
+                    let (mut recipients, agents) =
+                        resolve_team_principals_tx(&mut tx, target).await?;
+                    recipients.extend(agents);
+                    if !recipients.is_empty() {
+                        notify_blocked = Some((recipients, note.clone()));
                     }
                 }
             }
@@ -13379,12 +13397,16 @@ mod tests {
             .iter()
             .any(|t| t["id"] == json!(tid)));
 
-        // Block on a TEAM -> every person the team resolves to is notified (task 542 Phase 2).
+        // Block on a TEAM -> every PRINCIPAL the team resolves to is notified: people AND agents
+        // (team-scoped agents, task 542 Phase 1c). agent:qa is fresh (never individually blocked), so
+        // its only blocked_on_you for this task can come from the team fan-out.
         create_person(&pool, "pat", Some("Pat"), Some("u"), None).await?;
         create_person(&pool, "sam", Some("Sam"), Some("u"), None).await?;
+        register_agent(&pool, "agent:qa", None, None, None, None, None).await?;
         create_team(&pool, "reviewers", Some("Reviewers"), Some("u"), None).await?;
         add_team_member(&pool, "reviewers", "pat", "person", Some("u")).await?;
         add_team_member(&pool, "reviewers", "sam", "person", Some("u")).await?;
+        add_team_member(&pool, "reviewers", "agent:qa", "agent", Some("u")).await?;
         update_task(
             &pool,
             tid,
@@ -13402,7 +13424,7 @@ mod tests {
         let bo = get_task(&pool, tid).await?["blocked_on"].clone();
         assert_eq!(bo["kind"], json!("team"));
         assert_eq!(bo["target"], json!("reviewers"));
-        for who in ["pat", "sam"] {
+        for who in ["pat", "sam", "agent:qa"] {
             let notes = check_notifications(&pool, who, true, 50, None).await?;
             assert!(
                 notes["notifications"]
@@ -13412,7 +13434,7 @@ mod tests {
                     .any(
                         |n| n["type"] == json!("task.blocked_on_you") && n["task_id"] == json!(tid)
                     ),
-                "team member {who} is notified of the block: {notes}"
+                "team member {who} (person or agent) is notified of the block: {notes}"
             );
         }
         // A nonexistent team target is rejected.
@@ -14428,7 +14450,7 @@ mod tests {
     /// The multi-operator model (task 542 Phase 1): recursive team membership resolves to people
     /// through nested teams, write-time cycle/self/missing-member guards reject bad adds, the
     /// read-time expansion is cycle-safe even against a directly-inserted cycle, and
-    /// resolve_principal_people expands a team but passes a person/agent through unchanged.
+    /// resolve_principal_ids expands a team to people AND agents but passes a person/agent through.
     #[tokio::test]
     async fn teams_recursive_membership_and_cycle_guard() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -14456,6 +14478,34 @@ mod tests {
             BTreeSet::from(["zach".to_string(), "cameron".to_string()])
         );
 
+        // Team-scoped agents (task 542 Phase 1c): an agent can be a team member; the team resolves
+        // to its people AND its agents, kept separate (resolved_people unchanged).
+        register_agent(&pool, "v-rev", None, None, None, None, None).await?;
+        add_team_member(&pool, "eng", "v-rev", "agent", Some("system")).await?;
+        let eng = get_team(&pool, "eng").await?;
+        assert_eq!(
+            eng["resolved_agents"],
+            json!(["v-rev"]),
+            "agent member surfaces in resolved_agents"
+        );
+        let eng_people2: BTreeSet<String> = eng["resolved_people"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            eng_people2,
+            BTreeSet::from(["zach".to_string(), "cameron".to_string()]),
+            "resolved_people is NOT polluted by the agent member"
+        );
+        assert!(
+            add_team_member(&pool, "eng", "v-ghost", "agent", Some("system"))
+                .await
+                .is_err(),
+            "missing agent rejected"
+        );
+
         // Write-time guards: a cycle (operator already nested under eng), self-membership, and a
         // missing member are all rejected.
         assert!(
@@ -14477,29 +14527,38 @@ mod tests {
             "missing member rejected"
         );
 
-        // resolve_principal_people: a team expands; a person and an unknown/agent id pass through.
+        // resolve_principal_ids: a team expands to people AND agents; a person/agent passes through.
         assert_eq!(
-            resolve_principal_people(&pool, "operator").await?,
+            resolve_principal_ids(&pool, "operator").await?,
             BTreeSet::from(["cameron".to_string()])
         );
         assert_eq!(
-            resolve_principal_people(&pool, "zach").await?,
+            resolve_principal_ids(&pool, "eng").await?,
+            BTreeSet::from([
+                "zach".to_string(),
+                "cameron".to_string(),
+                "v-rev".to_string()
+            ]),
+            "eng principals = people (zach, cameron) + agent (v-rev)"
+        );
+        assert_eq!(
+            resolve_principal_ids(&pool, "zach").await?,
             BTreeSet::from(["zach".to_string()])
         );
         assert_eq!(
-            resolve_principal_people(&pool, "v-some-agent").await?,
+            resolve_principal_ids(&pool, "v-some-agent").await?,
             BTreeSet::from(["v-some-agent".to_string()])
         );
 
         // Defensive: a cycle inserted DIRECTLY (bypassing the write-time guard) still terminates on
-        // read -- the visited-set guard in resolve_team_people stops the loop.
+        // read -- the visited-set guard in resolve_team_principals stops the loop.
         create_team(&pool, "leads", None, Some("system"), None).await?;
         add_team_member(&pool, "leads", "eng", "team", Some("system")).await?;
         sqlx::query("INSERT INTO team_members(team_id, member_id, member_kind, created_at) VALUES('eng','leads','team',?)")
             .bind(now_iso())
             .execute(&pool)
             .await?;
-        let _ = resolve_team_people(&pool, "eng").await?; // must terminate despite the eng<->leads cycle
+        let _ = resolve_team_principals(&pool, "eng").await?; // must terminate despite the eng<->leads cycle
 
         // Deleting a team cascades its membership edges: 'leads' is dropped both as a member of eng
         // and as a team that had members. After it, eng no longer lists leads.
@@ -14529,10 +14588,16 @@ mod tests {
             get_person(&pool, "zach").await.is_err(),
             "deleted person is gone"
         );
+        let (eng_people_final, eng_agents_final) = resolve_team_principals(&pool, "eng").await?;
         assert_eq!(
-            resolve_team_people(&pool, "eng").await?,
+            eng_people_final,
             BTreeSet::from(["cameron".to_string()]),
             "eng now resolves to cameron only (via operator) after zach deleted"
+        );
+        assert_eq!(
+            eng_agents_final,
+            BTreeSet::from(["v-rev".to_string()]),
+            "the team-scoped agent member remains after the person deletions"
         );
         Ok(())
     }
