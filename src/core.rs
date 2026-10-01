@@ -7312,6 +7312,78 @@ pub async fn read_document_content(
     version_no: Option<i64>,
 ) -> anyhow::Result<Value> {
     let (vn, cid, ct) = resolve_document_version(pool, document_id, version_no).await?;
+    document_content_value(ipfs_api_url, document_id, vn, cid, ct).await
+}
+
+/// Resolve a document's APPROVED version `(version_no, cid, content_type)`, or `None` when the
+/// document exists but has no approved version yet (`approved_version_id IS NULL`). A missing
+/// document is an error (`no document {id}`), kept distinct from the no-approved-version case so a
+/// caller can map the two to different responses. The approved version does not move when an
+/// in-review draft advances `current_version_id`, so a reader gets the operator-gated body, never
+/// an unapproved draft.
+pub async fn resolve_approved_document_version(
+    pool: &Pool,
+    document_id: i64,
+) -> anyhow::Result<Option<(i64, String, String)>> {
+    let row = sqlx::query(
+        "SELECT dv.version_no, dv.cid, dv.content_type FROM documents d \
+         JOIN document_versions dv ON dv.id = d.approved_version_id WHERE d.id=?",
+    )
+    .bind(document_id)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(row) = row {
+        let vn: i64 = row.try_get("version_no")?;
+        let cid: String = row.try_get("cid")?;
+        let ct: Option<String> = row.try_get("content_type")?;
+        return Ok(Some((
+            vn,
+            cid,
+            ct.unwrap_or_else(|| "text/markdown".to_string()),
+        )));
+    }
+    // No joined row means EITHER the document doesn't exist OR it exists with approved_version_id
+    // NULL. Probe for the document so the two stay distinct: a missing document is an error, while
+    // present-but-unapproved is Ok(None) -- the not-available signal the caller maps to its own
+    // fallback (never a silent fall-through to the current draft).
+    let exists = sqlx::query("SELECT 1 FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        anyhow::bail!("no document {document_id}");
+    }
+    Ok(None)
+}
+
+/// Read a document's APPROVED-version body server-side, like [`read_document_content`] but keyed to
+/// the operator-approved version. Returns `Ok(None)` when the document has no approved version yet
+/// -- a distinct not-available signal, NOT a silent fallback to the current draft, so the caller
+/// (the task_815 contract materialize) keeps its own fallback until an approved version lands.
+pub async fn read_approved_document_content(
+    pool: &Pool,
+    ipfs_api_url: Option<&str>,
+    document_id: i64,
+) -> anyhow::Result<Option<Value>> {
+    let Some((vn, cid, ct)) = resolve_approved_document_version(pool, document_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        document_content_value(ipfs_api_url, document_id, vn, cid, ct).await?,
+    ))
+}
+
+/// Fetch a resolved document version's body through the IPFS backend and shape the read response
+/// (shared by the current-version and approved-version read paths). Text content is inlined as
+/// `content`; binary content returns a null `content` + the CID to fetch via the gateway. Requires
+/// `ipfs_api_url` (errors without one).
+async fn document_content_value(
+    ipfs_api_url: Option<&str>,
+    document_id: i64,
+    vn: i64,
+    cid: String,
+    ct: String,
+) -> anyhow::Result<Value> {
     let Some(url) = ipfs_api_url else {
         anyhow::bail!(
             "no IPFS backend configured (set ipfs_api_url); this board can't read content by CID"
@@ -12104,6 +12176,80 @@ mod tests {
         assert!(is_text_content_type(""));
         assert!(!is_text_content_type("image/png"));
         assert!(!is_text_content_type("application/pdf"));
+        Ok(())
+    }
+
+    /// The approved-version read path (task_842): resolve_approved_document_version returns Ok(None)
+    /// for a document with no approved version yet (a distinct not-available signal, NOT a fallback
+    /// to the current draft), errors on a missing document, and -- crucially -- stays pinned to the
+    /// APPROVED version's cid when a later draft advances the current version, only moving when a
+    /// new version is approved.
+    #[tokio::test]
+    async fn approved_version_read_is_distinct_and_tracks_approval() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(
+            &pool,
+            "Contract",
+            None,
+            "bafyv1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // No approved version yet: Ok(None), the distinct not-available signal. It short-circuits
+        // before the IPFS backend, so a None ipfs_api_url does NOT turn into a backend error here.
+        assert!(resolve_approved_document_version(&pool, did)
+            .await?
+            .is_none());
+        assert!(read_approved_document_content(&pool, None, did)
+            .await?
+            .is_none());
+        // A missing document is an error, kept distinct from the no-approved-version case.
+        assert!(resolve_approved_document_version(&pool, 9999)
+            .await
+            .is_err());
+
+        // Approve v1: the approved version resolves to v1's cid.
+        approve_document(&pool, did, Some("operator")).await?;
+        assert_eq!(
+            resolve_approved_document_version(&pool, did).await?,
+            Some((1, "bafyv1".to_string(), "text/markdown".to_string()))
+        );
+
+        // An in-review draft advances the current version, but the APPROVED cid does not move --
+        // this is what lets a conditional read stay 304 while a draft is in flight.
+        publish_version(&pool, did, "bafyv2", None, Some("alice"), None, None).await?;
+        assert_eq!(
+            resolve_document_version(&pool, did, None).await?.1,
+            "bafyv2",
+            "current advanced to the draft"
+        );
+        assert_eq!(
+            resolve_approved_document_version(&pool, did).await?,
+            Some((1, "bafyv1".to_string(), "text/markdown".to_string())),
+            "approved stays pinned to v1 while a draft is in review"
+        );
+
+        // Approving the new version moves the approved cid.
+        approve_document(&pool, did, Some("operator")).await?;
+        assert_eq!(
+            resolve_approved_document_version(&pool, did).await?,
+            Some((2, "bafyv2".to_string(), "text/markdown".to_string()))
+        );
+
+        // With an approved version present but no IPFS backend, the read reaches the fetch path and
+        // surfaces the backend-required error (REST -> 503), distinct from the Ok(None) above.
+        let err = read_approved_document_content(&pool, None, did)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no IPFS backend"), "got: {err}");
         Ok(())
     }
 
