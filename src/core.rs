@@ -3235,6 +3235,61 @@ fn validate_value_against_schema(schema: &Value, value: &Value) -> anyhow::Resul
     Ok(())
 }
 
+/// The supported-UI-element mapping (doc_33 v16 / task_755): the single source of truth for the
+/// question UI elements, authored to be consumed by BOTH the React component registry and this Rust
+/// seeder. Object-keyed by element name. Only the fields the seeder needs are modeled here; React
+/// reads the same file for its own fields (title, description, component), which serde ignores here.
+#[derive(serde::Deserialize)]
+pub struct UiElementSet {
+    pub elements: std::collections::BTreeMap<String, UiElementDef>,
+}
+
+/// One element's definition. `props_schema` is the element's reusable props/config contract -- the
+/// thing content-addressed to a CID that is the element's canonical identifier.
+#[derive(serde::Deserialize)]
+pub struct UiElementDef {
+    pub props_schema: Value,
+}
+
+/// Parse + validate a UI-element set from JSON bytes: it must have a non-empty `elements` map and
+/// every `props_schema` must itself be a valid JSON Schema. The pure, backend-free half of seeding,
+/// so it is unit-testable without an IPFS backend (task_755).
+pub fn parse_ui_element_set(json: &[u8]) -> anyhow::Result<UiElementSet> {
+    let set: UiElementSet = serde_json::from_slice(json)
+        .map_err(|e| anyhow::anyhow!("parsing ui-elements json: {e}"))?;
+    if set.elements.is_empty() {
+        anyhow::bail!("the ui-elements file has no `elements`");
+    }
+    for (name, def) in &set.elements {
+        compile_response_schema(&def.props_schema).map_err(|e| {
+            anyhow::anyhow!("element '{name}' props_schema is not a valid JSON Schema: {e}")
+        })?;
+    }
+    Ok(set)
+}
+
+/// Seed the board CAS with each element's reusable `props_schema` and return the name->CID manifest
+/// (task_755). Each props_schema is content-addressed (pinned) via the IPFS backend; the returned
+/// CID is the element's canonical build-time identifier that a question's `ui.element_schema_cid`
+/// references (doc_33 v16). Deterministic: the same schema bytes yield the same CID, so re-seeding
+/// is idempotent. The manifest is the artifact the web build consumes to map element -> CID without
+/// recomputing it (the single CID computer is this seeder).
+pub async fn seed_ui_elements(
+    ipfs_api_url: &str,
+    set: &UiElementSet,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut manifest = std::collections::BTreeMap::new();
+    for (name, def) in &set.elements {
+        let bytes = serde_json::to_vec(&def.props_schema)
+            .map_err(|e| anyhow::anyhow!("serializing element '{name}' props_schema: {e}"))?;
+        let cid = crate::ipfs::add(ipfs_api_url, bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("pinning element '{name}' props_schema: {e}"))?;
+        manifest.insert(name.clone(), cid);
+    }
+    Ok(manifest)
+}
+
 /// Classify a principal id as a team / agent / person, erroring if it is none. "operator" is the
 /// seeded team, so it classifies as "team".
 async fn principal_kind(
@@ -9596,6 +9651,28 @@ mod tests {
 
     /// Slice 2 (task_628): the question lifecycle ops -- pose/answer/decline/cancel with validation,
     /// the open-only guard, the out-of-frame text escape, and the blocking-question terminal path.
+    #[test]
+    fn parse_ui_element_set_validates() {
+        // A valid set parses; React-only fields (title/description/component) are ignored here.
+        let json = br#"{
+            "version": 1,
+            "elements": {
+                "yes-no": { "title": "Yes/No", "props_schema": {"type": "boolean"}, "component": "YesNo" },
+                "age-request": { "props_schema": {"type": "object"} }
+            }
+        }"#;
+        let set = parse_ui_element_set(json).expect("valid set parses");
+        assert_eq!(set.elements.len(), 2);
+        assert!(set.elements.contains_key("age-request"));
+        // Empty `elements` is rejected.
+        assert!(parse_ui_element_set(br#"{"elements": {}}"#).is_err());
+        // A props_schema that is not itself a valid JSON Schema is rejected.
+        assert!(
+            parse_ui_element_set(br#"{"elements": {"bad": {"props_schema": {"type": 123}}}}"#)
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn schema_driven_questions_validate_generically() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
