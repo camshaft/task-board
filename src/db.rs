@@ -947,6 +947,44 @@ CREATE TABLE b (id INTEGER);
         );
     }
 
+    /// Dedicated guard that the embedded SCHEMA actually APPLIES on a fresh DB (task 726). The
+    /// split test above proves statements are well-formed; this proves `init` runs them + the
+    /// migrations without error and lands the expected tables/columns. Its value is a CLEAR,
+    /// isolated signal: if a bad DDL or an un-stripped `;`-in-comment ever breaks the schema, THIS
+    /// named test fails on its own, instead of the cryptic "near X: syntax error" cascading into
+    /// all ~130 tests (the exact confusion the trap caused).
+    #[tokio::test]
+    async fn schema_applies_cleanly() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = init(tmp.path().join("fresh.db").to_str().unwrap()).await?;
+        let tables: Vec<String> = sqlx::query("SELECT name FROM sqlite_master WHERE type='table'")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        for t in ["documents", "tasks", "comments", "projects", "agents"] {
+            assert!(
+                tables.contains(&t.to_string()),
+                "missing table {t}: {tables:?}"
+            );
+        }
+        // A column added by a migration ALTER (not just the CREATE TABLE) applied too.
+        let doc_cols: Vec<String> = sqlx::query("PRAGMA table_info(documents)")
+            .fetch_all(&pool)
+            .await?
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        for c in ["deprecated_at", "superseded_by", "archived_at", "path"] {
+            assert!(
+                doc_cols.contains(&c.to_string()),
+                "missing documents.{c}: {doc_cols:?}"
+            );
+        }
+        Ok(())
+    }
+
     /// Regression for the #63 crash-loop: a DB whose `documents` table predates the `path`
     /// column must migrate cleanly. `path` is back-filled by an ALTER after the SCHEMA apply
     /// loop, so any index over `documents(path)` inside SCHEMA fails there with
