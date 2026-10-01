@@ -684,6 +684,23 @@ pub async fn set_status(
     Ok(out)
 }
 
+/// Roster fields that a CROSS-REPO fleet consumer depends on, which therefore MUST survive any
+/// future compaction of the default `list_agents` projection (task 500). This is a consumer-field
+/// CONTRACT, not just the current field list: the `fleet_consumed_roster_fields_contract` test
+/// asserts the default (non-verbose) projection keeps every field named here, so a projection tweak
+/// cannot silently drop one. History: the task 418 compaction dropped `metadata`, and the fleet
+/// watchdog (separate repo) filters observe-candidates on `metadata.native`; with the list omitting
+/// metadata every agent read native=false and the WHOLE self-improve observer cadence went dark
+/// (task 477 fixed the acute drop). Add a field here only when a fleet consumer genuinely depends on
+/// it in the compact roster -- it is a standing promise the gate enforces.
+pub const FLEET_CONSUMED_ROSTER_FIELDS: &[&str] = &["metadata"];
+
+/// The default compact `list_agents` projection (task 418): the human-facing id/name/status plus the
+/// load-bearing [`FLEET_CONSUMED_ROSTER_FIELDS`], minus the heavy `charter` (the one field whose size
+/// overflowed the caller token cap, so the one dropped). `get_agent` / verbose still return the full
+/// object. Keep every [`FLEET_CONSUMED_ROSTER_FIELDS`] entry in this list or the contract test reds.
+const COMPACT_ROSTER_FIELDS: &[&str] = &["id", "display_name", "status", "metadata"];
+
 /// List agents as a lightweight ROSTER by default (task #418): each entry is a compact
 /// {id, display_name, status, metadata} — name + id + tiny presence + the small metadata bag — so a
 /// scoped read stays well under a caller's token cap (the full roster with every agent's charter
@@ -704,6 +721,15 @@ pub async fn list_agents(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> anyhow::Result<Value> {
+    // Consumer-field contract (task 500): the compact projection must carry every fleet-consumed
+    // field. Enforced at compile-coverage by fleet_consumed_roster_fields_contract; this debug check
+    // is the belt-and-suspenders runtime guard (and keeps the contract const referenced in the bin).
+    debug_assert!(
+        FLEET_CONSUMED_ROSTER_FIELDS
+            .iter()
+            .all(|f| COMPACT_ROSTER_FIELDS.contains(f)),
+        "a FLEET_CONSUMED_ROSTER_FIELDS entry is missing from COMPACT_ROSTER_FIELDS"
+    );
     let mut sql = String::from("SELECT * FROM agents");
     let mut conds: Vec<&str> = Vec::new();
     if status.is_some() {
@@ -754,9 +780,9 @@ pub async fn list_agents(
             let full = agent_json(r);
             let mut m = Map::new();
             if let Value::Object(o) = &full {
-                for k in ["id", "display_name", "status", "metadata"] {
-                    if let Some(v) = o.get(k) {
-                        m.insert(k.to_string(), v.clone());
+                for k in COMPACT_ROSTER_FIELDS {
+                    if let Some(v) = o.get(*k) {
+                        m.insert((*k).to_string(), v.clone());
                     }
                 }
             }
@@ -10100,6 +10126,57 @@ mod tests {
         let page2 = list_agents(&pool, None, None, None, None, false, Some(2), Some(2)).await?;
         assert_eq!(page1.as_array().unwrap().len(), 2);
         assert_eq!(page2.as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// Consumer-field contract (task 500): the default (non-verbose) list_agents projection MUST keep
+    /// every FLEET_CONSUMED_ROSTER_FIELDS entry, so a future compaction cannot silently drop a field a
+    /// cross-repo fleet consumer depends on (the task 418 regression that dropped `metadata` and dark-
+    /// started the whole observer cadence). This generalizes task 477's one-off metadata-present assert
+    /// into the named contract: dropping a contracted field from COMPACT_ROSTER_FIELDS reds the gate.
+    #[tokio::test]
+    async fn fleet_consumed_roster_fields_contract() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // An agent carrying the exact key the fleet watchdog filters on (metadata.native).
+        register_agent(
+            &pool,
+            "v-x",
+            None,
+            None,
+            None,
+            Some(json!({"native": true, "area": "x"})),
+            None,
+        )
+        .await?;
+
+        let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
+        let entry = roster
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!("v-x"))
+            .unwrap();
+        for field in FLEET_CONSUMED_ROSTER_FIELDS {
+            assert!(
+                entry.get(*field).is_some(),
+                "contract: default roster projection must keep fleet-consumed field '{field}': {entry}"
+            );
+        }
+        // The specific consumer key must survive, not just the metadata object shell.
+        assert_eq!(
+            entry["metadata"]["native"],
+            json!(true),
+            "metadata.native must round-trip in the roster"
+        );
+        // Every contracted field is actually part of the projection list (guards a typo'd contract
+        // that names a field the projection never emits).
+        for field in FLEET_CONSUMED_ROSTER_FIELDS {
+            assert!(
+                COMPACT_ROSTER_FIELDS.contains(field),
+                "contract field '{field}' is not in COMPACT_ROSTER_FIELDS -- the projection cannot emit it"
+            );
+        }
         Ok(())
     }
 
