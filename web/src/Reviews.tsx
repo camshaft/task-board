@@ -58,8 +58,8 @@ export function reviewSourceLink(source: string | null, targetRef: string | null
     const m = targetRef.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/)
     if (m) return ext(`https://github.com/${m[1]}/pull/${m[2]}`, targetRef)
   }
-  // Anything already an absolute http(s) URL -> external link (covers url, and code_amazon_cr /
-  // github_pr supplied as a full URL).
+  // Anything already an absolute http(s) URL -> external link (covers url, and github_pr
+  // supplied as a full URL).
   if (/^https?:\/\//i.test(targetRef)) return ext(targetRef, targetRef)
   // No safely-constructible URL: show the raw ref.
   return <span className="font-mono text-xs text-[var(--color-muted)]">{targetRef}</span>

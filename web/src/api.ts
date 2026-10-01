@@ -296,7 +296,7 @@ export interface Meta {
 
 // A review over an artifact (BUILD 6 / task 377). The A2 `status` drives the lifecycle header;
 // the append-only `log` (present on getReview, omitted from the list) is the timeline. `source`
-// names the artifact kind (board_doc / github_pr / code_amazon_cr / url / …) and `target_ref`
+// names the artifact kind (board_doc / github_pr / url / …) and `target_ref`
 // locates it — rendered per source. `vetted` is the adversarial-review gate.
 export type ReviewStatus = 'open' | 'in_review' | 'changes_requested' | 'approved' | 'closed'
 
