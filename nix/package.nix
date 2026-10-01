@@ -9,7 +9,7 @@ let
     pname = "task-board-web";
     version = "0.1.0";
     src = ../web;
-    npmDepsHash = "sha256-tKBnXAGD964svAUa801ZddBsbX76S4YjAISOgYNMrgM=";
+    npmDepsHash = "sha256-ZzWAqhDEiSksQvqxWVw/1uWEBRc5nC7vCR8dZdgF0ho=";
     nodejs = nodejs_22;
     installPhase = ''
       runHook preInstall

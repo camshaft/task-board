@@ -11,10 +11,15 @@
   },
   "dependencies": {
     "age-encryption": "^0.3.1",
+    "mdast-util-find-and-replace": "^3.0.2",
+    "mdast-util-to-string": "^4.0.0",
     "mermaid": "^12.0.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.18.4",
+    "remark-gfm": "^4.0.1",
+    "unist-util-visit": "^5.1.0",
     "vega-embed": "^7.3.0"
   },
   "devDependencies": {
