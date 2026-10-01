@@ -11,6 +11,7 @@ import {
   type ChannelPost,
   type Document,
   type DocumentComment,
+  type DocumentContent,
   type DocumentSummary,
   type EventRow,
   type ExternalIdentity,
@@ -44,6 +45,7 @@ const keys = {
   // every loaded subtree on any document change (a path set/clear reshapes the tree).
   wiki: (prefix?: string) => `wiki:${prefix ?? ''}`,
   document: (documentId: number) => `document:${documentId}`,
+  documentContent: (documentId: number) => `documentContent:${documentId}`,
   documentComments: (documentId: number) => `documentComments:${documentId}`,
   agent: (id: string) => `agent:${id}`,
   // Keyed under the `tasks:` prefix so touched()'s task-list invalidation refreshes it too.
@@ -242,6 +244,15 @@ export function useDocument(documentId: number) {
   return useResource<Document>(keys.document(documentId), () => api.getDocument(documentId))
 }
 
+// The current version's inline body + its main-body word count (task_933). Separate from
+// useDocument so the doc view can show the word-count badge; errors (e.g. no IPFS backend) are kept
+// in `error` and leave `data` undefined, so the badge simply does not render rather than breaking.
+export function useDocumentContent(documentId: number) {
+  return useResource<DocumentContent>(keys.documentContent(documentId), () =>
+    api.getDocumentContent(documentId),
+  )
+}
+
 export function useDocumentComments(documentId: number) {
   return useResource<DocumentComment[]>(keys.documentComments(documentId), () =>
     api.getDocumentComments(documentId),
@@ -315,6 +326,7 @@ export function touched(
     // A document's own view + its comments, and the documents list (a new version, status
     // change, or fresh doc all show there).
     invalidate(keys.document(opts.documentId))
+    invalidate(keys.documentContent(opts.documentId)) // a new version reshapes the body + word count
     invalidate(keys.documentComments(opts.documentId))
     invalidateMatching('documents') // the plain list + every filtered documents: list
     invalidateMatching('wiki:') // a path set/clear or new version reshapes the tree
