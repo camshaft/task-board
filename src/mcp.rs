@@ -246,7 +246,10 @@ pub struct GetProjectArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateTaskArgs {
-    pub project_id: i64,
+    /// The project to create the task in. Optional when `parent_id` is given -- a child lives in its
+    /// parent's project, so it is inherited. Required for a top-level task (no parent).
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub project_id: Option<i64>,
     pub title: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -1585,16 +1588,21 @@ impl Board {
 
     // --- Tasks ---
     #[tool(
-        description = "Create a task in a project. The creator and assignee are auto-subscribed, so they get notified of future changes. `metadata` is an optional dict of arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...). Pass `parent_id` to nest it under an epic (same project). Returns the new task incl. its id."
+        description = "Create a task in a project. The creator and assignee are auto-subscribed, so they get notified of future changes. `metadata` is an optional dict of arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...). Pass `parent_id` to nest it under an epic — a child lives in its parent's project, so `project_id` is OPTIONAL when `parent_id` is given (it is inherited); supply `project_id` for a top-level task. Returns the new task incl. its id."
     )]
     async fn create_task(
         &self,
         Parameters(a): Parameters<CreateTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let created_by = self.me_opt(s(&a.created_by));
+        // project_id is optional when parent_id is given (task 691/708): a child inherits its
+        // parent's project, so the natural epic-decomposition call need not repeat it.
+        let project_id = core::resolve_create_project(&self.pool, a.project_id, a.parent_id)
+            .await
+            .map_err(err)?;
         core::create_task(
             &self.pool,
-            a.project_id,
+            project_id,
             &a.title,
             s(&a.description),
             s(&a.assignee),
@@ -3563,6 +3571,79 @@ mod tests {
         assert_eq!(
             task["blocked_on"]["target"],
             serde_json::json!(dep_id.to_string())
+        );
+        Ok(())
+    }
+
+    // task 708: a child task (parent_id given) is created WITHOUT a project_id -- it inherits the
+    // parent's project, so the natural epic-decomposition call no longer bounces on a missing
+    // field. A top-level task with neither project_id nor parent_id still errors clearly.
+    #[tokio::test]
+    async fn create_task_child_inherits_parent_project() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool.clone(), None);
+        let mkfail = |e: McpError| anyhow::anyhow!("{e:?}");
+
+        let p = core::create_project(&pool, "Epic project", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let epic = core::create_task(
+            &pool,
+            pid,
+            "Epic",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let epic_id = epic["id"].as_i64().unwrap();
+
+        // Child with parent_id and NO project_id -> created in the parent's project (the call that
+        // previously bounced on "missing field project_id").
+        board
+            .create_task(Parameters(serde_json::from_value(serde_json::json!({
+                "title": "Subtask", "parent_id": epic_id, "created_by": "u",
+            }))?))
+            .await
+            .map_err(mkfail)?;
+        let kids = core::list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            Some(epic_id),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        let kids = kids.as_array().unwrap();
+        assert_eq!(
+            kids.len(),
+            1,
+            "the child was created in the parent's project"
+        );
+        assert_eq!(kids[0]["title"], serde_json::json!("Subtask"));
+        assert_eq!(kids[0]["project_id"], serde_json::json!(pid));
+
+        // Neither project_id nor parent_id -> a clear error (not acting on a guessed project).
+        assert!(
+            board
+                .create_task(Parameters(serde_json::from_value(serde_json::json!({
+                    "title": "Orphan", "created_by": "u",
+                }))?))
+                .await
+                .is_err(),
+            "a top-level task with no project_id must error"
         );
         Ok(())
     }

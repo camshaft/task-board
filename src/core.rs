@@ -1590,6 +1590,34 @@ async fn assignee_registration_warning(
     }
 }
 
+/// Resolve the project a new task belongs to from an optional explicit `project_id` and an optional
+/// `parent_id` (task 708). A child always lives in its parent's project, so `project_id` is
+/// redundant when `parent_id` is given: omit it and the parent's project is inherited; give both and
+/// `create_task` enforces they agree; give neither and it is an error. This lets the natural
+/// epic-decomposition call (`parent_id` only, no `project_id`) succeed instead of bouncing a whole
+/// batch on a missing field.
+pub async fn resolve_create_project(
+    pool: &Pool,
+    project_id: Option<i64>,
+    parent_id: Option<i64>,
+) -> anyhow::Result<i64> {
+    match (project_id, parent_id) {
+        (Some(p), _) => Ok(p),
+        (None, Some(pid)) => {
+            let parent_proj: Option<i64> = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+                .bind(pid)
+                .fetch_optional(pool)
+                .await?
+                .map(|r| r.try_get("project_id"))
+                .transpose()?;
+            parent_proj.ok_or_else(|| anyhow::anyhow!("no parent task {pid}"))
+        }
+        (None, None) => {
+            anyhow::bail!("give a `project_id` (or a `parent_id` to inherit the parent's project)")
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_task(
     pool: &Pool,

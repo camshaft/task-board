@@ -1018,7 +1018,10 @@ async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQue
 
 #[derive(Deserialize, JsonSchema)]
 struct CreateTaskBody {
-    project_id: i64,
+    /// The project to create the task in. Optional when `parent_id` is given (a child inherits its
+    /// parent's project); required for a top-level task.
+    #[serde(default)]
+    project_id: Option<i64>,
     title: String,
     description: Option<String>,
     assignee: Option<String>,
@@ -1034,10 +1037,12 @@ struct CreateTaskBody {
 }
 
 async fn create_task(State(st): State<AppState>, Json(b): Json<CreateTaskBody>) -> ApiResult {
+    // project_id is optional when parent_id is given (task 708): inherit the parent's project.
+    let project_id = core::resolve_create_project(&st.pool, b.project_id, b.parent_id).await?;
     Ok(Json(
         core::create_task(
             &st.pool,
-            b.project_id,
+            project_id,
             &b.title,
             b.description.as_deref(),
             b.assignee.as_deref(),
