@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useScrollRestoration } from './scrollRestore'
 import type { TeamMember } from './api'
 import { useBoardContext } from './Layout'
 import {
@@ -20,6 +21,7 @@ import {
 // teams expanded server-side). Visibility/roles and server-side preferences come in later phases.
 export default function People() {
   const { actor } = useBoardContext()
+  const scrollRef = useScrollRestoration()
   const { data: people = [], loading: peopleLoading } = usePeople()
   const { data: teams = [], loading: teamsLoading } = useTeams()
   const [selectedTeam, setSelectedTeam] = useState<string | null>(null)
@@ -35,7 +37,10 @@ export default function People() {
           {teams.length === 1 ? 'team' : 'teams'}
         </span>
       </div>
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 overflow-y-auto px-5 py-4 lg:grid-cols-3">
+      <div
+        ref={scrollRef}
+        className="grid min-h-0 flex-1 grid-cols-1 gap-5 overflow-y-auto px-5 py-4 lg:grid-cols-3"
+      >
         {/* People */}
         <section className="flex min-w-0 flex-col gap-2">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">

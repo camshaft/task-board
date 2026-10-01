@@ -1,4 +1,5 @@
 import { Link } from 'react-router-dom'
+import { useScrollRestoration } from './scrollRestore'
 import { type Agent, type AgentStatus } from './api'
 import { useAgents } from './resources'
 import { AGENT_DOT, relTime } from './ui'
@@ -16,6 +17,7 @@ function seenMs(a: Agent): number {
 // cramped sidebar panel. Each card drills into the per-agent page. Backed by the resource
 // store, so presence live-updates.
 export default function Agents() {
+  const scrollRef = useScrollRestoration()
   const { data: agents = [], loading } = useAgents()
   const sorted = [...agents].sort(
     (a, b) => STATUS_RANK[a.status] - STATUS_RANK[b.status] || seenMs(b) - seenMs(a),
@@ -30,7 +32,7 @@ export default function Agents() {
           {agents.length} registered · {liveCount} active
         </span>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
         {loading && agents.length === 0 && (
           <p className="text-sm text-[var(--color-muted)]">Loading…</p>
         )}

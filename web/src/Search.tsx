@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
+import { useScrollRestoration } from './scrollRestore'
 import { api, type TaskStatus, type TaskSummary } from './api'
 import { useBoardContext } from './Layout'
 import { commentTask, updateTask, useProjects } from './resources'
@@ -11,6 +12,7 @@ import { Identity, STATUS_LABEL, StatusChip, TASK_COLUMNS, relTime } from './ui'
 // actions. It fetches on demand (search is transient) rather than living in the resource store,
 // and re-runs after each mutation so the list stays current.
 export default function Search() {
+  const scrollRef = useScrollRestoration()
   const { actor } = useBoardContext()
   const { data: projects = [] } = useProjects()
   const projectName = (id?: number) =>
@@ -155,7 +157,7 @@ export default function Search() {
         </form>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
         {error && <p className="text-sm text-rose-300">{error}</p>}
         {loading && <p className="text-sm text-[var(--color-muted)]">Searching…</p>}
         {!loading && results && results.length === 0 && (

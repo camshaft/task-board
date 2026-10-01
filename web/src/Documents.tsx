@@ -1,4 +1,5 @@
 import { Link } from 'react-router-dom'
+import { useScrollRestoration } from './scrollRestore'
 import { useDocuments, useProjects } from './resources'
 import { relTime } from './ui'
 
@@ -25,6 +26,7 @@ export function DocStatusChip({ status }: { status: string }) {
 }
 
 export default function Documents() {
+  const scrollRef = useScrollRestoration()
   const { data: projects = [] } = useProjects()
   const projectName = (id: number | null) =>
     id == null ? '' : (projects.find((p) => p.id === id)?.name ?? `#${id}`)
@@ -39,7 +41,7 @@ export default function Documents() {
           Versioned, content-addressed documents. Content lives on IPFS; the board stores the CID.
         </p>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
         {error && <p className="text-sm text-rose-300">{error.message}</p>}
         {loading && !docs && <p className="text-sm text-[var(--color-muted)]">Loading…</p>}
         {docs && docs.length === 0 && (

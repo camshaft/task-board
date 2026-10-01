@@ -1,4 +1,5 @@
 import { Link } from 'react-router-dom'
+import { useScrollRestoration } from './scrollRestore'
 import { useBoardContext } from './Layout'
 import { eventHref, useAgents, useAgentTasks, useEvents, useProjects } from './resources'
 import { AGENT_DOT, relTime, StatusChip, STATUS_CHIP, STATUS_LABEL, TASK_COLUMNS } from './ui'
@@ -9,6 +10,7 @@ import { AGENT_DOT, relTime, StatusChip, STATUS_CHIP, STATUS_LABEL, TASK_COLUMNS
 // SSE), so the whole page live-updates with no extra backend. Recent activity is in the Layout
 // rail, so it isn't duplicated here.
 export default function Home() {
+  const scrollRef = useScrollRestoration<HTMLElement>()
   const { actor } = useBoardContext()
   const { data: projects = [], loading } = useProjects()
   const { data: agents = [] } = useAgents()
@@ -41,7 +43,7 @@ export default function Home() {
   const projectName = (id: number) => projects.find((p) => p.id === id)?.name ?? `#${id}`
 
   return (
-    <main className="min-h-0 flex-1 overflow-y-auto p-5">
+    <main ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto p-5">
       <h1 className="mb-4 text-sm font-semibold">Fleet dashboard</h1>
 
       {/* Headline stats. */}
