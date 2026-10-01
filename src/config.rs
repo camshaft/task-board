@@ -80,12 +80,10 @@ pub struct Config {
 impl Config {
     /// Load settings from a TOML file, then attach the (non-TOML) `web_dir`.
     pub fn load(path: &Path, web_dir: Option<String>) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            anyhow::anyhow!("reading config file {}: {e}", path.display())
-        })?;
-        let settings: Settings = toml::from_str(&text).map_err(|e| {
-            anyhow::anyhow!("parsing config file {}: {e}", path.display())
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading config file {}: {e}", path.display()))?;
+        let settings: Settings = toml::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("parsing config file {}: {e}", path.display()))?;
         Ok(Self::from_settings(settings, web_dir))
     }
 

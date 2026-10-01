@@ -326,8 +326,12 @@ pub async fn emit(
             Some(tid) => recipients_for_task(tx, tid, actor, r#type, &data).await?,
             None => BTreeSet::new(),
         },
-        Recipients::FromProject(pid) => recipients_for_project(tx, pid, actor, r#type, &data).await?,
-        Recipients::FromChannel(cid) => recipients_for_channel(tx, cid, actor, r#type, &data).await?,
+        Recipients::FromProject(pid) => {
+            recipients_for_project(tx, pid, actor, r#type, &data).await?
+        }
+        Recipients::FromChannel(cid) => {
+            recipients_for_channel(tx, cid, actor, r#type, &data).await?
+        }
         Recipients::FromChannelThread(cid, reply_to) => {
             let mut set = recipients_for_channel(tx, cid, actor, r#type, &data).await?;
             if let Some(root) = reply_to {
@@ -337,7 +341,9 @@ pub async fn emit(
             }
             set
         }
-        Recipients::FromDocument(did) => recipients_for_document(tx, did, actor, r#type, &data).await?,
+        Recipients::FromDocument(did) => {
+            recipients_for_document(tx, did, actor, r#type, &data).await?
+        }
         Recipients::FromDocumentAndTask(did, tid) => {
             let mut set = recipients_for_document(tx, did, actor, r#type, &data).await?;
             set.extend(recipients_for_task(tx, tid, actor, r#type, &data).await?);
@@ -345,10 +351,11 @@ pub async fn emit(
         }
         Recipients::FromDocumentAndAttachedTasks(did) => {
             let mut set = recipients_for_document(tx, did, actor, r#type, &data).await?;
-            let attached = sqlx::query("SELECT task_id FROM document_attachments WHERE document_id=?")
-                .bind(did)
-                .fetch_all(&mut **tx)
-                .await?;
+            let attached =
+                sqlx::query("SELECT task_id FROM document_attachments WHERE document_id=?")
+                    .bind(did)
+                    .fetch_all(&mut **tx)
+                    .await?;
             for row in attached {
                 let tid: i64 = row.try_get("task_id")?;
                 set.extend(recipients_for_task(tx, tid, actor, r#type, &data).await?);
@@ -378,10 +385,11 @@ pub async fn emit(
     // — except the #461 task.created triage carve-out. A FILTERED board subscription (#462) receives
     // ONLY events matching its classes, and a match is a genuine wake (subscribed=true) since the
     // subscriber explicitly opted into those classes. Minus the actor either way.
-    let board_subs =
-        sqlx::query("SELECT subscriber, event_classes FROM subscriptions WHERE target_type='board'")
-            .fetch_all(&mut **tx)
-            .await?;
+    let board_subs = sqlx::query(
+        "SELECT subscriber, event_classes FROM subscriptions WHERE target_type='board'",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
     for s in board_subs {
         let sub: String = s.try_get("subscriber")?;
         if Some(sub.as_str()) == actor {
@@ -512,11 +520,41 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         // Two agents with webhook_urls, so emit produces a WebhookDelivery (carrying `subscribed`)
         // for each.
-        crate::core::register_agent(&pool, "alice", None, None, None, None, Some("http://x/wake")).await?;
-        crate::core::register_agent(&pool, "coord", None, None, None, None, Some("http://x/wake")).await?;
+        crate::core::register_agent(
+            &pool,
+            "alice",
+            None,
+            None,
+            None,
+            None,
+            Some("http://x/wake"),
+        )
+        .await?;
+        crate::core::register_agent(
+            &pool,
+            "coord",
+            None,
+            None,
+            None,
+            None,
+            Some("http://x/wake"),
+        )
+        .await?;
         let p = crate::core::create_project(&pool, "P", None, Some("owner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = crate::core::create_task(&pool, pid, "T", None, None, None, Some("owner"), None, None, None).await?;
+        let t = crate::core::create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         // alice subscribes to the task directly; coord subscribes to the whole-board firehose.
         crate::core::subscribe(&pool, "alice", Some(tid), None, None, None, false).await?;
@@ -540,10 +578,22 @@ mod tests {
         .await?;
         tx.commit().await?;
 
-        let alice = hooks.iter().find(|h| h.agent_id == "alice").expect("alice hook");
-        let coord = hooks.iter().find(|h| h.agent_id == "coord").expect("coord hook");
-        assert!(alice.subscribed, "direct task subscriber is woken on a comment");
-        assert!(!coord.subscribed, "firehose-only recipient is not push-woken per ticket");
+        let alice = hooks
+            .iter()
+            .find(|h| h.agent_id == "alice")
+            .expect("alice hook");
+        let coord = hooks
+            .iter()
+            .find(|h| h.agent_id == "coord")
+            .expect("coord hook");
+        assert!(
+            alice.subscribed,
+            "direct task subscriber is woken on a comment"
+        );
+        assert!(
+            !coord.subscribed,
+            "firehose-only recipient is not push-woken per ticket"
+        );
         Ok(())
     }
 
@@ -555,7 +605,16 @@ mod tests {
     async fn firehose_woken_on_task_created_only() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        crate::core::register_agent(&pool, "triage", None, None, None, None, Some("http://x/wake")).await?;
+        crate::core::register_agent(
+            &pool,
+            "triage",
+            None,
+            None,
+            None,
+            None,
+            Some("http://x/wake"),
+        )
+        .await?;
         // A whole-board (firehose) subscription — no task/project/etc. target.
         crate::core::subscribe(&pool, "triage", None, None, None, None, true).await?;
 
@@ -577,8 +636,14 @@ mod tests {
         )
         .await?;
         tx.commit().await?;
-        let created = hooks.iter().find(|h| h.agent_id == "triage").expect("triage woken on task.created");
-        assert!(created.subscribed, "firehose sub is push-woken (subscribed=true) on task.created");
+        let created = hooks
+            .iter()
+            .find(|h| h.agent_id == "triage")
+            .expect("triage woken on task.created");
+        assert!(
+            created.subscribed,
+            "firehose sub is push-woken (subscribed=true) on task.created"
+        );
 
         // task.commented: triage still RECEIVES it (firehose delivery) but is NOT push-woken.
         let mut tx = pool.begin().await?;
@@ -597,8 +662,14 @@ mod tests {
         )
         .await?;
         tx.commit().await?;
-        let commented = hooks.iter().find(|h| h.agent_id == "triage").expect("triage still receives the comment");
-        assert!(!commented.subscribed, "firehose sub is NOT push-woken on a per-ticket comment");
+        let commented = hooks
+            .iter()
+            .find(|h| h.agent_id == "triage")
+            .expect("triage still receives the comment");
+        assert!(
+            !commented.subscribed,
+            "firehose sub is NOT push-woken on a per-ticket comment"
+        );
         Ok(())
     }
 
@@ -608,19 +679,67 @@ mod tests {
     #[test]
     fn event_classes_match_expected_types() {
         let done = ["done".to_string()];
-        assert!(event_in_classes("task.status_changed", &json!({ "to": "done" }), &done));
-        assert!(!event_in_classes("task.status_changed", &json!({ "to": "cancelled" }), &done));
-        assert!(!event_in_classes("task.status_changed", &json!({ "to": "in_progress" }), &done));
-        assert!(event_in_classes("task.created", &json!({}), &["created".to_string()]));
-        assert!(event_in_classes("task.blocked_on_you", &json!({}), &["blocked".to_string()]));
-        assert!(event_in_classes("task.assigned", &json!({}), &["assigned".to_string()]));
-        assert!(event_in_classes("task.commented", &json!({}), &["comment".to_string()]));
-        assert!(event_in_classes("task.status_changed", &json!({ "to": "blocked" }), &["status".to_string()]));
-        assert!(event_in_classes("review.status_changed", &json!({}), &["review".to_string()]));
-        assert!(event_in_classes("document.approved", &json!({}), &["doc".to_string()]));
+        assert!(event_in_classes(
+            "task.status_changed",
+            &json!({ "to": "done" }),
+            &done
+        ));
+        assert!(!event_in_classes(
+            "task.status_changed",
+            &json!({ "to": "cancelled" }),
+            &done
+        ));
+        assert!(!event_in_classes(
+            "task.status_changed",
+            &json!({ "to": "in_progress" }),
+            &done
+        ));
+        assert!(event_in_classes(
+            "task.created",
+            &json!({}),
+            &["created".to_string()]
+        ));
+        assert!(event_in_classes(
+            "task.blocked_on_you",
+            &json!({}),
+            &["blocked".to_string()]
+        ));
+        assert!(event_in_classes(
+            "task.assigned",
+            &json!({}),
+            &["assigned".to_string()]
+        ));
+        assert!(event_in_classes(
+            "task.commented",
+            &json!({}),
+            &["comment".to_string()]
+        ));
+        assert!(event_in_classes(
+            "task.status_changed",
+            &json!({ "to": "blocked" }),
+            &["status".to_string()]
+        ));
+        assert!(event_in_classes(
+            "review.status_changed",
+            &json!({}),
+            &["review".to_string()]
+        ));
+        assert!(event_in_classes(
+            "document.approved",
+            &json!({}),
+            &["doc".to_string()]
+        ));
         // Non-matching type, and an unknown class name, match nothing.
-        assert!(!event_in_classes("task.commented", &json!({}), &["created".to_string()]));
-        assert!(!event_in_classes("task.created", &json!({}), &["bogus".to_string()]));
+        assert!(!event_in_classes(
+            "task.commented",
+            &json!({}),
+            &["created".to_string()]
+        ));
+        assert!(!event_in_classes(
+            "task.created",
+            &json!({}),
+            &["bogus".to_string()]
+        ));
         // NULL / empty filter => None (deliver everything); a real list round-trips.
         assert!(parse_event_classes(None).is_none());
         assert!(parse_event_classes(Some("[]".to_string())).is_none());
@@ -638,33 +757,87 @@ mod tests {
     async fn event_class_filter_gates_delivery() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        crate::core::register_agent(&pool, "triage", None, None, None, None, Some("http://x/wake")).await?;
+        crate::core::register_agent(
+            &pool,
+            "triage",
+            None,
+            None,
+            None,
+            None,
+            Some("http://x/wake"),
+        )
+        .await?;
         // A filtered board subscription: only the `created` class.
-        crate::core::subscribe_classed(&pool, "triage", None, None, None, None, true, &["created".to_string()])
-            .await?;
+        crate::core::subscribe_classed(
+            &pool,
+            "triage",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &["created".to_string()],
+        )
+        .await?;
 
         // task.created matches: delivered (one inbox row) and woken (subscribed=true).
         let mut tx = pool.begin().await?;
         let mut hooks: Vec<WebhookDelivery> = Vec::new();
-        emit(&mut tx, &mut hooks, "task.created", Some("owner"), Some(1), Some(1), None, None,
-            json!({ "title": "T" }), Recipients::Explicit(BTreeSet::new())).await?;
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.created",
+            Some("owner"),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            json!({ "title": "T" }),
+            Recipients::Explicit(BTreeSet::new()),
+        )
+        .await?;
         tx.commit().await?;
-        let created = hooks.iter().find(|h| h.agent_id == "triage").expect("filtered sub delivered task.created");
-        assert!(created.subscribed, "a matching class wakes the filtered subscriber");
+        let created = hooks
+            .iter()
+            .find(|h| h.agent_id == "triage")
+            .expect("filtered sub delivered task.created");
+        assert!(
+            created.subscribed,
+            "a matching class wakes the filtered subscriber"
+        );
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE recipient='triage'")
-            .fetch_one(&pool).await?;
+            .fetch_one(&pool)
+            .await?;
         assert_eq!(n, 1, "one inbox row for the matching event");
 
         // task.commented does NOT match: not delivered at all (no new inbox row, no wake).
         let mut tx = pool.begin().await?;
         let mut hooks: Vec<WebhookDelivery> = Vec::new();
-        emit(&mut tx, &mut hooks, "task.commented", Some("owner"), Some(1), None, None, None,
-            json!({ "body": "hi" }), Recipients::Explicit(BTreeSet::new())).await?;
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.commented",
+            Some("owner"),
+            Some(1),
+            None,
+            None,
+            None,
+            json!({ "body": "hi" }),
+            Recipients::Explicit(BTreeSet::new()),
+        )
+        .await?;
         tx.commit().await?;
-        assert!(hooks.iter().all(|h| h.agent_id != "triage"), "filtered-out event does not wake the subscriber");
+        assert!(
+            hooks.iter().all(|h| h.agent_id != "triage"),
+            "filtered-out event does not wake the subscriber"
+        );
         let n2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE recipient='triage'")
-            .fetch_one(&pool).await?;
-        assert_eq!(n2, 1, "no new inbox row for the filtered-out event (delivery-gated)");
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            n2, 1,
+            "no new inbox row for the filtered-out event (delivery-gated)"
+        );
         Ok(())
     }
 
@@ -675,7 +848,16 @@ mod tests {
     async fn thread_subscription_wakes_on_in_thread_followup() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        crate::core::register_agent(&pool, "frank", None, None, None, None, Some("http://x/wake")).await?;
+        crate::core::register_agent(
+            &pool,
+            "frank",
+            None,
+            None,
+            None,
+            None,
+            Some("http://x/wake"),
+        )
+        .await?;
         // Frank joins thread root seq=100 (he is NOT a member of channel 7).
         crate::core::subscribe_thread(&pool, "frank", 100).await?;
 
@@ -684,8 +866,19 @@ mod tests {
             async move {
                 let mut tx = pool.begin().await?;
                 let mut hooks: Vec<WebhookDelivery> = Vec::new();
-                emit(&mut tx, &mut hooks, "channel.post", Some("human"), None, None, Some(7), None,
-                    json!({ "body": "x", "reply_to": root }), Recipients::FromChannelThread(7, Some(root))).await?;
+                emit(
+                    &mut tx,
+                    &mut hooks,
+                    "channel.post",
+                    Some("human"),
+                    None,
+                    None,
+                    Some(7),
+                    None,
+                    json!({ "body": "x", "reply_to": root }),
+                    Recipients::FromChannelThread(7, Some(root)),
+                )
+                .await?;
                 tx.commit().await?;
                 Ok::<_, anyhow::Error>(hooks)
             }
@@ -693,17 +886,29 @@ mod tests {
 
         // Follow-up under the subscribed root reaches frank, woken.
         let hooks = post(100).await?;
-        let h = hooks.iter().find(|h| h.agent_id == "frank").expect("delivered in-thread follow-up");
-        assert!(h.subscribed, "thread subscriber is woken on an in-thread follow-up");
+        let h = hooks
+            .iter()
+            .find(|h| h.agent_id == "frank")
+            .expect("delivered in-thread follow-up");
+        assert!(
+            h.subscribed,
+            "thread subscriber is woken on an in-thread follow-up"
+        );
 
         // A post under a DIFFERENT root does not reach frank.
         let hooks = post(999).await?;
-        assert!(hooks.iter().all(|h| h.agent_id != "frank"), "not woken on a different thread's post");
+        assert!(
+            hooks.iter().all(|h| h.agent_id != "frank"),
+            "not woken on a different thread's post"
+        );
 
         // unsubscribe_thread stops delivery on the subscribed root.
         crate::core::unsubscribe_thread(&pool, "frank", 100).await?;
         let hooks = post(100).await?;
-        assert!(hooks.iter().all(|h| h.agent_id != "frank"), "unsubscribe_thread stops thread delivery");
+        assert!(
+            hooks.iter().all(|h| h.agent_id != "frank"),
+            "unsubscribe_thread stops thread delivery"
+        );
         Ok(())
     }
 }

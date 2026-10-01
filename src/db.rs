@@ -486,7 +486,10 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     // streams from the broadcast bus, not a held connection), so serial access is fine at this
     // scale. If read throughput ever bottlenecks, the next step is a read pool + a single writer
     // connection (or per-write BEGIN IMMEDIATE), not a wider undifferentiated pool.
-    let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await?;
 
     // executescript-equivalent: sqlx has no multi-statement execute, so apply the schema one
     // statement at a time (split_schema_statements strips comments, then splits on ';').
@@ -510,21 +513,31 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
 
     // Back-fill tasks.blocked_on_{kind,ref,note} (operator seq-1361: a blocked task records
     // what it's waiting on). All nullable; existing tasks carry no blocked_on until set.
-    let tasks_cols = sqlx::query("PRAGMA table_info(tasks)").fetch_all(&pool).await?;
+    let tasks_cols = sqlx::query("PRAGMA table_info(tasks)")
+        .fetch_all(&pool)
+        .await?;
     let tasks_has = |c: &str| tasks_cols.iter().any(|r| r.get::<String, _>("name") == c);
     if !tasks_has("blocked_on_kind") {
-        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_kind TEXT").execute(&pool).await?;
+        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_kind TEXT")
+            .execute(&pool)
+            .await?;
     }
     if !tasks_has("blocked_on_ref") {
-        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_ref TEXT").execute(&pool).await?;
+        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_ref TEXT")
+            .execute(&pool)
+            .await?;
     }
     if !tasks_has("blocked_on_note") {
-        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_note TEXT").execute(&pool).await?;
+        sqlx::query("ALTER TABLE tasks ADD COLUMN blocked_on_note TEXT")
+            .execute(&pool)
+            .await?;
     }
     // Back-fill tasks.archived_at (soft-archive, mirroring documents.archived_at): a retired task
     // stays queryable but drops out of list_tasks by default. Orthogonal to status; nullable.
     if !tasks_has("archived_at") {
-        sqlx::query("ALTER TABLE tasks ADD COLUMN archived_at TEXT").execute(&pool).await?;
+        sqlx::query("ALTER TABLE tasks ADD COLUMN archived_at TEXT")
+            .execute(&pool)
+            .await?;
     }
 
     // Back-fill channels.auto_join (fleet-wide broadcast channels): a legacy channels table opens
@@ -753,8 +766,14 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     // document_links table was created before embeds existed keeps its rows as kind='link'. All
     // three are nullable-or-defaulted, so no index/constraint over them goes in SCHEMA (the #63
     // path-index crash-loop lesson: never index a back-filled column in the SCHEMA apply loop).
-    let doclinks_cols = sqlx::query("PRAGMA table_info(document_links)").fetch_all(&pool).await?;
-    let has = |c: &str| doclinks_cols.iter().any(|r| r.get::<String, _>("name") == c);
+    let doclinks_cols = sqlx::query("PRAGMA table_info(document_links)")
+        .fetch_all(&pool)
+        .await?;
+    let has = |c: &str| {
+        doclinks_cols
+            .iter()
+            .any(|r| r.get::<String, _>("name") == c)
+    };
     if !has("kind") {
         sqlx::query("ALTER TABLE document_links ADD COLUMN kind TEXT NOT NULL DEFAULT 'link'")
             .execute(&pool)
@@ -828,9 +847,21 @@ CREATE TABLE b (id INTEGER);
 -- a dangling; comment; after the last statement
 ";
         let stmts = split_schema_statements(schema);
-        assert_eq!(stmts.len(), 2, "expected exactly two statements, got: {stmts:?}");
-        assert!(stmts[0].starts_with("CREATE TABLE a"), "got: {:?}", stmts[0]);
-        assert!(stmts[1].starts_with("CREATE TABLE b"), "got: {:?}", stmts[1]);
+        assert_eq!(
+            stmts.len(),
+            2,
+            "expected exactly two statements, got: {stmts:?}"
+        );
+        assert!(
+            stmts[0].starts_with("CREATE TABLE a"),
+            "got: {:?}",
+            stmts[0]
+        );
+        assert!(
+            stmts[1].starts_with("CREATE TABLE b"),
+            "got: {:?}",
+            stmts[1]
+        );
         assert!(
             stmts.iter().all(|s| !s.contains("comment")),
             "comment text leaked into a statement: {stmts:?}"
@@ -838,8 +869,15 @@ CREATE TABLE b (id INTEGER);
         // Sanity-check the real embedded SCHEMA too: it splits into many statements and none of
         // them still carry a `--` comment marker.
         let real = split_schema_statements(SCHEMA);
-        assert!(real.len() > 5, "SCHEMA should split into many statements, got {}", real.len());
-        assert!(real.iter().all(|s| !s.contains("--")), "a `--` comment survived the split");
+        assert!(
+            real.len() > 5,
+            "SCHEMA should split into many statements, got {}",
+            real.len()
+        );
+        assert!(
+            real.iter().all(|s| !s.contains("--")),
+            "a `--` comment survived the split"
+        );
     }
 
     /// Regression for the #63 crash-loop: a DB whose `documents` table predates the `path`
@@ -855,9 +893,12 @@ CREATE TABLE b (id INTEGER);
 
         // Seed a pre-#63 documents table: no `path` column.
         {
-            let opts = SqliteConnectOptions::from_str(&format!("sqlite://{dbp}"))?
-                .create_if_missing(true);
-            let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
+            let opts =
+                SqliteConnectOptions::from_str(&format!("sqlite://{dbp}"))?.create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await?;
             sqlx::query(
                 "CREATE TABLE documents (\
                     id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -887,7 +928,10 @@ CREATE TABLE b (id INTEGER);
             .await?
             .iter()
             .any(|r| r.get::<String, _>("name") == "path");
-        assert!(has_path, "init should back-fill documents.path on a legacy DB");
+        assert!(
+            has_path,
+            "init should back-fill documents.path on a legacy DB"
+        );
 
         // ...and the partial unique index exists (created after the back-fill).
         let has_index = sqlx::query(
@@ -913,7 +957,10 @@ CREATE TABLE b (id INTEGER);
             if i == 0 {
                 r.expect("first doc at a/b inserts");
             } else {
-                assert!(r.is_err(), "second doc at the same path violates the unique index");
+                assert!(
+                    r.is_err(),
+                    "second doc at the same path violates the unique index"
+                );
             }
         }
         Ok(())

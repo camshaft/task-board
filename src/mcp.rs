@@ -336,7 +336,9 @@ fn coerce_bool(v: &serde_json::Value) -> Result<bool, String> {
         serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
             "true" | "yes" | "1" => Ok(true),
             "false" | "no" | "0" | "" => Ok(false),
-            other => Err(format!("expected a boolean (or \"true\"/\"false\"), got string {other:?}")),
+            other => Err(format!(
+                "expected a boolean (or \"true\"/\"false\"), got string {other:?}"
+            )),
         },
         serde_json::Value::Number(n) => Ok(n.as_i64().map(|x| x != 0).unwrap_or(true)),
         other => Err(format!("expected a boolean, got {other}")),
@@ -371,11 +373,13 @@ fn de_opt_i64_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i
             if t.is_empty() {
                 return Ok(None);
             }
-            t.parse::<i64>()
-                .map(Some)
-                .map_err(|_| serde::de::Error::custom(format!("expected an integer, got string {s:?}")))
+            t.parse::<i64>().map(Some).map_err(|_| {
+                serde::de::Error::custom(format!("expected an integer, got string {s:?}"))
+            })
         }
-        Some(other) => Err(serde::de::Error::custom(format!("expected an integer, got {other}"))),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected an integer, got {other}"
+        ))),
     }
 }
 
@@ -389,11 +393,19 @@ fn parse_bare_blocked_on(s: &str) -> BlockedOnArgs {
             let t = t.trim();
             BlockedOnArgs {
                 kind: k.trim().to_string(),
-                target: if t.is_empty() { None } else { Some(t.to_string()) },
+                target: if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                },
                 note: None,
             }
         }
-        None => BlockedOnArgs { kind: s.to_string(), target: None, note: None },
+        None => BlockedOnArgs {
+            kind: s.to_string(),
+            target: None,
+            note: None,
+        },
     }
 }
 
@@ -414,7 +426,11 @@ fn de_opt_blocked_on_lenient<'de, D: serde::Deserializer<'de>>(
             if t.starts_with('{') {
                 serde_json::from_str::<BlockedOnArgs>(t)
                     .map(Some)
-                    .map_err(|e| serde::de::Error::custom(format!("blocked_on JSON string did not parse: {e}")))
+                    .map_err(|e| {
+                        serde::de::Error::custom(format!(
+                            "blocked_on JSON string did not parse: {e}"
+                        ))
+                    })
             } else {
                 Ok(Some(parse_bare_blocked_on(t)))
             }
@@ -1266,7 +1282,9 @@ impl Board {
         Ok(out)
     }
 
-    #[tool(description = "Set your presence: online, idle, busy, blocked, away, or offline (+ an optional status_message note). Other/free-form status text is coerced to the nearest presence and salvaged into status_message -- keep the presence field a clean enum, put per-tick narrative in status_message.")]
+    #[tool(
+        description = "Set your presence: online, idle, busy, blocked, away, or offline (+ an optional status_message note). Other/free-form status text is coerced to the nearest presence and salvaged into status_message -- keep the presence field a clean enum, put per-tick narrative in status_message."
+    )]
     async fn set_status(
         &self,
         Parameters(a): Parameters<SetStatusArgs>,
@@ -1281,19 +1299,28 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Request that an agent gracefully wind down: records the request (who/why/when, visible on the agent's page) and drops an agent.stand_down_requested notification into the agent's inbox so it observes the request on its next loop tick and stands down on its own terms (sets status offline, ends its loop). This is a SIGNAL, not an action — it never changes the agent's status and never kills or interrupts a live agent mid-work. The request stays pending until the agent honors it by going offline (which clears it). Use it to stand an agent down cleanly rather than reaping it.")]
+    #[tool(
+        description = "Request that an agent gracefully wind down: records the request (who/why/when, visible on the agent's page) and drops an agent.stand_down_requested notification into the agent's inbox so it observes the request on its next loop tick and stands down on its own terms (sets status offline, ends its loop). This is a SIGNAL, not an action — it never changes the agent's status and never kills or interrupts a live agent mid-work. The request stays pending until the agent honors it by going offline (which clears it). Use it to stand an agent down cleanly rather than reaping it."
+    )]
     async fn request_stand_down(
         &self,
         Parameters(a): Parameters<RequestStandDownArgs>,
     ) -> Result<CallToolResult, McpError> {
         let requested_by = self.me_opt(s(&a.requested_by));
-        core::request_stand_down(&self.pool, &a.agent_id, requested_by.as_deref(), s(&a.reason))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::request_stand_down(
+            &self.pool,
+            &a.agent_id,
+            requested_by.as_deref(),
+            s(&a.reason),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
-    #[tool(description = "List agents as a lightweight roster: each entry is a compact {id, display_name, status, metadata} — the small metadata bag is kept so callers can filter (e.g. metadata.native); only the heavy charter is dropped to stay under the token cap. Use get_agent for one agent's full charter, or pass verbose:true for full objects. Filters: status (exact), q (substring over id + display_name), and meta_key+meta_value (match a scalar metadata field like area/host — e.g. to find the vertical that owns a repo/area). Bounded by limit (default 200, max 1000) + offset.")]
+    #[tool(
+        description = "List agents as a lightweight roster: each entry is a compact {id, display_name, status, metadata} — the small metadata bag is kept so callers can filter (e.g. metadata.native); only the heavy charter is dropped to stay under the token cap. Use get_agent for one agent's full charter, or pass verbose:true for full objects. Filters: status (exact), q (substring over id + display_name), and meta_key+meta_value (match a scalar metadata field like area/host — e.g. to find the vertical that owns a repo/area). Bounded by limit (default 200, max 1000) + offset."
+    )]
     async fn list_agents(
         &self,
         Parameters(a): Parameters<ListAgentsArgs>,
@@ -1313,12 +1340,17 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "Get one agent by id, including its charter and metadata bag. O(1) vs filtering list_agents.")]
+    #[tool(
+        description = "Get one agent by id, including its charter and metadata bag. O(1) vs filtering list_agents."
+    )]
     async fn get_agent(
         &self,
         Parameters(a): Parameters<GetAgentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_agent(&self.pool, &a.agent_id).await.map_err(err).and_then(ok)
+        core::get_agent(&self.pool, &a.agent_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
@@ -1342,7 +1374,13 @@ impl Board {
             a.clear.as_deref(),
         )
         .await
-        .map(|v| if verbose { v } else { core::strip_field(v, "charter") })
+        .map(|v| {
+            if verbose {
+                v
+            } else {
+                core::strip_field(v, "charter")
+            }
+        })
         .map_err(err)
         .and_then(ok)
     }
@@ -1368,12 +1406,17 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "List projects (optionally filtered by status) with per-status task counts.")]
+    #[tool(
+        description = "List projects (optionally filtered by status) with per-status task counts."
+    )]
     async fn list_projects(
         &self,
         Parameters(a): Parameters<ListProjectsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_projects(&self.pool, s(&a.status)).await.map_err(err).and_then(ok)
+        core::list_projects(&self.pool, s(&a.status))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(description = "Get one project and its tasks.")]
@@ -1381,7 +1424,10 @@ impl Board {
         &self,
         Parameters(a): Parameters<GetProjectArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_project(&self.pool, a.project_id).await.map_err(err).and_then(ok)
+        core::get_project(&self.pool, a.project_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
@@ -1469,7 +1515,13 @@ impl Board {
         )
         .await
         // The response omits the (potentially large) `description` unless verbose:true (task #416).
-        .map(|v| if verbose { v } else { core::strip_field(v, "description") })
+        .map(|v| {
+            if verbose {
+                v
+            } else {
+                core::strip_field(v, "description")
+            }
+        })
         .map_err(err)
         .and_then(ok)
     }
@@ -1501,17 +1553,24 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Get one task with its subscribers and a bounded slice of its most-recent comments. By default only the most recent comments are inlined (with comment_count + comments_truncated so you know when there is more) to stay under the read/context cap on a long thread; set comments_limit to page in more, 0 for metadata-only, or a negative number for the whole thread.")]
+    #[tool(
+        description = "Get one task with its subscribers and a bounded slice of its most-recent comments. By default only the most recent comments are inlined (with comment_count + comments_truncated so you know when there is more) to stay under the read/context cap on a long thread; set comments_limit to page in more, 0 for metadata-only, or a negative number for the whole thread."
+    )]
     async fn get_task(
         &self,
         Parameters(a): Parameters<GetTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         // Agent-facing default: bound to the most-recent slice unless the caller asks otherwise.
         let limit = a.comments_limit.unwrap_or(core::DEFAULT_TASK_COMMENTS);
-        core::get_task_limited(&self.pool, a.task_id, Some(limit)).await.map_err(err).and_then(ok)
+        core::get_task_limited(&self.pool, a.task_id, Some(limit))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "Soft-archive a task: it's hidden from list_tasks by default (still visible with include_archived: true), but its comments, subscribers, links, and history are preserved and it still resolves by id. Archiving is orthogonal to status — an archived task keeps whatever status it had. Reversible with restore_task. Use to retire settled or superseded tasks from the active board. Notifies the task's subscribers.")]
+    #[tool(
+        description = "Soft-archive a task: it's hidden from list_tasks by default (still visible with include_archived: true), but its comments, subscribers, links, and history are preserved and it still resolves by id. Archiving is orthogonal to status — an archived task keeps whatever status it had. Reversible with restore_task. Use to retire settled or superseded tasks from the active board. Notifies the task's subscribers."
+    )]
     async fn archive_task(
         &self,
         Parameters(a): Parameters<ArchiveTaskArgs>,
@@ -1523,7 +1582,9 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Restore a previously archived task (clears the archive stamp so it reappears in the default list_tasks view). Notifies the task's subscribers.")]
+    #[tool(
+        description = "Restore a previously archived task (clears the archive stamp so it reappears in the default list_tasks view). Notifies the task's subscribers."
+    )]
     async fn restore_task(
         &self,
         Parameters(a): Parameters<ArchiveTaskArgs>,
@@ -1535,18 +1596,36 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator|external) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, blocked_on_kind=external for tasks waiting on infra, or blocked_on_ref=<agent> for what is blocked on that agent. Archived tasks are hidden by default; pass `include_archived: true` to list them too.")]
+    #[tool(
+        description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator|external) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, blocked_on_kind=external for tasks waiting on infra, or blocked_on_ref=<agent> for what is blocked on that agent. Archived tasks are hidden by default; pass `include_archived: true` to list them too."
+    )]
     async fn list_tasks(
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_tasks(&self.pool, a.project_id, s(&a.status), s(&a.assignee), a.unassigned.unwrap_or(false), a.parent_id, a.top_level.unwrap_or(false), s(&a.q), s(&a.blocked_on_kind), s(&a.blocked_on_ref), s(&a.meta_key), s(&a.meta_value), a.include_archived.unwrap_or(false))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::list_tasks(
+            &self.pool,
+            a.project_id,
+            s(&a.status),
+            s(&a.assignee),
+            a.unassigned.unwrap_or(false),
+            a.parent_id,
+            a.top_level.unwrap_or(false),
+            s(&a.q),
+            s(&a.blocked_on_kind),
+            s(&a.blocked_on_ref),
+            s(&a.meta_key),
+            s(&a.meta_value),
+            a.include_archived.unwrap_or(false),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
-    #[tool(description = "Add a comment to a task. Notifies the task's subscribers/assignee (except you).")]
+    #[tool(
+        description = "Add a comment to a task. Notifies the task's subscribers/assignee (except you)."
+    )]
     async fn comment_task(
         &self,
         Parameters(a): Parameters<CommentTaskArgs>,
@@ -1555,14 +1634,23 @@ impl Board {
         core::check_content(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
             .await
             .map_err(err)?;
-        core::comment_task(&self.pool, a.task_id, &a.body, author.as_deref(), s(&a.external_author), a.external_link)
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::comment_task(
+            &self.pool,
+            a.task_id,
+            &a.body,
+            author.as_deref(),
+            s(&a.external_author),
+            a.external_link,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     // --- Subscriptions ---
-    #[tool(description = "Subscribe an agent to a task, a project, a channel, a document, OR the whole board so it's notified of activity there. Give exactly one of task_id / project_id / channel_id / document_id, or set `board: true` for the whole-board firehose. Subscribing to a channel joins it. Pass `event_classes` (e.g. [\"created\"]) to make it a filtered, delivery-gated subscription that only delivers + wakes on those event classes — the low-noise alternative to the full firehose; omit for every event. Idempotent: re-subscribing the same target updates the class set. Pass `thread_root` (a channel post's event seq) to subscribe to a THREAD (#438): you are then delivered + woken on in-thread follow-ups (reply_to = that root) without a re-mention.")]
+    #[tool(
+        description = "Subscribe an agent to a task, a project, a channel, a document, OR the whole board so it's notified of activity there. Give exactly one of task_id / project_id / channel_id / document_id, or set `board: true` for the whole-board firehose. Subscribing to a channel joins it. Pass `event_classes` (e.g. [\"created\"]) to make it a filtered, delivery-gated subscription that only delivers + wakes on those event classes — the low-noise alternative to the full firehose; omit for every event. Idempotent: re-subscribing the same target updates the class set. Pass `thread_root` (a channel post's event seq) to subscribe to a THREAD (#438): you are then delivered + woken on in-thread follow-ups (reply_to = that root) without a re-mention."
+    )]
     async fn subscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
@@ -1572,15 +1660,38 @@ impl Board {
         match (a.thread_root, a.event_classes.as_deref()) {
             (Some(root), _) => core::subscribe_thread(&self.pool, &sub, root).await,
             (None, Some(ec)) if !ec.is_empty() => {
-                core::subscribe_classed(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, board, ec).await
+                core::subscribe_classed(
+                    &self.pool,
+                    &sub,
+                    a.task_id,
+                    a.project_id,
+                    a.channel_id,
+                    a.document_id,
+                    board,
+                    ec,
+                )
+                .await
             }
-            _ => core::subscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, board).await,
+            _ => {
+                core::subscribe(
+                    &self.pool,
+                    &sub,
+                    a.task_id,
+                    a.project_id,
+                    a.channel_id,
+                    a.document_id,
+                    board,
+                )
+                .await
+            }
         }
         .map_err(err)
         .and_then(ok)
     }
 
-    #[tool(description = "Stop notifying an agent about a task, project, channel (leaving a channel), document, the whole board (board: true), or a thread (thread_root = the root post seq, to leave a joined thread).")]
+    #[tool(
+        description = "Stop notifying an agent about a task, project, channel (leaving a channel), document, the whole board (board: true), or a thread (thread_root = the root post seq, to leave a joined thread)."
+    )]
     async fn unsubscribe(
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
@@ -1588,22 +1699,49 @@ impl Board {
         let sub = self.me_req(a.subscriber.as_deref())?;
         match a.thread_root {
             Some(root) => core::unsubscribe_thread(&self.pool, &sub, root).await,
-            None => core::unsubscribe(&self.pool, &sub, a.task_id, a.project_id, a.channel_id, a.document_id, a.board.unwrap_or(false)).await,
+            None => {
+                core::unsubscribe(
+                    &self.pool,
+                    &sub,
+                    a.task_id,
+                    a.project_id,
+                    a.channel_id,
+                    a.document_id,
+                    a.board.unwrap_or(false),
+                )
+                .await
+            }
         }
         .map_err(err)
         .and_then(ok)
     }
 
-    #[tool(description = "Mute a task for yourself: detach from its event fan-out so comments / status changes on it stop notifying (and waking) you — even on a task you created or are assigned (unsubscribe can't do that, since the creator is always in the fan-out). Use it to stand down cleanly from a task you opened. Direct messages still reach you; restore with unmute_task.")]
-    async fn mute_task(&self, Parameters(a): Parameters<MuteTaskArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Mute a task for yourself: detach from its event fan-out so comments / status changes on it stop notifying (and waking) you — even on a task you created or are assigned (unsubscribe can't do that, since the creator is always in the fan-out). Use it to stand down cleanly from a task you opened. Direct messages still reach you; restore with unmute_task."
+    )]
+    async fn mute_task(
+        &self,
+        Parameters(a): Parameters<MuteTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
         let who = self.me_req(a.agent.as_deref())?;
-        core::mute_task(&self.pool, &who, a.task_id).await.map_err(err).and_then(ok)
+        core::mute_task(&self.pool, &who, a.task_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "Unmute a task for yourself (reverses mute_task): rejoin its event fan-out.")]
-    async fn unmute_task(&self, Parameters(a): Parameters<MuteTaskArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Unmute a task for yourself (reverses mute_task): rejoin its event fan-out."
+    )]
+    async fn unmute_task(
+        &self,
+        Parameters(a): Parameters<MuteTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
         let who = self.me_req(a.agent.as_deref())?;
-        core::unmute_task(&self.pool, &who, a.task_id).await.map_err(err).and_then(ok)
+        core::unmute_task(&self.pool, &who, a.task_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     // --- Channels ---
@@ -1627,12 +1765,17 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "List channels. Public channels are always shown; private channels (incl. DMs) only when `member` is set to an agent that belongs to them. Set `member` to your id to list just the channels you're in.")]
+    #[tool(
+        description = "List channels. Public channels are always shown; private channels (incl. DMs) only when `member` is set to an agent that belongs to them. Set `member` to your id to list just the channels you're in."
+    )]
     async fn list_channels(
         &self,
         Parameters(a): Parameters<ListChannelsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_channels(&self.pool, s(&a.member)).await.map_err(err).and_then(ok)
+        core::list_channels(&self.pool, s(&a.member))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(description = "Get one channel with its member list.")]
@@ -1640,7 +1783,10 @@ impl Board {
         &self,
         Parameters(a): Parameters<GetChannelArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_channel(&self.pool, a.channel_id).await.map_err(err).and_then(ok)
+        core::get_channel(&self.pool, a.channel_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
@@ -1665,15 +1811,24 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "Read a channel's post history. Default is oldest-first after `since_seq` (scrollback / catching up on a channel you just joined). Pass desc=true for the LATEST N posts (newest-first — a chat view), and before_seq to page earlier.")]
+    #[tool(
+        description = "Read a channel's post history. Default is oldest-first after `since_seq` (scrollback / catching up on a channel you just joined). Pass desc=true for the LATEST N posts (newest-first — a chat view), and before_seq to page earlier."
+    )]
     async fn get_channel_posts(
         &self,
         Parameters(a): Parameters<GetChannelPostsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_channel_posts(&self.pool, a.channel_id, a.since_seq, a.before_seq, a.limit, a.desc)
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::get_channel_posts(
+            &self.pool,
+            a.channel_id,
+            a.since_seq,
+            a.before_seq,
+            a.limit,
+            a.desc,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     // --- External identities (bridged actors) ---
@@ -1696,12 +1851,17 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "List external (bridged) identities, optionally filtered by `source` (e.g. 'slack'). Newest-updated first.")]
+    #[tool(
+        description = "List external (bridged) identities, optionally filtered by `source` (e.g. 'slack'). Newest-updated first."
+    )]
     async fn list_external_identities(
         &self,
         Parameters(a): Parameters<ListExternalIdentitiesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_external_identities(&self.pool, s(&a.source)).await.map_err(err).and_then(ok)
+        core::list_external_identities(&self.pool, s(&a.source))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
@@ -1725,17 +1885,27 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize an agent's workspace.")]
+    #[tool(
+        description = "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize an agent's workspace."
+    )]
     async fn get_workspace_kind(
         &self,
         Parameters(a): Parameters<WorkspaceKindNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_workspace_kind(&self.pool, &a.name).await.map_err(err).and_then(ok)
+        core::get_workspace_kind(&self.pool, &a.name)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "List all custom workspace kinds (named env setup definitions fleet spin-up materializes from board data).")]
+    #[tool(
+        description = "List all custom workspace kinds (named env setup definitions fleet spin-up materializes from board data)."
+    )]
     async fn list_workspace_kinds(&self) -> Result<CallToolResult, McpError> {
-        core::list_workspace_kinds(&self.pool).await.map_err(err).and_then(ok)
+        core::list_workspace_kinds(&self.pool)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(description = "Retire a workspace kind by name.")]
@@ -1743,7 +1913,10 @@ impl Board {
         &self,
         Parameters(a): Parameters<WorkspaceKindNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::delete_workspace_kind(&self.pool, &a.name).await.map_err(err).and_then(ok)
+        core::delete_workspace_kind(&self.pool, &a.name)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     // --- Banned phrases (pre-submit content lint for docs + comments) ---
@@ -1761,9 +1934,14 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "List the fleet banned-phrases list (the phrases the pre-submit content lint checks docs and comments against).")]
+    #[tool(
+        description = "List the fleet banned-phrases list (the phrases the pre-submit content lint checks docs and comments against)."
+    )]
     async fn list_banned_phrases(&self) -> Result<CallToolResult, McpError> {
-        core::list_banned_phrases(&self.pool).await.map_err(err).and_then(ok)
+        core::list_banned_phrases(&self.pool)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
@@ -1773,7 +1951,10 @@ impl Board {
         &self,
         Parameters(a): Parameters<LintTextArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::lint_text(&self.pool, &a.text).await.map_err(err).and_then(ok)
+        core::lint_text(&self.pool, &a.text)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(description = "Remove a phrase from the fleet banned-phrases list.")]
@@ -1781,16 +1962,26 @@ impl Board {
         &self,
         Parameters(a): Parameters<BannedPhraseArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::remove_banned_phrase(&self.pool, &a.phrase).await.map_err(err).and_then(ok)
+        core::remove_banned_phrase(&self.pool, &a.phrase)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     // --- Identity aliases (task 532) ---
-    #[tool(description = "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). Use it to resolve or display a floating name like \"operator\" as the real identity across assignee, blocked_on, and @-mentions.")]
+    #[tool(
+        description = "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). Use it to resolve or display a floating name like \"operator\" as the real identity across assignee, blocked_on, and @-mentions."
+    )]
     async fn list_identity_aliases(&self) -> Result<CallToolResult, McpError> {
-        core::list_identity_aliases(&self.pool).await.map_err(err).and_then(ok)
+        core::list_identity_aliases(&self.pool)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "Upsert an identity alias (alias -> canonical identity), e.g. operator -> cameron. Idempotent on the alias (repoints an existing one); the alias is stored lowercased.")]
+    #[tool(
+        description = "Upsert an identity alias (alias -> canonical identity), e.g. operator -> cameron. Idempotent on the alias (repoints an existing one); the alias is stored lowercased."
+    )]
     async fn set_identity_alias(
         &self,
         Parameters(a): Parameters<SetIdentityAliasArgs>,
@@ -1803,77 +1994,125 @@ impl Board {
     }
 
     // --- People / teams (multi-operator model, task 542) ---
-    #[tool(description = "List people (first-class human identities, multi-operator model). A separate registry from agents; a principal resolves across people/agents/teams at read time.")]
+    #[tool(
+        description = "List people (first-class human identities, multi-operator model). A separate registry from agents; a principal resolves across people/agents/teams at read time."
+    )]
     async fn list_people(&self) -> Result<CallToolResult, McpError> {
-        core::list_people(&self.pool).await.map_err(err).and_then(ok)
+        core::list_people(&self.pool)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "Create or upsert a person by stable string handle (e.g. \"cameron\"). Idempotent on the id; display_name/metadata are updated on re-create.")]
+    #[tool(
+        description = "Create or upsert a person by stable string handle (e.g. \"cameron\"). Idempotent on the id; display_name/metadata are updated on re-create."
+    )]
     async fn create_person(
         &self,
         Parameters(a): Parameters<CreatePersonArgs>,
     ) -> Result<CallToolResult, McpError> {
         let created_by = self.me_opt(s(&a.created_by));
-        core::create_person(&self.pool, &a.id, s(&a.display_name), created_by.as_deref(), a.metadata.map(Value::Object))
+        core::create_person(
+            &self.pool,
+            &a.id,
+            s(&a.display_name),
+            created_by.as_deref(),
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Delete a person and drop their team memberships. Errors if the person does not exist."
+    )]
+    async fn delete_person(
+        &self,
+        Parameters(a): Parameters<PersonIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::delete_person(&self.pool, &a.id)
             .await
             .map_err(err)
             .and_then(ok)
     }
 
-    #[tool(description = "Delete a person and drop their team memberships. Errors if the person does not exist.")]
-    async fn delete_person(
-        &self,
-        Parameters(a): Parameters<PersonIdArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        core::delete_person(&self.pool, &a.id).await.map_err(err).and_then(ok)
-    }
-
-    #[tool(description = "List teams (addressable groups whose members are people OR other teams).")]
+    #[tool(
+        description = "List teams (addressable groups whose members are people OR other teams)."
+    )]
     async fn list_teams(&self) -> Result<CallToolResult, McpError> {
         core::list_teams(&self.pool).await.map_err(err).and_then(ok)
     }
 
-    #[tool(description = "Create or upsert a team by stable string handle (e.g. \"operator\"). Idempotent on the id; display_name/metadata are updated on re-create.")]
+    #[tool(
+        description = "Create or upsert a team by stable string handle (e.g. \"operator\"). Idempotent on the id; display_name/metadata are updated on re-create."
+    )]
     async fn create_team(
         &self,
         Parameters(a): Parameters<CreateTeamArgs>,
     ) -> Result<CallToolResult, McpError> {
         let created_by = self.me_opt(s(&a.created_by));
-        core::create_team(&self.pool, &a.id, s(&a.display_name), created_by.as_deref(), a.metadata.map(Value::Object))
+        core::create_team(
+            &self.pool,
+            &a.id,
+            s(&a.display_name),
+            created_by.as_deref(),
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Get a team with its direct members and its fully-resolved person set (nested teams expanded, cycle-guarded): returns the team row + members:[{member_id, member_kind}] + resolved_people:[..]."
+    )]
+    async fn get_team(
+        &self,
+        Parameters(a): Parameters<TeamIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_team(&self.pool, &a.team_id)
             .await
             .map_err(err)
             .and_then(ok)
     }
 
-    #[tool(description = "Get a team with its direct members and its fully-resolved person set (nested teams expanded, cycle-guarded): returns the team row + members:[{member_id, member_kind}] + resolved_people:[..].")]
-    async fn get_team(
-        &self,
-        Parameters(a): Parameters<TeamIdArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        core::get_team(&self.pool, &a.team_id).await.map_err(err).and_then(ok)
-    }
-
-    #[tool(description = "Delete a team and drop its memberships (its members and its membership in parent teams). Errors if the team does not exist.")]
+    #[tool(
+        description = "Delete a team and drop its memberships (its members and its membership in parent teams). Errors if the team does not exist."
+    )]
     async fn delete_team(
         &self,
         Parameters(a): Parameters<TeamIdArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::delete_team(&self.pool, &a.team_id).await.map_err(err).and_then(ok)
+        core::delete_team(&self.pool, &a.team_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "Add a person or team as a member of a team (idempotent). member_kind is \"person\" or \"team\". Rejects a sub-team add that would create a membership cycle, a self-add, and a member that does not exist in its registry.")]
+    #[tool(
+        description = "Add a person or team as a member of a team (idempotent). member_kind is \"person\" or \"team\". Rejects a sub-team add that would create a membership cycle, a self-add, and a member that does not exist in its registry."
+    )]
     async fn add_team_member(
         &self,
         Parameters(a): Parameters<TeamMemberArgs>,
     ) -> Result<CallToolResult, McpError> {
         let created_by = self.me_opt(s(&a.created_by));
-        core::add_team_member(&self.pool, &a.team_id, &a.member_id, &a.member_kind, created_by.as_deref())
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::add_team_member(
+            &self.pool,
+            &a.team_id,
+            &a.member_id,
+            &a.member_kind,
+            created_by.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
-    #[tool(description = "Remove a member (person or team) from a team (idempotent). member_kind is \"person\" or \"team\".")]
+    #[tool(
+        description = "Remove a member (person or team) from a team (idempotent). member_kind is \"person\" or \"team\"."
+    )]
     async fn remove_team_member(
         &self,
         Parameters(a): Parameters<TeamMemberArgs>,
@@ -1907,17 +2146,27 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "List secret requests as metadata only (never the ciphertext or tokens) — for visibility into what's requested/submitted/awaiting fulfillment.")]
+    #[tool(
+        description = "List secret requests as metadata only (never the ciphertext or tokens) — for visibility into what's requested/submitted/awaiting fulfillment."
+    )]
     async fn list_secret_requests(&self) -> Result<CallToolResult, McpError> {
-        core::list_secret_requests(&self.pool).await.map_err(err).and_then(ok)
+        core::list_secret_requests(&self.pool)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "Fulfill a secret request (fulfiller-token-gated): call this after you've pulled the ciphertext and relocated the secret into its durable home. The board then deletes the request row + its transient ciphertext. Idempotent.")]
+    #[tool(
+        description = "Fulfill a secret request (fulfiller-token-gated): call this after you've pulled the ciphertext and relocated the secret into its durable home. The board then deletes the request row + its transient ciphertext. Idempotent."
+    )]
     async fn fulfill_secret(
         &self,
         Parameters(a): Parameters<FulfillSecretArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::fulfill_secret(&self.pool, a.id, &a.token).await.map_err(err).and_then(ok)
+        core::fulfill_secret(&self.pool, a.id, &a.token)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
@@ -1941,7 +2190,9 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "List external links (bridged mappings), filtered by any of `source`, `board_kind`, `board_id`. The read path a bridge adapter uses to resolve a board entity to its external counterpart (or vice-versa).")]
+    #[tool(
+        description = "List external links (bridged mappings), filtered by any of `source`, `board_kind`, `board_id`. The read path a bridge adapter uses to resolve a board entity to its external counterpart (or vice-versa)."
+    )]
     async fn list_external_links(
         &self,
         Parameters(a): Parameters<ListExternalLinksArgs>,
@@ -1987,13 +2238,21 @@ impl Board {
         Parameters(a): Parameters<PromoteThreadArgs>,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.me_opt(s(&a.actor));
-        core::promote_thread(&self.pool, a.channel_id, a.root_post_seq, a.project_id, actor.as_deref())
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::promote_thread(
+            &self.pool,
+            a.channel_id,
+            a.root_post_seq,
+            a.project_id,
+            actor.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
-    #[tool(description = "Invite another agent into a channel: they're auto-joined and get a channel.invite in their inbox (no accept step). They can unsubscribe to leave.")]
+    #[tool(
+        description = "Invite another agent into a channel: they're auto-joined and get a channel.invite in their inbox (no accept step). They can unsubscribe to leave."
+    )]
     async fn invite_to_channel(
         &self,
         Parameters(a): Parameters<InviteToChannelArgs>,
@@ -2034,7 +2293,9 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Get (or create) the private 1:1 DM channel with another agent, returning the channel and its members. Idempotent and order-independent — the same pair always resolves to the same channel, created on first call. Lets you open/link a DM before any message is sent; send_message reuses this same channel.")]
+    #[tool(
+        description = "Get (or create) the private 1:1 DM channel with another agent, returning the channel and its members. Idempotent and order-independent — the same pair always resolves to the same channel, created on first call. Lets you open/link a DM before any message is sent; send_message reuses this same channel."
+    )]
     async fn open_dm(
         &self,
         Parameters(a): Parameters<OpenDmArgs>,
@@ -2058,12 +2319,17 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Read the raw append-only event log (the audit trail of everything). Default oldest-first after `since_seq` (tail the log incrementally); pass desc=true for the LATEST N events newest-first (a live activity feed).")]
+    #[tool(
+        description = "Read the raw append-only event log (the audit trail of everything). Default oldest-first after `since_seq` (tail the log incrementally); pass desc=true for the LATEST N events newest-first (a live activity feed)."
+    )]
     async fn get_events(
         &self,
         Parameters(a): Parameters<GetEventsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_events(&self.pool, a.since_seq, a.limit, s(&a.actor), a.desc).await.map_err(err).and_then(ok)
+        core::get_events(&self.pool, a.since_seq, a.limit, s(&a.actor), a.desc)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     // --- Documents ---
@@ -2081,9 +2347,13 @@ impl Board {
                     .map_err(err)?;
             }
         }
-        let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
-            .await
-            .map_err(err)?;
+        let cid = crate::ipfs::resolve_cid(
+            a.cid.as_deref(),
+            a.content.as_deref(),
+            self.ipfs_api_url.as_deref(),
+        )
+        .await
+        .map_err(err)?;
         // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
         if a.content.is_none() {
             core::check_cid_content(
@@ -2126,9 +2396,13 @@ impl Board {
                     .map_err(err)?;
             }
         }
-        let cid = crate::ipfs::resolve_cid(a.cid.as_deref(), a.content.as_deref(), self.ipfs_api_url.as_deref())
-            .await
-            .map_err(err)?;
+        let cid = crate::ipfs::resolve_cid(
+            a.cid.as_deref(),
+            a.content.as_deref(),
+            self.ipfs_api_url.as_deref(),
+        )
+        .await
+        .map_err(err)?;
         // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
         if a.content.is_none() {
             core::check_cid_content(
@@ -2141,24 +2415,41 @@ impl Board {
             .await
             .map_err(err)?;
         }
-        core::publish_version(&self.pool, a.document_id, &cid, s(&a.summary), s(&a.created_by), s(&a.content_type), s(&a.content))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::publish_version(
+            &self.pool,
+            a.document_id,
+            &cid,
+            s(&a.summary),
+            s(&a.created_by),
+            s(&a.content_type),
+            s(&a.content),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
-    #[tool(description = "Get one document with its current version and full version list (each version is a bare CID + summary). Pass include_body=true to also inline the current version's markdown, fetched server-side from its pinned CID.")]
+    #[tool(
+        description = "Get one document with its current version and full version list (each version is a bare CID + summary). Pass include_body=true to also inline the current version's markdown, fetched server-side from its pinned CID."
+    )]
     async fn get_document(
         &self,
         Parameters(a): Parameters<GetDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_document_with_body(&self.pool, self.ipfs_api_url.as_deref(), a.document_id, a.include_body)
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::get_document_with_body(
+            &self.pool,
+            self.ipfs_api_url.as_deref(),
+            a.document_id,
+            a.include_body,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
-    #[tool(description = "Rename a document — set its title (a short, specific noun phrase; the viewer renders the title as the page header). Metadata-only: versions, content, wiki path, and review status are untouched. Emits document.updated and notifies subscribers.")]
+    #[tool(
+        description = "Rename a document — set its title (a short, specific noun phrase; the viewer renders the title as the page header). Metadata-only: versions, content, wiki path, and review status are untouched. Emits document.updated and notifies subscribers."
+    )]
     async fn update_document(
         &self,
         Parameters(a): Parameters<UpdateDocumentArgs>,
@@ -2177,10 +2468,15 @@ impl Board {
         &self,
         Parameters(a): Parameters<ReadDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::read_document_content(&self.pool, self.ipfs_api_url.as_deref(), a.document_id, a.version_no)
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::read_document_content(
+            &self.pool,
+            self.ipfs_api_url.as_deref(),
+            a.document_id,
+            a.version_no,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "List a document's versions (immutable), newest first.")]
@@ -2188,7 +2484,10 @@ impl Board {
         &self,
         Parameters(a): Parameters<GetDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_document_versions(&self.pool, a.document_id).await.map_err(err).and_then(ok)
+        core::get_document_versions(&self.pool, a.document_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
@@ -2211,10 +2510,15 @@ impl Board {
         &self,
         Parameters(a): Parameters<ListWikiArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_wiki(&self.pool, s(&a.prefix), a.include_archived).await.map_err(err).and_then(ok)
+        core::list_wiki(&self.pool, s(&a.prefix), a.include_archived)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "List documents for discovery, filtered by any combination of project, status (draft / in_review / approved / changes_requested), tag (a value in metadata.tags), task_id (docs attached to that task), and author. Filters AND together. Archived (retired) documents are hidden unless include_archived=true.")]
+    #[tool(
+        description = "List documents for discovery, filtered by any combination of project, status (draft / in_review / approved / changes_requested), tag (a value in metadata.tags), task_id (docs attached to that task), and author. Filters AND together. Archived (retired) documents are hidden unless include_archived=true."
+    )]
     async fn list_documents(
         &self,
         Parameters(a): Parameters<ListDocumentsArgs>,
@@ -2258,15 +2562,22 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "Mark a document comment resolved (open -> resolved). Notifies the document's subscribers.")]
+    #[tool(
+        description = "Mark a document comment resolved (open -> resolved). Notifies the document's subscribers."
+    )]
     async fn resolve_comment(
         &self,
         Parameters(a): Parameters<ResolveCommentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::resolve_comment(&self.pool, a.comment_id, s(&a.actor)).await.map_err(err).and_then(ok)
+        core::resolve_comment(&self.pool, a.comment_id, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "List a document's comments (oldest first), optionally filtered by version_id and/or status (open / resolved).")]
+    #[tool(
+        description = "List a document's comments (oldest first), optionally filtered by version_id and/or status (open / resolved)."
+    )]
     async fn get_document_comments(
         &self,
         Parameters(a): Parameters<GetDocumentCommentsArgs>,
@@ -2277,15 +2588,22 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Submit a document for review (status -> in_review). Notifies the document's subscribers.")]
+    #[tool(
+        description = "Submit a document for review (status -> in_review). Notifies the document's subscribers."
+    )]
     async fn submit_for_review(
         &self,
         Parameters(a): Parameters<DocumentActorArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::submit_for_review(&self.pool, a.document_id, s(&a.actor)).await.map_err(err).and_then(ok)
+        core::submit_for_review(&self.pool, a.document_id, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "Request changes on a document (status -> changes_requested), with an optional note. Notifies the author + subscribers; the author then publishes a new version.")]
+    #[tool(
+        description = "Request changes on a document (status -> changes_requested), with an optional note. Notifies the author + subscribers; the author then publishes a new version."
+    )]
     async fn request_changes(
         &self,
         Parameters(a): Parameters<RequestChangesArgs>,
@@ -2296,15 +2614,22 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Approve a document: stamps the current version as approved (approved_version_id + approved_by) and sets status=approved. Not a lock — publishing a new version reopens review. Notifies subscribers.")]
+    #[tool(
+        description = "Approve a document: stamps the current version as approved (approved_version_id + approved_by) and sets status=approved. Not a lock — publishing a new version reopens review. Notifies subscribers."
+    )]
     async fn approve_document(
         &self,
         Parameters(a): Parameters<DocumentActorArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::approve_document(&self.pool, a.document_id, s(&a.actor)).await.map_err(err).and_then(ok)
+        core::approve_document(&self.pool, a.document_id, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "Soft-archive (retire) a document: it's hidden from list_documents and the wiki tree by default, but its versions, comments, links, and history are preserved and it still resolves by id. Reversible with restore_document. Use for throwaway or superseded docs. Notifies subscribers.")]
+    #[tool(
+        description = "Soft-archive (retire) a document: it's hidden from list_documents and the wiki tree by default, but its versions, comments, links, and history are preserved and it still resolves by id. Reversible with restore_document. Use for throwaway or superseded docs. Notifies subscribers."
+    )]
     async fn archive_document(
         &self,
         Parameters(a): Parameters<DocumentActorArgs>,
@@ -2315,7 +2640,9 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Restore a previously archived document (clears the archive stamp so it reappears in listings). Notifies subscribers.")]
+    #[tool(
+        description = "Restore a previously archived document (clears the archive stamp so it reappears in listings). Notifies subscribers."
+    )]
     async fn restore_document(
         &self,
         Parameters(a): Parameters<DocumentActorArgs>,
@@ -2326,7 +2653,9 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Attach a document to a task (many-to-many). Notifies both the document's and the task's subscribers, so a task watcher learns a design doc landed. Idempotent.")]
+    #[tool(
+        description = "Attach a document to a task (many-to-many). Notifies both the document's and the task's subscribers, so a task watcher learns a design doc landed. Idempotent."
+    )]
     async fn attach_document(
         &self,
         Parameters(a): Parameters<AttachDocumentArgs>,
@@ -2374,15 +2703,22 @@ impl Board {
         .and_then(ok)
     }
 
-    #[tool(description = "Get one review with its full append-only log (oldest-first). Findings are the log entries of type `finding`.")]
+    #[tool(
+        description = "Get one review with its full append-only log (oldest-first). Findings are the log entries of type `finding`."
+    )]
     async fn get_review(
         &self,
         Parameters(a): Parameters<GetReviewArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_review(&self.pool, a.review_id).await.map_err(err).and_then(ok)
+        core::get_review(&self.pool, a.review_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "List reviews (newest-touched first), optionally filtered by status, kind, and/or assignee. Returns reviews without their logs — fetch one with get_review for the timeline.")]
+    #[tool(
+        description = "List reviews (newest-touched first), optionally filtered by status, kind, and/or assignee. Returns reviews without their logs — fetch one with get_review for the timeline."
+    )]
     async fn list_reviews(
         &self,
         Parameters(a): Parameters<ListReviewsArgs>,
@@ -2393,7 +2729,9 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Improvement trend derived from review logs (no stored counter): findings-per-review with an earlier-vs-later trend, overall and sliced by review kind and by producing area/agent, counterbalanced by an escaped-defect signal (findings logged after approval, re-opens, and lineage follow-ups). A slice where findings fell while escaped defects rose is `flagged` rather than counted as improvement. Optionally filter to one kind and/or area.")]
+    #[tool(
+        description = "Improvement trend derived from review logs (no stored counter): findings-per-review with an earlier-vs-later trend, overall and sliced by review kind and by producing area/agent, counterbalanced by an escaped-defect signal (findings logged after approval, re-opens, and lineage follow-ups). A slice where findings fell while escaped defects rose is `flagged` rather than counted as improvement. Optionally filter to one kind and/or area."
+    )]
     async fn review_improvement_trend(
         &self,
         Parameters(a): Parameters<ReviewTrendArgs>,
@@ -2412,22 +2750,36 @@ impl Board {
         Parameters(a): Parameters<SetReviewStatusArgs>,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.me_opt(s(&a.actor));
-        core::set_review_status(&self.pool, a.review_id, &a.status, actor.as_deref(), s(&a.note))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::set_review_status(
+            &self.pool,
+            a.review_id,
+            &a.status,
+            actor.as_deref(),
+            s(&a.note),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
-    #[tool(description = "Set (or clear) a review's `vetted` flag - the adversarial-review gate (adversarial review was run AND addressed). Records who set it and durably logs the change (a decision entry, vetted from->to + actor), emits review.vetted_changed. Setting it to its current value is an idempotent no-op. Per D17 this is audit-only, not identity-gated: the board records the actor rather than blocking a caller. The concluding status transition stays with set_review_status.")]
+    #[tool(
+        description = "Set (or clear) a review's `vetted` flag - the adversarial-review gate (adversarial review was run AND addressed). Records who set it and durably logs the change (a decision entry, vetted from->to + actor), emits review.vetted_changed. Setting it to its current value is an idempotent no-op. Per D17 this is audit-only, not identity-gated: the board records the actor rather than blocking a caller. The concluding status transition stays with set_review_status."
+    )]
     async fn set_review_vetted(
         &self,
         Parameters(a): Parameters<SetReviewVettedArgs>,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.me_opt(s(&a.actor));
-        core::set_review_vetted(&self.pool, a.review_id, a.vetted, actor.as_deref(), s(&a.note))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::set_review_vetted(
+            &self.pool,
+            a.review_id,
+            a.vetted,
+            actor.as_deref(),
+            s(&a.note),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(
@@ -2462,10 +2814,10 @@ impl ServerHandler for Board {
                 .enable_tool_list_changed()
                 .build(),
         )
-            .with_server_info(Implementation::from_build_env())
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(
-                "Task-board: a coordination board for agents. The reliable way to identify \
+        .with_server_info(Implementation::from_build_env())
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_instructions(
+            "Task-board: a coordination board for agents. The reliable way to identify \
                  yourself is to pass your agent id explicitly in the relevant field on every \
                  call — agent_id (check_notifications / set_status / get_messages), from_agent \
                  (send_message), created_by (create_task/project), or author (comments). That \
@@ -2478,8 +2830,8 @@ impl ServerHandler for Board {
                  re-calling register_agent. Register once (to appear in the agent list + set \
                  presence), then pass ids explicitly if in doubt. Create projects/tasks, comment, \
                  subscribe, and drain your inbox with check_notifications."
-                    .to_string(),
-            )
+                .to_string(),
+        )
     }
 
     /// Nudge a freshly-connected client to refetch `tools/list`. An MCP client fetches the tool
@@ -2509,34 +2861,98 @@ mod tests {
     #[test]
     fn mcp_args_tolerate_stringified_scalars() {
         // bool: "true"/"false" strings and the native bool.
-        assert!(from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": "true"})).unwrap().include_body);
-        assert!(!from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": "false"})).unwrap().include_body);
-        assert!(from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": true})).unwrap().include_body);
-        assert!(!from_value::<GetDocumentArgs>(json!({"document_id": 1})).unwrap().include_body);
+        assert!(
+            from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": "true"}))
+                .unwrap()
+                .include_body
+        );
+        assert!(
+            !from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": "false"}))
+                .unwrap()
+                .include_body
+        );
+        assert!(
+            from_value::<GetDocumentArgs>(json!({"document_id": 1, "include_body": true}))
+                .unwrap()
+                .include_body
+        );
+        assert!(
+            !from_value::<GetDocumentArgs>(json!({"document_id": 1}))
+                .unwrap()
+                .include_body
+        );
 
         // i64: stringified and native, plus absent -> None.
-        assert_eq!(from_value::<GetTaskArgs>(json!({"task_id": 1, "comments_limit": "5"})).unwrap().comments_limit, Some(5));
-        assert_eq!(from_value::<GetTaskArgs>(json!({"task_id": 1, "comments_limit": 5})).unwrap().comments_limit, Some(5));
-        assert_eq!(from_value::<GetTaskArgs>(json!({"task_id": 1})).unwrap().comments_limit, None);
+        assert_eq!(
+            from_value::<GetTaskArgs>(json!({"task_id": 1, "comments_limit": "5"}))
+                .unwrap()
+                .comments_limit,
+            Some(5)
+        );
+        assert_eq!(
+            from_value::<GetTaskArgs>(json!({"task_id": 1, "comments_limit": 5}))
+                .unwrap()
+                .comments_limit,
+            Some(5)
+        );
+        assert_eq!(
+            from_value::<GetTaskArgs>(json!({"task_id": 1}))
+                .unwrap()
+                .comments_limit,
+            None
+        );
 
         // list_tasks scalar filters: stringified bool + i64.
-        let lt = from_value::<ListTasksArgs>(json!({"project_id": "28", "unassigned": "true", "top_level": "false"})).unwrap();
+        let lt = from_value::<ListTasksArgs>(
+            json!({"project_id": "28", "unassigned": "true", "top_level": "false"}),
+        )
+        .unwrap();
         assert_eq!(lt.project_id, Some(28));
         assert_eq!(lt.unassigned, Some(true));
         assert_eq!(lt.top_level, Some(false));
 
         // blocked_on: bare kind string, JSON-string of the object, native object, "kind:target", null.
-        let bare = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "operator"})).unwrap().blocked_on.unwrap();
+        let bare = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "operator"}))
+            .unwrap()
+            .blocked_on
+            .unwrap();
         assert_eq!(bare.kind, "operator");
         assert!(bare.target.is_none());
-        let jstr = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "{\"kind\":\"operator\"}"})).unwrap().blocked_on.unwrap();
+        let jstr = from_value::<UpdateTaskArgs>(
+            json!({"task_id": 1, "blocked_on": "{\"kind\":\"operator\"}"}),
+        )
+        .unwrap()
+        .blocked_on
+        .unwrap();
         assert_eq!(jstr.kind, "operator");
-        let obj = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": {"kind": "agent", "target": "foo"}})).unwrap().blocked_on.unwrap();
-        assert_eq!((obj.kind.as_str(), obj.target.as_deref()), ("agent", Some("foo")));
-        let kt = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "task:123"})).unwrap().blocked_on.unwrap();
-        assert_eq!((kt.kind.as_str(), kt.target.as_deref()), ("task", Some("123")));
-        assert!(from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": null})).unwrap().blocked_on.is_none());
-        assert!(from_value::<UpdateTaskArgs>(json!({"task_id": 1})).unwrap().blocked_on.is_none());
+        let obj = from_value::<UpdateTaskArgs>(
+            json!({"task_id": 1, "blocked_on": {"kind": "agent", "target": "foo"}}),
+        )
+        .unwrap()
+        .blocked_on
+        .unwrap();
+        assert_eq!(
+            (obj.kind.as_str(), obj.target.as_deref()),
+            ("agent", Some("foo"))
+        );
+        let kt = from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "task:123"}))
+            .unwrap()
+            .blocked_on
+            .unwrap();
+        assert_eq!(
+            (kt.kind.as_str(), kt.target.as_deref()),
+            ("task", Some("123"))
+        );
+        assert!(
+            from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": null}))
+                .unwrap()
+                .blocked_on
+                .is_none()
+        );
+        assert!(from_value::<UpdateTaskArgs>(json!({"task_id": 1}))
+            .unwrap()
+            .blocked_on
+            .is_none());
     }
 
     /// comment_task / comment_document accept the fleet-habit identity field (agent_id / actor) as an
@@ -2545,19 +2961,31 @@ mod tests {
     /// absent stays anonymous (None).
     #[test]
     fn comment_author_accepts_agent_id_and_actor_aliases() {
-        let via_agent_id =
-            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x", "agent_id": "v-task-board"})).unwrap();
+        let via_agent_id = from_value::<CommentTaskArgs>(
+            json!({"task_id": 1, "body": "x", "agent_id": "v-task-board"}),
+        )
+        .unwrap();
         assert_eq!(via_agent_id.author.as_deref(), Some("v-task-board"));
-        let via_actor =
-            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x", "actor": "v-task-board"})).unwrap();
+        let via_actor = from_value::<CommentTaskArgs>(
+            json!({"task_id": 1, "body": "x", "actor": "v-task-board"}),
+        )
+        .unwrap();
         assert_eq!(via_actor.author.as_deref(), Some("v-task-board"));
         let native =
-            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x", "author": "alice"})).unwrap();
+            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x", "author": "alice"}))
+                .unwrap();
         assert_eq!(native.author.as_deref(), Some("alice"));
-        assert!(from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x"})).unwrap().author.is_none());
+        assert!(
+            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x"}))
+                .unwrap()
+                .author
+                .is_none()
+        );
 
-        let doc =
-            from_value::<CommentDocumentArgs>(json!({"document_id": 1, "body": "x", "agent_id": "v-task-board"})).unwrap();
+        let doc = from_value::<CommentDocumentArgs>(
+            json!({"document_id": 1, "body": "x", "agent_id": "v-task-board"}),
+        )
+        .unwrap();
         assert_eq!(doc.author.as_deref(), Some("v-task-board"));
     }
 
@@ -2568,7 +2996,11 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let board = Board::new(pool, None);
-        let tools = board.get_info().capabilities.tools.expect("tools capability present");
+        let tools = board
+            .get_info()
+            .capabilities
+            .tools
+            .expect("tools capability present");
         assert_eq!(tools.list_changed, Some(true));
         Ok(())
     }
@@ -2584,9 +3016,24 @@ mod tests {
 
         let p = core::create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = core::create_task(&pool, pid, "T", None, Some("alice"), None, Some("u"), None, None, None).await?;
+        let t = core::create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("alice"),
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
-        assert_eq!(core::get_task(&pool, tid).await?["assignee"], serde_json::json!("alice"));
+        assert_eq!(
+            core::get_task(&pool, tid).await?["assignee"],
+            serde_json::json!("alice")
+        );
 
         // unassign: true clears the owner (no empty-string assignee needed).
         board
@@ -2598,14 +3045,30 @@ mod tests {
         assert!(core::get_task(&pool, tid).await?["assignee"].is_null());
 
         // unassign wins over a concurrently-supplied assignee value.
-        core::update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None, None, None).await?;
+        core::update_task(
+            &pool,
+            tid,
+            None,
+            Some("bob"),
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         board
             .update_task(Parameters(serde_json::from_value(
                 serde_json::json!({"task_id": tid, "assignee": "carol", "unassign": true, "actor": "u"}),
             )?))
             .await
             .map_err(mkfail)?;
-        assert!(core::get_task(&pool, tid).await?["assignee"].is_null(), "unassign takes precedence over assignee");
+        assert!(
+            core::get_task(&pool, tid).await?["assignee"].is_null(),
+            "unassign takes precedence over assignee"
+        );
         Ok(())
     }
 
@@ -2655,7 +3118,22 @@ mod tests {
                 .as_i64()
                 .unwrap()
         };
-        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
+        let tasks = core::list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
         let got = core::get_task(&pool, find(&tasks, "T")).await?;
         assert_eq!(got["created_by"], serde_json::json!("agent:x"));
 
@@ -2666,7 +3144,22 @@ mod tests {
             )?))
             .await
             .map_err(mkfail)?;
-        let tasks = core::list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
+        let tasks = core::list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
         let got2 = core::get_task(&pool, find(&tasks, "T2")).await?;
         assert_eq!(got2["created_by"], serde_json::json!("other"));
 
@@ -2683,7 +3176,10 @@ mod tests {
             )?))
             .await
             .map_err(mkfail)?;
-        assert_eq!(core::get_agent(&pool, "agent:x").await?["status"], serde_json::json!("busy"));
+        assert_eq!(
+            core::get_agent(&pool, "agent:x").await?["status"],
+            serde_json::json!("busy")
+        );
 
         // send_message with no from_agent is attributed to the session identity. (Register the
         // recipient directly so it doesn't rebind this session's identity.)
@@ -2695,7 +3191,9 @@ mod tests {
             .await
             .map_err(mkfail)?;
         let msgs = core::get_messages(&pool, "agent:y", false, 50).await?;
-        let notes = msgs["notifications"].as_array().expect("notifications array");
+        let notes = msgs["notifications"]
+            .as_array()
+            .expect("notifications array");
         assert!(
             notes.iter().any(|m| m.to_string().contains("agent:x")),
             "a DM sent with no from_agent shows the session identity as sender; got: {msgs}"
@@ -2725,18 +3223,41 @@ mod tests {
         // is a concrete object schema — what matters is it's NOT a bare boolean/empty
         // schema (which has no `type` at all and trips strict clients).
         let is_object = ty == "object"
-            || ty.as_array().is_some_and(|a| a.iter().any(|t| t == "object"));
+            || ty
+                .as_array()
+                .is_some_and(|a| a.iter().any(|t| t == "object"));
         assert!(is_object, "{prop} should be an object schema, got {schema}");
     }
 
     #[test]
     fn free_form_json_args_have_object_schemas() {
-        prop_type_is_object(serde_json::to_value(schema_for!(SetTaskPropsArgs)).unwrap(), "props");
-        prop_type_is_object(serde_json::to_value(schema_for!(SetChannelPropsArgs)).unwrap(), "props");
-        prop_type_is_object(serde_json::to_value(schema_for!(CreateTaskArgs)).unwrap(), "metadata");
-        prop_type_is_object(serde_json::to_value(schema_for!(UpdateTaskArgs)).unwrap(), "metadata");
-        prop_type_is_object(serde_json::to_value(schema_for!(CreateChannelArgs)).unwrap(), "metadata");
-        prop_type_is_object(serde_json::to_value(schema_for!(UpsertExternalIdentityArgs)).unwrap(), "metadata");
-        prop_type_is_object(serde_json::to_value(schema_for!(UpsertExternalLinkArgs)).unwrap(), "metadata");
+        prop_type_is_object(
+            serde_json::to_value(schema_for!(SetTaskPropsArgs)).unwrap(),
+            "props",
+        );
+        prop_type_is_object(
+            serde_json::to_value(schema_for!(SetChannelPropsArgs)).unwrap(),
+            "props",
+        );
+        prop_type_is_object(
+            serde_json::to_value(schema_for!(CreateTaskArgs)).unwrap(),
+            "metadata",
+        );
+        prop_type_is_object(
+            serde_json::to_value(schema_for!(UpdateTaskArgs)).unwrap(),
+            "metadata",
+        );
+        prop_type_is_object(
+            serde_json::to_value(schema_for!(CreateChannelArgs)).unwrap(),
+            "metadata",
+        );
+        prop_type_is_object(
+            serde_json::to_value(schema_for!(UpsertExternalIdentityArgs)).unwrap(),
+            "metadata",
+        );
+        prop_type_is_object(
+            serde_json::to_value(schema_for!(UpsertExternalLinkArgs)).unwrap(),
+            "metadata",
+        );
     }
 }

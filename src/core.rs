@@ -160,17 +160,22 @@ pub fn check_bare_refs(text: &str) -> anyhow::Result<()> {
 /// called while a transaction holds the single pooled connection — resolve after commit.
 async fn add_external_author_name(pool: &Pool, data: &mut Value) {
     let Value::Object(m) = data else { return };
-    let Some(id) = m.get("external_author").and_then(|v| v.as_str()).map(str::to_string) else {
+    let Some(id) = m
+        .get("external_author")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
         return;
     };
-    let name: Option<String> =
-        sqlx::query_scalar::<_, Option<String>>("SELECT display_name FROM external_identities WHERE id=?")
-            .bind(&id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .flatten();
+    let name: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT display_name FROM external_identities WHERE id=?",
+    )
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
     if let Some(name) = name {
         m.insert("external_author_name".into(), json!(name));
     }
@@ -454,8 +459,9 @@ pub async fn register_agent(
         // A newly-registered agent auto-joins every fleet-wide broadcast channel (auto_join=1),
         // so an announcement reaches it without a manual invite. Only on first registration —
         // a re-register (presence refresh) does not re-add a channel the agent has left.
-        let auto_channels =
-            sqlx::query("SELECT id FROM channels WHERE auto_join=1").fetch_all(&mut *tx).await?;
+        let auto_channels = sqlx::query("SELECT id FROM channels WHERE auto_join=1")
+            .fetch_all(&mut *tx)
+            .await?;
         for c in &auto_channels {
             let cid: i64 = c.try_get("id")?;
             join_channel(&mut tx, cid, agent_id).await?;
@@ -516,11 +522,20 @@ pub async fn update_agent(
     // `clear` names columns to set to NULL. An explicit value for the same field wins (its `field=?`
     // is already queued, so we skip the NULL to avoid a duplicate SET). status is not clearable
     // (presence is a keyword, not nullable); metadata is merged, not cleared, via update.
-    const CLEARABLE: [&str; 5] = ["display_name", "kind", "charter", "status_message", "webhook_url"];
+    const CLEARABLE: [&str; 5] = [
+        "display_name",
+        "kind",
+        "charter",
+        "status_message",
+        "webhook_url",
+    ];
     if let Some(clear) = clear {
         for name in clear {
             if !CLEARABLE.contains(&name.as_str()) {
-                anyhow::bail!("cannot clear field '{name}'; clearable fields: {}", CLEARABLE.join(", "));
+                anyhow::bail!(
+                    "cannot clear field '{name}'; clearable fields: {}",
+                    CLEARABLE.join(", ")
+                );
             }
             if !set_clauses.iter().any(|c| c == &format!("{name}=?")) {
                 set_clauses.push(format!("{name}=NULL"));
@@ -579,7 +594,12 @@ fn normalize_presence(status: &str, status_message: Option<&str>) -> (String, Op
     let raw = status.trim();
     // The presence intent is the first whitespace/':'-delimited token (agents write e.g.
     // "idle: inbox drained" or "blocked on review").
-    let token = raw.split([':', ' ']).next().unwrap_or("").trim().to_ascii_lowercase();
+    let token = raw
+        .split([':', ' '])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     let canonical = match token.as_str() {
         "online" | "active" | "available" | "up" | "ready" | "live" | "healthy" => Some("online"),
         "idle" | "free" => Some("idle"),
@@ -836,7 +856,9 @@ pub async fn create_project(
         .await?
     {
         let existing_id: i64 = row.try_get("id")?;
-        let out = project_json(&mut tx, existing_id).await?.unwrap_or(Value::Null);
+        let out = project_json(&mut tx, existing_id)
+            .await?
+            .unwrap_or(Value::Null);
         tx.commit().await?;
         return Ok(out);
     }
@@ -927,12 +949,13 @@ pub async fn update_project(
     // reintroduce the duplicate sprawl create_project's get-or-create prevents.
     if let Some(new_name) = name {
         if !new_name.eq_ignore_ascii_case(&old_name) {
-            let clash = sqlx::query("SELECT 1 FROM projects WHERE name = ? COLLATE NOCASE AND id != ?")
-                .bind(new_name)
-                .bind(project_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
+            let clash =
+                sqlx::query("SELECT 1 FROM projects WHERE name = ? COLLATE NOCASE AND id != ?")
+                    .bind(new_name)
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .is_some();
             if clash {
                 anyhow::bail!("give a unique name: a project named '{new_name}' already exists");
             }
@@ -966,7 +989,9 @@ pub async fn update_project(
 
     if set_clauses.is_empty() {
         // Nothing to change — return the current project unchanged.
-        let out = project_json(&mut tx, project_id).await?.unwrap_or(Value::Null);
+        let out = project_json(&mut tx, project_id)
+            .await?
+            .unwrap_or(Value::Null);
         tx.commit().await?;
         return Ok(out);
     }
@@ -1007,7 +1032,9 @@ pub async fn update_project(
         Recipients::FromProject(project_id),
     )
     .await?;
-    let out = project_json(&mut tx, project_id).await?.unwrap_or(Value::Null);
+    let out = project_json(&mut tx, project_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -1021,18 +1048,21 @@ pub async fn list_projects(pool: &Pool, status: Option<&str>) -> anyhow::Result<
                 .fetch_all(pool)
                 .await?
         }
-        None => sqlx::query("SELECT * FROM projects ORDER BY id")
-            .fetch_all(pool)
-            .await?,
+        None => {
+            sqlx::query("SELECT * FROM projects ORDER BY id")
+                .fetch_all(pool)
+                .await?
+        }
     };
     let mut out = Vec::new();
     for r in &rows {
         let mut d = row_to_json(r);
         let pid: i64 = r.try_get("id")?;
-        let counts = sqlx::query("SELECT status, COUNT(*) n FROM tasks WHERE project_id=? GROUP BY status")
-            .bind(pid)
-            .fetch_all(pool)
-            .await?;
+        let counts =
+            sqlx::query("SELECT status, COUNT(*) n FROM tasks WHERE project_id=? GROUP BY status")
+                .bind(pid)
+                .fetch_all(pool)
+                .await?;
         let mut cmap = Map::new();
         for c in &counts {
             let s: String = c.try_get("status")?;
@@ -1041,7 +1071,7 @@ pub async fn list_projects(pool: &Pool, status: Option<&str>) -> anyhow::Result<
         }
         if let Value::Object(ref mut m) = d {
             insert_ref(m, "project"); // typed canonical id (task 504)
-            // metadata: parse JSON string -> object (mirrors get_project/get_task).
+                                      // metadata: parse JSON string -> object (mirrors get_project/get_task).
             let meta: Value = m
                 .get("metadata")
                 .and_then(|v| v.as_str())
@@ -1070,7 +1100,7 @@ pub async fn get_project(pool: &Pool, project_id: i64) -> anyhow::Result<Value> 
     .await?;
     if let Value::Object(ref mut m) = d {
         insert_ref(m, "project"); // typed canonical id (task 504)
-        // metadata: parse JSON string -> object (mirrors get_task).
+                                  // metadata: parse JSON string -> object (mirrors get_task).
         let meta: Value = m
             .get("metadata")
             .and_then(|v| v.as_str())
@@ -1091,9 +1121,11 @@ pub async fn get_project(pool: &Pool, project_id: i64) -> anyhow::Result<Value> 
 /// (seeded with operator -> cameron) that consumers/UI use to resolve or display a floating name
 /// like "operator" as the canonical identity across assignee, blocked_on, and @-mentions.
 pub async fn list_identity_aliases(pool: &Pool) -> anyhow::Result<Value> {
-    let rows = sqlx::query("SELECT alias, canonical, created_by, created_at FROM identity_aliases ORDER BY alias")
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT alias, canonical, created_by, created_at FROM identity_aliases ORDER BY alias",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
@@ -1163,7 +1195,10 @@ pub async fn create_person(
 }
 
 pub async fn get_person(pool: &Pool, id: &str) -> anyhow::Result<Value> {
-    let Some(row) = sqlx::query("SELECT * FROM people WHERE id=?").bind(id).fetch_optional(pool).await?
+    let Some(row) = sqlx::query("SELECT * FROM people WHERE id=?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
     else {
         anyhow::bail!("no person {id}");
     };
@@ -1171,7 +1206,9 @@ pub async fn get_person(pool: &Pool, id: &str) -> anyhow::Result<Value> {
 }
 
 pub async fn list_people(pool: &Pool) -> anyhow::Result<Value> {
-    let rows = sqlx::query("SELECT * FROM people ORDER BY id").fetch_all(pool).await?;
+    let rows = sqlx::query("SELECT * FROM people ORDER BY id")
+        .fetch_all(pool)
+        .await?;
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
@@ -1205,13 +1242,18 @@ pub async fn create_team(
 }
 
 pub async fn list_teams(pool: &Pool) -> anyhow::Result<Value> {
-    let rows = sqlx::query("SELECT * FROM teams ORDER BY id").fetch_all(pool).await?;
+    let rows = sqlx::query("SELECT * FROM teams ORDER BY id")
+        .fetch_all(pool)
+        .await?;
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
 /// A team plus its direct members and its fully-resolved person set (nested teams expanded).
 pub async fn get_team(pool: &Pool, team_id: &str) -> anyhow::Result<Value> {
-    let Some(row) = sqlx::query("SELECT * FROM teams WHERE id=?").bind(team_id).fetch_optional(pool).await?
+    let Some(row) = sqlx::query("SELECT * FROM teams WHERE id=?")
+        .bind(team_id)
+        .fetch_optional(pool)
+        .await?
     else {
         anyhow::bail!("no team {team_id}");
     };
@@ -1289,10 +1331,11 @@ async fn team_reaches_team(pool: &Pool, from: &str, target: &str) -> anyhow::Res
         if !visited.insert(tid.clone()) {
             continue;
         }
-        for r in sqlx::query("SELECT member_id FROM team_members WHERE team_id=? AND member_kind='team'")
-            .bind(&tid)
-            .fetch_all(pool)
-            .await?
+        for r in
+            sqlx::query("SELECT member_id FROM team_members WHERE team_id=? AND member_kind='team'")
+                .bind(&tid)
+                .fetch_all(pool)
+                .await?
         {
             stack.push(r.try_get("member_id")?);
         }
@@ -1314,10 +1357,19 @@ pub async fn add_team_member(
     if member_kind != "person" && member_kind != "team" {
         anyhow::bail!("member_kind must be \"person\" or \"team\"");
     }
-    if sqlx::query("SELECT 1 FROM teams WHERE id=?").bind(team_id).fetch_optional(pool).await?.is_none() {
+    if sqlx::query("SELECT 1 FROM teams WHERE id=?")
+        .bind(team_id)
+        .fetch_optional(pool)
+        .await?
+        .is_none()
+    {
         anyhow::bail!("no team {team_id}");
     }
-    let member_table = if member_kind == "person" { "people" } else { "teams" };
+    let member_table = if member_kind == "person" {
+        "people"
+    } else {
+        "teams"
+    };
     if sqlx::query(&format!("SELECT 1 FROM {member_table} WHERE id=?"))
         .bind(member_id)
         .fetch_optional(pool)
@@ -1368,7 +1420,10 @@ pub async fn remove_team_member(
 
 /// Delete a person and cascade: drop any team memberships where this person is a member.
 pub async fn delete_person(pool: &Pool, id: &str) -> anyhow::Result<Value> {
-    let res = sqlx::query("DELETE FROM people WHERE id=?").bind(id).execute(pool).await?;
+    let res = sqlx::query("DELETE FROM people WHERE id=?")
+        .bind(id)
+        .execute(pool)
+        .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!("no person {id}");
     }
@@ -1382,7 +1437,10 @@ pub async fn delete_person(pool: &Pool, id: &str) -> anyhow::Result<Value> {
 /// Delete a team and cascade: drop its own memberships (its members) and any memberships where it
 /// is a sub-team of another team.
 pub async fn delete_team(pool: &Pool, id: &str) -> anyhow::Result<Value> {
-    let res = sqlx::query("DELETE FROM teams WHERE id=?").bind(id).execute(pool).await?;
+    let res = sqlx::query("DELETE FROM teams WHERE id=?")
+        .bind(id)
+        .execute(pool)
+        .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!("no team {id}");
     }
@@ -1400,7 +1458,12 @@ pub async fn delete_team(pool: &Pool, id: &str) -> anyhow::Result<Value> {
 // Exercised by tests now; the bin consumer lands in Phase 2 (team addressing / blocked_on kind=team).
 #[allow(dead_code)]
 pub async fn resolve_principal_people(pool: &Pool, id: &str) -> anyhow::Result<BTreeSet<String>> {
-    if sqlx::query("SELECT 1 FROM teams WHERE id=?").bind(id).fetch_optional(pool).await?.is_some() {
+    if sqlx::query("SELECT 1 FROM teams WHERE id=?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
         resolve_team_people(pool, id).await
     } else {
         Ok(BTreeSet::from([id.to_string()]))
@@ -1694,7 +1757,11 @@ pub async fn update_task(
     let mut reparented = false;
     let mut reparent_to: Option<i64> = None;
     if let Some(new_parent) = parent_id {
-        let target: Option<i64> = if new_parent == 0 { None } else { Some(new_parent) };
+        let target: Option<i64> = if new_parent == 0 {
+            None
+        } else {
+            Some(new_parent)
+        };
         if target != old_parent_id {
             if let Some(np) = target {
                 if np == task_id {
@@ -1746,18 +1813,34 @@ pub async fn update_task(
     enum BlockedChange {
         Leave,
         Clear,
-        Set { kind: String, target: Option<String>, note: Option<String> },
+        Set {
+            kind: String,
+            target: Option<String>,
+            note: Option<String>,
+        },
     }
     let change = match &blocked_on {
         None => BlockedChange::Leave,
         Some(Value::Null) => BlockedChange::Clear,
         Some(Value::Object(o)) => {
-            let kind = o.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let kind = o
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let target = o
                 .get("target")
-                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string())))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| v.as_i64().map(|n| n.to_string()))
+                })
                 .filter(|s| !s.is_empty());
-            let note = o.get("note").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+            let note = o
+                .get("note")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             BlockedChange::Set { kind, target, note }
         }
         Some(_) => anyhow::bail!("give `blocked_on` as an object with a `kind`, or null to clear"),
@@ -1830,7 +1913,11 @@ pub async fn update_task(
             blocked_changed = true;
         }
     } else if let BlockedChange::Set { kind, target, note } = &change {
-        let stored_ref = if kind == "operator" || kind == "external" { None } else { target.clone() };
+        let stored_ref = if kind == "operator" || kind == "external" {
+            None
+        } else {
+            target.clone()
+        };
         sqlx::query(
             "UPDATE tasks SET blocked_on_kind=?, blocked_on_ref=?, blocked_on_note=?, updated_at=? WHERE id=?",
         )
@@ -1952,7 +2039,12 @@ pub async fn update_task(
         )
         .await?;
     }
-    if (has_fields || blocked_changed) && !status_changed && !reassigned && !unassigned && !reparented {
+    if (has_fields || blocked_changed)
+        && !status_changed
+        && !reassigned
+        && !unassigned
+        && !reparented
+    {
         emit(
             &mut tx,
             &mut hooks,
@@ -2028,12 +2120,11 @@ pub async fn move_task(
             "cannot move task {task_id} to another project while it has a parent — clear its parent (parent_id=0) first"
         );
     }
-    let child_count: i64 =
-        sqlx::query("SELECT COUNT(*) AS n FROM tasks WHERE parent_id=?")
-            .bind(task_id)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get("n")?;
+    let child_count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM tasks WHERE parent_id=?")
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("n")?;
     if child_count > 0 {
         anyhow::bail!(
             "cannot move task {task_id} to another project while it has {child_count} child task(s) — reparent them first"
@@ -2096,7 +2187,11 @@ pub async fn set_task_archived(
         .bind(task_id)
         .execute(&mut *tx)
         .await?;
-    let event_type = if archived { "task.archived" } else { "task.restored" };
+    let event_type = if archived {
+        "task.archived"
+    } else {
+        "task.restored"
+    };
     emit(
         &mut tx,
         &mut hooks,
@@ -2146,7 +2241,7 @@ pub async fn get_task_limited(
     let mut d = row_to_json(&t);
     if let Value::Object(ref mut m) = d {
         insert_ref(m, "task"); // typed canonical id (task 504)
-        // metadata: parse JSON string -> object
+                               // metadata: parse JSON string -> object
         let meta: Value = m
             .get("metadata")
             .and_then(|v| v.as_str())
@@ -2155,18 +2250,24 @@ pub async fn get_task_limited(
         // Surface metadata.monitor_exempt as a derived top-level bool (default false) so the nudge
         // daemon + the #506 holding-work watchdog can read it from a list/get scan (task from
         // board-pm; consumed by v-fleet-tooling). metadata stays the source of truth.
-        let monitor_exempt = meta.get("monitor_exempt").and_then(|v| v.as_bool()).unwrap_or(false);
+        let monitor_exempt = meta
+            .get("monitor_exempt")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         m.insert("metadata".into(), meta);
         m.insert("monitor_exempt".into(), Value::Bool(monitor_exempt));
 
         // Collapse the raw blocked_on_* columns into one nested object (null when not blocked).
-        let blocked_on = m.get("blocked_on_kind").and_then(|v| v.as_str()).map(|kind| {
-            json!({
-                "kind": kind,
-                "target": m.get("blocked_on_ref").cloned().unwrap_or(Value::Null),
-                "note": m.get("blocked_on_note").cloned().unwrap_or(Value::Null),
-            })
-        });
+        let blocked_on = m
+            .get("blocked_on_kind")
+            .and_then(|v| v.as_str())
+            .map(|kind| {
+                json!({
+                    "kind": kind,
+                    "target": m.get("blocked_on_ref").cloned().unwrap_or(Value::Null),
+                    "note": m.get("blocked_on_note").cloned().unwrap_or(Value::Null),
+                })
+            });
         m.remove("blocked_on_kind");
         m.remove("blocked_on_ref");
         m.remove("blocked_on_note");
@@ -2174,10 +2275,11 @@ pub async fn get_task_limited(
 
         // Comments, bounded by `comments_limit` (#511). Always report the total so a caller knows
         // whether there is more than what was inlined.
-        let comment_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comments WHERE task_id=?")
-            .bind(task_id)
-            .fetch_one(pool)
-            .await?;
+        let comment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM comments WHERE task_id=?")
+                .bind(task_id)
+                .fetch_one(pool)
+                .await?;
         let comments: Vec<Value> = match comments_limit {
             // Metadata-only: inline no comments.
             Some(0) => Vec::new(),
@@ -2241,19 +2343,33 @@ pub async fn get_task_limited(
         );
 
         // Epic nesting: children (id/title/status), a done/total roll-up, and the parent title.
-        let children = sqlx::query(
-            "SELECT id, title, status FROM tasks WHERE parent_id=? ORDER BY id",
-        )
-        .bind(task_id)
-        .fetch_all(pool)
-        .await?;
+        let children =
+            sqlx::query("SELECT id, title, status FROM tasks WHERE parent_id=? ORDER BY id")
+                .bind(task_id)
+                .fetch_all(pool)
+                .await?;
         let total = children.len() as i64;
         let done = children
             .iter()
-            .filter(|r| r.try_get::<String, _>("status").map(|s| s == "done").unwrap_or(false))
+            .filter(|r| {
+                r.try_get::<String, _>("status")
+                    .map(|s| s == "done")
+                    .unwrap_or(false)
+            })
             .count() as i64;
-        m.insert("children".into(), Value::Array(children.iter().map(|r| row_to_json_ref(r, "task")).collect()));
-        m.insert("child_rollup".into(), json!({ "done": done, "total": total }));
+        m.insert(
+            "children".into(),
+            Value::Array(
+                children
+                    .iter()
+                    .map(|r| row_to_json_ref(r, "task"))
+                    .collect(),
+            ),
+        );
+        m.insert(
+            "child_rollup".into(),
+            json!({ "done": done, "total": total }),
+        );
 
         let parent_id = m.get("parent_id").and_then(|v| v.as_i64());
         let parent_title = if let Some(pid) = parent_id {
@@ -2402,12 +2518,18 @@ pub async fn list_tasks(
 async fn annotate_assignee_reachability(pool: &Pool, tasks: &mut [Value]) -> anyhow::Result<()> {
     let assignees: std::collections::BTreeSet<String> = tasks
         .iter()
-        .filter_map(|t| t.get("assignee").and_then(|a| a.as_str()).map(str::to_string))
+        .filter_map(|t| {
+            t.get("assignee")
+                .and_then(|a| a.as_str())
+                .map(str::to_string)
+        })
         .collect();
     if assignees.is_empty() {
         return Ok(());
     }
-    let placeholders = std::iter::repeat_n("?", assignees.len()).collect::<Vec<_>>().join(",");
+    let placeholders = std::iter::repeat_n("?", assignees.len())
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!("SELECT id, status, last_seen FROM agents WHERE id IN ({placeholders})");
     let mut q = sqlx::query(&sql);
     for a in &assignees {
@@ -2427,7 +2549,10 @@ async fn annotate_assignee_reachability(pool: &Pool, tasks: &mut [Value]) -> any
                 .and_then(|a| map.get(a))
                 .cloned()
                 .unwrap_or((None, None));
-            m.insert("assignee_status".into(), status.map(Value::String).unwrap_or(Value::Null));
+            m.insert(
+                "assignee_status".into(),
+                status.map(Value::String).unwrap_or(Value::Null),
+            );
             m.insert(
                 "assignee_last_seen".into(),
                 last_seen.map(Value::String).unwrap_or(Value::Null),
@@ -2564,7 +2689,16 @@ pub async fn comment_task(
         }
     }
     // If this task mirrors a promoted channel thread, fan the comment back out as a thread reply.
-    mirror_task_comment_to_thread(&mut tx, &mut hooks, task_id, cid, author, body, external_author).await?;
+    mirror_task_comment_to_thread(
+        &mut tx,
+        &mut hooks,
+        task_id,
+        cid,
+        author,
+        body,
+        external_author,
+    )
+    .await?;
     // Record the external dedup link (board_kind='comment', board_id=comment id) atomically with
     // the insert (task 270), so a retrying adapter re-hits the short-circuit above instead of
     // duplicating the comment.
@@ -2674,7 +2808,9 @@ pub async fn subscribe_classed(
     .bind(now_iso())
     .execute(pool)
     .await?;
-    Ok(json!({ "subscriber": subscriber, "target_type": tt, "target_id": tid, "event_classes": event_classes }))
+    Ok(
+        json!({ "subscriber": subscriber, "target_type": tt, "target_id": tid, "event_classes": event_classes }),
+    )
 }
 
 /// Subscribe an agent to a channel THREAD (#438). The thread root is a channel post's event seq;
@@ -2682,7 +2818,11 @@ pub async fn subscribe_classed(
 /// so a reactive agent that joined a thread answers later follow-ups without a re-mention. The root
 /// seq is globally unique, so it alone keys the subscription. Idempotent (INSERT OR IGNORE) so a
 /// bridge daemon can safely re-register the same root each tick.
-pub async fn subscribe_thread(pool: &Pool, subscriber: &str, thread_root: i64) -> anyhow::Result<Value> {
+pub async fn subscribe_thread(
+    pool: &Pool,
+    subscriber: &str,
+    thread_root: i64,
+) -> anyhow::Result<Value> {
     sqlx::query(
         "INSERT OR IGNORE INTO subscriptions(subscriber, target_type, target_id, created_at) \
          VALUES(?,'thread',?,?)",
@@ -2697,7 +2837,11 @@ pub async fn subscribe_thread(pool: &Pool, subscriber: &str, thread_root: i64) -
 
 /// Unsubscribe an agent from a channel thread (#438). Used when a bridge evicts a cold thread from
 /// its active set, so a stale thread stops waking the agent.
-pub async fn unsubscribe_thread(pool: &Pool, subscriber: &str, thread_root: i64) -> anyhow::Result<Value> {
+pub async fn unsubscribe_thread(
+    pool: &Pool,
+    subscriber: &str,
+    thread_root: i64,
+) -> anyhow::Result<Value> {
     let n = sqlx::query(
         "DELETE FROM subscriptions WHERE subscriber=? AND target_type='thread' AND target_id=?",
     )
@@ -2831,18 +2975,19 @@ pub async fn create_channel(
 
     // Get-or-create by case-insensitive name among non-DM channels (dm_key IS NULL), so
     // opening "#general" twice returns the same channel rather than a duplicate.
-    if let Some(row) = sqlx::query(
-        "SELECT id FROM channels WHERE dm_key IS NULL AND name = ? COLLATE NOCASE",
-    )
-    .bind(name)
-    .fetch_optional(&mut *tx)
-    .await?
+    if let Some(row) =
+        sqlx::query("SELECT id FROM channels WHERE dm_key IS NULL AND name = ? COLLATE NOCASE")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?
     {
         let existing_id: i64 = row.try_get("id")?;
         if let Some(sub) = created_by {
             join_channel(&mut tx, existing_id, sub).await?;
         }
-        let out = channel_row_json(&mut tx, existing_id).await?.unwrap_or(Value::Null);
+        let out = channel_row_json(&mut tx, existing_id)
+            .await?
+            .unwrap_or(Value::Null);
         tx.commit().await?;
         return Ok(out);
     }
@@ -2974,7 +3119,9 @@ pub async fn list_channels(pool: &Pool, member: Option<&str>) -> anyhow::Result<
 /// Fetch one channel with its member list.
 pub async fn get_channel(pool: &Pool, channel_id: i64) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
-    let out = channel_row_json(&mut tx, channel_id).await?.unwrap_or(Value::Null);
+    let out = channel_row_json(&mut tx, channel_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     Ok(out)
 }
@@ -3006,7 +3153,11 @@ pub async fn post_to_channel_meta(
         anyhow::bail!("no channel {channel_id}");
     };
     let is_dm: Option<String> = ch.try_get("dm_key")?;
-    let evtype = if is_dm.is_some() { "message.direct" } else { "channel.post" };
+    let evtype = if is_dm.is_some() {
+        "message.direct"
+    } else {
+        "channel.post"
+    };
     let ch_meta: Value = ch
         .try_get::<Option<String>, _>("metadata")?
         .as_deref()
@@ -3105,8 +3256,17 @@ pub async fn post_to_channel_meta(
 
     // If this post replies to a promoted thread's root, mirror it into the linked task as a
     // comment (live thread->task sync, #151 slice 2). Direct insert -> no echo back to the thread.
-    mirror_thread_reply_to_task(&mut tx, &mut hooks, channel_id, seq, reply_to, sender, body, external_author)
-        .await?;
+    mirror_thread_reply_to_task(
+        &mut tx,
+        &mut hooks,
+        channel_id,
+        seq,
+        reply_to,
+        sender,
+        body,
+        external_author,
+    )
+    .await?;
 
     sqlx::query("UPDATE channels SET updated_at=? WHERE id=?")
         .bind(now_iso())
@@ -3128,7 +3288,16 @@ pub async fn post_to_channel(
     reply_to: Option<i64>,
     external_author: Option<&str>,
 ) -> anyhow::Result<Value> {
-    post_to_channel_meta(pool, channel_id, sender, body, reply_to, external_author, None).await
+    post_to_channel_meta(
+        pool,
+        channel_id,
+        sender,
+        body,
+        reply_to,
+        external_author,
+        None,
+    )
+    .await
 }
 
 /// Outbound reflect-back policy (design #141 §5), read from a policy-bearing `metadata` bag —
@@ -3139,7 +3308,10 @@ pub async fn post_to_channel(
 /// allowlist. The safe default is board-internal: an unconfigured entity (direction defaults to
 /// "in") reflects nothing, so existing channels/links never start leaking to an external system.
 fn reflects_out(metadata: &Value, author: &str) -> bool {
-    let direction = metadata.get("direction").and_then(|v| v.as_str()).unwrap_or("in");
+    let direction = metadata
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("in");
     if direction != "out" && direction != "both" {
         return false;
     }
@@ -3153,7 +3325,11 @@ fn reflects_out(metadata: &Value, author: &str) -> bool {
 /// Merge arbitrary key/value properties into a channel's metadata (JSON), returning the merged
 /// bag — mirrors `set_task_props`. This is how a channel's outbound reflect-back policy
 /// (`outbound_authors` / `direction`, see `channel_reflects_out`) is configured after creation.
-pub async fn set_channel_props(pool: &Pool, channel_id: i64, props: Value) -> anyhow::Result<Value> {
+pub async fn set_channel_props(
+    pool: &Pool,
+    channel_id: i64,
+    props: Value,
+) -> anyhow::Result<Value> {
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let row = sqlx::query("SELECT metadata FROM channels WHERE id=?")
@@ -3212,7 +3388,9 @@ pub async fn set_channel_auto_join(
         .await?;
     if auto_join {
         // Backfill every registered agent as a member (idempotent).
-        let agents = sqlx::query("SELECT id FROM agents").fetch_all(&mut *tx).await?;
+        let agents = sqlx::query("SELECT id FROM agents")
+            .fetch_all(&mut *tx)
+            .await?;
         for a in &agents {
             let id: String = a.try_get("id")?;
             join_channel(&mut tx, channel_id, &id).await?;
@@ -3232,7 +3410,9 @@ pub async fn set_channel_auto_join(
         Recipients::Explicit(BTreeSet::new()),
     )
     .await?;
-    let out = channel_row_json(&mut tx, channel_id).await?.unwrap_or(Value::Null);
+    let out = channel_row_json(&mut tx, channel_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -3241,7 +3421,11 @@ pub async fn set_channel_auto_join(
 /// Derive a task title from a thread's root body: its first non-empty line, trimmed and
 /// truncated, with a fallback when the body is empty.
 fn thread_title(body: &str, channel_id: i64) -> String {
-    let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let first = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     if first.is_empty() {
         return format!("Thread from channel {channel_id}");
     }
@@ -3276,11 +3460,12 @@ pub async fn promote_thread(
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
 
     // Idempotent: a thread maps to exactly one task. Re-promoting returns the existing task.
-    if let Some(row) = sqlx::query("SELECT task_id FROM task_links WHERE source_kind=? AND source_id=?")
-        .bind(source_kind)
-        .bind(&source_id)
-        .fetch_optional(&mut *tx)
-        .await?
+    if let Some(row) =
+        sqlx::query("SELECT task_id FROM task_links WHERE source_kind=? AND source_id=?")
+            .bind(source_kind)
+            .bind(&source_id)
+            .fetch_optional(&mut *tx)
+            .await?
     {
         let tid: i64 = row.try_get("task_id")?;
         tx.commit().await?;
@@ -3310,11 +3495,15 @@ pub async fn promote_thread(
     .fetch_all(&mut *tx)
     .await?;
     let parse = |s: Option<String>| -> Value {
-        s.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| json!({}))
+        s.as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}))
     };
 
     // The root post must exist in this channel.
-    let Some(root) = posts.iter().find(|r| r.try_get::<i64, _>("seq").ok() == Some(root_post_seq))
+    let Some(root) = posts
+        .iter()
+        .find(|r| r.try_get::<i64, _>("seq").ok() == Some(root_post_seq))
     else {
         anyhow::bail!("no post {root_post_seq} in channel {channel_id}");
     };
@@ -3437,7 +3626,9 @@ async fn mirror_thread_reply_to_task(
     body: &str,
     external_author: Option<&str>,
 ) -> anyhow::Result<()> {
-    let Some(root_seq) = reply_to else { return Ok(()) };
+    let Some(root_seq) = reply_to else {
+        return Ok(());
+    };
     let source_id = format!("channel:{channel_id}:{root_seq}");
     let task_id: Option<i64> = sqlx::query(
         "SELECT task_id FROM task_links WHERE source_kind='channel_thread' AND source_id=?",
@@ -3447,7 +3638,9 @@ async fn mirror_thread_reply_to_task(
     .await?
     .map(|r| r.try_get("task_id"))
     .transpose()?;
-    let Some(task_id) = task_id else { return Ok(()) };
+    let Some(task_id) = task_id else {
+        return Ok(());
+    };
     let origin = post_seq.to_string();
     if sqlx::query("SELECT 1 FROM comments WHERE task_id=? AND origin_ref=?")
         .bind(task_id)
@@ -3476,8 +3669,19 @@ async fn mirror_thread_reply_to_task(
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
     }
-    emit(tx, hooks, "task.commented", Some(from), Some(task_id), None, None, None, data, Recipients::FromTask)
-        .await?;
+    emit(
+        tx,
+        hooks,
+        "task.commented",
+        Some(from),
+        Some(task_id),
+        None,
+        None,
+        None,
+        data,
+        Recipients::FromTask,
+    )
+    .await?;
     Ok(())
 }
 
@@ -3506,17 +3710,30 @@ async fn mirror_task_comment_to_thread(
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_else(|| json!({}));
-    let (Some(channel_id), Some(root_seq)) = (meta["channel_id"].as_i64(), meta["root_post_seq"].as_i64())
+    let (Some(channel_id), Some(root_seq)) =
+        (meta["channel_id"].as_i64(), meta["root_post_seq"].as_i64())
     else {
         return Ok(());
     };
     let from = author.unwrap_or("anon");
-    let mut data = json!({ "body": body, "from": from, "reply_to": root_seq, "origin_comment": comment_id });
+    let mut data =
+        json!({ "body": body, "from": from, "reply_to": root_seq, "origin_comment": comment_id });
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
     }
-    emit(tx, hooks, "channel.post", Some(from), None, None, Some(channel_id), None, data, Recipients::FromChannelThread(channel_id, Some(root_seq)))
-        .await?;
+    emit(
+        tx,
+        hooks,
+        "channel.post",
+        Some(from),
+        None,
+        None,
+        Some(channel_id),
+        None,
+        data,
+        Recipients::FromChannelThread(channel_id, Some(root_seq)),
+    )
+    .await?;
     sqlx::query("UPDATE channels SET updated_at=? WHERE id=?")
         .bind(now_iso())
         .bind(channel_id)
@@ -3548,7 +3765,11 @@ pub async fn get_channel_posts(
     // `seq>since_seq` (lower bound) and `seq<before_seq` (optional upper bound) compose with either
     // order.
     let order = if desc { "DESC" } else { "ASC" };
-    let before_clause = if before_seq.is_some() { "AND seq<?" } else { "" };
+    let before_clause = if before_seq.is_some() {
+        "AND seq<?"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT seq, type, actor, channel_id, data, created_at FROM events \
          WHERE channel_id=? AND seq>? {before_clause} AND type IN ('channel.post','message.direct') \
@@ -3614,7 +3835,9 @@ pub async fn invite_to_channel(
         Recipients::Explicit(recips),
     )
     .await?;
-    let out = channel_row_json(&mut tx, channel_id).await?.unwrap_or(Value::Null);
+    let out = channel_row_json(&mut tx, channel_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -3623,11 +3846,7 @@ pub async fn invite_to_channel(
 /// Get-or-create the private 1:1 DM channel for an unordered pair of agents. The pair is
 /// keyed by `dm_key` (both ids sorted, NUL-joined) so A→B and B→A resolve to one channel.
 /// Both agents are auto-joined. This is what lets DMs reuse the channel data model.
-async fn dm_channel(
-    tx: &mut Transaction<'_, Sqlite>,
-    a: &str,
-    b: &str,
-) -> anyhow::Result<i64> {
+async fn dm_channel(tx: &mut Transaction<'_, Sqlite>, a: &str, b: &str) -> anyhow::Result<i64> {
     let mut pair = [a, b];
     pair.sort_unstable();
     let dm_key = format!("{}\u{0}{}", pair[0], pair[1]);
@@ -3839,7 +4058,9 @@ pub async fn upsert_external_identity(
 ) -> anyhow::Result<Value> {
     let id = id.trim();
     if id.is_empty() {
-        anyhow::bail!("give an `id` for the external identity (namespaced source:handle, e.g. slack:U123)");
+        anyhow::bail!(
+            "give an `id` for the external identity (namespaced source:handle, e.g. slack:U123)"
+        );
     }
     if source.trim().is_empty() {
         anyhow::bail!("give a `source` for the external identity (e.g. slack, github)");
@@ -3847,11 +4068,12 @@ pub async fn upsert_external_identity(
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     // Merge metadata into any existing bag (mirrors register_agent / update_project).
-    let existing: Option<String> = sqlx::query("SELECT metadata FROM external_identities WHERE id=?")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .and_then(|r| r.try_get::<Option<String>, _>("metadata").ok().flatten());
+    let existing: Option<String> =
+        sqlx::query("SELECT metadata FROM external_identities WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .and_then(|r| r.try_get::<Option<String>, _>("metadata").ok().flatten());
     let mut meta: Map<String, Value> = existing
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -3908,7 +4130,9 @@ pub async fn list_external_identities(pool: &Pool, source: Option<&str>) -> anyh
                 .await?
         }
     };
-    Ok(Value::Array(rows.iter().map(hydrate_external_identity).collect()))
+    Ok(Value::Array(
+        rows.iter().map(hydrate_external_identity).collect(),
+    ))
 }
 
 /// Row -> JSON with the `metadata` TEXT column parsed into an object (like other hydrators).
@@ -3966,11 +4190,19 @@ pub async fn set_workspace_kind(
     // Keep the stored script/description/creator/created_at when this call omits them.
     let final_script = setup_script
         .map(str::to_string)
-        .or_else(|| existing.as_ref().and_then(|r| r.try_get::<Option<String>, _>("setup_script").ok().flatten()))
+        .or_else(|| {
+            existing.as_ref().and_then(|r| {
+                r.try_get::<Option<String>, _>("setup_script")
+                    .ok()
+                    .flatten()
+            })
+        })
         .unwrap_or_default();
-    let final_desc = description
-        .map(str::to_string)
-        .or_else(|| existing.as_ref().and_then(|r| r.try_get::<Option<String>, _>("description").ok().flatten()));
+    let final_desc = description.map(str::to_string).or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|r| r.try_get::<Option<String>, _>("description").ok().flatten())
+    });
     let final_creator = existing
         .as_ref()
         .and_then(|r| r.try_get::<Option<String>, _>("created_by").ok().flatten())
@@ -4017,7 +4249,9 @@ pub async fn list_workspace_kinds(pool: &Pool) -> anyhow::Result<Value> {
     let rows = sqlx::query("SELECT * FROM workspace_kinds ORDER BY name")
         .fetch_all(pool)
         .await?;
-    Ok(Value::Array(rows.iter().map(hydrate_workspace_kind).collect()))
+    Ok(Value::Array(
+        rows.iter().map(hydrate_workspace_kind).collect(),
+    ))
 }
 
 /// Retire a workspace kind. Returns `{name, deleted}` (deleted=false if it didn't exist).
@@ -4239,13 +4473,15 @@ pub async fn check_cid_content(
     if !is_text_content_type(content_type) {
         return Ok(());
     }
-    let bytes = crate::ipfs::cat(url, cid, DOCUMENT_READ_CAP_BYTES).await.map_err(|e| {
-        anyhow::anyhow!(
+    let bytes = crate::ipfs::cat(url, cid, DOCUMENT_READ_CAP_BYTES)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
             "could not fetch CID {cid} to content-scan it before publishing ({e}); ensure it is \
              pinned/reachable on the board's IPFS, or pass acknowledge_banned=true to publish \
              without the content scan"
         )
-    })?;
+        })?;
     if let Ok(text) = String::from_utf8(bytes) {
         check_content(pool, &text, acknowledge).await?;
     }
@@ -4313,29 +4549,45 @@ pub async fn upsert_external_link(
     // A clean 404 for the kinds backed by a real table (thread = a channel post seq, skipped).
     match board_kind {
         "channel" => {
-            if sqlx::query("SELECT 1 FROM channels WHERE id=?").bind(board_id).fetch_optional(&mut *tx).await?.is_none() {
+            if sqlx::query("SELECT 1 FROM channels WHERE id=?")
+                .bind(board_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_none()
+            {
                 anyhow::bail!("no channel {board_id}");
             }
         }
         "task" => {
-            if sqlx::query("SELECT 1 FROM tasks WHERE id=?").bind(board_id).fetch_optional(&mut *tx).await?.is_none() {
+            if sqlx::query("SELECT 1 FROM tasks WHERE id=?")
+                .bind(board_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_none()
+            {
                 anyhow::bail!("no task {board_id}");
             }
         }
         "comment" => {
-            if sqlx::query("SELECT 1 FROM comments WHERE id=?").bind(board_id).fetch_optional(&mut *tx).await?.is_none() {
+            if sqlx::query("SELECT 1 FROM comments WHERE id=?")
+                .bind(board_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_none()
+            {
                 anyhow::bail!("no comment {board_id}");
             }
         }
         _ => {}
     }
     // Merge metadata into any existing bag (mirrors the other upserts).
-    let existing: Option<String> = sqlx::query("SELECT metadata FROM external_links WHERE source=? AND external_id=?")
-        .bind(source)
-        .bind(external_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .and_then(|r| r.try_get::<Option<String>, _>("metadata").ok().flatten());
+    let existing: Option<String> =
+        sqlx::query("SELECT metadata FROM external_links WHERE source=? AND external_id=?")
+            .bind(source)
+            .bind(external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .and_then(|r| r.try_get::<Option<String>, _>("metadata").ok().flatten());
     let mut meta: Map<String, Value> = existing
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -4405,7 +4657,9 @@ pub async fn list_external_links(
         q = q.bind(id);
     }
     let rows = q.fetch_all(pool).await?;
-    Ok(Value::Array(rows.iter().map(hydrate_external_link).collect()))
+    Ok(Value::Array(
+        rows.iter().map(hydrate_external_link).collect(),
+    ))
 }
 
 /// Row -> JSON with `metadata` parsed into an object.
@@ -4588,7 +4842,10 @@ fn extract_wiki_edges(content: &str) -> Vec<WikiEdge> {
                     None => (left, None),
                 };
                 let (raw_path, version_no) = match left.split_once('@') {
-                    Some((p, v)) => (p, v.trim().trim_start_matches(['v', 'V']).parse::<i64>().ok()),
+                    Some((p, v)) => (
+                        p,
+                        v.trim().trim_start_matches(['v', 'V']).parse::<i64>().ok(),
+                    ),
                     None => (left, None),
                 };
                 let path = normalize_wiki_path(raw_path);
@@ -4600,7 +4857,11 @@ fn extract_wiki_edges(content: &str) -> Vec<WikiEdge> {
                         kind,
                         // A pin/region only makes sense for an embed; ignore them on a link.
                         version_no: if is_embed { version_no } else { None },
-                        region: if is_embed { region.filter(|r| !r.is_empty()) } else { None },
+                        region: if is_embed {
+                            region.filter(|r| !r.is_empty())
+                        } else {
+                            None
+                        },
                     });
                 }
                 i += 2 + close + 2;
@@ -4681,17 +4942,15 @@ async fn document_json(
     tx: &mut Transaction<'_, Sqlite>,
     document_id: i64,
 ) -> anyhow::Result<Option<Value>> {
-    let Some(mut d) =
-        fetch_one_json(tx, "SELECT * FROM documents WHERE id=?", document_id).await?
+    let Some(mut d) = fetch_one_json(tx, "SELECT * FROM documents WHERE id=?", document_id).await?
     else {
         return Ok(None);
     };
-    let vrows = sqlx::query(
-        "SELECT * FROM document_versions WHERE document_id=? ORDER BY version_no DESC",
-    )
-    .bind(document_id)
-    .fetch_all(&mut **tx)
-    .await?;
+    let vrows =
+        sqlx::query("SELECT * FROM document_versions WHERE document_id=? ORDER BY version_no DESC")
+            .bind(document_id)
+            .fetch_all(&mut **tx)
+            .await?;
     let versions: Vec<Value> = vrows.iter().map(row_to_json).collect();
     if let Value::Object(ref mut m) = d {
         insert_ref(m, "doc"); // typed canonical id (task 504)
@@ -4702,8 +4961,12 @@ async fn document_json(
             .unwrap_or_else(|| json!({}));
         m.insert("metadata".into(), meta);
         let cur_id = m.get("current_version_id").and_then(|v| v.as_i64());
-        let current =
-            cur_id.and_then(|cid| versions.iter().find(|v| v["id"].as_i64() == Some(cid)).cloned());
+        let current = cur_id.and_then(|cid| {
+            versions
+                .iter()
+                .find(|v| v["id"].as_i64() == Some(cid))
+                .cloned()
+        });
         m.insert("current_version".into(), current.unwrap_or(Value::Null));
         m.insert("versions".into(), Value::Array(versions));
 
@@ -4716,7 +4979,10 @@ async fn document_json(
         .bind(document_id)
         .fetch_all(&mut **tx)
         .await?;
-        m.insert("attached_tasks".into(), Value::Array(tasks.iter().map(|r| row_to_json_ref(r, "task")).collect()));
+        m.insert(
+            "attached_tasks".into(),
+            Value::Array(tasks.iter().map(|r| row_to_json_ref(r, "task")).collect()),
+        );
 
         // Outbound wiki links ([[target]] this doc points at, kind='link'), each resolved to the
         // document currently filed at that path (target_* are null when the link dangles).
@@ -4729,7 +4995,10 @@ async fn document_json(
         .bind(document_id)
         .fetch_all(&mut **tx)
         .await?;
-        m.insert("outbound_links".into(), Value::Array(out_links.iter().map(row_to_json).collect()));
+        m.insert(
+            "outbound_links".into(),
+            Value::Array(out_links.iter().map(row_to_json).collect()),
+        );
 
         // Outbound embeds (![[target]] this doc transcludes) from the document_embeds table.
         // Carries the pinned target_version_id (null = floats to the target's current version)
@@ -4743,7 +5012,10 @@ async fn document_json(
         .bind(document_id)
         .fetch_all(&mut **tx)
         .await?;
-        m.insert("embeds".into(), Value::Array(embeds.iter().map(row_to_json).collect()));
+        m.insert(
+            "embeds".into(),
+            Value::Array(embeds.iter().map(row_to_json).collect()),
+        );
 
         // Incoming edges to THIS doc's path: backlinks (docs that LINK here) and embedded_by
         // (docs that EMBED here -- the "what depends on me before I change it" payoff). Both
@@ -4945,7 +5217,9 @@ pub async fn publish_version(
         Recipients::FromDocument(document_id),
     )
     .await?;
-    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    let out = document_json(&mut tx, document_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -4980,7 +5254,10 @@ pub async fn get_document_with_body(
         match read_document_content(pool, ipfs_api_url, document_id, None).await {
             Ok(content) => {
                 if let Value::Object(ref mut m) = v {
-                    m.insert("body".into(), content.get("content").cloned().unwrap_or(Value::Null));
+                    m.insert(
+                        "body".into(),
+                        content.get("content").cloned().unwrap_or(Value::Null),
+                    );
                     if let Some(ct) = content.get("content_type") {
                         m.insert("body_content_type".into(), ct.clone());
                     }
@@ -5047,7 +5324,9 @@ pub async fn update_document(
         Recipients::FromDocument(document_id),
     )
     .await?;
-    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    let out = document_json(&mut tx, document_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -5059,7 +5338,12 @@ pub const DOCUMENT_READ_CAP_BYTES: usize = 25 * 1024 * 1024;
 /// Whether a content_type is text-shaped, i.e. safe to return as a UTF-8 string from the read
 /// path. Binary types (image/pdf/...) are not inlined; the caller fetches their bytes by CID.
 pub fn is_text_content_type(ct: &str) -> bool {
-    let t = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let t = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     t.is_empty()
         || t.starts_with("text/")
         || t == "application/json"
@@ -5134,8 +5418,9 @@ pub async fn read_document_content(
     });
     if is_text_content_type(&ct) {
         let bytes = crate::ipfs::cat(url, &cid, DOCUMENT_READ_CAP_BYTES).await?;
-        let text = String::from_utf8(bytes)
-            .map_err(|_| anyhow::anyhow!("document {document_id} v{vn} content is not valid UTF-8"))?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!("document {document_id} v{vn} content is not valid UTF-8")
+        })?;
         out["content"] = json!(text);
     } else {
         out["content"] = Value::Null;
@@ -5148,12 +5433,11 @@ pub async fn read_document_content(
 
 /// List a document's versions (immutable), newest first.
 pub async fn get_document_versions(pool: &Pool, document_id: i64) -> anyhow::Result<Value> {
-    let rows = sqlx::query(
-        "SELECT * FROM document_versions WHERE document_id=? ORDER BY version_no DESC",
-    )
-    .bind(document_id)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT * FROM document_versions WHERE document_id=? ORDER BY version_no DESC")
+            .bind(document_id)
+            .fetch_all(pool)
+            .await?;
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
@@ -5218,7 +5502,9 @@ pub async fn list_documents(
         query = query.bind(tg);
     }
     let rows = query.fetch_all(pool).await?;
-    Ok(Value::Array(rows.iter().map(|r| row_to_json_ref(r, "doc")).collect()))
+    Ok(Value::Array(
+        rows.iter().map(|r| row_to_json_ref(r, "doc")).collect(),
+    ))
 }
 
 // --- Wiki: hierarchical paths over documents (#105) ---
@@ -5234,7 +5520,11 @@ pub async fn set_document_path(
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
     let trimmed = path.trim().trim_matches('/');
-    let new_path: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+    let new_path: Option<&str> = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let Some(doc) = sqlx::query("SELECT project_id FROM documents WHERE id=?")
@@ -5277,7 +5567,9 @@ pub async fn set_document_path(
         Recipients::FromDocument(document_id),
     )
     .await?;
-    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    let out = document_json(&mut tx, document_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -5292,10 +5584,17 @@ pub async fn list_wiki(
     include_archived: bool,
 ) -> anyhow::Result<Value> {
     // Archived docs are hidden from the tree by default (reversible; the doc still resolves by id).
-    let arch = if include_archived { "" } else { " AND archived_at IS NULL" };
+    let arch = if include_archived {
+        ""
+    } else {
+        " AND archived_at IS NULL"
+    };
     let cols = "id, title, slug, path, project_id, status, current_version_id, \
                 approved_version_id, created_by, updated_at, archived_at";
-    let rows = match prefix.map(|p| p.trim().trim_matches('/')).filter(|p| !p.is_empty()) {
+    let rows = match prefix
+        .map(|p| p.trim().trim_matches('/'))
+        .filter(|p| !p.is_empty())
+    {
         Some(p) => {
             sqlx::query(&format!(
                 "SELECT {cols} FROM documents \
@@ -5406,19 +5705,23 @@ pub async fn comment_document(
          FROM document_comments dc LEFT JOIN external_identities ei ON ei.id = dc.external_author \
          WHERE dc.id=?",
     )
-        .bind(cid)
-        .fetch_optional(&mut *tx)
-        .await?
-        .as_ref()
-        .map(document_comment_json)
-        .unwrap_or(Value::Null);
+    .bind(cid)
+    .fetch_optional(&mut *tx)
+    .await?
+    .as_ref()
+    .map(document_comment_json)
+    .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
 }
 
 /// Mark a comment resolved and emit `document.comment_resolved` (FromDocument).
-pub async fn resolve_comment(pool: &Pool, comment_id: i64, actor: Option<&str>) -> anyhow::Result<Value> {
+pub async fn resolve_comment(
+    pool: &Pool,
+    comment_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let Some(row) = sqlx::query("SELECT document_id FROM document_comments WHERE id=?")
@@ -5451,12 +5754,12 @@ pub async fn resolve_comment(pool: &Pool, comment_id: i64, actor: Option<&str>) 
          FROM document_comments dc LEFT JOIN external_identities ei ON ei.id = dc.external_author \
          WHERE dc.id=?",
     )
-        .bind(comment_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .as_ref()
-        .map(document_comment_json)
-        .unwrap_or(Value::Null);
+    .bind(comment_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .as_ref()
+    .map(document_comment_json)
+    .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -5489,7 +5792,9 @@ pub async fn get_document_comments(
         query = query.bind(s);
     }
     let rows = query.fetch_all(pool).await?;
-    Ok(Value::Array(rows.iter().map(document_comment_json).collect()))
+    Ok(Value::Array(
+        rows.iter().map(document_comment_json).collect(),
+    ))
 }
 
 /// Shared driver for a document status transition: set the status (optionally stamping the
@@ -5564,7 +5869,9 @@ async fn document_transition(
         Recipients::FromDocument(document_id),
     )
     .await?;
-    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    let out = document_json(&mut tx, document_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -5658,7 +5965,11 @@ pub async fn set_document_archived(
         .bind(document_id)
         .execute(&mut *tx)
         .await?;
-    let event_type = if archived { "document.archived" } else { "document.restored" };
+    let event_type = if archived {
+        "document.archived"
+    } else {
+        "document.restored"
+    };
     emit(
         &mut tx,
         &mut hooks,
@@ -5672,7 +5983,9 @@ pub async fn set_document_archived(
         Recipients::FromDocument(document_id),
     )
     .await?;
-    let out = document_json(&mut tx, document_id).await?.unwrap_or(Value::Null);
+    let out = document_json(&mut tx, document_id)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -5923,7 +6236,10 @@ pub async fn create_secret_request(
         .await?;
     let mut out = secret_request_meta(&row);
     if let Value::Object(ref mut m) = out {
-        m.insert("submit_url".into(), json!(format!("/secret-requests/{id}?t={submit_token}")));
+        m.insert(
+            "submit_url".into(),
+            json!(format!("/secret-requests/{id}?t={submit_token}")),
+        );
         m.insert("submit_token".into(), json!(submit_token));
         m.insert("fulfiller_token".into(), json!(fulfiller_token));
     }
@@ -5970,11 +6286,15 @@ pub async fn submit_secret(
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
-    let row = sqlx::query("SELECT submit_token, submit_used, status, name, fulfiller FROM secret_requests WHERE id=?")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let Some(row) = row else { anyhow::bail!("no secret request {id}") };
+    let row = sqlx::query(
+        "SELECT submit_token, submit_used, status, name, fulfiller FROM secret_requests WHERE id=?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        anyhow::bail!("no secret request {id}")
+    };
     let stored_token: String = row.try_get("submit_token")?;
     let submit_used: i64 = row.try_get("submit_used")?;
     let status: String = row.try_get("status")?;
@@ -6039,7 +6359,9 @@ pub async fn get_secret_ciphertext(pool: &Pool, id: i64, token: &str) -> anyhow:
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    let Some(row) = row else { anyhow::bail!("no secret request {id}") };
+    let Some(row) = row else {
+        anyhow::bail!("no secret request {id}")
+    };
     let stored_token: String = row.try_get("fulfiller_token")?;
     if token != stored_token {
         anyhow::bail!("invalid fulfiller token");
@@ -6063,10 +6385,12 @@ pub async fn get_secret_ciphertext(pool: &Pool, id: i64, token: &str) -> anyhow:
 pub async fn fulfill_secret(pool: &Pool, id: i64, token: &str) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
-    let row = sqlx::query("SELECT fulfiller_token, name, fulfiller, requested_by FROM secret_requests WHERE id=?")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let row = sqlx::query(
+        "SELECT fulfiller_token, name, fulfiller, requested_by FROM secret_requests WHERE id=?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(row) = row else {
         // Already gone — idempotent success (a retried fulfill after the row was deleted).
         tx.commit().await?;
@@ -6161,8 +6485,13 @@ pub async fn cancel_secret_request(
 /// a KNOWN A2 state rather than forbidding transitions between them. Deliberately permissive: the
 /// github-bridge adapter maps whatever an upstream PR does onto set_review_status, and the board
 /// must not reject a legitimate upstream transition. A same-status set is an idempotent no-op.
-const REVIEW_STATUSES: [&str; 5] =
-    ["open", "in_review", "changes_requested", "approved", "closed"];
+const REVIEW_STATUSES: [&str; 5] = [
+    "open",
+    "in_review",
+    "changes_requested",
+    "approved",
+    "closed",
+];
 
 /// The A1 log entry types. A finding is an entry of type `finding` (NOT a separate collection);
 /// an actionable finding links a child `task_id`. Any count/trend (open findings, etc.) is
@@ -6363,7 +6692,9 @@ pub async fn create_review(
         .execute(&mut *tx)
         .await?;
     }
-    let mut out = review_json(&mut tx, rid, true).await?.unwrap_or(Value::Null);
+    let mut out = review_json(&mut tx, rid, true)
+        .await?
+        .unwrap_or(Value::Null);
     if let Value::Object(ref mut m) = out {
         m.insert("created".into(), json!(true));
     }
@@ -6463,7 +6794,9 @@ pub async fn set_review_status(
     let assignee: Option<String> = row.try_get("assignee")?;
     // Same status -> idempotent no-op (no log entry, no event).
     if old_status == new_status {
-        let out = review_json(&mut tx, review_id, true).await?.unwrap_or(Value::Null);
+        let out = review_json(&mut tx, review_id, true)
+            .await?
+            .unwrap_or(Value::Null);
         tx.commit().await?;
         return Ok(out);
     }
@@ -6534,7 +6867,9 @@ pub async fn set_review_status(
         )
         .await?;
     }
-    let out = review_json(&mut tx, review_id, true).await?.unwrap_or(Value::Null);
+    let out = review_json(&mut tx, review_id, true)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -6570,7 +6905,9 @@ pub async fn set_review_vetted(
     let assignee: Option<String> = row.try_get("assignee")?;
     // Same value -> idempotent no-op (no audit entry, no event).
     if old_vetted == vetted {
-        let out = review_json(&mut tx, review_id, true).await?.unwrap_or(Value::Null);
+        let out = review_json(&mut tx, review_id, true)
+            .await?
+            .unwrap_or(Value::Null);
         tx.commit().await?;
         return Ok(out);
     }
@@ -6611,7 +6948,9 @@ pub async fn set_review_vetted(
         Recipients::Explicit(recips),
     )
     .await?;
-    let out = review_json(&mut tx, review_id, true).await?.unwrap_or(Value::Null);
+    let out = review_json(&mut tx, review_id, true)
+        .await?
+        .unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -6695,7 +7034,9 @@ pub async fn append_review_log(
     .await?;
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
-    Ok(json!({ "review_id": review_id, "entry_id": eid, "appended": true, "entry_type": entry_type }))
+    Ok(
+        json!({ "review_id": review_id, "entry_id": eid, "appended": true, "entry_type": entry_type }),
+    )
 }
 
 // --- Reviews: improvement trend (Document #5, increment 5 / BUILD 5) ---
@@ -6740,7 +7081,11 @@ fn trend_slice(aggs: &[&ReviewAgg]) -> Value {
     let post: u64 = aggs.iter().map(|a| a.post_approval_findings).sum();
     let reopens: u64 = aggs.iter().filter(|a| a.reopened).count() as u64;
     let lineage: u64 = aggs.iter().filter(|a| a.lineage_followup).count() as u64;
-    let fpr = if n > 0 { findings as f64 / n as f64 } else { 0.0 };
+    let fpr = if n > 0 {
+        findings as f64 / n as f64
+    } else {
+        0.0
+    };
 
     let eps = 1e-9;
     let (findings_trend, escaped_trend, flagged, earlier_v, later_v) = if n >= 2 {
@@ -6776,7 +7121,13 @@ fn trend_slice(aggs: &[&ReviewAgg]) -> Value {
             json!({ "reviews": l.len(), "findings_per_review": round2(lfpr), "escaped_per_review": round2(lepr) }),
         )
     } else {
-        ("insufficient_data", "insufficient_data", false, Value::Null, Value::Null)
+        (
+            "insufficient_data",
+            "insufficient_data",
+            false,
+            Value::Null,
+            Value::Null,
+        )
     };
 
     json!({
@@ -6884,7 +7235,10 @@ pub async fn review_improvement_trend(
         // Timestamps share now_iso()'s fixed RFC3339 (micros + 'Z') shape, so lexicographic > is
         // chronologically after.
         let post_approval_findings = match &approved_at {
-            Some(at) => finding_times.iter().filter(|t| t.as_str() > at.as_str()).count() as u64,
+            Some(at) => finding_times
+                .iter()
+                .filter(|t| t.as_str() > at.as_str())
+                .count() as u64,
             None => 0,
         };
         let lineage_followup = has_predecessor && findings > 0;
@@ -6952,15 +7306,68 @@ mod tests {
         register_agent(&pool, "planner", Some("Planner"), None, None, None, None).await?;
         register_agent(&pool, "fixer", Some("Fixer"), None, None, None, None).await?;
 
-        let p = create_project(&pool, "Voron tuning", Some("dial in the printer"), Some("planner"), None).await?;
+        let p = create_project(
+            &pool,
+            "Voron tuning",
+            Some("dial in the printer"),
+            Some("planner"),
+            None,
+        )
+        .await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "Calibrate pressure advance", None, Some("fixer"), None, Some("planner"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "Calibrate pressure advance",
+            None,
+            Some("fixer"),
+            None,
+            Some("planner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         subscribe(&pool, "planner", Some(tid), None, None, None, false).await?; // (already auto-subscribed as creator)
-        comment_task(&pool, tid, "Start from PA=0.03", Some("planner"), None, None).await?;
-        update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("fixer"), None, None, None).await?;
-        update_task(&pool, tid, Some("done"), None, None, None, None, Some("fixer"), None, None, None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "Start from PA=0.03",
+            Some("planner"),
+            None,
+            None,
+        )
+        .await?;
+        update_task(
+            &pool,
+            tid,
+            Some("in_progress"),
+            None,
+            None,
+            None,
+            None,
+            Some("fixer"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        update_task(
+            &pool,
+            tid,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("fixer"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         send_message(&pool, "fixer", "planner", "PA done, landed at 0.032").await?;
 
         // planner should hear: 2 status changes (by fixer) + 1 DM = 3; NOT its own comment.
@@ -6976,8 +7383,10 @@ mod tests {
             .iter()
             .map(|n| n["type"].as_str().unwrap().to_string())
             .collect();
-        let expected: BTreeSet<String> =
-            ["task.status_changed", "message.direct"].iter().map(|s| s.to_string()).collect();
+        let expected: BTreeSet<String> = ["task.status_changed", "message.direct"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(types, expected);
 
         // Draining a second time yields nothing (marked read).
@@ -6997,7 +7406,19 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("a"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         for i in 0..5 {
             comment_task(&pool, tid, &format!("c{i}"), Some("a"), None, None).await?;
@@ -7040,7 +7461,10 @@ mod tests {
     #[test]
     fn detect_bare_task_refs_matches_only_ambiguous_bare_refs() {
         assert_eq!(detect_bare_task_refs("see #183 please"), vec![183]);
-        assert_eq!(detect_bare_task_refs("#12 and #34 and #12 again"), vec![12, 34]);
+        assert_eq!(
+            detect_bare_task_refs("#12 and #34 and #12 again"),
+            vec![12, 34]
+        );
         assert_eq!(detect_bare_task_refs("(#7)"), vec![7]);
         assert!(detect_bare_task_refs("abc#1").is_empty());
         assert!(detect_bare_task_refs("camshaft/fleet#183").is_empty());
@@ -7076,11 +7500,25 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("a"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Comment with a bare ref -> rejected with an actionable, typed-form-naming error.
-        let err = comment_task(&pool, tid, "duplicate of #7", Some("a"), None, None).await.unwrap_err();
+        let err = comment_task(&pool, tid, "duplicate of #7", Some("a"), None, None)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.starts_with("ambiguous bare reference"), "got: {msg}");
         assert!(msg.contains("task_7"), "error names the typed form: {msg}");
@@ -7088,17 +7526,71 @@ mod tests {
         assert_eq!(get_task(&pool, tid).await?["comment_count"], json!(0));
 
         // A clean comment (typed form + repo-qualified external) succeeds.
-        comment_task(&pool, tid, "use task_7 and camshaft/task-board#7", Some("a"), None, None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "use task_7 and camshaft/task-board#7",
+            Some("a"),
+            None,
+            None,
+        )
+        .await?;
         // A bare "#N" inside inline code or a fenced block is NOT a reference -> allowed.
         comment_task(&pool, tid, "the literal `#9` token", Some("a"), None, None).await?;
-        comment_task(&pool, tid, "```\nsee #9 in code\n```", Some("a"), None, None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "```\nsee #9 in code\n```",
+            Some("a"),
+            None,
+            None,
+        )
+        .await?;
         assert_eq!(get_task(&pool, tid).await?["comment_count"], json!(3));
 
         // create_task + publish-style paths reject a bare ref in title/description too.
-        assert!(create_task(&pool, pid, "blocks #9", None, None, None, Some("a"), None, None, None).await.is_err());
-        assert!(create_task(&pool, pid, "title", Some("see #9"), None, None, Some("a"), None, None, None).await.is_err());
+        assert!(create_task(
+            &pool,
+            pid,
+            "blocks #9",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None
+        )
+        .await
+        .is_err());
+        assert!(create_task(
+            &pool,
+            pid,
+            "title",
+            Some("see #9"),
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None
+        )
+        .await
+        .is_err());
         // A clean create succeeds.
-        create_task(&pool, pid, "clean title", Some("see task_9"), None, None, Some("a"), None, None, None).await?;
+        create_task(
+            &pool,
+            pid,
+            "clean title",
+            Some("see task_9"),
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -7111,24 +7603,82 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("a"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        create_task(&pool, pid, "plain", None, None, None, Some("a"), None, None, None).await?;
-        let exempt = create_task(&pool, pid, "exempt", None, None, None, Some("a"), None, None, None).await?;
+        create_task(
+            &pool,
+            pid,
+            "plain",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let exempt = create_task(
+            &pool,
+            pid,
+            "exempt",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let eid = exempt["id"].as_i64().unwrap();
 
         // Default: not exempt.
         assert_eq!(get_task(&pool, eid).await?["monitor_exempt"], json!(false));
 
         // Set metadata.monitor_exempt via the update_task metadata merge.
-        update_task(&pool, eid, None, None, None, None, None, Some("a"), Some(json!({ "monitor_exempt": true })), None, None)
-            .await?;
+        update_task(
+            &pool,
+            eid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("a"),
+            Some(json!({ "monitor_exempt": true })),
+            None,
+            None,
+        )
+        .await?;
 
         let got = get_task(&pool, eid).await?;
-        assert_eq!(got["monitor_exempt"], json!(true), "get_task reflects the derived flag");
-        assert_eq!(got["metadata"]["monitor_exempt"], json!(true), "metadata stays the source of truth");
+        assert_eq!(
+            got["monitor_exempt"],
+            json!(true),
+            "get_task reflects the derived flag"
+        );
+        assert_eq!(
+            got["metadata"]["monitor_exempt"],
+            json!(true),
+            "metadata stays the source of truth"
+        );
 
         // list_tasks surfaces the derived bool per row.
-        let list =
-            list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
+        let list = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
         let arr = list.as_array().unwrap();
         let by_title = |t: &str| arr.iter().find(|x| x["title"] == json!(t)).unwrap().clone();
         assert_eq!(by_title("exempt")["monitor_exempt"], json!(true));
@@ -7179,7 +7729,19 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("a"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "blocked on brazil merge", None, None, None, Some("a"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "blocked on brazil merge",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Block on external with a free-text note, no target.
@@ -7188,18 +7750,77 @@ mod tests {
         let got = get_task(&pool, tid).await?;
         assert_eq!(got["status"], json!("blocked"));
         assert_eq!(got["blocked_on"]["kind"], json!("external"));
-        assert_eq!(got["blocked_on"]["target"], json!(null), "external has no target");
-        assert!(got["blocked_on"]["note"].as_str().unwrap().contains("Brazil"));
+        assert_eq!(
+            got["blocked_on"]["target"],
+            json!(null),
+            "external has no target"
+        );
+        assert!(got["blocked_on"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("Brazil"));
 
         // OFF the operator queue; ON the external filter.
-        let op = list_tasks(&pool, None, None, None, false, None, false, None, Some("operator"), None, None, None, false).await?;
-        assert!(op.as_array().unwrap().iter().all(|x| x["id"] != json!(tid)), "external task must not be on the operator queue");
-        let ext = list_tasks(&pool, None, None, None, false, None, false, None, Some("external"), None, None, None, false).await?;
-        assert!(ext.as_array().unwrap().iter().any(|x| x["id"] == json!(tid)), "external task found via the external filter");
+        let op = list_tasks(
+            &pool,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            Some("operator"),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert!(
+            op.as_array().unwrap().iter().all(|x| x["id"] != json!(tid)),
+            "external task must not be on the operator queue"
+        );
+        let ext = list_tasks(
+            &pool,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            Some("external"),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert!(
+            ext.as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["id"] == json!(tid)),
+            "external task found via the external filter"
+        );
 
         // An unknown kind is still rejected.
-        assert!(update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("a"), None, None,
-            Some(json!({ "kind": "bogus" }))).await.is_err());
+        assert!(update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            Some(json!({ "kind": "bogus" }))
+        )
+        .await
+        .is_err());
         Ok(())
     }
 
@@ -7216,7 +7837,19 @@ mod tests {
         // Activity by another actor, in projects the watcher never joined.
         let a = create_project(&pool, "A", None, Some("alice"), None).await?;
         let aid = a["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("alice"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            aid,
+            "T",
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         comment_task(&pool, tid, "hi", Some("alice"), None, None).await?;
         create_project(&pool, "B", None, Some("alice"), None).await?;
@@ -7232,19 +7865,30 @@ mod tests {
             .map(|n| n["type"].as_str().unwrap().to_string())
             .collect();
         for want in ["project.created", "task.created", "task.commented"] {
-            assert!(types.contains(want), "firehose should carry {want}: {types:?}");
+            assert!(
+                types.contains(want),
+                "firehose should carry {want}: {types:?}"
+            );
         }
 
         // The watcher's OWN action does not notify itself (actor excluded).
         create_project(&pool, "C", None, Some("watcher"), None).await?;
         let own = check_notifications(&pool, "watcher", true, 50, None).await?;
-        assert_eq!(own["count"].as_i64(), Some(0), "actor excluded from its own events");
+        assert_eq!(
+            own["count"].as_i64(),
+            Some(0),
+            "actor excluded from its own events"
+        );
 
         // Unsubscribing stops the firehose.
         unsubscribe(&pool, "watcher", None, None, None, None, true).await?;
         create_project(&pool, "D", None, Some("alice"), None).await?;
         let after = check_notifications(&pool, "watcher", true, 50, None).await?;
-        assert_eq!(after["count"].as_i64(), Some(0), "no events after unsubscribe");
+        assert_eq!(
+            after["count"].as_i64(),
+            Some(0),
+            "no events after unsubscribe"
+        );
 
         Ok(())
     }
@@ -7281,7 +7925,16 @@ mod tests {
         assert_eq!(d["versions"].as_array().unwrap().len(), 1);
 
         // Publish version 2 -> current advances, immutable history grows.
-        let d2 = publish_version(&pool, did, "bafyv2", Some("revise"), Some("alice"), None, None).await?;
+        let d2 = publish_version(
+            &pool,
+            did,
+            "bafyv2",
+            Some("revise"),
+            Some("alice"),
+            None,
+            None,
+        )
+        .await?;
         assert_eq!(d2["current_version"]["version_no"], json!(2));
         assert_eq!(d2["current_version"]["cid"], json!("bafyv2"));
         assert_eq!(d2["versions"].as_array().unwrap().len(), 2);
@@ -7294,16 +7947,38 @@ mod tests {
         assert_eq!(vers[1]["version_no"], json!(1));
 
         // list_documents by project + status.
-        assert_eq!(list_documents(&pool, Some(pid), None, None, None, None, false).await?.as_array().unwrap().len(), 1);
         assert_eq!(
-            list_documents(&pool, Some(pid), Some("draft"), None, None, None, false).await?.as_array().unwrap().len(),
+            list_documents(&pool, Some(pid), None, None, None, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            list_documents(&pool, Some(pid), Some("approved"), None, None, None, false).await?.as_array().unwrap().len(),
+            list_documents(&pool, Some(pid), Some("draft"), None, None, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_documents(&pool, Some(pid), Some("approved"), None, None, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
             0
         );
-        assert_eq!(list_documents(&pool, Some(99999), None, None, None, None, false).await?.as_array().unwrap().len(), 0);
+        assert_eq!(
+            list_documents(&pool, Some(99999), None, None, None, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
 
         // A new version resets an approved doc back to in_review.
         sqlx::query("UPDATE documents SET status='approved' WHERE id=?")
@@ -7311,7 +7986,11 @@ mod tests {
             .execute(&pool)
             .await?;
         let d3 = publish_version(&pool, did, "bafyv3", None, Some("alice"), None, None).await?;
-        assert_eq!(d3["status"], json!("in_review"), "new version supersedes approval");
+        assert_eq!(
+            d3["status"],
+            json!("in_review"),
+            "new version supersedes approval"
+        );
 
         // Missing document -> error.
         assert!(get_document(&pool, 424242).await.is_err());
@@ -7327,20 +8006,42 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let mk = |title: &'static str| {
             let pool = pool.clone();
-            async move { create_document(&pool, title, None, "bafy", None, Some("alice"), None, None, None).await }
+            async move {
+                create_document(
+                    &pool,
+                    title,
+                    None,
+                    "bafy",
+                    None,
+                    Some("alice"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
         };
         let a = mk("A").await?["id"].as_i64().unwrap();
         let b = mk("B").await?["id"].as_i64().unwrap();
         let c = mk("C").await?["id"].as_i64().unwrap();
 
         // File a doc; leading/trailing slashes are trimmed, and get_document reflects the path.
-        let filed = set_document_path(&pool, a, "/architecture/board/events/", Some("alice")).await?;
+        let filed =
+            set_document_path(&pool, a, "/architecture/board/events/", Some("alice")).await?;
         assert_eq!(filed["path"], json!("architecture/board/events"));
-        assert_eq!(get_document(&pool, a).await?["path"], json!("architecture/board/events"));
+        assert_eq!(
+            get_document(&pool, a).await?["path"],
+            json!("architecture/board/events")
+        );
 
         // Collision: filing another doc at the same path is rejected (400-mapped "give " error).
-        let err = set_document_path(&pool, b, "architecture/board/events", None).await.unwrap_err();
-        assert!(err.to_string().starts_with("give "), "collision error, got: {err}");
+        let err = set_document_path(&pool, b, "architecture/board/events", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("give "),
+            "collision error, got: {err}"
+        );
 
         // File the rest of the tree, plus one doc outside it.
         set_document_path(&pool, b, "architecture/board/schema", None).await?;
@@ -7358,14 +8059,28 @@ mod tests {
         let arch = list_wiki(&pool, Some("architecture"), false).await?;
         assert_eq!(arch.as_array().unwrap().len(), 2);
         // A prefix must not match a sibling that merely shares a string head.
-        assert_eq!(list_wiki(&pool, Some("runbooks"), false).await?.as_array().unwrap().len(), 1);
+        assert_eq!(
+            list_wiki(&pool, Some("runbooks"), false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Rename frees the old path (b can now take it) and clearing unfiles a doc.
         set_document_path(&pool, a, "architecture/board/events-v2", None).await?;
         set_document_path(&pool, b, "architecture/board/events", None).await?; // no longer a collision
         set_document_path(&pool, c, "", None).await?; // clear -> unfiled
         assert!(get_document(&pool, c).await?["path"].is_null());
-        assert_eq!(list_wiki(&pool, None, false).await?.as_array().unwrap().len(), 2);
+        assert_eq!(
+            list_wiki(&pool, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         Ok(())
     }
 
@@ -7378,7 +8093,20 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let mk = |title: &'static str| {
             let pool = pool.clone();
-            async move { create_document(&pool, title, None, "bafy", None, Some("alice"), None, None, None).await }
+            async move {
+                create_document(
+                    &pool,
+                    title,
+                    None,
+                    "bafy",
+                    None,
+                    Some("alice"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
         };
         let keep = mk("Keep").await?["id"].as_i64().unwrap();
         let probe = mk("Probe").await?["id"].as_i64().unwrap();
@@ -7386,28 +8114,92 @@ mod tests {
         set_document_path(&pool, probe, "docs/probe", None).await?;
 
         // Both visible before archiving.
-        assert_eq!(list_documents(&pool, None, None, None, None, None, false).await?.as_array().unwrap().len(), 2);
-        assert_eq!(list_wiki(&pool, None, false).await?.as_array().unwrap().len(), 2);
+        assert_eq!(
+            list_documents(&pool, None, None, None, None, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            list_wiki(&pool, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
 
         // Archive the probe: hidden from list_documents and the wiki tree by default.
         let archived = set_document_archived(&pool, probe, true, Some("concierge")).await?;
-        assert!(archived["archived_at"].is_string(), "archived_at is stamped");
-        assert_eq!(list_documents(&pool, None, None, None, None, None, false).await?.as_array().unwrap().len(), 1);
-        assert_eq!(list_wiki(&pool, None, false).await?.as_array().unwrap().len(), 1);
+        assert!(
+            archived["archived_at"].is_string(),
+            "archived_at is stamped"
+        );
+        assert_eq!(
+            list_documents(&pool, None, None, None, None, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_wiki(&pool, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         // include_archived=true still surfaces it, and it always resolves by id (nothing destroyed).
-        assert_eq!(list_documents(&pool, None, None, None, None, None, true).await?.as_array().unwrap().len(), 2);
-        assert_eq!(list_wiki(&pool, None, true).await?.as_array().unwrap().len(), 2);
+        assert_eq!(
+            list_documents(&pool, None, None, None, None, None, true)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            list_wiki(&pool, None, true)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(get_document(&pool, probe).await?["archived_at"].is_string());
 
         // Restore: back in the listings, stamp cleared.
         let restored = set_document_archived(&pool, probe, false, Some("concierge")).await?;
-        assert!(restored["archived_at"].is_null(), "restore clears the stamp");
-        assert_eq!(list_documents(&pool, None, None, None, None, None, false).await?.as_array().unwrap().len(), 2);
-        assert_eq!(list_wiki(&pool, None, false).await?.as_array().unwrap().len(), 2);
+        assert!(
+            restored["archived_at"].is_null(),
+            "restore clears the stamp"
+        );
+        assert_eq!(
+            list_documents(&pool, None, None, None, None, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            list_wiki(&pool, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
 
         // Archiving a missing document is an error.
-        assert!(set_document_archived(&pool, 999_999, true, None).await.is_err());
+        assert!(set_document_archived(&pool, 999_999, true, None)
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -7420,19 +8212,39 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("owner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("owner"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Baseline: another agent's comment reaches the creator (they're in the fan-out).
         comment_task(&pool, tid, "hello", Some("bob"), None, None).await?;
         let n = check_notifications(&pool, "owner", true, 50, None).await?;
-        assert_eq!(n["count"], json!(1), "creator hears the comment before muting");
+        assert_eq!(
+            n["count"],
+            json!(1),
+            "creator hears the comment before muting"
+        );
 
         // Mute for the owner → subsequent task events no longer reach them.
         mute_task(&pool, "owner", tid).await?;
         comment_task(&pool, tid, "hello again", Some("bob"), None, None).await?;
         let n = check_notifications(&pool, "owner", true, 50, None).await?;
-        assert_eq!(n["count"], json!(0), "muted creator gets no fan-out for the task");
+        assert_eq!(
+            n["count"],
+            json!(0),
+            "muted creator gets no fan-out for the task"
+        );
 
         // Unmute → back in the fan-out.
         unmute_task(&pool, "owner", tid).await?;
@@ -7457,7 +8269,15 @@ mod tests {
         // Source doc A links to two paths and embeds a third (the embed must NOT become a link).
         let content = "See [[guide/setup]] and [[guide/advanced|Advanced Guide]].\n![[guide/diagram]]\nDup [[guide/setup]] again.";
         let a = create_document(
-            &pool, "Intro", None, "bafyA", None, Some("alice"), None, None, Some(content),
+            &pool,
+            "Intro",
+            None,
+            "bafyA",
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(content),
         )
         .await?;
         let aid = a["id"].as_i64().unwrap();
@@ -7466,23 +8286,53 @@ mod tests {
         // outbound_links: guide/setup + guide/advanced, de-duped, embed excluded, ordered by path.
         let a_doc = get_document(&pool, aid).await?;
         let links = a_doc["outbound_links"].as_array().unwrap();
-        assert_eq!(links.len(), 2, "two distinct links, embed excluded, dup collapsed: {links:?}");
+        assert_eq!(
+            links.len(),
+            2,
+            "two distinct links, embed excluded, dup collapsed: {links:?}"
+        );
         assert_eq!(links[0]["target_path"], json!("guide/advanced"));
         assert_eq!(links[0]["label"], json!("Advanced Guide"));
-        assert!(links[0]["target_document_id"].is_null(), "advanced dangles (nothing filed there)");
+        assert!(
+            links[0]["target_document_id"].is_null(),
+            "advanced dangles (nothing filed there)"
+        );
         assert_eq!(links[1]["target_path"], json!("guide/setup"));
         assert!(links[1]["label"].is_null());
-        assert!(links[1]["target_document_id"].is_null(), "setup dangles until a doc is filed there");
+        assert!(
+            links[1]["target_document_id"].is_null(),
+            "setup dangles until a doc is filed there"
+        );
 
         // File a doc at guide/setup: A's link to it now resolves, and that doc sees the backlink.
-        let b = create_document(&pool, "Setup", None, "bafyB", None, Some("bob"), None, None, None).await?;
+        let b = create_document(
+            &pool,
+            "Setup",
+            None,
+            "bafyB",
+            None,
+            Some("bob"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let bid = b["id"].as_i64().unwrap();
         set_document_path(&pool, bid, "guide/setup", None).await?;
 
         let a_doc = get_document(&pool, aid).await?;
-        let setup = a_doc["outbound_links"].as_array().unwrap().iter()
-            .find(|l| l["target_path"] == json!("guide/setup")).unwrap().clone();
-        assert_eq!(setup["target_document_id"], json!(bid), "link resolves to the doc filed at that path");
+        let setup = a_doc["outbound_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["target_path"] == json!("guide/setup"))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            setup["target_document_id"],
+            json!(bid),
+            "link resolves to the doc filed at that path"
+        );
         assert_eq!(setup["target_title"], json!("Setup"));
 
         let b_doc = get_document(&pool, bid).await?;
@@ -7492,18 +8342,52 @@ mod tests {
         assert_eq!(backlinks[0]["path"], json!("guide/intro"));
 
         // A new version WITH content re-indexes edges (now only guide/setup).
-        publish_version(&pool, aid, "bafyA2", Some("trim"), Some("alice"), None, Some("only [[guide/setup]] now")).await?;
+        publish_version(
+            &pool,
+            aid,
+            "bafyA2",
+            Some("trim"),
+            Some("alice"),
+            None,
+            Some("only [[guide/setup]] now"),
+        )
+        .await?;
         let a_doc = get_document(&pool, aid).await?;
-        assert_eq!(a_doc["outbound_links"].as_array().unwrap().len(), 1, "edges refreshed from new content");
+        assert_eq!(
+            a_doc["outbound_links"].as_array().unwrap().len(),
+            1,
+            "edges refreshed from new content"
+        );
 
         // A CID-only publish (no content) leaves the edges as-is (board can't rescan a bare CID).
         publish_version(&pool, aid, "bafyA3", None, Some("alice"), None, None).await?;
         let a_doc = get_document(&pool, aid).await?;
-        assert_eq!(a_doc["outbound_links"].as_array().unwrap().len(), 1, "CID-only publish keeps prior edges");
+        assert_eq!(
+            a_doc["outbound_links"].as_array().unwrap().len(),
+            1,
+            "CID-only publish keeps prior edges"
+        );
 
         // An unfiled doc (no path) has no backlinks even if others link to some path.
-        let c = create_document(&pool, "Orphan", None, "bafyC", None, Some("carol"), None, None, Some("x")).await?;
-        assert_eq!(get_document(&pool, c["id"].as_i64().unwrap()).await?["backlinks"].as_array().unwrap().len(), 0);
+        let c = create_document(
+            &pool,
+            "Orphan",
+            None,
+            "bafyC",
+            None,
+            Some("carol"),
+            None,
+            None,
+            Some("x"),
+        )
+        .await?;
+        assert_eq!(
+            get_document(&pool, c["id"].as_i64().unwrap()).await?["backlinks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         Ok(())
     }
 
@@ -7516,16 +8400,44 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // Target doc "lib/widget" with two versions (so a @v1 pin has something to resolve to).
-        let t = create_document(&pool, "Widget", None, "bafyW1", None, Some("bob"), None, None, None).await?;
+        let t = create_document(
+            &pool,
+            "Widget",
+            None,
+            "bafyW1",
+            None,
+            Some("bob"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         set_document_path(&pool, tid, "lib/widget", None).await?;
         let v2 = publish_version(&pool, tid, "bafyW2", Some("v2"), Some("bob"), None, None).await?;
-        let v1_id = v2["versions"].as_array().unwrap().iter()
-            .find(|v| v["version_no"] == json!(1)).unwrap()["id"].as_i64().unwrap();
+        let v1_id = v2["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["version_no"] == json!(1))
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
 
         // Source doc: one plain link, one floating embed, one pinned embed, one region embed.
         let content = "[[lib/widget]] jump\n![[lib/widget]] float\n![[lib/widget@v1]] pinned\n![[lib/notes#intro]] region";
-        let s = create_document(&pool, "Page", None, "bafyS", None, Some("alice"), None, None, Some(content)).await?;
+        let s = create_document(
+            &pool,
+            "Page",
+            None,
+            "bafyS",
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(content),
+        )
+        .await?;
         let sid = s["id"].as_i64().unwrap();
 
         let s_doc = get_document(&pool, sid).await?;
@@ -7534,34 +8446,98 @@ mod tests {
         // being dropped). Within embeds, the float ![[lib/widget]] is seen before ![[lib/widget@v1]]
         // so it wins that path (one embed edge per path).
         let links = s_doc["outbound_links"].as_array().unwrap();
-        assert!(links.iter().any(|l| l["target_path"] == json!("lib/widget")), "the link is recorded");
+        assert!(
+            links
+                .iter()
+                .any(|l| l["target_path"] == json!("lib/widget")),
+            "the link is recorded"
+        );
         let embeds = s_doc["embeds"].as_array().unwrap();
-        let w_emb = embeds.iter().find(|e| e["target_path"] == json!("lib/widget")).unwrap();
-        assert!(w_emb["target_version_id"].is_null(), "float embed (![[lib/widget]]) wins over the later @v1; floats");
-        assert_eq!(w_emb["target_document_id"], json!(tid), "embed resolves to the filed doc");
-        let notes = embeds.iter().find(|e| e["target_path"] == json!("lib/notes")).unwrap();
+        let w_emb = embeds
+            .iter()
+            .find(|e| e["target_path"] == json!("lib/widget"))
+            .unwrap();
+        assert!(
+            w_emb["target_version_id"].is_null(),
+            "float embed (![[lib/widget]]) wins over the later @v1; floats"
+        );
+        assert_eq!(
+            w_emb["target_document_id"],
+            json!(tid),
+            "embed resolves to the filed doc"
+        );
+        let notes = embeds
+            .iter()
+            .find(|e| e["target_path"] == json!("lib/notes"))
+            .unwrap();
         assert_eq!(notes["region"], json!("intro"), "region fragment captured");
-        assert!(notes["target_document_id"].is_null(), "lib/notes dangles (unfiled)");
+        assert!(
+            notes["target_document_id"].is_null(),
+            "lib/notes dangles (unfiled)"
+        );
 
         // Now a doc where the embed path is distinct so pinning resolves to a version id.
         let content2 = "![[lib/widget@v1]] pinned\n![[lib/widget-x]] float-dangling";
-        let s2 = create_document(&pool, "Page2", None, "bafyS2", None, Some("alice"), None, None, Some(content2)).await?;
+        let s2 = create_document(
+            &pool,
+            "Page2",
+            None,
+            "bafyS2",
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(content2),
+        )
+        .await?;
         let s2_doc = get_document(&pool, s2["id"].as_i64().unwrap()).await?;
         let emb = s2_doc["embeds"].as_array().unwrap();
-        let pinned = emb.iter().find(|e| e["target_path"] == json!("lib/widget")).unwrap();
-        assert_eq!(pinned["target_version_id"], json!(v1_id), "@v1 pins to version 1's id");
-        assert_eq!(pinned["target_document_id"], json!(tid), "resolved to the target doc");
-        let floating = emb.iter().find(|e| e["target_path"] == json!("lib/widget-x")).unwrap();
-        assert!(floating["target_version_id"].is_null(), "unpinned embed floats (null version)");
+        let pinned = emb
+            .iter()
+            .find(|e| e["target_path"] == json!("lib/widget"))
+            .unwrap();
+        assert_eq!(
+            pinned["target_version_id"],
+            json!(v1_id),
+            "@v1 pins to version 1's id"
+        );
+        assert_eq!(
+            pinned["target_document_id"],
+            json!(tid),
+            "resolved to the target doc"
+        );
+        let floating = emb
+            .iter()
+            .find(|e| e["target_path"] == json!("lib/widget-x"))
+            .unwrap();
+        assert!(
+            floating["target_version_id"].is_null(),
+            "unpinned embed floats (null version)"
+        );
 
         // embedded_by: the Widget doc sees who embeds it. Page2 pins it; Page floats it.
         let t_doc = get_document(&pool, tid).await?;
         let emb_by = t_doc["embedded_by"].as_array().unwrap();
-        assert!(emb_by.iter().any(|e| e["id"] == json!(s2["id"].as_i64().unwrap())), "Page2 embeds Widget");
+        assert!(
+            emb_by
+                .iter()
+                .any(|e| e["id"] == json!(s2["id"].as_i64().unwrap())),
+            "Page2 embeds Widget"
+        );
         // The task-108 bug case: Page BOTH links and embeds lib/widget, so it must appear in
         // BOTH backlinks AND embedded_by (previously the embed was silently dropped).
-        assert!(emb_by.iter().any(|e| e["id"] == json!(sid)), "Page embeds Widget (same path it also links)");
-        assert!(t_doc["backlinks"].as_array().unwrap().iter().any(|b| b["id"] == json!(sid)), "Page links Widget");
+        assert!(
+            emb_by.iter().any(|e| e["id"] == json!(sid)),
+            "Page embeds Widget (same path it also links)"
+        );
+        assert!(
+            t_doc["backlinks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["id"] == json!(sid)),
+            "Page links Widget"
+        );
         Ok(())
     }
 
@@ -7572,21 +8548,52 @@ mod tests {
     async fn read_document_content_resolves_version_and_needs_backend() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Spec", None, "bafycurrent", None, Some("alice"), None, Some("text/markdown"), None).await?;
+        let d = create_document(
+            &pool,
+            "Spec",
+            None,
+            "bafycurrent",
+            None,
+            Some("alice"),
+            None,
+            Some("text/markdown"),
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
-        publish_version(&pool, did, "bafyv2", Some("s"), Some("alice"), Some("application/pdf"), None).await?;
+        publish_version(
+            &pool,
+            did,
+            "bafyv2",
+            Some("s"),
+            Some("alice"),
+            Some("application/pdf"),
+            None,
+        )
+        .await?;
 
         // The current version resolves to v2 + its cid/content_type; a named older version resolves too.
         let (vn, cid, ct) = resolve_document_version(&pool, did, None).await?;
-        assert_eq!((vn, cid.as_str(), ct.as_str()), (2, "bafyv2", "application/pdf"));
+        assert_eq!(
+            (vn, cid.as_str(), ct.as_str()),
+            (2, "bafyv2", "application/pdf")
+        );
         let (vn1, cid1, ct1) = resolve_document_version(&pool, did, Some(1)).await?;
-        assert_eq!((vn1, cid1.as_str(), ct1.as_str()), (1, "bafycurrent", "text/markdown"));
+        assert_eq!(
+            (vn1, cid1.as_str(), ct1.as_str()),
+            (1, "bafycurrent", "text/markdown")
+        );
         // A missing version or document errors.
-        assert!(resolve_document_version(&pool, did, Some(99)).await.is_err());
+        assert!(resolve_document_version(&pool, did, Some(99))
+            .await
+            .is_err());
         assert!(resolve_document_version(&pool, 9999, None).await.is_err());
 
         // With no IPFS backend, the read path errors with the backend-required message (REST -> 503).
-        let err = read_document_content(&pool, None, did, None).await.unwrap_err().to_string();
+        let err = read_document_content(&pool, None, did, None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no IPFS backend"), "got: {err}");
 
         assert!(is_text_content_type("text/markdown"));
@@ -7606,7 +8613,18 @@ mod tests {
     async fn get_document_with_body_inlines_or_degrades() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Spec", None, "bafycurrent", None, Some("alice"), None, Some("text/markdown"), None).await?;
+        let d = create_document(
+            &pool,
+            "Spec",
+            None,
+            "bafycurrent",
+            None,
+            Some("alice"),
+            None,
+            Some("text/markdown"),
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
 
         // Metadata-only: identical to get_document, no body fields.
@@ -7619,7 +8637,10 @@ mod tests {
         let full = get_document_with_body(&pool, None, did, true).await?;
         assert_eq!(full["id"].as_i64(), Some(did));
         assert!(full["title"].as_str().is_some(), "metadata is preserved");
-        assert!(full["body"].is_null(), "body is null when it can't be fetched");
+        assert!(
+            full["body"].is_null(),
+            "body is null when it can't be fetched"
+        );
         let be = full["body_error"].as_str().expect("body_error note");
         assert!(be.contains("no IPFS backend"), "got: {be}");
         Ok(())
@@ -7632,7 +8653,18 @@ mod tests {
     async fn update_document_renames_title_and_slug() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Design: a very long working title", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Design: a very long working title",
+            None,
+            "bafy1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
 
         // bob renames it to a short noun phrase.
@@ -7647,15 +8679,25 @@ mod tests {
         // The owner (alice) hears document.updated with the new title; the actor (bob) does not.
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
         assert!(
-            alice["notifications"].as_array().unwrap().iter().any(|n| n["type"] == json!("document.updated")
-                && n["data"]["title"] == json!("Review entity")),
+            alice["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["type"] == json!("document.updated")
+                    && n["data"]["title"] == json!("Review entity")),
             "owner notified of rename: {alice}"
         );
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
-        assert_eq!(bob["count"].as_i64(), Some(0), "renamer excluded from own event");
+        assert_eq!(
+            bob["count"].as_i64(),
+            Some(0),
+            "renamer excluded from own event"
+        );
 
         // An empty title and an unknown document are rejected.
-        assert!(update_document(&pool, did, "   ", Some("bob")).await.is_err());
+        assert!(update_document(&pool, did, "   ", Some("bob"))
+            .await
+            .is_err());
         assert!(update_document(&pool, 9999, "x", None).await.is_err());
         Ok(())
     }
@@ -7669,13 +8711,33 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // alice creates a doc (auto-subscribed as author).
-        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Spec",
+            None,
+            "bafy1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
         // bob explicitly subscribes to the document.
         subscribe(&pool, "bob", None, None, None, Some(did), false).await?;
 
         // carol publishes v2 -> author (alice) + subscriber (bob) hear it; carol (actor) does not.
-        publish_version(&pool, did, "bafy2", Some("second"), Some("carol"), None, None).await?;
+        publish_version(
+            &pool,
+            did,
+            "bafy2",
+            Some("second"),
+            Some("carol"),
+            None,
+            None,
+        )
+        .await?;
 
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
@@ -7694,7 +8756,10 @@ mod tests {
         );
         // bob (subscriber) hears exactly the publish, carrying the new version.
         assert_eq!(bob["count"].as_i64(), Some(1), "bob: {bob}");
-        assert_eq!(bob["notifications"][0]["type"], json!("document.version_published"));
+        assert_eq!(
+            bob["notifications"][0]["type"],
+            json!("document.version_published")
+        );
         assert_eq!(bob["notifications"][0]["data"]["version_no"], json!(2));
         // carol is the actor -> excluded from her own event.
         assert_eq!(carol["count"].as_i64(), Some(0), "actor excluded: {carol}");
@@ -7703,7 +8768,11 @@ mod tests {
         unsubscribe(&pool, "bob", None, None, None, Some(did), false).await?;
         publish_version(&pool, did, "bafy3", None, Some("alice"), None, None).await?;
         let bob2 = check_notifications(&pool, "bob", true, 50, None).await?;
-        assert_eq!(bob2["count"].as_i64(), Some(0), "no events after unsubscribe");
+        assert_eq!(
+            bob2["count"].as_i64(),
+            Some(0),
+            "no events after unsubscribe"
+        );
 
         Ok(())
     }
@@ -7715,7 +8784,18 @@ mod tests {
     async fn document_owner_notified_on_comment_without_subscription() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Spec",
+            None,
+            "bafy1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
 
         // Remove the owner's auto-subscription, so the ONLY way alice can hear the comment is via
@@ -7723,22 +8803,44 @@ mod tests {
         unsubscribe(&pool, "alice", None, None, None, Some(did), false).await?;
 
         // bob comments on alice's doc.
-        comment_document(&pool, did, None, Some("bob"), "please clarify §2", None, None, None).await?;
+        comment_document(
+            &pool,
+            did,
+            None,
+            Some("bob"),
+            "please clarify §2",
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         // alice (the owner) is still notified, despite having no subscription row.
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
-        assert_eq!(alice["count"].as_i64(), Some(1), "owner notified without a subscription: {alice}");
+        assert_eq!(
+            alice["count"].as_i64(),
+            Some(1),
+            "owner notified without a subscription: {alice}"
+        );
         let n = &alice["notifications"][0];
         assert_eq!(n["type"], json!("document.comment"));
         // The payload is self-describing — which document, its title — and names the commenter as
         // the event actor, so the owner can act without a lookup (task #300 + #313).
         assert_eq!(n["data"]["document_id"], json!(did));
         assert_eq!(n["data"]["title"], json!("Spec"));
-        assert_eq!(n["actor"], json!("bob"), "the commenter is surfaced as the event actor");
+        assert_eq!(
+            n["actor"],
+            json!("bob"),
+            "the commenter is surfaced as the event actor"
+        );
 
         // The commenter (actor) is not notified of their own comment.
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
-        assert_eq!(bob["count"].as_i64(), Some(0), "actor excluded from own comment: {bob}");
+        assert_eq!(
+            bob["count"].as_i64(),
+            Some(0),
+            "actor excluded from own comment: {bob}"
+        );
         Ok(())
     }
 
@@ -7750,7 +8852,18 @@ mod tests {
     async fn document_approval_notifies_owner_with_context() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Design X", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Design X",
+            None,
+            "bafy1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
 
         // bob (a reviewer) approves alice's document.
@@ -7759,13 +8872,21 @@ mod tests {
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
         let n = &alice["notifications"][0];
         assert_eq!(n["type"], json!("document.approved"));
-        assert_eq!(n["actor"], json!("bob"), "the approver is surfaced as the event actor");
+        assert_eq!(
+            n["actor"],
+            json!("bob"),
+            "the approver is surfaced as the event actor"
+        );
         assert_eq!(n["data"]["document_id"], json!(did));
         assert_eq!(n["data"]["title"], json!("Design X"));
         assert_eq!(n["data"]["status"], json!("approved"));
         // The approver is not notified of their own action.
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
-        assert_eq!(bob["count"].as_i64(), Some(0), "approver excluded from own event");
+        assert_eq!(
+            bob["count"].as_i64(),
+            Some(0),
+            "approver excluded from own event"
+        );
 
         // request_changes carries the same self-describing context.
         request_changes(&pool, did, Some("bob"), Some("tighten §2")).await?;
@@ -7786,7 +8907,18 @@ mod tests {
     async fn document_comments_roundtrip() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Spec", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Spec",
+            None,
+            "bafy1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
         let vid = d["current_version"]["id"].as_i64().unwrap();
 
@@ -7798,16 +8930,34 @@ mod tests {
             "TextQuoteSelector": { "exact": "widgets", "prefix": "the ", "suffix": " are" },
             "TextPositionSelector": { "start": 10, "end": 17 }
         });
-        let c =
-            comment_document(&pool, did, Some(vid), Some("carol"), "typo", Some(region.clone()), None, None)
-                .await?;
+        let c = comment_document(
+            &pool,
+            did,
+            Some(vid),
+            Some("carol"),
+            "typo",
+            Some(region.clone()),
+            None,
+            None,
+        )
+        .await?;
         let cid = c["id"].as_i64().unwrap();
         assert_eq!(c["status"], json!("open"));
         assert_eq!(c["region"], region, "region round-trips as JSON");
         assert_eq!(c["version_id"], json!(vid));
 
         // A doc-level comment (no region), threaded under the first.
-        let c2 = comment_document(&pool, did, None, Some("dave"), "agreed", None, Some(cid), None).await?;
+        let c2 = comment_document(
+            &pool,
+            did,
+            None,
+            Some("dave"),
+            "agreed",
+            None,
+            Some(cid),
+            None,
+        )
+        .await?;
         assert!(c2["region"].is_null(), "doc-level comment has null region");
         assert_eq!(c2["reply_to"], json!(cid));
 
@@ -7821,9 +8971,20 @@ mod tests {
             .all(|n| n["type"] == json!("document.comment")));
 
         // List + filters.
-        assert_eq!(get_document_comments(&pool, did, None, None).await?.as_array().unwrap().len(), 2);
         assert_eq!(
-            get_document_comments(&pool, did, Some(vid), None).await?.as_array().unwrap().len(),
+            get_document_comments(&pool, did, None, None)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            get_document_comments(&pool, did, Some(vid), None)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
             1,
             "only the region comment carries this version_id"
         );
@@ -7832,25 +8993,56 @@ mod tests {
         let r = resolve_comment(&pool, cid, Some("alice")).await?;
         assert_eq!(r["status"], json!("resolved"));
         assert_eq!(
-            get_document_comments(&pool, did, None, Some("open")).await?.as_array().unwrap().len(),
+            get_document_comments(&pool, did, None, Some("open"))
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            get_document_comments(&pool, did, None, Some("resolved")).await?.as_array().unwrap().len(),
+            get_document_comments(&pool, did, None, Some("resolved"))
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
 
         // An ingested comment attributed to an external human (§6): author stays the ingester,
         // external_author carries the identity, and it round-trips through get_document_comments.
-        let c3 = comment_document(&pool, did, None, Some("slack-bridge"), "from ada", None, None, Some("slack:U1")).await?;
+        let c3 = comment_document(
+            &pool,
+            did,
+            None,
+            Some("slack-bridge"),
+            "from ada",
+            None,
+            None,
+            Some("slack:U1"),
+        )
+        .await?;
         assert_eq!(c3["author"], json!("slack-bridge"));
         assert_eq!(c3["external_author"], json!("slack:U1"));
         let listed = get_document_comments(&pool, did, None, None).await?;
-        let c3_listed = listed.as_array().unwrap().iter().find(|x| x["id"] == c3["id"]).unwrap();
-        assert_eq!(c3_listed["external_author"], json!("slack:U1"), "attribution surfaces in the list");
+        let c3_listed = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == c3["id"])
+            .unwrap();
+        assert_eq!(
+            c3_listed["external_author"],
+            json!("slack:U1"),
+            "attribution surfaces in the list"
+        );
 
         // Errors: comment on a missing doc, resolve a missing comment.
-        assert!(comment_document(&pool, 999, None, Some("x"), "hi", None, None, None).await.is_err());
+        assert!(
+            comment_document(&pool, 999, None, Some("x"), "hi", None, None, None)
+                .await
+                .is_err()
+        );
         assert!(resolve_comment(&pool, 999, Some("x")).await.is_err());
         Ok(())
     }
@@ -7861,7 +9053,18 @@ mod tests {
     async fn document_review_workflow() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let d = create_document(&pool, "Design", None, "bafy1", None, Some("alice"), None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Design",
+            None,
+            "bafy1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
         assert_eq!(d["status"], json!("draft"));
 
@@ -7877,20 +9080,41 @@ mod tests {
         assert_eq!(rc["status"], json!("changes_requested"));
 
         // Author publishes a new version -> reopens review (per publish_version).
-        let v2 = publish_version(&pool, did, "bafy2", Some("addressed"), Some("alice"), None, None).await?;
-        assert_eq!(v2["status"], json!("in_review"), "a new version reopens review");
+        let v2 = publish_version(
+            &pool,
+            did,
+            "bafy2",
+            Some("addressed"),
+            Some("alice"),
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            v2["status"],
+            json!("in_review"),
+            "a new version reopens review"
+        );
         let v2id = v2["current_version"]["id"].as_i64().unwrap();
 
         // Operator approves -> stamps the current version.
         let ap = approve_document(&pool, did, Some("operator")).await?;
         assert_eq!(ap["status"], json!("approved"));
-        assert_eq!(ap["approved_version_id"], json!(v2id), "approval stamps the current version");
+        assert_eq!(
+            ap["approved_version_id"],
+            json!(v2id),
+            "approval stamps the current version"
+        );
         assert_eq!(ap["approved_by"], json!("operator"));
 
         // Approval is a stamp, not a lock: publishing again reopens review but keeps the stamp.
         let v3 = publish_version(&pool, did, "bafy3", None, Some("alice"), None, None).await?;
         assert_eq!(v3["status"], json!("in_review"));
-        assert_eq!(v3["approved_version_id"], json!(v2id), "stamp persists across a new version");
+        assert_eq!(
+            v3["approved_version_id"],
+            json!(v2id),
+            "stamp persists across a new version"
+        );
 
         // The operator (a subscriber) heard the author-driven transitions (submit, both publishes)
         // but not their own request_changes/approve (actor excluded).
@@ -7901,8 +9125,14 @@ mod tests {
             .iter()
             .map(|n| n["type"].as_str().unwrap().to_string())
             .collect();
-        assert!(types.contains(&"document.submitted_for_review".to_string()), "{types:?}");
-        assert!(types.contains(&"document.version_published".to_string()), "{types:?}");
+        assert!(
+            types.contains(&"document.submitted_for_review".to_string()),
+            "{types:?}"
+        );
+        assert!(
+            types.contains(&"document.version_published".to_string()),
+            "{types:?}"
+        );
         assert!(
             !types.contains(&"document.approved".to_string()),
             "actor excluded from own approve: {types:?}"
@@ -7922,10 +9152,32 @@ mod tests {
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         // A task owned by alice, and a doc authored by bob.
-        let t = create_task(&pool, pid, "Build widget", None, Some("alice"), None, Some("alice"), None, None, None)
-            .await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "Build widget",
+            None,
+            Some("alice"),
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
-        let d = create_document(&pool, "Widget design", None, "bafy1", None, Some("bob"), None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Widget design",
+            None,
+            "bafy1",
+            None,
+            Some("bob"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
 
         // Drain the create notifications so the attach fan-out is isolated.
@@ -7944,13 +9196,19 @@ mod tests {
         // Both summaries carry project_id so a client can deep-link. The task belongs to pid;
         // the doc was created without a project, so its summary's project_id is null (present).
         assert_eq!(doc["attached_tasks"][0]["project_id"], json!(pid));
-        assert!(task["attached_documents"][0].as_object().unwrap().contains_key("project_id"));
+        assert!(task["attached_documents"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("project_id"));
         assert!(task["attached_documents"][0]["project_id"].is_null());
 
         // Idempotent: re-attaching doesn't duplicate.
         attach_document(&pool, did, tid, Some("carol")).await?;
         assert_eq!(
-            get_task(&pool, tid).await?["attached_documents"].as_array().unwrap().len(),
+            get_task(&pool, tid).await?["attached_documents"]
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
 
@@ -7958,27 +9216,46 @@ mod tests {
         // subscribed on create) heard document.attached; carol (actor) did not.
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
         let bob = check_notifications(&pool, "bob", true, 50, None).await?;
-        assert!(alice["notifications"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n["type"] == json!("document.attached")), "task watcher heard it: {alice}");
-        assert!(bob["notifications"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n["type"] == json!("document.attached")), "doc watcher heard it: {bob}");
+        assert!(
+            alice["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["type"] == json!("document.attached")),
+            "task watcher heard it: {alice}"
+        );
+        assert!(
+            bob["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["type"] == json!("document.attached")),
+            "doc watcher heard it: {bob}"
+        );
 
         // Detach removes the link and reports the removal.
         let rm = detach_document(&pool, did, tid, Some("carol")).await?;
         assert_eq!(rm["removed"], json!(1));
-        assert_eq!(get_task(&pool, tid).await?["attached_documents"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            get_task(&pool, tid).await?["attached_documents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         // Detaching again is a no-op (0 removed).
-        assert_eq!(detach_document(&pool, did, tid, Some("carol")).await?["removed"], json!(0));
+        assert_eq!(
+            detach_document(&pool, did, tid, Some("carol")).await?["removed"],
+            json!(0)
+        );
 
         // Attaching to a missing task or doc errors.
-        assert!(attach_document(&pool, did, 9999, Some("carol")).await.is_err());
-        assert!(attach_document(&pool, 9999, tid, Some("carol")).await.is_err());
+        assert!(attach_document(&pool, did, 9999, Some("carol"))
+            .await
+            .is_err());
+        assert!(attach_document(&pool, 9999, tid, Some("carol"))
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -7992,47 +9269,133 @@ mod tests {
         let pid = p["id"].as_i64().unwrap();
 
         let a = create_document(
-            &pool, "A", Some(pid), "bafyA", None, Some("alice"),
-            Some(json!({ "tags": ["design", "rfc"] })), None, None,
-        ).await?;
+            &pool,
+            "A",
+            Some(pid),
+            "bafyA",
+            None,
+            Some("alice"),
+            Some(json!({ "tags": ["design", "rfc"] })),
+            None,
+            None,
+        )
+        .await?;
         let aid = a["id"].as_i64().unwrap();
         let b = create_document(
-            &pool, "B", None, "bafyB", None, Some("bob"), Some(json!({ "tags": ["ops"] })), None, None,
-        ).await?;
+            &pool,
+            "B",
+            None,
+            "bafyB",
+            None,
+            Some("bob"),
+            Some(json!({ "tags": ["ops"] })),
+            None,
+            None,
+        )
+        .await?;
         let bid = b["id"].as_i64().unwrap();
-        let c = create_document(&pool, "C", Some(pid), "bafyC", None, Some("alice"), None, None, None).await?;
+        let c = create_document(
+            &pool,
+            "C",
+            Some(pid),
+            "bafyC",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let cid = c["id"].as_i64().unwrap();
         approve_document(&pool, cid, Some("op")).await?;
 
         // Attach A to a task.
-        let t = create_task(&pool, pid, "T", None, None, None, Some("u"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         attach_document(&pool, aid, tid, Some("u")).await?;
 
         let ids = |v: &Value| -> Vec<i64> {
-            v.as_array().unwrap().iter().map(|d| d["id"].as_i64().unwrap()).collect()
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["id"].as_i64().unwrap())
+                .collect()
         };
 
         // author
-        assert_eq!(ids(&list_documents(&pool, None, None, None, None, Some("alice"), false).await?), vec![aid, cid]);
-        assert_eq!(ids(&list_documents(&pool, None, None, None, None, Some("bob"), false).await?), vec![bid]);
+        assert_eq!(
+            ids(&list_documents(&pool, None, None, None, None, Some("alice"), false).await?),
+            vec![aid, cid]
+        );
+        assert_eq!(
+            ids(&list_documents(&pool, None, None, None, None, Some("bob"), false).await?),
+            vec![bid]
+        );
         // tag
-        assert_eq!(ids(&list_documents(&pool, None, None, Some("design"), None, None, false).await?), vec![aid]);
-        assert_eq!(ids(&list_documents(&pool, None, None, Some("ops"), None, None, false).await?), vec![bid]);
-        assert!(list_documents(&pool, None, None, Some("nope"), None, None, false).await?.as_array().unwrap().is_empty());
+        assert_eq!(
+            ids(&list_documents(&pool, None, None, Some("design"), None, None, false).await?),
+            vec![aid]
+        );
+        assert_eq!(
+            ids(&list_documents(&pool, None, None, Some("ops"), None, None, false).await?),
+            vec![bid]
+        );
+        assert!(
+            list_documents(&pool, None, None, Some("nope"), None, None, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         // task attachment
-        assert_eq!(ids(&list_documents(&pool, None, None, None, Some(tid), None, false).await?), vec![aid]);
+        assert_eq!(
+            ids(&list_documents(&pool, None, None, None, Some(tid), None, false).await?),
+            vec![aid]
+        );
         // project
-        assert_eq!(ids(&list_documents(&pool, Some(pid), None, None, None, None, false).await?), vec![aid, cid]);
+        assert_eq!(
+            ids(&list_documents(&pool, Some(pid), None, None, None, None, false).await?),
+            vec![aid, cid]
+        );
         // status
-        assert_eq!(ids(&list_documents(&pool, None, Some("approved"), None, None, None, false).await?), vec![cid]);
+        assert_eq!(
+            ids(&list_documents(&pool, None, Some("approved"), None, None, None, false).await?),
+            vec![cid]
+        );
         // combined AND: project + tag rfc + author alice -> only A
         assert_eq!(
-            ids(&list_documents(&pool, Some(pid), None, Some("rfc"), None, Some("alice"), false).await?),
+            ids(&list_documents(
+                &pool,
+                Some(pid),
+                None,
+                Some("rfc"),
+                None,
+                Some("alice"),
+                false
+            )
+            .await?),
             vec![aid]
         );
         // contradictory combo -> empty
-        assert!(list_documents(&pool, None, None, Some("ops"), None, Some("alice"), false).await?.as_array().unwrap().is_empty());
+        assert!(
+            list_documents(&pool, None, None, Some("ops"), None, Some("alice"), false)
+                .await?
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -8049,21 +9412,87 @@ mod tests {
         let pid2 = p2["id"].as_i64().unwrap();
 
         let ids = |v: &Value| -> Vec<i64> {
-            v.as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect()
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_i64().unwrap())
+                .collect()
         };
 
         // An epic with two children.
-        let epic = create_task(&pool, pid, "Epic", None, None, None, Some("u"), None, None, None).await?;
+        let epic = create_task(
+            &pool,
+            pid,
+            "Epic",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let eid = epic["id"].as_i64().unwrap();
-        let c1 = create_task(&pool, pid, "c1", None, None, None, Some("u"), None, Some(eid), None).await?;
+        let c1 = create_task(
+            &pool,
+            pid,
+            "c1",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(eid),
+            None,
+        )
+        .await?;
         let c1id = c1["id"].as_i64().unwrap();
-        let c2 = create_task(&pool, pid, "c2", None, None, None, Some("u"), None, Some(eid), None).await?;
+        let c2 = create_task(
+            &pool,
+            pid,
+            "c2",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(eid),
+            None,
+        )
+        .await?;
         let c2id = c2["id"].as_i64().unwrap();
 
         // Cross-project parent rejected at create.
-        assert!(create_task(&pool, pid2, "x", None, None, None, Some("u"), None, Some(eid), None).await.is_err());
+        assert!(create_task(
+            &pool,
+            pid2,
+            "x",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(eid),
+            None
+        )
+        .await
+        .is_err());
         // Non-existent parent rejected.
-        assert!(create_task(&pool, pid, "y", None, None, None, Some("u"), None, Some(99999), None).await.is_err());
+        assert!(create_task(
+            &pool,
+            pid,
+            "y",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(99999),
+            None
+        )
+        .await
+        .is_err());
 
         // get_task: children + roll-up.
         let e = get_task(&pool, eid).await?;
@@ -8071,8 +9500,24 @@ mod tests {
         assert_eq!(e["child_rollup"], json!({ "done": 0, "total": 2 }));
 
         // Mark c1 done -> roll-up 1/2.
-        update_task(&pool, c1id, Some("done"), None, None, None, None, Some("u"), None, None, None).await?;
-        assert_eq!(get_task(&pool, eid).await?["child_rollup"], json!({ "done": 1, "total": 2 }));
+        update_task(
+            &pool,
+            c1id,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            get_task(&pool, eid).await?["child_rollup"],
+            json!({ "done": 1, "total": 2 })
+        );
 
         // Child surfaces parent_id + parent_title.
         let c = get_task(&pool, c1id).await?;
@@ -8080,27 +9525,111 @@ mod tests {
         assert_eq!(c["parent_title"], json!("Epic"));
 
         // list_tasks top_level -> only the epic; parent_id -> the two children.
-        assert_eq!(ids(&list_tasks(&pool, Some(pid), None, None, false, None, true, None, None, None, None, None, false).await?), vec![eid]);
         assert_eq!(
-            ids(&list_tasks(&pool, Some(pid), None, None, false, Some(eid), false, None, None, None, None, None, false).await?),
+            ids(&list_tasks(
+                &pool,
+                Some(pid),
+                None,
+                None,
+                false,
+                None,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false
+            )
+            .await?),
+            vec![eid]
+        );
+        assert_eq!(
+            ids(&list_tasks(
+                &pool,
+                Some(pid),
+                None,
+                None,
+                false,
+                Some(eid),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false
+            )
+            .await?),
             vec![c1id, c2id]
         );
 
         // Guards: self-parent + cycle rejected.
-        assert!(update_task(&pool, eid, None, None, None, None, None, Some("u"), None, Some(eid), None).await.is_err());
-        assert!(update_task(&pool, eid, None, None, None, None, None, Some("u"), None, Some(c1id), None).await.is_err());
+        assert!(update_task(
+            &pool,
+            eid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(eid),
+            None
+        )
+        .await
+        .is_err());
+        assert!(update_task(
+            &pool,
+            eid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(c1id),
+            None
+        )
+        .await
+        .is_err());
 
         // Clear c2's parent (parent_id=0) -> top-level; emits task.reparented; roll-up shrinks.
-        let r = update_task(&pool, c2id, None, None, None, None, None, Some("u"), None, Some(0), None).await?;
+        let r = update_task(
+            &pool,
+            c2id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(0),
+            None,
+        )
+        .await?;
         assert!(r["parent_id"].is_null());
-        assert_eq!(get_task(&pool, eid).await?["child_rollup"], json!({ "done": 1, "total": 1 }));
+        assert_eq!(
+            get_task(&pool, eid).await?["child_rollup"],
+            json!({ "done": 1, "total": 1 })
+        );
         let evs = get_events(&pool, 0, 200, None, false).await?;
-        assert!(evs.as_array().unwrap().iter().any(|e| e["type"] == json!("task.reparented")));
+        assert!(evs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == json!("task.reparented")));
 
         // move_task guard: the epic still has a child -> cannot cross projects.
         assert!(move_task(&pool, eid, pid2, Some("u")).await.is_err());
         // c2 is now top-level with no children -> it can move.
-        assert_eq!(move_task(&pool, c2id, pid2, Some("u")).await?["project_id"], json!(pid2));
+        assert_eq!(
+            move_task(&pool, c2id, pid2, Some("u")).await?["project_id"],
+            json!(pid2)
+        );
         Ok(())
     }
 
@@ -8115,43 +9644,168 @@ mod tests {
         let p2 = create_project(&pool, "Beta", None, Some("u"), None).await?;
         let pid2 = p2["id"].as_i64().unwrap();
 
-        create_task(&pool, pid1, "Fix the widget pipeline", Some("handles reflow"), None, None, Some("u"), None, None, None).await?;
-        create_task(&pool, pid1, "Unrelated chore", None, None, None, Some("u"), None, None, None).await?;
-        create_task(&pool, pid2, "Widget docs", Some("describe the WIDGET api"), Some("alice"), None, Some("u"), None, None, None).await?;
+        create_task(
+            &pool,
+            pid1,
+            "Fix the widget pipeline",
+            Some("handles reflow"),
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        create_task(
+            &pool,
+            pid1,
+            "Unrelated chore",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        create_task(
+            &pool,
+            pid2,
+            "Widget docs",
+            Some("describe the WIDGET api"),
+            Some("alice"),
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         let titles = |v: &Value| -> Vec<String> {
-            let mut t: Vec<String> =
-                v.as_array().unwrap().iter().map(|x| x["title"].as_str().unwrap().to_string()).collect();
+            let mut t: Vec<String> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["title"].as_str().unwrap().to_string())
+                .collect();
             t.sort();
             t
         };
 
         // "widget" across ALL projects (case-insensitive) -> the two widget tasks, not the chore.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("widget"), None, None, None, None, false).await?),
-            vec!["Fix the widget pipeline".to_string(), "Widget docs".to_string()]
+            titles(
+                &list_tasks(
+                    &pool,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some("widget"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false
+                )
+                .await?
+            ),
+            vec![
+                "Fix the widget pipeline".to_string(),
+                "Widget docs".to_string()
+            ]
         );
         // Matches description too.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, None, false, None, false, Some("reflow"), None, None, None, None, false).await?),
+            titles(
+                &list_tasks(
+                    &pool,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some("reflow"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false
+                )
+                .await?
+            ),
             vec!["Fix the widget pipeline".to_string()]
         );
         // Composable with assignee: widget + alice -> only the Beta doc task.
         assert_eq!(
-            titles(&list_tasks(&pool, None, None, Some("alice"), false, None, false, Some("widget"), None, None, None, None, false).await?),
+            titles(
+                &list_tasks(
+                    &pool,
+                    None,
+                    None,
+                    Some("alice"),
+                    false,
+                    None,
+                    false,
+                    Some("widget"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false
+                )
+                .await?
+            ),
             vec!["Widget docs".to_string()]
         );
         // Composable with project scope: widget in Alpha -> only the pipeline task.
         assert_eq!(
-            titles(&list_tasks(&pool, Some(pid1), None, None, false, None, false, Some("widget"), None, None, None, None, false).await?),
+            titles(
+                &list_tasks(
+                    &pool,
+                    Some(pid1),
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some("widget"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false
+                )
+                .await?
+            ),
             vec!["Fix the widget pipeline".to_string()]
         );
         // No match -> empty.
-        assert!(list_tasks(&pool, None, None, None, false, None, false, Some("zzznope"), None, None, None, None, false)
-            .await?
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(list_tasks(
+            &pool,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            Some("zzznope"),
+            None,
+            None,
+            None,
+            None,
+            false
+        )
+        .await?
+        .as_array()
+        .unwrap()
+        .is_empty());
         Ok(())
     }
 
@@ -8162,11 +9816,36 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, None, None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, None, Some(json!({"a": 1})), None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            None,
+            Some(json!({"a": 1})),
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         set_task_props(&pool, tid, json!({"b": 2})).await?;
-        update_task(&pool, tid, None, None, None, None, None, None, Some(json!({"c": 3})), None, None).await?;
+        update_task(
+            &pool,
+            tid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({"c": 3})),
+            None,
+            None,
+        )
+        .await?;
 
         let task = get_task(&pool, tid).await?;
         assert_eq!(task["metadata"], json!({"a": 1, "b": 2, "c": 3}));
@@ -8197,12 +9876,36 @@ mod tests {
         assert_eq!(a["charter"], "own X");
 
         // Re-register with a partial bag: merges (model kept), doesn't clobber charter.
-        let a = register_agent(&pool, "v-x", None, None, None, Some(json!({"effort": "high"})), None).await?;
-        assert_eq!(a["metadata"], json!({"role": "vertical", "model": "opus", "effort": "high"}));
+        let a = register_agent(
+            &pool,
+            "v-x",
+            None,
+            None,
+            None,
+            Some(json!({"effort": "high"})),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            a["metadata"],
+            json!({"role": "vertical", "model": "opus", "effort": "high"})
+        );
         assert_eq!(a["charter"], "own X");
 
         // update_agent: away without a message keeps status_message; metadata merges again.
-        update_agent(&pool, "v-x", None, None, None, Some("away"), None, None, Some(json!({"branch": "main"})), None).await?;
+        update_agent(
+            &pool,
+            "v-x",
+            None,
+            None,
+            None,
+            Some("away"),
+            None,
+            None,
+            Some(json!({"branch": "main"})),
+            None,
+        )
+        .await?;
         let got = get_agent(&pool, "v-x").await?;
         assert_eq!(got["status"], "away");
         assert_eq!(
@@ -8212,18 +9915,81 @@ mod tests {
 
         // clear affordance (task 489): set then CLEAR webhook_url to null in one call. A null/omitted
         // field would leave it unchanged, so clear is the only way to empty it.
-        update_agent(&pool, "v-x", None, None, None, None, None, Some("http://x/wake"), None, None).await?;
-        assert_eq!(get_agent(&pool, "v-x").await?["webhook_url"], json!("http://x/wake"));
-        update_agent(&pool, "v-x", None, None, None, None, None, None, None, Some(&["webhook_url".to_string()])).await?;
-        assert!(get_agent(&pool, "v-x").await?["webhook_url"].is_null(), "clear empties the field");
+        update_agent(
+            &pool,
+            "v-x",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("http://x/wake"),
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            get_agent(&pool, "v-x").await?["webhook_url"],
+            json!("http://x/wake")
+        );
+        update_agent(
+            &pool,
+            "v-x",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&["webhook_url".to_string()]),
+        )
+        .await?;
+        assert!(
+            get_agent(&pool, "v-x").await?["webhook_url"].is_null(),
+            "clear empties the field"
+        );
         // An explicit value wins over clearing the same field in one call.
-        update_agent(&pool, "v-x", None, None, None, None, None, Some("http://y/wake"), None, Some(&["webhook_url".to_string()])).await?;
-        assert_eq!(get_agent(&pool, "v-x").await?["webhook_url"], json!("http://y/wake"), "explicit value wins over clear");
+        update_agent(
+            &pool,
+            "v-x",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("http://y/wake"),
+            None,
+            Some(&["webhook_url".to_string()]),
+        )
+        .await?;
+        assert_eq!(
+            get_agent(&pool, "v-x").await?["webhook_url"],
+            json!("http://y/wake"),
+            "explicit value wins over clear"
+        );
         // A non-clearable field name is rejected.
-        assert!(update_agent(&pool, "v-x", None, None, None, None, None, None, None, Some(&["status".to_string()])).await.is_err());
+        assert!(update_agent(
+            &pool,
+            "v-x",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&["status".to_string()])
+        )
+        .await
+        .is_err());
 
         // update_agent on an unknown agent errors (it's a mutate, not an upsert).
-        assert!(update_agent(&pool, "nope", None, None, None, None, None, None, None, None).await.is_err());
+        assert!(
+            update_agent(&pool, "nope", None, None, None, None, None, None, None, None)
+                .await
+                .is_err()
+        );
 
         // A fresh agent gets an empty bag by default, not null.
         register_agent(&pool, "v-y", None, None, None, None, None).await?;
@@ -8239,9 +10005,36 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let big_charter = "x".repeat(3000);
-        register_agent(&pool, "v-compiler", Some("Compiler"), Some("vertical"), Some(&big_charter), Some(json!({"area":"compiler"})), None).await?;
-        register_agent(&pool, "v-runtime", Some("Runtime"), Some("vertical"), Some(&big_charter), Some(json!({"area":"runtime"})), None).await?;
-        register_agent(&pool, "concierge", Some("Concierge"), Some("ops"), Some(&big_charter), Some(json!({"area":"ops"})), None).await?;
+        register_agent(
+            &pool,
+            "v-compiler",
+            Some("Compiler"),
+            Some("vertical"),
+            Some(&big_charter),
+            Some(json!({"area":"compiler"})),
+            None,
+        )
+        .await?;
+        register_agent(
+            &pool,
+            "v-runtime",
+            Some("Runtime"),
+            Some("vertical"),
+            Some(&big_charter),
+            Some(json!({"area":"runtime"})),
+            None,
+        )
+        .await?;
+        register_agent(
+            &pool,
+            "concierge",
+            Some("Concierge"),
+            Some("ops"),
+            Some(&big_charter),
+            Some(json!({"area":"ops"})),
+            None,
+        )
+        .await?;
         set_status(&pool, "v-compiler", "online", None).await?;
         set_status(&pool, "v-runtime", "offline", None).await?;
         set_status(&pool, "concierge", "offline", None).await?; // register defaults to online
@@ -8254,8 +10047,14 @@ mod tests {
         assert_eq!(arr.len(), 3);
         for a in arr {
             assert!(a.get("id").is_some() && a.get("status").is_some());
-            assert!(a.get("charter").is_none(), "roster must omit the heavy charter: {a}");
-            assert!(a.get("metadata").is_some(), "roster must include metadata for filtering: {a}");
+            assert!(
+                a.get("charter").is_none(),
+                "roster must omit the heavy charter: {a}"
+            );
+            assert!(
+                a.get("metadata").is_some(),
+                "roster must include metadata for filtering: {a}"
+            );
         }
         // The metadata bag is the real object, so a consumer can filter on it (e.g. metadata.area).
         let compiler = arr.iter().find(|a| a["id"] == json!("v-compiler")).unwrap();
@@ -8263,10 +10062,15 @@ mod tests {
 
         // verbose -> full objects (charter present).
         let full = list_agents(&pool, None, None, None, None, true, None, None).await?;
-        assert!(full.as_array().unwrap().iter().all(|a| a["charter"].is_string()));
+        assert!(full
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["charter"].is_string()));
 
         // status filter.
-        let online = list_agents(&pool, Some("online"), None, None, None, false, None, None).await?;
+        let online =
+            list_agents(&pool, Some("online"), None, None, None, false, None, None).await?;
         let online = online.as_array().unwrap();
         assert_eq!(online.len(), 1);
         assert_eq!(online[0]["id"], json!("v-compiler"));
@@ -8277,7 +10081,17 @@ mod tests {
         assert_eq!(q.as_array().unwrap()[0]["id"], json!("v-runtime"));
 
         // meta_key/meta_value routing filter (the v-cadenza-ci case: find the owning area).
-        let by_area = list_agents(&pool, None, None, Some("area"), Some("compiler"), false, None, None).await?;
+        let by_area = list_agents(
+            &pool,
+            None,
+            None,
+            Some("area"),
+            Some("compiler"),
+            false,
+            None,
+            None,
+        )
+        .await?;
         assert_eq!(by_area.as_array().unwrap().len(), 1);
         assert_eq!(by_area.as_array().unwrap()[0]["id"], json!("v-compiler"));
 
@@ -8381,7 +10195,10 @@ mod tests {
         // Two case-variant projects created directly (bypass get-or-create) to simulate
         // the pre-existing sprawl.
         let ts = now_iso();
-        for (name, t) in [("Backend", "2026-01-01T00:00:00Z"), ("backend", "2026-02-01T00:00:00Z")] {
+        for (name, t) in [
+            ("Backend", "2026-01-01T00:00:00Z"),
+            ("backend", "2026-02-01T00:00:00Z"),
+        ] {
             sqlx::query("INSERT INTO projects(name, created_at, updated_at) VALUES(?,?,?)")
                 .bind(name)
                 .bind(t)
@@ -8390,7 +10207,19 @@ mod tests {
                 .await?;
         }
         // ids: 1 = "Backend" (earlier), 2 = "backend" (later).
-        create_task(&pool, 2, "on dupe", None, None, None, Some("u"), None, None, None).await?;
+        create_task(
+            &pool,
+            2,
+            "on dupe",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         // Same subscriber on both projects -> collision on repoint; both on dupe only too.
         subscribe(&pool, "alice", None, Some(1), None, None, false).await?;
         subscribe(&pool, "alice", None, Some(2), None, None, false).await?; // will collide with keep=1
@@ -8407,7 +10236,22 @@ mod tests {
         assert_eq!(arr[0]["id"], json!(1));
 
         // The task moved onto the surviving project.
-        let tasks = list_tasks(&pool, Some(1), None, None, false, None, false, None, None, None, None, None, false).await?;
+        let tasks = list_tasks(
+            &pool,
+            Some(1),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
         assert_eq!(tasks.as_array().unwrap().len(), 1);
 
         // Subscriptions: alice (deduped to one), bob (repointed) both on project 1.
@@ -8434,20 +10278,34 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
-        let p = create_project(&pool, "Alpha", None, Some("u"), Some(json!({"repo": "r1"}))).await?;
+        let p =
+            create_project(&pool, "Alpha", None, Some("u"), Some(json!({"repo": "r1"}))).await?;
         let pid = p["id"].as_i64().unwrap();
         // create returns metadata parsed as an object, not a JSON string.
         assert_eq!(p["metadata"], json!({"repo": "r1"}));
 
         // Rename + add a metadata key (existing keys preserved = merge, not replace).
-        let up = update_project(&pool, pid, Some("Alpha Prime"), None, None, Some(json!({"lang": "rust"})), Some("u")).await?;
+        let up = update_project(
+            &pool,
+            pid,
+            Some("Alpha Prime"),
+            None,
+            None,
+            Some(json!({"lang": "rust"})),
+            Some("u"),
+        )
+        .await?;
         assert_eq!(up["name"], json!("Alpha Prime"));
         assert_eq!(up["metadata"], json!({"repo": "r1", "lang": "rust"}));
 
         // Archive it: it drops out of the active-filtered list but is still there.
         update_project(&pool, pid, None, None, Some("archived"), None, Some("u")).await?;
         let active = list_projects(&pool, Some("active")).await?;
-        assert_eq!(active.as_array().unwrap().len(), 0, "archived project hidden from active list");
+        assert_eq!(
+            active.as_array().unwrap().len(),
+            0,
+            "archived project hidden from active list"
+        );
         let archived = list_projects(&pool, Some("archived")).await?;
         assert_eq!(archived.as_array().unwrap().len(), 1);
 
@@ -8487,14 +10345,68 @@ mod tests {
         let b = create_project(&pool, "B", None, Some("u"), None).await?;
         let aid = a["id"].as_i64().unwrap();
         let bid = b["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            aid,
+            "T",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         let moved = move_task(&pool, tid, bid, Some("u")).await?;
         assert_eq!(moved["project_id"], json!(bid));
         // It now lists under B, not A.
-        assert_eq!(list_tasks(&pool, Some(aid), None, None, false, None, false, None, None, None, None, None, false).await?.as_array().unwrap().len(), 0);
-        assert_eq!(list_tasks(&pool, Some(bid), None, None, false, None, false, None, None, None, None, None, false).await?.as_array().unwrap().len(), 1);
+        assert_eq!(
+            list_tasks(
+                &pool,
+                Some(aid),
+                None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false
+            )
+            .await?
+            .as_array()
+            .unwrap()
+            .len(),
+            0
+        );
+        assert_eq!(
+            list_tasks(
+                &pool,
+                Some(bid),
+                None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false
+            )
+            .await?
+            .as_array()
+            .unwrap()
+            .len(),
+            1
+        );
 
         // A task.moved event was recorded carrying both ends.
         let events = get_events(&pool, 0, 100, None, false).await?;
@@ -8508,9 +10420,17 @@ mod tests {
         assert_eq!(ev["data"]["to_project_id"], json!(bid));
 
         // Moving onto the current project is a no-op (no new event, still on B).
-        let before = get_events(&pool, 0, 100, None, false).await?.as_array().unwrap().len();
+        let before = get_events(&pool, 0, 100, None, false)
+            .await?
+            .as_array()
+            .unwrap()
+            .len();
         move_task(&pool, tid, bid, Some("u")).await?;
-        let after = get_events(&pool, 0, 100, None, false).await?.as_array().unwrap().len();
+        let after = get_events(&pool, 0, 100, None, false)
+            .await?
+            .as_array()
+            .unwrap()
+            .len();
         assert_eq!(before, after, "no-op move should not emit an event");
         Ok(())
     }
@@ -8523,31 +10443,118 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        create_task(&pool, pid, "owned", None, Some("alice"), None, Some("u"), None, None, None).await?;
-        create_task(&pool, pid, "free", None, None, None, Some("u"), None, None, None).await?;
+        create_task(
+            &pool,
+            pid,
+            "owned",
+            None,
+            Some("alice"),
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        create_task(
+            &pool,
+            pid,
+            "free",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         // unassigned=true -> only the ownerless task.
-        let un = list_tasks(&pool, Some(pid), None, None, true, None, false, None, None, None, None, None, false).await?;
+        let un = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            true,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
         let un = un.as_array().unwrap();
         assert_eq!(un.len(), 1);
         assert_eq!(un[0]["title"], json!("free"));
         assert!(un[0]["assignee"].is_null());
 
         // assignee equality still works when unassigned is false.
-        let mine = list_tasks(&pool, Some(pid), None, Some("alice"), false, None, false, None, None, None, None, None, false).await?;
+        let mine = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            Some("alice"),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
         let mine = mine.as_array().unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0]["title"], json!("owned"));
 
         // unassigned=true wins over a contradictory assignee= filter (no owner beats owner=alice).
-        let both = list_tasks(&pool, Some(pid), None, Some("alice"), true, None, false, None, None, None, None, None, false).await?;
+        let both = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            Some("alice"),
+            true,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
         let both = both.as_array().unwrap();
         assert_eq!(both.len(), 1);
         assert_eq!(both[0]["title"], json!("free"));
 
         // No filter returns both.
         assert_eq!(
-            list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?.as_array().unwrap().len(),
+            list_tasks(
+                &pool,
+                Some(pid),
+                None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false
+            )
+            .await?
+            .as_array()
+            .unwrap()
+            .len(),
             2
         );
         Ok(())
@@ -8563,29 +10570,177 @@ mod tests {
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         // Two tasks observing "widget-a", one observing "widget-b", one with no metadata.
-        create_task(&pool, pid, "obs-a1", None, None, None, Some("u"), Some(json!({"observes": "widget-a"})), None, None).await?;
-        create_task(&pool, pid, "obs-a2", None, None, None, Some("u"), Some(json!({"observes": "widget-a"})), None, None).await?;
-        create_task(&pool, pid, "obs-b", None, None, None, Some("u"), Some(json!({"observes": "widget-b"})), None, None).await?;
-        create_task(&pool, pid, "plain", None, None, None, Some("u"), None, None, None).await?;
+        create_task(
+            &pool,
+            pid,
+            "obs-a1",
+            None,
+            None,
+            None,
+            Some("u"),
+            Some(json!({"observes": "widget-a"})),
+            None,
+            None,
+        )
+        .await?;
+        create_task(
+            &pool,
+            pid,
+            "obs-a2",
+            None,
+            None,
+            None,
+            Some("u"),
+            Some(json!({"observes": "widget-a"})),
+            None,
+            None,
+        )
+        .await?;
+        create_task(
+            &pool,
+            pid,
+            "obs-b",
+            None,
+            None,
+            None,
+            Some("u"),
+            Some(json!({"observes": "widget-b"})),
+            None,
+            None,
+        )
+        .await?;
+        create_task(
+            &pool,
+            pid,
+            "plain",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
 
-        let a = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("widget-a"), false).await?;
-        let titles: Vec<_> = a.as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap().to_string()).collect();
+        let a = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("observes"),
+            Some("widget-a"),
+            false,
+        )
+        .await?;
+        let titles: Vec<_> = a
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(titles, vec!["obs-a1", "obs-a2"]);
 
         // Composes with a status filter: no open task observes widget-b once it's marked done.
-        let bid = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("widget-b"), false)
-            .await?[0]["id"]
+        let bid = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("observes"),
+            Some("widget-b"),
+            false,
+        )
+        .await?[0]["id"]
             .as_i64()
             .unwrap();
-        update_task(&pool, bid, Some("done"), None, None, None, None, Some("u"), None, None, None).await?;
-        let open_b = list_tasks(&pool, Some(pid), Some("todo"), None, false, None, false, None, None, None, Some("observes"), Some("widget-b"), false).await?;
-        assert_eq!(open_b.as_array().unwrap().len(), 0, "no OPEN task observes widget-b after it's done");
+        update_task(
+            &pool,
+            bid,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let open_b = list_tasks(
+            &pool,
+            Some(pid),
+            Some("todo"),
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("observes"),
+            Some("widget-b"),
+            false,
+        )
+        .await?;
+        assert_eq!(
+            open_b.as_array().unwrap().len(),
+            0,
+            "no OPEN task observes widget-b after it's done"
+        );
 
         // A key with no matching value returns nothing; only meta_key (no value) does not filter.
-        let none = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), Some("nope"), false).await?;
+        let none = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("observes"),
+            Some("nope"),
+            false,
+        )
+        .await?;
         assert_eq!(none.as_array().unwrap().len(), 0);
-        let unfiltered = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, Some("observes"), None, false).await?;
-        assert_eq!(unfiltered.as_array().unwrap().len(), 4, "meta_key without meta_value is inert");
+        let unfiltered = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("observes"),
+            None,
+            false,
+        )
+        .await?;
+        assert_eq!(
+            unfiltered.as_array().unwrap().len(),
+            4,
+            "meta_key without meta_value is inert"
+        );
         Ok(())
     }
 
@@ -8597,31 +10752,137 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("owner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let keep = create_task(&pool, pid, "keep", None, None, None, Some("owner"), None, None, None).await?;
-        let retire = create_task(&pool, pid, "retire", None, None, None, Some("owner"), None, None, None).await?;
+        let keep = create_task(
+            &pool,
+            pid,
+            "keep",
+            None,
+            None,
+            None,
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let retire = create_task(
+            &pool,
+            pid,
+            "retire",
+            None,
+            None,
+            None,
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let retire_id = retire["id"].as_i64().unwrap();
         let _ = keep;
 
         // Both visible before archiving.
-        let before = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
+        let before = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
         assert_eq!(before.as_array().unwrap().len(), 2);
 
         // Archive one: the default view drops it, but include_archived still lists it.
         let archived = set_task_archived(&pool, retire_id, true, Some("owner")).await?;
-        assert!(archived["archived_at"].is_string(), "archived_at stamped: {archived}");
-        let default_view = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
-        let titles: Vec<_> = default_view.as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap().to_string()).collect();
+        assert!(
+            archived["archived_at"].is_string(),
+            "archived_at stamped: {archived}"
+        );
+        let default_view = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        let titles: Vec<_> = default_view
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(titles, vec!["keep"], "archived task hidden by default");
-        let with_archived = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, true).await?;
-        assert_eq!(with_archived.as_array().unwrap().len(), 2, "include_archived lists it");
+        let with_archived = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await?;
+        assert_eq!(
+            with_archived.as_array().unwrap().len(),
+            2,
+            "include_archived lists it"
+        );
         // Still fetchable by id.
-        assert_eq!(get_task(&pool, retire_id).await?["title"].as_str(), Some("retire"));
+        assert_eq!(
+            get_task(&pool, retire_id).await?["title"].as_str(),
+            Some("retire")
+        );
 
         // Restore: reappears in the default view, stamp cleared.
         let restored = set_task_archived(&pool, retire_id, false, Some("owner")).await?;
-        assert!(restored["archived_at"].is_null(), "archived_at cleared: {restored}");
-        let after = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
-        assert_eq!(after.as_array().unwrap().len(), 2, "restored task back in default view");
+        assert!(
+            restored["archived_at"].is_null(),
+            "archived_at cleared: {restored}"
+        );
+        let after = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert_eq!(
+            after.as_array().unwrap().len(),
+            2,
+            "restored task back in default view"
+        );
 
         // Archiving an unknown task errors.
         assert!(set_task_archived(&pool, 999_999, true, None).await.is_err());
@@ -8654,7 +10915,10 @@ mod tests {
         let id = req["id"].as_i64().unwrap();
         let submit_token = req["submit_token"].as_str().unwrap().to_string();
         let fulfiller_token = req["fulfiller_token"].as_str().unwrap().to_string();
-        assert!(req["submit_url"].as_str().unwrap().contains(&format!("/secret-requests/{id}?t=")));
+        assert!(req["submit_url"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("/secret-requests/{id}?t=")));
         assert_eq!(req["status"], "requested");
         assert_eq!(req["recipients"].as_array().unwrap().len(), 2);
 
@@ -8670,7 +10934,10 @@ mod tests {
         // Submit with the right token flips to submitted, hides the ciphertext, notifies the fulfiller.
         let submitted = submit_secret(&pool, id, &submit_token, "AGE-CIPHERTEXT-BLOB").await?;
         assert_eq!(submitted["status"], "submitted");
-        assert!(submitted.get("ciphertext").is_none(), "submit metadata hides ciphertext");
+        assert!(
+            submitted.get("ciphertext").is_none(),
+            "submit metadata hides ciphertext"
+        );
         let notif = check_notifications(&pool, "green-machine-ops", true, 50, None).await?;
         let types: Vec<String> = notif["notifications"]
             .as_array()
@@ -8678,20 +10945,30 @@ mod tests {
             .iter()
             .map(|n| n["type"].as_str().unwrap().to_string())
             .collect();
-        assert!(types.contains(&"secret.submitted".to_string()), "fulfiller notified: {types:?}");
+        assert!(
+            types.contains(&"secret.submitted".to_string()),
+            "fulfiller notified: {types:?}"
+        );
 
         // The submit link is single-use: a second submit is rejected.
-        assert!(submit_secret(&pool, id, &submit_token, "AGAIN").await.is_err());
+        assert!(submit_secret(&pool, id, &submit_token, "AGAIN")
+            .await
+            .is_err());
 
         // The fulfiller pulls the ciphertext (token-gated); a wrong token is rejected.
-        assert!(get_secret_ciphertext(&pool, id, "wrong-token").await.is_err());
+        assert!(get_secret_ciphertext(&pool, id, "wrong-token")
+            .await
+            .is_err());
         let pulled = get_secret_ciphertext(&pool, id, &fulfiller_token).await?;
         assert_eq!(pulled["ciphertext"], "AGE-CIPHERTEXT-BLOB");
 
         // Fulfill deletes the row; a second fulfill (row gone) is idempotent.
         let done = fulfill_secret(&pool, id, &fulfiller_token).await?;
         assert_eq!(done["fulfilled"], true);
-        assert!(get_secret_request(&pool, id).await.is_err(), "row deleted after fulfill");
+        assert!(
+            get_secret_request(&pool, id).await.is_err(),
+            "row deleted after fulfill"
+        );
         let again = fulfill_secret(&pool, id, "any").await?;
         assert_eq!(again["already"], true, "idempotent fulfill on a gone row");
 
@@ -8707,7 +10984,9 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // Empty list: nothing matches, and check passes.
-        assert!(scan_banned_phrases(&pool, "anything at all").await?.is_empty());
+        assert!(scan_banned_phrases(&pool, "anything at all")
+            .await?
+            .is_empty());
         check_banned_phrases(&pool, "anything at all", false).await?;
 
         // Add two phrases (stored lowercased; idempotent + note-updating on re-add).
@@ -8715,16 +10994,36 @@ mod tests {
         add_banned_phrase(&pool, "floored", None, Some("librarian")).await?;
         add_banned_phrase(&pool, "the floor", Some("still jargon"), Some("librarian")).await?; // dup -> update
         let list = list_banned_phrases(&pool).await?;
-        assert_eq!(list.as_array().unwrap().len(), 2, "dup add did not grow the list: {list}");
+        assert_eq!(
+            list.as_array().unwrap().len(),
+            2,
+            "dup add did not grow the list: {list}"
+        );
 
         // Case-insensitive, whole-phrase match; the term inside a larger word does NOT match.
-        assert_eq!(scan_banned_phrases(&pool, "we hit THE FLOOR today").await?, vec!["the floor"]);
-        assert_eq!(scan_banned_phrases(&pool, "I am floored.").await?, vec!["floored"]);
-        assert!(scan_banned_phrases(&pool, "the floorboard creaks").await?.is_empty(), "whole-word only");
-        assert!(scan_banned_phrases(&pool, "no jargon here").await?.is_empty());
+        assert_eq!(
+            scan_banned_phrases(&pool, "we hit THE FLOOR today").await?,
+            vec!["the floor"]
+        );
+        assert_eq!(
+            scan_banned_phrases(&pool, "I am floored.").await?,
+            vec!["floored"]
+        );
+        assert!(
+            scan_banned_phrases(&pool, "the floorboard creaks")
+                .await?
+                .is_empty(),
+            "whole-word only"
+        );
+        assert!(scan_banned_phrases(&pool, "no jargon here")
+            .await?
+            .is_empty());
 
         // check bails on a hit, unless acknowledged.
-        let err = check_banned_phrases(&pool, "down to the floor", false).await.unwrap_err().to_string();
+        let err = check_banned_phrases(&pool, "down to the floor", false)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.starts_with("banned phrase"), "got: {err}");
         assert!(err.contains("the floor"), "names the phrase: {err}");
         check_banned_phrases(&pool, "down to the floor", true).await?; // acknowledged -> passes
@@ -8732,9 +11031,18 @@ mod tests {
         // Remove one; it stops matching and the list shrinks.
         let r = remove_banned_phrase(&pool, "THE FLOOR").await?;
         assert_eq!(r["deleted"], json!(true));
-        assert!(scan_banned_phrases(&pool, "we hit the floor").await?.is_empty());
-        assert_eq!(list_banned_phrases(&pool).await?.as_array().unwrap().len(), 1);
-        assert_eq!(remove_banned_phrase(&pool, "the floor").await?["deleted"], json!(false), "already gone");
+        assert!(scan_banned_phrases(&pool, "we hit the floor")
+            .await?
+            .is_empty());
+        assert_eq!(
+            list_banned_phrases(&pool).await?.as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            remove_banned_phrase(&pool, "the floor").await?["deleted"],
+            json!(false),
+            "already gone"
+        );
         Ok(())
     }
 
@@ -8755,7 +11063,9 @@ mod tests {
             assert!(e.contains("line 1, column"), "reports a location: {e}");
         }
         // Location counts newlines.
-        let e = check_non_ascii("line one\nsecond \u{2014} dash", false).unwrap_err().to_string();
+        let e = check_non_ascii("line one\nsecond \u{2014} dash", false)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("line 2"), "counts newlines: {e}");
         // Acknowledge overrides.
         assert!(check_non_ascii("em dash \u{2014} acked", true).is_ok());
@@ -8768,15 +11078,43 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         // Create with a non-ASCII (em dash) title is rejected before any DB write.
-        let e = create_document(&pool, "Bad \u{2014} title", None, "Qmcid", None, Some("u"), None, None, None)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(e.starts_with("non-ASCII"), "create rejects non-ASCII title: {e}");
+        let e = create_document(
+            &pool,
+            "Bad \u{2014} title",
+            None,
+            "Qmcid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.starts_with("non-ASCII"),
+            "create rejects non-ASCII title: {e}"
+        );
         // An ASCII create succeeds; renaming to a non-ASCII title is rejected; ASCII rename is fine.
-        let d = create_document(&pool, "Good title", None, "Qmcid", None, Some("u"), None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Good title",
+            None,
+            "Qmcid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let id = d["id"].as_i64().unwrap();
-        assert!(update_document(&pool, id, "Renamed \u{2194} bad", Some("u")).await.is_err());
+        assert!(
+            update_document(&pool, id, "Renamed \u{2194} bad", Some("u"))
+                .await
+                .is_err()
+        );
         update_document(&pool, id, "Renamed good", Some("u")).await?;
         Ok(())
     }
@@ -8790,15 +11128,45 @@ mod tests {
         register_agent(&pool, "alice", None, None, None, None, None).await?;
         let p = create_project(&pool, "P", None, Some("owner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("owner"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         // owner comments mentioning @alice (registered) and @nobody (not registered).
-        comment_task(&pool, tid, "hey @alice and @nobody take a look", Some("owner"), None, None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "hey @alice and @nobody take a look",
+            Some("owner"),
+            None,
+            None,
+        )
+        .await?;
         let task = get_task(&pool, tid).await?;
-        let subs: Vec<&str> =
-            task["subscribers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(subs.contains(&"alice"), "mentioned registered agent subscribed: {subs:?}");
-        assert!(!subs.contains(&"nobody"), "unregistered @token ignored: {subs:?}");
+        let subs: Vec<&str> = task["subscribers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            subs.contains(&"alice"),
+            "mentioned registered agent subscribed: {subs:?}"
+        );
+        assert!(
+            !subs.contains(&"nobody"),
+            "unregistered @token ignored: {subs:?}"
+        );
         Ok(())
     }
 
@@ -8809,7 +11177,10 @@ mod tests {
             vec!["v-task-board", "board-pm", "alice_1"]
         );
         assert!(extract_mentions("no mentions here").is_empty());
-        assert_eq!(extract_mentions("email a@b.com is not a mention start"), vec!["b"]);
+        assert_eq!(
+            extract_mentions("email a@b.com is not a mention start"),
+            vec!["b"]
+        );
     }
 
     /// #476: register_agent/update_agent coerce a hand-authored metadata.repos (a CSV/space/newline
@@ -8819,7 +11190,9 @@ mod tests {
     fn coerce_repos_metadata_normalizes_unstructured_forms() {
         assert_eq!(
             coerce_repos_metadata(Some(&json!("Membrain, MembrainCDK\nElasticShuffleCDK"))),
-            Some(json!([{ "repo": "Membrain" }, { "repo": "MembrainCDK" }, { "repo": "ElasticShuffleCDK" }]))
+            Some(
+                json!([{ "repo": "Membrain" }, { "repo": "MembrainCDK" }, { "repo": "ElasticShuffleCDK" }])
+            )
         );
         assert_eq!(
             coerce_repos_metadata(Some(&json!(["a", "b"]))),
@@ -8847,7 +11220,12 @@ mod tests {
         let ch = create_channel(&pool, "announcements", None, Some("owner"), None).await?;
         let cid = ch["id"].as_i64().unwrap();
         let members = |v: &Value| -> Vec<String> {
-            v["members"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+            v["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect()
         };
 
         // Before enabling, a and b (registered before the channel existed) are not members.
@@ -8856,17 +11234,26 @@ mod tests {
         // Enable: backfill joins every registered agent.
         set_channel_auto_join(&pool, cid, true, Some("owner")).await?;
         let m = members(&get_channel(&pool, cid).await?);
-        assert!(m.contains(&"a".to_string()) && m.contains(&"b".to_string()), "backfilled: {m:?}");
+        assert!(
+            m.contains(&"a".to_string()) && m.contains(&"b".to_string()),
+            "backfilled: {m:?}"
+        );
 
         // A newly-registered agent auto-joins.
         register_agent(&pool, "c", None, None, None, None, None).await?;
-        assert!(members(&get_channel(&pool, cid).await?).contains(&"c".to_string()), "c auto-joined");
+        assert!(
+            members(&get_channel(&pool, cid).await?).contains(&"c".to_string()),
+            "c auto-joined"
+        );
 
         // Disabling stops future auto-joins (existing members stay).
         set_channel_auto_join(&pool, cid, false, Some("owner")).await?;
         register_agent(&pool, "d", None, None, None, None, None).await?;
         let m2 = members(&get_channel(&pool, cid).await?);
-        assert!(!m2.contains(&"d".to_string()), "d did not auto-join after disable: {m2:?}");
+        assert!(
+            !m2.contains(&"d".to_string()),
+            "d did not auto-join after disable: {m2:?}"
+        );
         assert!(m2.contains(&"c".to_string()), "existing member c retained");
         Ok(())
     }
@@ -8880,13 +11267,40 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, Some("alice"), None, Some("u"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("alice"),
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Clear the owner.
-        let cleared =
-            update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None, None).await?;
-        assert!(cleared["assignee"].is_null(), "assignee should be NULL after unassign");
+        let cleared = update_task(
+            &pool,
+            tid,
+            None,
+            Some(""),
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            cleared["assignee"].is_null(),
+            "assignee should be NULL after unassign"
+        );
 
         let events = get_events(&pool, 0, 100, None, false).await?;
         let un = events
@@ -8895,10 +11309,27 @@ mod tests {
             .iter()
             .find(|e| e["type"] == json!("task.unassigned"))
             .expect("task.unassigned emitted");
-        assert_eq!(un["data"]["from"], json!("alice"), "carries the prior owner");
+        assert_eq!(
+            un["data"]["from"],
+            json!("alice"),
+            "carries the prior owner"
+        );
 
         // Clearing an already-unassigned task does NOT emit a second task.unassigned.
-        update_task(&pool, tid, None, Some(""), None, None, None, Some("u"), None, None, None).await?;
+        update_task(
+            &pool,
+            tid,
+            None,
+            Some(""),
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let after = get_events(&pool, 0, 200, None, false).await?;
         assert_eq!(
             after
@@ -8912,12 +11343,27 @@ mod tests {
         );
 
         // Re-assigning to a real owner emits task.assigned.
-        update_task(&pool, tid, None, Some("bob"), None, None, None, Some("u"), None, None, None).await?;
+        update_task(
+            &pool,
+            tid,
+            None,
+            Some("bob"),
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let evs = get_events(&pool, 0, 200, None, false).await?;
         assert!(
-            evs.as_array().unwrap().iter().any(
-                |e| e["type"] == json!("task.assigned") && e["data"]["assignee"] == json!("bob")
-            ),
+            evs.as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["type"] == json!("task.assigned")
+                    && e["data"]["assignee"] == json!("bob")),
             "task.assigned emitted for the new owner"
         );
         Ok(())
@@ -8930,7 +11376,19 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let a = create_project(&pool, "A", None, Some("u"), None).await?;
         let aid = a["id"].as_i64().unwrap();
-        let t = create_task(&pool, aid, "T", None, None, None, Some("u"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            aid,
+            "T",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         assert!(move_task(&pool, tid, 9999, Some("u")).await.is_err());
         Ok(())
@@ -8975,7 +11433,16 @@ mod tests {
         assert_eq!(got["name"], json!("old"));
         assert_eq!(got["metadata"], json!({}));
         // And a merge write works on the back-filled column.
-        update_project(&pool, 1, None, None, None, Some(json!({"repo": "r"})), Some("u")).await?;
+        update_project(
+            &pool,
+            1,
+            None,
+            None,
+            None,
+            Some(json!({"repo": "r"})),
+            Some("u"),
+        )
+        .await?;
         let after = get_project(&pool, 1).await?;
         assert_eq!(after["metadata"], json!({"repo": "r"}));
         Ok(())
@@ -8997,8 +11464,15 @@ mod tests {
         assert_eq!(again["id"].as_i64(), Some(cid), "get-or-create by name");
         // bob joined via the get-or-create call.
         let members: BTreeSet<String> = again["members"]
-            .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert_eq!(members, ["alice", "bob"].iter().map(|s| s.to_string()).collect());
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            members,
+            ["alice", "bob"].iter().map(|s| s.to_string()).collect()
+        );
 
         // carol joins explicitly, then alice posts. bob + carol hear it; alice (poster) doesn't.
         subscribe(&pool, "carol", None, None, Some(cid), None, false).await?;
@@ -9009,8 +11483,16 @@ mod tests {
         let carol = check_notifications(&pool, "carol", true, 50, None).await?;
         let alice = check_notifications(&pool, "alice", true, 50, None).await?;
         assert_eq!(bob["count"].as_i64(), Some(1), "bob hears the post: {bob}");
-        assert_eq!(carol["count"].as_i64(), Some(1), "carol hears the post: {carol}");
-        assert_eq!(alice["count"].as_i64(), Some(0), "poster isn't self-notified: {alice}");
+        assert_eq!(
+            carol["count"].as_i64(),
+            Some(1),
+            "carol hears the post: {carol}"
+        );
+        assert_eq!(
+            alice["count"].as_i64(),
+            Some(0),
+            "poster isn't self-notified: {alice}"
+        );
         assert_eq!(bob["notifications"][0]["type"], json!("channel.post"));
 
         // A fresh joiner reads history from the backlog (inbox only holds post-join events).
@@ -9081,7 +11563,11 @@ mod tests {
         let cid = m1["channel_id"].as_i64().unwrap();
         // Reverse direction resolves to the SAME channel (canonical dm_key).
         let m2 = send_message(&pool, "bob", "alice", "hey alice").await?;
-        assert_eq!(m2["channel_id"].as_i64(), Some(cid), "A->B and B->A share a channel");
+        assert_eq!(
+            m2["channel_id"].as_i64(),
+            Some(cid),
+            "A->B and B->A share a channel"
+        );
 
         // bob hears alice's message (1st DM), alice hears bob's (2nd) — each as message.direct,
         // never their own.
@@ -9090,13 +11576,24 @@ mod tests {
         assert_eq!(bob["notifications"][0]["data"]["body"], json!("hey bob"));
         let alice = get_messages(&pool, "alice", true, 50).await?;
         assert_eq!(alice["count"].as_i64(), Some(1), "alice: {alice}");
-        assert_eq!(alice["notifications"][0]["data"]["body"], json!("hey alice"));
+        assert_eq!(
+            alice["notifications"][0]["data"]["body"],
+            json!("hey alice")
+        );
 
         // The DM channel is private: not in the public list, but visible to a member.
         let public = list_channels(&pool, None).await?;
-        assert_eq!(public.as_array().unwrap().len(), 0, "DM hidden from public list");
+        assert_eq!(
+            public.as_array().unwrap().len(),
+            0,
+            "DM hidden from public list"
+        );
         let alices = list_channels(&pool, Some("alice")).await?;
-        assert_eq!(alices.as_array().unwrap().len(), 1, "member sees their DM channel");
+        assert_eq!(
+            alices.as_array().unwrap().len(),
+            1,
+            "member sees their DM channel"
+        );
         assert_eq!(alices[0]["private"], json!(true));
 
         // Full conversation is readable as a backlog on the shared channel.
@@ -9117,18 +11614,29 @@ mod tests {
 
         let after = invite_to_channel(&pool, cid, "bob", Some("alice")).await?;
         let members: BTreeSet<String> = after["members"]
-            .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
         assert!(members.contains("bob"), "invitee auto-joined");
 
         let bob = check_notifications(&pool, "bob", true, 50, Some("channel.invite")).await?;
         assert_eq!(bob["count"].as_i64(), Some(1), "bob got the invite: {bob}");
-        assert_eq!(bob["notifications"][0]["data"]["invited_by"], json!("alice"));
+        assert_eq!(
+            bob["notifications"][0]["data"]["invited_by"],
+            json!("alice")
+        );
 
         // Leaving = unsubscribe from the channel.
         unsubscribe(&pool, "bob", None, None, Some(cid), None, false).await?;
         let after = get_channel(&pool, cid).await?;
         let members: Vec<&str> = after["members"]
-            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
         assert!(!members.contains(&"bob"), "unsubscribe leaves the channel");
         Ok(())
     }
@@ -9166,7 +11674,10 @@ mod tests {
             .await?
             .iter()
             .any(|r| r.get::<String, _>("name") == "channel_id");
-        assert!(has_channel_col, "migration should have added events.channel_id");
+        assert!(
+            has_channel_col,
+            "migration should have added events.channel_id"
+        );
 
         // Channels work on the migrated DB: create, post, read back.
         let c = create_channel(&pool, "general", None, Some("alice"), None).await?;
@@ -9184,54 +11695,151 @@ mod tests {
     async fn external_identity_and_attribution_roundtrip() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        register_agent(&pool, "slack-bridge", Some("Slack Bridge"), None, None, None, None).await?;
+        register_agent(
+            &pool,
+            "slack-bridge",
+            Some("Slack Bridge"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         // Upsert an external identity, then re-upsert to refresh + merge metadata (idempotent).
-        let e = upsert_external_identity(&pool, " slack:U123 ", "slack", Some("Ada"), Some(json!({"tz":"UTC"}))).await?;
+        let e = upsert_external_identity(
+            &pool,
+            " slack:U123 ",
+            "slack",
+            Some("Ada"),
+            Some(json!({"tz":"UTC"})),
+        )
+        .await?;
         assert_eq!(e["id"], json!("slack:U123"), "id is trimmed + stored");
         assert_eq!(e["source"], json!("slack"));
         assert_eq!(e["display_name"], json!("Ada"));
-        assert_eq!(e["metadata"]["tz"], json!("UTC"), "metadata parsed to an object");
-        let e2 = upsert_external_identity(&pool, "slack:U123", "slack", None, Some(json!({"avatar":"x"}))).await?;
-        assert_eq!(e2["display_name"], json!("Ada"), "null display_name keeps the prior value");
-        assert_eq!(e2["metadata"]["tz"], json!("UTC"), "metadata is merged, not replaced");
+        assert_eq!(
+            e["metadata"]["tz"],
+            json!("UTC"),
+            "metadata parsed to an object"
+        );
+        let e2 = upsert_external_identity(
+            &pool,
+            "slack:U123",
+            "slack",
+            None,
+            Some(json!({"avatar":"x"})),
+        )
+        .await?;
+        assert_eq!(
+            e2["display_name"],
+            json!("Ada"),
+            "null display_name keeps the prior value"
+        );
+        assert_eq!(
+            e2["metadata"]["tz"],
+            json!("UTC"),
+            "metadata is merged, not replaced"
+        );
         assert_eq!(e2["metadata"]["avatar"], json!("x"));
 
         // list, filtered by source.
-        assert_eq!(list_external_identities(&pool, Some("slack")).await?.as_array().unwrap().len(), 1);
-        assert_eq!(list_external_identities(&pool, Some("github")).await?.as_array().unwrap().len(), 0);
-        assert!(get_external_identity(&pool, "slack:unknown").await?.is_null());
+        assert_eq!(
+            list_external_identities(&pool, Some("slack"))
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_external_identities(&pool, Some("github"))
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(get_external_identity(&pool, "slack:unknown")
+            .await?
+            .is_null());
 
         // A comment ingested by the bridge, attributed to the external human.
         let p = create_project(&pool, "P", None, Some("slack-bridge"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("slack-bridge"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("slack-bridge"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
-        comment_task(&pool, tid, "hi from slack", Some("slack-bridge"), Some("slack:U123"), None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "hi from slack",
+            Some("slack-bridge"),
+            Some("slack:U123"),
+            None,
+        )
+        .await?;
         let task = get_task(&pool, tid).await?;
         let c0 = &task["comments"][0];
-        assert_eq!(c0["author"], json!("slack-bridge"), "author is the fleet ingester");
-        assert_eq!(c0["external_author"], json!("slack:U123"), "attributed to the external human");
         assert_eq!(
-            c0["external_author_name"], json!("Ada"),
+            c0["author"],
+            json!("slack-bridge"),
+            "author is the fleet ingester"
+        );
+        assert_eq!(
+            c0["external_author"],
+            json!("slack:U123"),
+            "attributed to the external human"
+        );
+        assert_eq!(
+            c0["external_author_name"],
+            json!("Ada"),
             "the identity's display_name is resolved on read (id stays the key)"
         );
 
         // A channel post carries the same attribution on its event data.
         let ch = create_channel(&pool, "bridge", None, Some("slack-bridge"), None).await?;
         let cid = ch["id"].as_i64().unwrap();
-        post_to_channel(&pool, cid, "slack-bridge", "hello", None, Some("slack:U123")).await?;
+        post_to_channel(
+            &pool,
+            cid,
+            "slack-bridge",
+            "hello",
+            None,
+            Some("slack:U123"),
+        )
+        .await?;
         let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         assert_eq!(posts[0]["data"]["from"], json!("slack-bridge"));
         assert_eq!(posts[0]["data"]["external_author"], json!("slack:U123"));
         assert_eq!(
-            posts[0]["data"]["external_author_name"], json!("Ada"),
+            posts[0]["data"]["external_author_name"],
+            json!("Ada"),
             "channel-post attribution resolves the display name on read too"
         );
 
         // An identity with no registered display_name: external_author stays, name is absent
         // (consumers fall back to the id — never a fabricated name).
-        post_to_channel(&pool, cid, "slack-bridge", "who am i", None, Some("slack:UNKNOWN")).await?;
+        post_to_channel(
+            &pool,
+            cid,
+            "slack-bridge",
+            "who am i",
+            None,
+            Some("slack:UNKNOWN"),
+        )
+        .await?;
         let posts2 = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         let last = posts2.as_array().unwrap().last().unwrap();
         assert_eq!(last["data"]["external_author"], json!("slack:UNKNOWN"));
@@ -9241,8 +11849,14 @@ mod tests {
         );
 
         // Guardrails: empty id/source are client errors.
-        assert!(upsert_external_identity(&pool, "  ", "slack", None, None).await.is_err());
-        assert!(upsert_external_identity(&pool, "slack:U9", "  ", None, None).await.is_err());
+        assert!(upsert_external_identity(&pool, "  ", "slack", None, None)
+            .await
+            .is_err());
+        assert!(
+            upsert_external_identity(&pool, "slack:U9", "  ", None, None)
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
@@ -9278,13 +11892,23 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|e| e["type"] == json!("channel.outbound_reflect") && e["data"]["channel_id"] == json!(cid))
+                .filter(|e| {
+                    e["type"] == json!("channel.outbound_reflect")
+                        && e["data"]["channel_id"] == json!(cid)
+                })
                 .cloned()
                 .collect()
         };
 
         // An out-enabled channel with the default allowlist (concierge).
-        let ch = create_channel(&pool, "bridge-out", None, Some("concierge"), Some(json!({"direction":"both"}))).await?;
+        let ch = create_channel(
+            &pool,
+            "bridge-out",
+            None,
+            Some("concierge"),
+            Some(json!({"direction":"both"})),
+        )
+        .await?;
         let cid = ch["id"].as_i64().unwrap();
 
         // Allowed author -> reflect event carrying the post details.
@@ -9299,20 +11923,32 @@ mod tests {
         // Denied author -> no new reflect event.
         post_to_channel(&pool, cid, "worker", "internal only", None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
-        assert_eq!(reflects(&ev, cid).len(), 1, "denied author stays board-internal");
+        assert_eq!(
+            reflects(&ev, cid).len(),
+            1,
+            "denied author stays board-internal"
+        );
 
         // An unconfigured channel never reflects, even for concierge.
         let plain = create_channel(&pool, "plain", None, Some("concierge"), None).await?;
         let pid = plain["id"].as_i64().unwrap();
         post_to_channel(&pool, pid, "concierge", "hi", None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
-        assert_eq!(reflects(&ev, pid).len(), 0, "default policy is board-internal");
+        assert_eq!(
+            reflects(&ev, pid).len(),
+            0,
+            "default policy is board-internal"
+        );
 
         // set_channel_props turns reflect-back ON for the plain channel.
         set_channel_props(&pool, pid, json!({ "direction": "out" })).await?;
         post_to_channel(&pool, pid, "concierge", "now out", None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
-        assert_eq!(reflects(&ev, pid).len(), 1, "policy configurable after creation");
+        assert_eq!(
+            reflects(&ev, pid).len(),
+            1,
+            "policy configurable after creation"
+        );
         Ok(())
     }
 
@@ -9353,7 +11989,12 @@ mod tests {
 
         // The metadata is stored on the post event (surfaced on reads).
         let ev = get_events(&pool, 0, 500, None, false).await?;
-        let human_ev = ev.as_array().unwrap().iter().find(|e| e["seq"] == json!(human_seq)).unwrap();
+        let human_ev = ev
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["seq"] == json!(human_seq))
+            .unwrap();
         assert_eq!(human_ev["data"]["metadata"]["thread_ts"], json!("1727.001"));
 
         // Frank replies on the board -> reflects OUT, and the reflect carries parent_metadata (the
@@ -9364,9 +12005,11 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["type"] == json!("channel.outbound_reflect")
-                && e["data"]["channel_id"] == json!(cid)
-                && e["data"]["author"] == json!("frank"))
+            .find(|e| {
+                e["type"] == json!("channel.outbound_reflect")
+                    && e["data"]["channel_id"] == json!(cid)
+                    && e["data"]["author"] == json!("frank")
+            })
             .expect("frank's reply reflects out");
         assert_eq!(reflect["data"]["reply_to"], json!(human_seq));
         assert_eq!(
@@ -9376,17 +12019,32 @@ mod tests {
         );
 
         // A top-level reflected post carries its OWN metadata and no parent_metadata.
-        post_to_channel_meta(&pool, cid, "frank", "top-level", None, None, Some(json!({ "k": "v" }))).await?;
+        post_to_channel_meta(
+            &pool,
+            cid,
+            "frank",
+            "top-level",
+            None,
+            None,
+            Some(json!({ "k": "v" })),
+        )
+        .await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         let top = ev
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["type"] == json!("channel.outbound_reflect") && e["data"]["author"] == json!("frank"))
+            .filter(|e| {
+                e["type"] == json!("channel.outbound_reflect")
+                    && e["data"]["author"] == json!("frank")
+            })
             .next_back()
             .unwrap();
         assert_eq!(top["data"]["metadata"]["k"], json!("v"));
-        assert!(top["data"].get("parent_metadata").is_none(), "no parent_metadata without reply_to");
+        assert!(
+            top["data"].get("parent_metadata").is_none(),
+            "no parent_metadata without reply_to"
+        );
         Ok(())
     }
 
@@ -9408,16 +12066,36 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|e| e["type"] == json!("task.outbound_reflect") && e["data"]["task_id"] == json!(tid))
+                .filter(|e| {
+                    e["type"] == json!("task.outbound_reflect")
+                        && e["data"]["task_id"] == json!(tid)
+                })
                 .cloned()
                 .collect()
         };
 
         // A task linked to a GitHub issue, out-enabled with the default allowlist (concierge).
-        let task = create_task(&pool, pid, "t", None, None, None, Some("concierge"), None, None, None).await?;
+        let task = create_task(
+            &pool,
+            pid,
+            "t",
+            None,
+            None,
+            None,
+            Some("concierge"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = task["id"].as_i64().unwrap();
         upsert_external_link(
-            &pool, "github", "camshaft/task-board#42", Some("issue"), "task", tid,
+            &pool,
+            "github",
+            "camshaft/task-board#42",
+            Some("issue"),
+            "task",
+            tid,
             Some(json!({ "direction": "both" })),
         )
         .await?;
@@ -9435,29 +12113,69 @@ mod tests {
         assert!(r[0]["data"]["comment_id"].as_i64().is_some());
 
         // Denied author (the ingesting bridge, not in outbound_authors) -> no echo back out.
-        comment_task(&pool, tid, "ingested from github", Some("gh-bridge"), Some("github:U9"), None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "ingested from github",
+            Some("gh-bridge"),
+            Some("github:U9"),
+            None,
+        )
+        .await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
-        assert_eq!(reflects(&ev, tid).len(), 1, "ingested comment stays board-internal (loop-safe)");
+        assert_eq!(
+            reflects(&ev, tid).len(),
+            1,
+            "ingested comment stays board-internal (loop-safe)"
+        );
 
         // A task with no external link never reflects, even for an allowed author.
-        let plain = create_task(&pool, pid, "unlinked", None, None, None, Some("concierge"), None, None, None).await?;
+        let plain = create_task(
+            &pool,
+            pid,
+            "unlinked",
+            None,
+            None,
+            None,
+            Some("concierge"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let plain_id = plain["id"].as_i64().unwrap();
         comment_task(&pool, plain_id, "hi", Some("concierge"), None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
-        assert_eq!(reflects(&ev, plain_id).len(), 0, "unlinked task is board-internal");
+        assert_eq!(
+            reflects(&ev, plain_id).len(),
+            0,
+            "unlinked task is board-internal"
+        );
 
         // Per-link independence: add a SECOND link that is inbound-only; a comment fires only the
         // out-enabled github link, not the inbound one.
         upsert_external_link(
-            &pool, "gitlab", "grp/proj#7", None, "task", tid,
+            &pool,
+            "gitlab",
+            "grp/proj#7",
+            None,
+            "task",
+            tid,
             Some(json!({ "direction": "in" })),
         )
         .await?;
         comment_task(&pool, tid, "second reflect", Some("concierge"), None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         let r = reflects(&ev, tid);
-        assert_eq!(r.len(), 2, "only the out-enabled link fires; inbound link stays internal");
-        assert!(r.iter().all(|e| e["data"]["source"] == json!("github")), "gitlab (in) never reflects");
+        assert_eq!(
+            r.len(),
+            2,
+            "only the out-enabled link fires; inbound link stays internal"
+        );
+        assert!(
+            r.iter().all(|e| e["data"]["source"] == json!("github")),
+            "gitlab (in) never reflects"
+        );
         Ok(())
     }
 
@@ -9469,7 +12187,9 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         register_agent(&pool, "gh", None, None, None, None, None).await?;
-        let pid = create_project(&pool, "P", None, Some("gh"), None).await?["id"].as_i64().unwrap();
+        let pid = create_project(&pool, "P", None, Some("gh"), None).await?["id"]
+            .as_i64()
+            .unwrap();
         let link = ExternalRef {
             source: "github".into(),
             external_id: "camshaft/x#1".into(),
@@ -9477,18 +12197,65 @@ mod tests {
         };
 
         // First ingest: creates the task + link, created:true.
-        let a = create_task(&pool, pid, "issue 1", None, None, None, Some("gh"), None, None, Some(link.clone())).await?;
+        let a = create_task(
+            &pool,
+            pid,
+            "issue 1",
+            None,
+            None,
+            None,
+            Some("gh"),
+            None,
+            None,
+            Some(link.clone()),
+        )
+        .await?;
         assert_eq!(a["created"], json!(true));
         let tid = a["id"].as_i64().unwrap();
 
         // Retry with the SAME (source, external_id): returns the SAME task, created:false, no dup —
         // even though the retry passed a different title.
-        let b = create_task(&pool, pid, "issue 1 RETRY", None, None, None, Some("gh"), None, None, Some(link.clone())).await?;
+        let b = create_task(
+            &pool,
+            pid,
+            "issue 1 RETRY",
+            None,
+            None,
+            None,
+            Some("gh"),
+            None,
+            None,
+            Some(link.clone()),
+        )
+        .await?;
         assert_eq!(b["created"], json!(false));
         assert_eq!(b["id"].as_i64().unwrap(), tid, "same task, not a duplicate");
-        assert_eq!(b["title"], json!("issue 1"), "existing task returned unchanged");
-        let tasks = list_tasks(&pool, Some(pid), None, None, false, None, false, None, None, None, None, None, false).await?;
-        assert_eq!(tasks.as_array().unwrap().len(), 1, "exactly one task, no duplicate");
+        assert_eq!(
+            b["title"],
+            json!("issue 1"),
+            "existing task returned unchanged"
+        );
+        let tasks = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert_eq!(
+            tasks.as_array().unwrap().len(),
+            1,
+            "exactly one task, no duplicate"
+        );
 
         // Comment idempotency on the new board_kind='comment'.
         let clink = ExternalRef {
@@ -9496,17 +12263,53 @@ mod tests {
             external_id: "camshaft/x#1-c9".into(),
             external_parent_id: Some("camshaft/x#1".into()),
         };
-        let c1 = comment_task(&pool, tid, "hi from github", Some("gh"), Some("github:U1"), Some(clink.clone())).await?;
+        let c1 = comment_task(
+            &pool,
+            tid,
+            "hi from github",
+            Some("gh"),
+            Some("github:U1"),
+            Some(clink.clone()),
+        )
+        .await?;
         assert_eq!(c1["created"], json!(true));
         let cid = c1["comment_id"].as_i64().unwrap();
-        let c2 = comment_task(&pool, tid, "hi from github RETRY", Some("gh"), Some("github:U1"), Some(clink.clone())).await?;
+        let c2 = comment_task(
+            &pool,
+            tid,
+            "hi from github RETRY",
+            Some("gh"),
+            Some("github:U1"),
+            Some(clink.clone()),
+        )
+        .await?;
         assert_eq!(c2["created"], json!(false));
-        assert_eq!(c2["comment_id"].as_i64().unwrap(), cid, "same comment, not a duplicate");
+        assert_eq!(
+            c2["comment_id"].as_i64().unwrap(),
+            cid,
+            "same comment, not a duplicate"
+        );
         let got = get_task(&pool, tid).await?;
-        assert_eq!(got["comments"].as_array().unwrap().len(), 1, "exactly one comment, no duplicate");
+        assert_eq!(
+            got["comments"].as_array().unwrap().len(),
+            1,
+            "exactly one comment, no duplicate"
+        );
 
         // A create/comment WITHOUT an external_link is unaffected and reports created:true.
-        let plain = create_task(&pool, pid, "manual", None, None, None, Some("gh"), None, None, None).await?;
+        let plain = create_task(
+            &pool,
+            pid,
+            "manual",
+            None,
+            None,
+            None,
+            Some("gh"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         assert_eq!(plain["created"], json!(true));
         let pc = comment_task(&pool, tid, "manual comment", Some("gh"), None, None).await?;
         assert_eq!(pc["created"], json!(true));
@@ -9541,19 +12344,48 @@ mod tests {
         assert_eq!(g["config"]["repo"], json!("r"));
 
         // Update: omit script + description (kept), merge a new config key (cwd/repo kept).
-        let u = set_workspace_kind(&pool, "custom-env", None, Some(json!({ "branch": "main" })), None, None).await?;
-        assert_eq!(u["setup_script"], json!("checkout && build"), "omitted script kept");
-        assert_eq!(u["description"], json!("a custom workspace"), "omitted description kept");
+        let u = set_workspace_kind(
+            &pool,
+            "custom-env",
+            None,
+            Some(json!({ "branch": "main" })),
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            u["setup_script"],
+            json!("checkout && build"),
+            "omitted script kept"
+        );
+        assert_eq!(
+            u["description"],
+            json!("a custom workspace"),
+            "omitted description kept"
+        );
         assert_eq!(u["config"]["cwd"], json!("/w"), "prior config key kept");
-        assert_eq!(u["config"]["branch"], json!("main"), "new config key merged in");
+        assert_eq!(
+            u["config"]["branch"],
+            json!("main"),
+            "new config key merged in"
+        );
         assert_eq!(u["created_by"], json!("board-pm"), "creator preserved");
 
         // List, unknown, delete (idempotent).
-        assert_eq!(list_workspace_kinds(&pool).await?.as_array().unwrap().len(), 1);
+        assert_eq!(
+            list_workspace_kinds(&pool).await?.as_array().unwrap().len(),
+            1
+        );
         assert!(get_workspace_kind(&pool, "nope").await?.is_null());
-        assert_eq!(delete_workspace_kind(&pool, "custom-env").await?["deleted"], json!(true));
+        assert_eq!(
+            delete_workspace_kind(&pool, "custom-env").await?["deleted"],
+            json!(true)
+        );
         assert!(get_workspace_kind(&pool, "custom-env").await?.is_null());
-        assert_eq!(delete_workspace_kind(&pool, "custom-env").await?["deleted"], json!(false));
+        assert_eq!(
+            delete_workspace_kind(&pool, "custom-env").await?["deleted"],
+            json!(false)
+        );
         Ok(())
     }
 
@@ -9573,43 +12405,108 @@ mod tests {
 
         // A thread: root + two direct replies (one attributed to an external human) + an
         // unrelated top-level post that must NOT be imported.
-        let root = post_to_channel(&pool, cid, "concierge", "Root topic\nmore detail", None, None).await?;
+        let root = post_to_channel(
+            &pool,
+            cid,
+            "concierge",
+            "Root topic\nmore detail",
+            None,
+            None,
+        )
+        .await?;
         let root_seq = root["seq"].as_i64().unwrap();
-        let r1 = post_to_channel(&pool, cid, "slack-bridge", "reply from ada", Some(root_seq), Some("slack:U1")).await?;
+        let r1 = post_to_channel(
+            &pool,
+            cid,
+            "slack-bridge",
+            "reply from ada",
+            Some(root_seq),
+            Some("slack:U1"),
+        )
+        .await?;
         let r1_seq = r1["seq"].as_i64().unwrap();
-        post_to_channel(&pool, cid, "concierge", "second reply", Some(root_seq), None).await?;
+        post_to_channel(
+            &pool,
+            cid,
+            "concierge",
+            "second reply",
+            Some(root_seq),
+            None,
+        )
+        .await?;
         post_to_channel(&pool, cid, "concierge", "unrelated top-level", None, None).await?;
 
         let res = promote_thread(&pool, cid, root_seq, pid, Some("concierge")).await?;
         let tid = res["task_id"].as_i64().unwrap();
-        assert_eq!(res["imported_comments"], json!(2), "only the two direct replies import");
+        assert_eq!(
+            res["imported_comments"],
+            json!(2),
+            "only the two direct replies import"
+        );
         assert_eq!(res["already_promoted"], json!(false));
 
         let task = get_task(&pool, tid).await?;
-        assert_eq!(task["title"], json!("Root topic"), "title = root's first line");
-        assert_eq!(task["description"], json!("Root topic\nmore detail"), "root body -> description");
+        assert_eq!(
+            task["title"],
+            json!("Root topic"),
+            "title = root's first line"
+        );
+        assert_eq!(
+            task["description"],
+            json!("Root topic\nmore detail"),
+            "root body -> description"
+        );
         let comments = task["comments"].as_array().unwrap();
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0]["body"], json!("reply from ada"));
-        assert_eq!(comments[0]["author"], json!("slack-bridge"), "ingester preserved");
-        assert_eq!(comments[0]["external_author"], json!("slack:U1"), "attribution preserved");
-        assert_eq!(comments[0]["origin_ref"], json!(r1_seq.to_string()), "origin id recorded for sync/dedup");
+        assert_eq!(
+            comments[0]["author"],
+            json!("slack-bridge"),
+            "ingester preserved"
+        );
+        assert_eq!(
+            comments[0]["external_author"],
+            json!("slack:U1"),
+            "attribution preserved"
+        );
+        assert_eq!(
+            comments[0]["origin_ref"],
+            json!(r1_seq.to_string()),
+            "origin id recorded for sync/dedup"
+        );
         assert_eq!(comments[1]["body"], json!("second reply"));
 
         // Timestamp fidelity: the imported comment carries the original reply's created_at.
         let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
-        let r1_created = posts.as_array().unwrap().iter()
-            .find(|p| p["seq"].as_i64() == Some(r1_seq)).unwrap()["created_at"].clone();
-        assert_eq!(comments[0]["created_at"], r1_created, "reply timestamp preserved");
+        let r1_created = posts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["seq"].as_i64() == Some(r1_seq))
+            .unwrap()["created_at"]
+            .clone();
+        assert_eq!(
+            comments[0]["created_at"], r1_created,
+            "reply timestamp preserved"
+        );
 
         // Idempotent: re-promoting returns the same task, no re-import, no duplicate comments.
         let again = promote_thread(&pool, cid, root_seq, pid, Some("concierge")).await?;
         assert_eq!(again["task_id"], json!(tid));
         assert_eq!(again["already_promoted"], json!(true));
-        assert_eq!(get_task(&pool, tid).await?["comments"].as_array().unwrap().len(), 2, "no duplicate import");
+        assert_eq!(
+            get_task(&pool, tid).await?["comments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "no duplicate import"
+        );
 
         // A missing root post is an error.
-        assert!(promote_thread(&pool, cid, 999999, pid, Some("concierge")).await.is_err());
+        assert!(promote_thread(&pool, cid, 999999, pid, Some("concierge"))
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -9623,11 +12520,32 @@ mod tests {
         let cid = ch["id"].as_i64().unwrap();
         let p = create_project(&pool, "P", None, Some("concierge"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, None, None, Some("concierge"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("concierge"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Channel-map link (board channel <-> Slack channel).
-        let l = upsert_external_link(&pool, "slack", "C123", None, "channel", cid, Some(json!({"name":"#planning"}))).await?;
+        let l = upsert_external_link(
+            &pool,
+            "slack",
+            "C123",
+            None,
+            "channel",
+            cid,
+            Some(json!({"name":"#planning"})),
+        )
+        .await?;
         assert_eq!(l["source"], json!("slack"));
         assert_eq!(l["external_id"], json!("C123"));
         assert_eq!(l["board_kind"], json!("channel"));
@@ -9635,24 +12553,99 @@ mod tests {
         assert_eq!(l["metadata"]["name"], json!("#planning"));
 
         // Idempotent on (source, external_id): re-link updates parent + MERGES metadata.
-        let l2 = upsert_external_link(&pool, "slack", "C123", Some("workspaceA"), "channel", cid, Some(json!({"topic":"x"}))).await?;
+        let l2 = upsert_external_link(
+            &pool,
+            "slack",
+            "C123",
+            Some("workspaceA"),
+            "channel",
+            cid,
+            Some(json!({"topic":"x"})),
+        )
+        .await?;
         assert_eq!(l2["external_parent_id"], json!("workspaceA"));
-        assert_eq!(l2["metadata"]["name"], json!("#planning"), "metadata merged, not replaced");
+        assert_eq!(
+            l2["metadata"]["name"],
+            json!("#planning"),
+            "metadata merged, not replaced"
+        );
         assert_eq!(l2["metadata"]["topic"], json!("x"));
-        assert_eq!(list_external_links(&pool, Some("slack"), None, None).await?.as_array().unwrap().len(), 1, "still one link");
+        assert_eq!(
+            list_external_links(&pool, Some("slack"), None, None)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "still one link"
+        );
 
         // The SAME table carries a task link from a different source.
-        upsert_external_link(&pool, "github", "https://gh/issues/1", None, "task", tid, None).await?;
-        assert_eq!(list_external_links(&pool, None, None, None).await?.as_array().unwrap().len(), 2);
-        assert_eq!(list_external_links(&pool, None, Some("channel"), Some(cid)).await?.as_array().unwrap().len(), 1, "adapter resolves board->external");
-        assert_eq!(list_external_links(&pool, None, Some("task"), None).await?.as_array().unwrap().len(), 1);
-        assert_eq!(list_external_links(&pool, Some("github"), None, None).await?.as_array().unwrap().len(), 1);
+        upsert_external_link(
+            &pool,
+            "github",
+            "https://gh/issues/1",
+            None,
+            "task",
+            tid,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            list_external_links(&pool, None, None, None)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            list_external_links(&pool, None, Some("channel"), Some(cid))
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "adapter resolves board->external"
+        );
+        assert_eq!(
+            list_external_links(&pool, None, Some("task"), None)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_external_links(&pool, Some("github"), None, None)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Guards: bad kind, missing board entity, empty source/external_id.
-        assert!(upsert_external_link(&pool, "slack", "C9", None, "widget", cid, None).await.is_err());
-        assert!(upsert_external_link(&pool, "slack", "C9", None, "channel", 999999, None).await.is_err());
-        assert!(upsert_external_link(&pool, "  ", "C9", None, "channel", cid, None).await.is_err());
-        assert!(upsert_external_link(&pool, "slack", "  ", None, "channel", cid, None).await.is_err());
+        assert!(
+            upsert_external_link(&pool, "slack", "C9", None, "widget", cid, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            upsert_external_link(&pool, "slack", "C9", None, "channel", 999999, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            upsert_external_link(&pool, "  ", "C9", None, "channel", cid, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            upsert_external_link(&pool, "slack", "  ", None, "channel", cid, None)
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
@@ -9672,37 +12665,96 @@ mod tests {
         // Promote a (reply-less) thread -> task, then wire lives.
         let root = post_to_channel(&pool, cid, "concierge", "root topic", None, None).await?;
         let root_seq = root["seq"].as_i64().unwrap();
-        let tid = promote_thread(&pool, cid, root_seq, pid, Some("concierge")).await?["task_id"].as_i64().unwrap();
-        assert_eq!(get_task(&pool, tid).await?["comments"].as_array().unwrap().len(), 0);
+        let tid = promote_thread(&pool, cid, root_seq, pid, Some("concierge")).await?["task_id"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(
+            get_task(&pool, tid).await?["comments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
 
         // Direction 1: a new thread reply -> a task comment (attribution + origin preserved).
-        let r1 = post_to_channel(&pool, cid, "slack-bridge", "reply from ada", Some(root_seq), Some("slack:U1")).await?;
+        let r1 = post_to_channel(
+            &pool,
+            cid,
+            "slack-bridge",
+            "reply from ada",
+            Some(root_seq),
+            Some("slack:U1"),
+        )
+        .await?;
         let r1_seq = r1["seq"].as_i64().unwrap();
-        let comments = get_task(&pool, tid).await?["comments"].as_array().unwrap().clone();
+        let comments = get_task(&pool, tid).await?["comments"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(comments.len(), 1, "thread reply mirrored to a task comment");
         assert_eq!(comments[0]["body"], json!("reply from ada"));
         assert_eq!(comments[0]["author"], json!("slack-bridge"));
         assert_eq!(comments[0]["external_author"], json!("slack:U1"));
         assert_eq!(comments[0]["origin_ref"], json!(r1_seq.to_string()));
         // No echo: the mirrored comment did NOT create another thread post.
-        assert_eq!(get_channel_posts(&pool, cid, 0, None, 100, false).await?.as_array().unwrap().len(), 2, "root + r1 only");
+        assert_eq!(
+            get_channel_posts(&pool, cid, 0, None, 100, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "root + r1 only"
+        );
 
         // Direction 2: a new task comment -> a thread reply.
         comment_task(&pool, tid, "reply from board", Some("worker"), None, None).await?;
         let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         let posts = posts.as_array().unwrap();
         assert_eq!(posts.len(), 3, "root + r1 + the mirrored comment");
-        let mirrored = posts.iter().find(|p| p["data"]["origin_comment"].is_i64()).unwrap();
+        let mirrored = posts
+            .iter()
+            .find(|p| p["data"]["origin_comment"].is_i64())
+            .unwrap();
         assert_eq!(mirrored["data"]["reply_to"], json!(root_seq));
         assert_eq!(mirrored["data"]["from"], json!("worker"));
         assert_eq!(mirrored["data"]["body"], json!("reply from board"));
         // No echo: the mirrored post did NOT create another task comment (still r1-mirror + worker's).
-        assert_eq!(get_task(&pool, tid).await?["comments"].as_array().unwrap().len(), 2, "no echo comment");
+        assert_eq!(
+            get_task(&pool, tid).await?["comments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "no echo comment"
+        );
 
         // Safety: a comment on a NON-linked task posts nothing to the channel.
-        let solo = create_task(&pool, pid, "solo", None, None, None, Some("worker"), None, None, None).await?["id"].as_i64().unwrap();
+        let solo = create_task(
+            &pool,
+            pid,
+            "solo",
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
         comment_task(&pool, solo, "unrelated", Some("worker"), None, None).await?;
-        assert_eq!(get_channel_posts(&pool, cid, 0, None, 100, false).await?.as_array().unwrap().len(), 3, "unlinked task doesn't post");
+        assert_eq!(
+            get_channel_posts(&pool, cid, 0, None, 100, false)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            3,
+            "unlinked task doesn't post"
+        );
         Ok(())
     }
 
@@ -9718,28 +12770,65 @@ mod tests {
         register_agent(&pool, "creator", None, None, None, None, None).await?;
         register_agent(&pool, "watcher", None, None, None, None, None).await?;
         register_agent(&pool, "op1", None, None, None, None, None).await?;
-        let pid = create_project(&pool, "P", None, Some("creator"), None).await?["id"].as_i64().unwrap();
+        let pid = create_project(&pool, "P", None, Some("creator"), None).await?["id"]
+            .as_i64()
+            .unwrap();
         // Task with NO assignee, so `watcher` is a PURE subscriber (not assignee/creator).
-        let tid = create_task(&pool, pid, "T", None, None, None, Some("creator"), None, None, None).await?["id"].as_i64().unwrap();
+        let tid = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("creator"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
         subscribe(&pool, "watcher", Some(tid), None, None, None, false).await?;
 
         // op1 comments -> the pure subscriber hears it; the author (op1) does not hear its own.
         comment_task(&pool, tid, "first", Some("op1"), None, None).await?;
         let w = check_notifications(&pool, "watcher", true, 50, None).await?;
-        assert_eq!(w["count"].as_i64(), Some(1), "pure subscriber notified: {w}");
+        assert_eq!(
+            w["count"].as_i64(),
+            Some(1),
+            "pure subscriber notified: {w}"
+        );
         assert_eq!(w["notifications"][0]["type"], json!("task.commented"));
-        assert_eq!(w["notifications"][0]["task_id"], json!(tid), "wake payload carries task_id");
-        assert_eq!(check_notifications(&pool, "op1", true, 50, None).await?["count"].as_i64(), Some(0), "author not notified of own comment");
+        assert_eq!(
+            w["notifications"][0]["task_id"],
+            json!(tid),
+            "wake payload carries task_id"
+        );
+        assert_eq!(
+            check_notifications(&pool, "op1", true, 50, None).await?["count"].as_i64(),
+            Some(0),
+            "author not notified of own comment"
+        );
 
         // Commenting auto-subscribed op1, so it hears a subsequent comment by someone else.
         comment_task(&pool, tid, "second", Some("watcher"), None, None).await?;
         let o = check_notifications(&pool, "op1", true, 50, None).await?;
-        assert_eq!(o["count"].as_i64(), Some(1), "commenter auto-subscribed, hears later comments: {o}");
+        assert_eq!(
+            o["count"].as_i64(),
+            Some(1),
+            "commenter auto-subscribed, hears later comments: {o}"
+        );
         assert_eq!(o["notifications"][0]["type"], json!("task.commented"));
 
         // Every task.commented event carries task_id (the wake/webhook payload's routing key).
         let events = get_events(&pool, 0, 500, None, false).await?;
-        let commented: Vec<&Value> = events.as_array().unwrap().iter().filter(|e| e["type"] == json!("task.commented")).collect();
+        let commented: Vec<&Value> = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == json!("task.commented"))
+            .collect();
         assert_eq!(commented.len(), 2);
         assert!(commented.iter().all(|e| e["task_id"] == json!(tid)));
         Ok(())
@@ -9753,17 +12842,39 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         register_agent(&pool, "a", None, None, None, None, None).await?;
         register_agent(&pool, "b", None, None, None, None, None).await?;
-        let pid = create_project(&pool, "P", None, Some("a"), None).await?["id"].as_i64().unwrap();
-        let tid = create_task(&pool, pid, "T", None, None, None, Some("a"), None, None, None).await?["id"].as_i64().unwrap();
+        let pid = create_project(&pool, "P", None, Some("a"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let tid = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
         comment_task(&pool, tid, "hi", Some("b"), None, None).await?;
 
         let all = get_events(&pool, 0, 500, None, false).await?;
-        assert!(all.as_array().unwrap().len() >= 3, "project.created + task.created + task.commented");
+        assert!(
+            all.as_array().unwrap().len() >= 3,
+            "project.created + task.created + task.commented"
+        );
 
         let by_a = get_events(&pool, 0, 500, Some("a"), false).await?;
         let by_a = by_a.as_array().unwrap();
         assert!(!by_a.is_empty());
-        assert!(by_a.iter().all(|e| e["actor"] == json!("a")), "only actor a: {by_a:?}");
+        assert!(
+            by_a.iter().all(|e| e["actor"] == json!("a")),
+            "only actor a: {by_a:?}"
+        );
         assert!(by_a.iter().any(|e| e["type"] == json!("task.created")));
 
         let by_b = get_events(&pool, 0, 500, Some("b"), false).await?;
@@ -9772,7 +12883,11 @@ mod tests {
         assert_eq!(by_b[0]["type"], json!("task.commented"));
         assert_eq!(by_b[0]["actor"], json!("b"));
 
-        assert!(get_events(&pool, 0, 500, Some("nobody"), false).await?.as_array().unwrap().is_empty());
+        assert!(get_events(&pool, 0, 500, Some("nobody"), false)
+            .await?
+            .as_array()
+            .unwrap()
+            .is_empty());
         Ok(())
     }
 
@@ -9785,11 +12900,29 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         register_agent(&pool, "a", None, None, None, None, None).await?;
-        let pid = create_project(&pool, "P", None, Some("a"), None).await?["id"].as_i64().unwrap();
+        let pid = create_project(&pool, "P", None, Some("a"), None).await?["id"]
+            .as_i64()
+            .unwrap();
         // Generate a run of events (project.created + one task.created per create_task).
         let mut tids = Vec::new();
         for i in 0..6 {
-            tids.push(create_task(&pool, pid, &format!("T{i}"), None, None, None, Some("a"), None, None, None).await?["id"].as_i64().unwrap());
+            tids.push(
+                create_task(
+                    &pool,
+                    pid,
+                    &format!("T{i}"),
+                    None,
+                    None,
+                    None,
+                    Some("a"),
+                    None,
+                    None,
+                    None,
+                )
+                .await?["id"]
+                    .as_i64()
+                    .unwrap(),
+            );
         }
 
         let seq_of = |v: &Value| v["seq"].as_i64().unwrap();
@@ -9798,32 +12931,55 @@ mod tests {
         let latest = get_events(&pool, 0, 3, None, true).await?;
         let latest = latest.as_array().unwrap().clone();
         assert_eq!(latest.len(), 3, "limit caps the window");
-        assert!(seq_of(&latest[0]) > seq_of(&latest[1]) && seq_of(&latest[1]) > seq_of(&latest[2]), "newest-first: {latest:?}");
+        assert!(
+            seq_of(&latest[0]) > seq_of(&latest[1]) && seq_of(&latest[1]) > seq_of(&latest[2]),
+            "newest-first: {latest:?}"
+        );
 
         // It is the TAIL, not the head: the newest desc seq == the max seq in the full asc log,
         // and the oldest asc event (project.created) is NOT in the latest-3 window.
         let asc = get_events(&pool, 0, 500, None, false).await?;
         let asc = asc.as_array().unwrap();
         let max_seq = asc.iter().map(seq_of).max().unwrap();
-        assert_eq!(seq_of(&latest[0]), max_seq, "desc head is the tail of history");
-        assert!(!latest.iter().any(|e| e["type"] == json!("project.created")), "oldest event excluded from latest-N");
+        assert_eq!(
+            seq_of(&latest[0]),
+            max_seq,
+            "desc head is the tail of history"
+        );
+        assert!(
+            !latest.iter().any(|e| e["type"] == json!("project.created")),
+            "oldest event excluded from latest-N"
+        );
 
         // The feed advances: a new event becomes the new desc head.
         comment_task(&pool, tids[0], "newest", Some("a"), None, None).await?;
         let latest2 = get_events(&pool, 0, 3, None, true).await?;
         let latest2 = latest2.as_array().unwrap();
-        assert_eq!(latest2[0]["type"], json!("task.commented"), "the just-added event leads");
-        assert!(seq_of(&latest2[0]) > max_seq, "advanced past the prior tail");
+        assert_eq!(
+            latest2[0]["type"],
+            json!("task.commented"),
+            "the just-added event leads"
+        );
+        assert!(
+            seq_of(&latest2[0]) > max_seq,
+            "advanced past the prior tail"
+        );
 
         // `seq>since_seq` lower bound still applies in desc mode (latest N ABOVE a floor).
         let above = get_events(&pool, max_seq, 50, None, true).await?;
         let above = above.as_array().unwrap();
-        assert!(above.iter().all(|e| seq_of(e) > max_seq), "floor honored in desc: {above:?}");
+        assert!(
+            above.iter().all(|e| seq_of(e) > max_seq),
+            "floor honored in desc: {above:?}"
+        );
 
         // Actor filter composes with desc.
         register_agent(&pool, "z", None, None, None, None, None).await?;
         let by_z = get_events(&pool, 0, 10, Some("z"), true).await?;
-        assert!(by_z.as_array().unwrap().is_empty(), "actor filter still applies");
+        assert!(
+            by_z.as_array().unwrap().is_empty(),
+            "actor filter still applies"
+        );
         Ok(())
     }
 
@@ -9835,26 +12991,75 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // v1 with an explicit non-markdown type.
-        let d = create_document(&pool, "Diagram", None, "bafypng", None, Some("alice"), None, Some("image/png"), None).await?;
+        let d = create_document(
+            &pool,
+            "Diagram",
+            None,
+            "bafypng",
+            None,
+            Some("alice"),
+            None,
+            Some("image/png"),
+            None,
+        )
+        .await?;
         let did = d["id"].as_i64().unwrap();
         assert_eq!(d["current_version"]["content_type"], json!("image/png"));
 
         // A later version can change the type; the authoritative type is per-version.
-        let d2 = publish_version(&pool, did, "bafypdf", Some("as pdf"), Some("alice"), Some("application/pdf"), None).await?;
-        assert_eq!(d2["current_version"]["content_type"], json!("application/pdf"));
+        let d2 = publish_version(
+            &pool,
+            did,
+            "bafypdf",
+            Some("as pdf"),
+            Some("alice"),
+            Some("application/pdf"),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            d2["current_version"]["content_type"],
+            json!("application/pdf")
+        );
 
         // Omitting content_type defaults to text/markdown (back-compat).
         let d3 = publish_version(&pool, did, "bafymd", None, Some("alice"), None, None).await?;
-        assert_eq!(d3["current_version"]["content_type"], json!("text/markdown"));
+        assert_eq!(
+            d3["current_version"]["content_type"],
+            json!("text/markdown")
+        );
 
         // get_document_versions surfaces content_type per version.
         let vers = get_document_versions(&pool, did).await?;
-        let types: Vec<&str> = vers.as_array().unwrap().iter().map(|v| v["content_type"].as_str().unwrap()).collect();
-        assert_eq!(types, vec!["text/markdown", "application/pdf", "image/png"], "newest first");
+        let types: Vec<&str> = vers
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["content_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["text/markdown", "application/pdf", "image/png"],
+            "newest first"
+        );
 
         // A default create_document (no content_type) is text/markdown, matching the initial docs work.
-        let plain = create_document(&pool, "Notes", None, "bafymd2", None, Some("bob"), None, None, None).await?;
-        assert_eq!(plain["current_version"]["content_type"], json!("text/markdown"));
+        let plain = create_document(
+            &pool,
+            "Notes",
+            None,
+            "bafymd2",
+            None,
+            Some("bob"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            plain["current_version"]["content_type"],
+            json!("text/markdown")
+        );
         Ok(())
     }
 
@@ -9867,51 +13072,174 @@ mod tests {
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         register_agent(&pool, "agent:rev", None, None, None, None, None).await?;
-        let t = create_task(&pool, pid, "Ship it", None, None, None, Some("alice"), None, None, None).await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "Ship it",
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
-        let dep = create_task(&pool, pid, "Dependency", None, None, None, Some("bob"), None, None, None).await?;
+        let dep = create_task(
+            &pool,
+            pid,
+            "Dependency",
+            None,
+            None,
+            None,
+            Some("bob"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let dep_id = dep["id"].as_i64().unwrap();
 
         // Enforcement: blocked without a blocked_on is rejected (maps to 400 via the "give " prefix).
-        let e = update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None, None)
-            .await
-            .unwrap_err();
-        assert!(e.to_string().starts_with("give "), "blocked needs a blocked_on, got: {e}");
+        let e = update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            e.to_string().starts_with("give "),
+            "blocked needs a blocked_on, got: {e}"
+        );
 
         // Block on another TASK.
-        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
-            Some(json!({"kind": "task", "target": dep_id.to_string(), "note": "waiting on dep"}))).await?;
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(json!({"kind": "task", "target": dep_id.to_string(), "note": "waiting on dep"})),
+        )
+        .await?;
         let bo = get_task(&pool, tid).await?["blocked_on"].clone();
         assert_eq!(bo["kind"], json!("task"));
         assert_eq!(bo["target"], json!(dep_id.to_string()));
         assert_eq!(bo["note"], json!("waiting on dep"));
 
         // A nonexistent task target is rejected.
-        assert!(update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
-            Some(json!({"kind": "task", "target": "999999"}))).await.is_err());
+        assert!(update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(json!({"kind": "task", "target": "999999"}))
+        )
+        .await
+        .is_err());
 
         // Re-block on an AGENT -> that agent is notified they're blocking.
-        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
-            Some(json!({"kind": "agent", "target": "agent:rev", "note": "need review"}))).await?;
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(json!({"kind": "agent", "target": "agent:rev", "note": "need review"})),
+        )
+        .await?;
         let notes = check_notifications(&pool, "agent:rev", true, 50, None).await?;
         let arr = notes["notifications"].as_array().unwrap();
         assert!(
-            arr.iter().any(|n| n["type"] == json!("task.blocked_on_you") && n["task_id"] == json!(tid)),
+            arr.iter()
+                .any(|n| n["type"] == json!("task.blocked_on_you") && n["task_id"] == json!(tid)),
             "the blocking agent is notified: {notes}"
         );
 
         // "What is blocked on agent:rev" view.
-        let on_agent = list_tasks(&pool, Some(pid), None, None, false, None, false, None, Some("agent"), Some("agent:rev"), None, None, false).await?;
+        let on_agent = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            Some("agent"),
+            Some("agent:rev"),
+            None,
+            None,
+            false,
+        )
+        .await?;
         assert_eq!(on_agent.as_array().unwrap().len(), 1);
 
         // Block on the OPERATOR -> ref is null, and the operator view lists it.
-        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
-            Some(json!({"kind": "operator"}))).await?;
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(json!({"kind": "operator"})),
+        )
+        .await?;
         let bo = get_task(&pool, tid).await?["blocked_on"].clone();
         assert_eq!(bo["kind"], json!("operator"));
         assert!(bo["target"].is_null());
-        let on_op = list_tasks(&pool, None, None, None, false, None, false, None, Some("operator"), None, None, None, false).await?;
-        assert!(on_op.as_array().unwrap().iter().any(|t| t["id"] == json!(tid)));
+        let on_op = list_tasks(
+            &pool,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            Some("operator"),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert!(on_op
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == json!(tid)));
 
         // Block on a TEAM -> every person the team resolves to is notified (task 542 Phase 2).
         create_person(&pool, "pat", Some("Pat"), Some("u"), None).await?;
@@ -9919,27 +13247,75 @@ mod tests {
         create_team(&pool, "reviewers", Some("Reviewers"), Some("u"), None).await?;
         add_team_member(&pool, "reviewers", "pat", "person", Some("u")).await?;
         add_team_member(&pool, "reviewers", "sam", "person", Some("u")).await?;
-        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
-            Some(json!({"kind": "team", "target": "reviewers", "note": "need a review"}))).await?;
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(json!({"kind": "team", "target": "reviewers", "note": "need a review"})),
+        )
+        .await?;
         let bo = get_task(&pool, tid).await?["blocked_on"].clone();
         assert_eq!(bo["kind"], json!("team"));
         assert_eq!(bo["target"], json!("reviewers"));
         for who in ["pat", "sam"] {
             let notes = check_notifications(&pool, who, true, 50, None).await?;
             assert!(
-                notes["notifications"].as_array().unwrap().iter().any(
-                    |n| n["type"] == json!("task.blocked_on_you") && n["task_id"] == json!(tid)
-                ),
+                notes["notifications"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(
+                        |n| n["type"] == json!("task.blocked_on_you") && n["task_id"] == json!(tid)
+                    ),
                 "team member {who} is notified of the block: {notes}"
             );
         }
         // A nonexistent team target is rejected.
-        assert!(update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
-            Some(json!({"kind": "team", "target": "ghosts"}))).await.is_err(), "unknown team rejected");
+        assert!(
+            update_task(
+                &pool,
+                tid,
+                Some("blocked"),
+                None,
+                None,
+                None,
+                None,
+                Some("alice"),
+                None,
+                None,
+                Some(json!({"kind": "team", "target": "ghosts"}))
+            )
+            .await
+            .is_err(),
+            "unknown team rejected"
+        );
 
         // Leaving blocked clears blocked_on.
-        update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("alice"), None, None, None).await?;
-        assert!(get_task(&pool, tid).await?["blocked_on"].is_null(), "unblocking clears blocked_on");
+        update_task(
+            &pool,
+            tid,
+            Some("in_progress"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            get_task(&pool, tid).await?["blocked_on"].is_null(),
+            "unblocking clears blocked_on"
+        );
         Ok(())
     }
 
@@ -9968,10 +13344,35 @@ mod tests {
                 for r in 0..ROUNDS {
                     // A burst mixing the common write paths, incl. the read->write upgrade in
                     // check_notifications (subscribed to the task it just created).
-                    let t = create_task(&pool, pid, &format!("t{w}-{r}"), None, None, None, Some(&agent), None, None, None).await?;
+                    let t = create_task(
+                        &pool,
+                        pid,
+                        &format!("t{w}-{r}"),
+                        None,
+                        None,
+                        None,
+                        Some(&agent),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
                     let tid = t["id"].as_i64().unwrap();
                     comment_task(&pool, tid, "working", Some(&agent), None, None).await?;
-                    update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some(&agent), None, None, None).await?;
+                    update_task(
+                        &pool,
+                        tid,
+                        Some("in_progress"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&agent),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
                     check_notifications(&pool, &agent, true, 50, None).await?;
                 }
                 Ok::<_, anyhow::Error>(())
@@ -10048,7 +13449,14 @@ mod tests {
         assert_eq!(dup["appended"], json!(false));
         assert_eq!(dup["entry_id"], finding["entry_id"]);
 
-        set_review_status(&pool, rid, "changes_requested", Some("reviewer"), Some("fix the deref")).await?;
+        set_review_status(
+            &pool,
+            rid,
+            "changes_requested",
+            Some("reviewer"),
+            Some("fix the deref"),
+        )
+        .await?;
         set_review_status(&pool, rid, "in_review", Some("author"), None).await?;
         let approved = set_review_status(&pool, rid, "approved", Some("reviewer"), None).await?;
         assert_eq!(approved["status"], json!("approved"));
@@ -10065,7 +13473,9 @@ mod tests {
         assert_eq!(finding_count, 1);
 
         // An unknown status is rejected.
-        assert!(set_review_status(&pool, rid, "bogus", Some("x"), None).await.is_err());
+        assert!(set_review_status(&pool, rid, "bogus", Some("x"), None)
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -10081,8 +13491,16 @@ mod tests {
             external_parent_id: None,
         };
         let first = create_review(
-            &pool, "code", Some("github-pull-request"), Some("owner/repo#7"), Some("PR 7"),
-            Some("in_review"), Some("bridge"), None, None, Some(ext.clone()),
+            &pool,
+            "code",
+            Some("github-pull-request"),
+            Some("owner/repo#7"),
+            Some("PR 7"),
+            Some("in_review"),
+            Some("bridge"),
+            None,
+            None,
+            Some(ext.clone()),
         )
         .await?;
         assert_eq!(first["created"], json!(true));
@@ -10090,13 +13508,29 @@ mod tests {
         let rid = first["id"].as_i64().unwrap();
 
         let second = create_review(
-            &pool, "code", Some("github-pull-request"), Some("owner/repo#7"), Some("PR 7 again"),
-            Some("open"), Some("bridge"), None, None, Some(ext),
+            &pool,
+            "code",
+            Some("github-pull-request"),
+            Some("owner/repo#7"),
+            Some("PR 7 again"),
+            Some("open"),
+            Some("bridge"),
+            None,
+            None,
+            Some(ext),
         )
         .await?;
         assert_eq!(second["created"], json!(false));
-        assert_eq!(second["id"].as_i64().unwrap(), rid, "same review, no duplicate");
-        assert_eq!(second["status"], json!("in_review"), "existing state preserved");
+        assert_eq!(
+            second["id"].as_i64().unwrap(),
+            rid,
+            "same review, no duplicate"
+        );
+        assert_eq!(
+            second["status"],
+            json!("in_review"),
+            "existing state preserved"
+        );
 
         let all = list_reviews(&pool, None, None, None).await?;
         assert_eq!(all["reviews"].as_array().unwrap().len(), 1);
@@ -10113,7 +13547,13 @@ mod tests {
         register_agent(&pool, "worker", None, None, None, None, None).await?;
         set_status(&pool, "worker", "online", None).await?;
 
-        let a = request_stand_down(&pool, "worker", Some("concierge"), Some("rebalancing the fleet")).await?;
+        let a = request_stand_down(
+            &pool,
+            "worker",
+            Some("concierge"),
+            Some("rebalancing the fleet"),
+        )
+        .await?;
         // Recorded, but status is untouched (never a kill / forced offline).
         assert_eq!(a["status"], json!("online"), "status must not change");
         assert_eq!(a["stand_down_requested_by"], json!("concierge"));
@@ -10132,12 +13572,17 @@ mod tests {
         // Honoring it by going offline clears the request.
         let off = set_status(&pool, "worker", "offline", None).await?;
         assert_eq!(off["status"], json!("offline"));
-        assert!(off["stand_down_requested_at"].is_null(), "cleared on offline");
+        assert!(
+            off["stand_down_requested_at"].is_null(),
+            "cleared on offline"
+        );
         assert!(off["stand_down_requested_by"].is_null());
         assert!(off["stand_down_reason"].is_null());
 
         // Unknown agent -> error (surfaces as a 404 at the API).
-        assert!(request_stand_down(&pool, "ghost", Some("x"), None).await.is_err());
+        assert!(request_stand_down(&pool, "ghost", Some("x"), None)
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -10155,7 +13600,11 @@ mod tests {
         let cid1 = c1["id"].as_i64().unwrap();
         // Order-independent + idempotent: (bob, alice) resolves to the same channel.
         let c2 = get_or_create_dm(&pool, "bob", "alice").await?;
-        assert_eq!(c2["id"].as_i64().unwrap(), cid1, "same DM channel either way");
+        assert_eq!(
+            c2["id"].as_i64().unwrap(),
+            cid1,
+            "same DM channel either way"
+        );
 
         // Both are members, and it's private.
         let members: BTreeSet<String> = c1["members"]
@@ -10164,7 +13613,10 @@ mod tests {
             .iter()
             .map(|m| m.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(members, ["alice", "bob"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(
+            members,
+            ["alice", "bob"].iter().map(|s| s.to_string()).collect()
+        );
         assert_eq!(c1["private"], json!(true));
 
         // send_message reuses the exact same channel (no duplicate DM).
@@ -10185,33 +13637,114 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // r1 (code, alpha): 3 findings, no escaped defects. Created first => earlier window.
-        let r1 = create_review(&pool, "code", None, None, Some("r1"), None, Some("alpha"), None, None, None).await?;
+        let r1 = create_review(
+            &pool,
+            "code",
+            None,
+            None,
+            Some("r1"),
+            None,
+            Some("alpha"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let r1id = r1["id"].as_i64().unwrap();
         for _ in 0..3 {
             append_review_log(&pool, r1id, "finding", Some("f"), Some("alpha"), None, None).await?;
         }
 
         // r2 (code, alpha): 1 pre-approval finding + 1 finding logged AFTER approval (escaped).
-        let r2 = create_review(&pool, "code", None, None, Some("r2"), None, Some("alpha"), None, None, None).await?;
+        let r2 = create_review(
+            &pool,
+            "code",
+            None,
+            None,
+            Some("r2"),
+            None,
+            Some("alpha"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let r2id = r2["id"].as_i64().unwrap();
-        append_review_log(&pool, r2id, "finding", Some("pre"), Some("alpha"), None, None).await?;
+        append_review_log(
+            &pool,
+            r2id,
+            "finding",
+            Some("pre"),
+            Some("alpha"),
+            None,
+            None,
+        )
+        .await?;
         set_review_status(&pool, r2id, "in_review", Some("alpha"), None).await?;
         set_review_status(&pool, r2id, "approved", Some("alpha"), None).await?;
         tokio::time::sleep(std::time::Duration::from_millis(3)).await; // ensure a strictly later ts
-        append_review_log(&pool, r2id, "finding", Some("escaped after approval"), Some("qa"), None, None).await?;
+        append_review_log(
+            &pool,
+            r2id,
+            "finding",
+            Some("escaped after approval"),
+            Some("qa"),
+            None,
+            None,
+        )
+        .await?;
 
         // r3 (design, beta): a lineage follow-up (declares a predecessor) that still found something.
-        let r3 = create_review(&pool, "design", None, None, Some("r3"), None, Some("beta"), None,
-            Some(json!({ "predecessor_review_id": r1id })), None).await?;
+        let r3 = create_review(
+            &pool,
+            "design",
+            None,
+            None,
+            Some("r3"),
+            None,
+            Some("beta"),
+            None,
+            Some(json!({ "predecessor_review_id": r1id })),
+            None,
+        )
+        .await?;
         let r3id = r3["id"].as_i64().unwrap();
-        append_review_log(&pool, r3id, "finding", Some("missed by predecessor"), Some("beta"), None, None).await?;
+        append_review_log(
+            &pool,
+            r3id,
+            "finding",
+            Some("missed by predecessor"),
+            Some("beta"),
+            None,
+            None,
+        )
+        .await?;
 
         // r4 (design, beta): a re-open (approved -> back to in_review), no findings.
-        let r4 = create_review(&pool, "design", None, None, Some("r4"), None, Some("beta"), None, None, None).await?;
+        let r4 = create_review(
+            &pool,
+            "design",
+            None,
+            None,
+            Some("r4"),
+            None,
+            Some("beta"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let r4id = r4["id"].as_i64().unwrap();
         set_review_status(&pool, r4id, "in_review", Some("beta"), None).await?;
         set_review_status(&pool, r4id, "approved", Some("beta"), None).await?;
-        set_review_status(&pool, r4id, "in_review", Some("beta"), Some("reopened for a regression")).await?;
+        set_review_status(
+            &pool,
+            r4id,
+            "in_review",
+            Some("beta"),
+            Some("reopened for a regression"),
+        )
+        .await?;
 
         let t = review_improvement_trend(&pool, None, None).await?;
         assert_eq!(t["overall"]["reviews"].as_u64(), Some(4));
@@ -10222,12 +13755,21 @@ mod tests {
         assert_eq!(code["findings_trend"], json!("improving"));
         assert_eq!(code["escaped_trend"], json!("rising"));
         assert_eq!(code["flagged"], json!(true));
-        assert_eq!(code["escaped_defects"]["post_approval_findings"].as_u64(), Some(1));
+        assert_eq!(
+            code["escaped_defects"]["post_approval_findings"].as_u64(),
+            Some(1)
+        );
         assert_eq!(code["escaped_defects"]["total"].as_u64(), Some(1));
 
         // design slice: a lineage follow-up and a re-open each register as an escaped defect.
-        let design = by_kind.iter().find(|s| s["kind"] == json!("design")).unwrap();
-        assert_eq!(design["escaped_defects"]["lineage_followups"].as_u64(), Some(1));
+        let design = by_kind
+            .iter()
+            .find(|s| s["kind"] == json!("design"))
+            .unwrap();
+        assert_eq!(
+            design["escaped_defects"]["lineage_followups"].as_u64(),
+            Some(1)
+        );
         assert_eq!(design["escaped_defects"]["reopens"].as_u64(), Some(1));
 
         // Sliced by producing area too.
@@ -10237,7 +13779,10 @@ mod tests {
             .iter()
             .map(|s| s["area"].as_str().unwrap().to_string())
             .collect();
-        assert!(areas.contains("alpha") && areas.contains("beta"), "areas: {areas:?}");
+        assert!(
+            areas.contains("alpha") && areas.contains("beta"),
+            "areas: {areas:?}"
+        );
 
         // Filters narrow the population.
         let code_only = review_improvement_trend(&pool, Some("code"), None).await?;
@@ -10245,8 +13790,14 @@ mod tests {
         assert_eq!(code_only["overall"]["flagged"], json!(true));
         let beta_only = review_improvement_trend(&pool, None, Some("beta")).await?;
         assert_eq!(beta_only["overall"]["reviews"].as_u64(), Some(2));
-        assert_eq!(beta_only["overall"]["escaped_defects"]["reopens"].as_u64(), Some(1));
-        assert_eq!(beta_only["overall"]["escaped_defects"]["lineage_followups"].as_u64(), Some(1));
+        assert_eq!(
+            beta_only["overall"]["escaped_defects"]["reopens"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            beta_only["overall"]["escaped_defects"]["lineage_followups"].as_u64(),
+            Some(1)
+        );
         Ok(())
     }
 
@@ -10257,25 +13808,47 @@ mod tests {
     async fn mutation_responses_are_trimmed() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        register_agent(&pool, "worker", Some("Worker"), None, Some("a very long charter ".repeat(200).trim()), None, None).await?;
+        register_agent(
+            &pool,
+            "worker",
+            Some("Worker"),
+            None,
+            Some("a very long charter ".repeat(200).trim()),
+            None,
+            None,
+        )
+        .await?;
 
         // set_status's core still returns the full agent; presence_projection (what the boundary
         // applies) keeps only presence fields and drops the charter.
         let full = set_status(&pool, "worker", "online", Some("ping")).await?;
-        assert!(full["charter"].is_string(), "core still has the full object");
+        assert!(
+            full["charter"].is_string(),
+            "core still has the full object"
+        );
         let presence = presence_projection(full);
         assert_eq!(presence["id"], json!("worker"));
         assert_eq!(presence["status"], json!("online"));
         assert_eq!(presence["status_message"], json!("ping"));
         assert!(presence.get("last_seen").is_some());
-        assert!(presence.get("charter").is_none(), "presence response must omit the charter");
-        assert!(presence.get("metadata").is_none(), "presence response is presence-only");
+        assert!(
+            presence.get("charter").is_none(),
+            "presence response must omit the charter"
+        );
+        assert!(
+            presence.get("metadata").is_none(),
+            "presence response is presence-only"
+        );
 
         // strip_field drops one blob, keeps the rest, and is a no-op on a non-object.
         let agent = get_agent(&pool, "worker").await?;
         let trimmed = strip_field(agent.clone(), "charter");
         assert!(trimmed.get("charter").is_none());
-        assert_eq!(trimmed["display_name"], json!("Worker"), "other fields survive the strip");
+        assert_eq!(
+            trimmed["display_name"],
+            json!("Worker"),
+            "other fields survive the strip"
+        );
         assert_eq!(strip_field(json!("scalar"), "charter"), json!("scalar"));
         Ok(())
     }
@@ -10289,31 +13862,64 @@ mod tests {
         register_agent(&pool, "author", None, None, None, None, None).await?;
         register_agent(&pool, "gatekeeper", None, None, None, None, None).await?;
 
-        let r = create_review(&pool, "design", None, None, Some("d"), None, Some("author"), None, None, None).await?;
+        let r = create_review(
+            &pool,
+            "design",
+            None,
+            None,
+            Some("d"),
+            None,
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let rid = r["id"].as_i64().unwrap();
         assert_eq!(r["vetted"], json!(false));
         let base_log = r["log"].as_array().unwrap().len();
 
         // Mark vetted: flag flips, and a decision entry records actor + from/to.
-        let v = set_review_vetted(&pool, rid, true, Some("gatekeeper"), Some("adversarial pass clean")).await?;
+        let v = set_review_vetted(
+            &pool,
+            rid,
+            true,
+            Some("gatekeeper"),
+            Some("adversarial pass clean"),
+        )
+        .await?;
         assert_eq!(v["vetted"], json!(true));
         let log = v["log"].as_array().unwrap();
         assert_eq!(log.len(), base_log + 1, "one audit entry added");
         let entry = log.last().unwrap();
         assert_eq!(entry["entry_type"], json!("decision"));
         assert_eq!(entry["author"], json!("gatekeeper"));
-        assert!(entry["body"].as_str().unwrap().contains("vetted: false -> true"), "audit records from/to: {entry}");
+        assert!(
+            entry["body"]
+                .as_str()
+                .unwrap()
+                .contains("vetted: false -> true"),
+            "audit records from/to: {entry}"
+        );
 
         // The creator (author) hears review.vetted_changed; the actor (gatekeeper) does not self-notify.
         let inbox = check_notifications(&pool, "author", true, 50, None).await?;
         assert!(
-            inbox["notifications"].as_array().unwrap().iter().any(|n| n["type"] == json!("review.vetted_changed")),
+            inbox["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["type"] == json!("review.vetted_changed")),
             "creator is notified of the vetted change: {inbox}"
         );
 
         // Idempotent no-op: setting true again adds no log entry.
         let again = set_review_vetted(&pool, rid, true, Some("gatekeeper"), None).await?;
-        assert_eq!(again["log"].as_array().unwrap().len(), base_log + 1, "no-op adds no entry");
+        assert_eq!(
+            again["log"].as_array().unwrap().len(),
+            base_log + 1,
+            "no-op adds no entry"
+        );
 
         // Clearing flips it back and logs another decision entry.
         let cleared = set_review_vetted(&pool, rid, false, Some("gatekeeper"), None).await?;
@@ -10321,7 +13927,9 @@ mod tests {
         assert_eq!(cleared["log"].as_array().unwrap().len(), base_log + 2);
 
         // Unknown review errors (404 at the API).
-        assert!(set_review_vetted(&pool, 99999, true, Some("x"), None).await.is_err());
+        assert!(set_review_vetted(&pool, 99999, true, Some("x"), None)
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -10368,11 +13976,31 @@ mod tests {
         add_banned_phrase(&pool, "robust", None, Some("t")).await?;
 
         // No IPFS backend -> cannot fetch, so it cannot gate: Ok without touching the network.
-        assert!(check_cid_content(&pool, None, "Qm-whatever", "text/markdown", false).await.is_ok());
+        assert!(
+            check_cid_content(&pool, None, "Qm-whatever", "text/markdown", false)
+                .await
+                .is_ok()
+        );
         // A configured backend URL that we never reach, because acknowledge short-circuits first.
-        assert!(check_cid_content(&pool, Some("http://127.0.0.1:1"), "Qm-x", "text/markdown", true).await.is_ok());
+        assert!(check_cid_content(
+            &pool,
+            Some("http://127.0.0.1:1"),
+            "Qm-x",
+            "text/markdown",
+            true
+        )
+        .await
+        .is_ok());
         // Non-text content is out of scope for the banned-phrase/ASCII gate: skipped before any fetch.
-        assert!(check_cid_content(&pool, Some("http://127.0.0.1:1"), "Qm-x", "image/png", false).await.is_ok());
+        assert!(check_cid_content(
+            &pool,
+            Some("http://127.0.0.1:1"),
+            "Qm-x",
+            "image/png",
+            false
+        )
+        .await
+        .is_ok());
         Ok(())
     }
 
@@ -10386,21 +14014,51 @@ mod tests {
         register_agent(&pool, "owner", None, None, None, None, None).await?;
         register_agent(&pool, "assignee", None, None, None, None, None).await?;
         register_agent(&pool, "commenter", None, None, None, None, None).await?;
-        let doc =
-            create_document(&pool, "Design", None, "Qm-cid", None, Some("owner"), None, None, None).await?;
+        let doc = create_document(
+            &pool,
+            "Design",
+            None,
+            "Qm-cid",
+            None,
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let did = doc["id"].as_i64().unwrap();
         let p = create_project(&pool, "P", None, Some("owner"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = create_task(&pool, pid, "T", None, Some("assignee"), None, Some("owner"), None, None, None)
-            .await?;
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("assignee"),
+            None,
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         attach_document(&pool, did, tid, Some("owner")).await?;
         // Drain prior notifications so we isolate the comment's fan-out.
         check_notifications(&pool, "owner", true, 50, None).await?;
         check_notifications(&pool, "assignee", true, 50, None).await?;
 
-        comment_document(&pool, did, None, Some("commenter"), "please revise section 2", None, None, None)
-            .await?;
+        comment_document(
+            &pool,
+            did,
+            None,
+            Some("commenter"),
+            "please revise section 2",
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         // The attached task's assignee hears the doc comment even though they never subscribed to
         // the doc; the doc owner hears it too (doc recipient).
@@ -10431,7 +14089,10 @@ mod tests {
     #[test]
     fn normalize_presence_coerces_and_salvages() {
         // Canonical value passes through untouched; an explicit message is preserved.
-        assert_eq!(normalize_presence("online", None), ("online".to_string(), None));
+        assert_eq!(
+            normalize_presence("online", None),
+            ("online".to_string(), None)
+        );
         assert_eq!(
             normalize_presence("busy", Some("compiling")),
             ("busy".to_string(), Some("compiling".to_string()))
@@ -10473,40 +14134,117 @@ mod tests {
         let pid = p["id"].as_i64().unwrap();
 
         // Unregistered, non-alias assignee -> warning present (the "dotfiles" dead-letter case).
-        let t1 =
-            create_task(&pool, pid, "T1", None, Some("dotfiles"), None, Some("real-agent"), None, None, None)
-                .await?;
-        assert!(t1.get("assignee_warning").is_some(), "unregistered assignee warns: {t1}");
+        let t1 = create_task(
+            &pool,
+            pid,
+            "T1",
+            None,
+            Some("dotfiles"),
+            None,
+            Some("real-agent"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            t1.get("assignee_warning").is_some(),
+            "unregistered assignee warns: {t1}"
+        );
 
         // Registered agent -> no warning.
         let t2 = create_task(
-            &pool, pid, "T2", None, Some("real-agent"), None, Some("real-agent"), None, None, None,
+            &pool,
+            pid,
+            "T2",
+            None,
+            Some("real-agent"),
+            None,
+            Some("real-agent"),
+            None,
+            None,
+            None,
         )
         .await?;
-        assert!(t2.get("assignee_warning").is_none(), "registered assignee: no warning: {t2}");
+        assert!(
+            t2.get("assignee_warning").is_none(),
+            "registered assignee: no warning: {t2}"
+        );
 
         // Seeded alias "operator" (-> cameron) and its canonical "cameron" are known identities.
-        let t3 =
-            create_task(&pool, pid, "T3", None, Some("operator"), None, Some("real-agent"), None, None, None)
-                .await?;
-        assert!(t3.get("assignee_warning").is_none(), "alias assignee: no warning: {t3}");
-        let t4 =
-            create_task(&pool, pid, "T4", None, Some("cameron"), None, Some("real-agent"), None, None, None)
-                .await?;
-        assert!(t4.get("assignee_warning").is_none(), "canonical identity: no warning: {t4}");
+        let t3 = create_task(
+            &pool,
+            pid,
+            "T3",
+            None,
+            Some("operator"),
+            None,
+            Some("real-agent"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            t3.get("assignee_warning").is_none(),
+            "alias assignee: no warning: {t3}"
+        );
+        let t4 = create_task(
+            &pool,
+            pid,
+            "T4",
+            None,
+            Some("cameron"),
+            None,
+            Some("real-agent"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            t4.get("assignee_warning").is_none(),
+            "canonical identity: no warning: {t4}"
+        );
 
         // update_task: setting an unregistered assignee warns; unassigning (empty sentinel) does not.
         let tid = t2["id"].as_i64().unwrap();
         let u = update_task(
-            &pool, tid, None, Some("ghost-xyz"), None, None, None, Some("real-agent"), None, None, None,
+            &pool,
+            tid,
+            None,
+            Some("ghost-xyz"),
+            None,
+            None,
+            None,
+            Some("real-agent"),
+            None,
+            None,
+            None,
         )
         .await?;
-        assert!(u.get("assignee_warning").is_some(), "update to unregistered warns: {u}");
+        assert!(
+            u.get("assignee_warning").is_some(),
+            "update to unregistered warns: {u}"
+        );
         let un = update_task(
-            &pool, tid, None, Some(""), None, None, None, Some("real-agent"), None, None, None,
+            &pool,
+            tid,
+            None,
+            Some(""),
+            None,
+            None,
+            None,
+            Some("real-agent"),
+            None,
+            None,
+            None,
         )
         .await?;
-        assert!(un.get("assignee_warning").is_none(), "unassign: no warning: {un}");
+        assert!(
+            un.get("assignee_warning").is_none(),
+            "unassign: no warning: {un}"
+        );
         Ok(())
     }
 
@@ -10525,11 +14263,27 @@ mod tests {
             json!({ "id": 3, "assignee": Value::Null }),
         ];
         annotate_assignee_reachability(&pool, &mut tasks).await?;
-        assert_eq!(tasks[0]["assignee_status"], json!("busy"), "live assignee status: {:?}", tasks[0]);
-        assert!(tasks[0]["assignee_last_seen"].is_string(), "live assignee has last_seen");
-        assert_eq!(tasks[1]["assignee_status"], Value::Null, "unregistered assignee -> null status");
+        assert_eq!(
+            tasks[0]["assignee_status"],
+            json!("busy"),
+            "live assignee status: {:?}",
+            tasks[0]
+        );
+        assert!(
+            tasks[0]["assignee_last_seen"].is_string(),
+            "live assignee has last_seen"
+        );
+        assert_eq!(
+            tasks[1]["assignee_status"],
+            Value::Null,
+            "unregistered assignee -> null status"
+        );
         assert_eq!(tasks[1]["assignee_last_seen"], Value::Null);
-        assert_eq!(tasks[2]["assignee_status"], Value::Null, "no assignee -> null status");
+        assert_eq!(
+            tasks[2]["assignee_status"],
+            Value::Null,
+            "no assignee -> null status"
+        );
         Ok(())
     }
 
@@ -10542,7 +14296,10 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         // Seeded by db::init: person cameron, team operator (member cameron).
-        assert_eq!(get_team(&pool, "operator").await?["resolved_people"], json!(["cameron"]));
+        assert_eq!(
+            get_team(&pool, "operator").await?["resolved_people"],
+            json!(["cameron"])
+        );
 
         create_person(&pool, "zach", Some("Zach"), Some("system"), None).await?;
         create_team(&pool, "eng", Some("Engineering"), Some("system"), None).await?;
@@ -10556,23 +14313,41 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(eng_people, BTreeSet::from(["zach".to_string(), "cameron".to_string()]));
+        assert_eq!(
+            eng_people,
+            BTreeSet::from(["zach".to_string(), "cameron".to_string()])
+        );
 
         // Write-time guards: a cycle (operator already nested under eng), self-membership, and a
         // missing member are all rejected.
         assert!(
-            add_team_member(&pool, "operator", "eng", "team", Some("system")).await.is_err(),
+            add_team_member(&pool, "operator", "eng", "team", Some("system"))
+                .await
+                .is_err(),
             "cycle add rejected"
         );
-        assert!(add_team_member(&pool, "eng", "eng", "team", Some("system")).await.is_err(), "self rejected");
         assert!(
-            add_team_member(&pool, "eng", "ghost", "person", Some("system")).await.is_err(),
+            add_team_member(&pool, "eng", "eng", "team", Some("system"))
+                .await
+                .is_err(),
+            "self rejected"
+        );
+        assert!(
+            add_team_member(&pool, "eng", "ghost", "person", Some("system"))
+                .await
+                .is_err(),
             "missing member rejected"
         );
 
         // resolve_principal_people: a team expands; a person and an unknown/agent id pass through.
-        assert_eq!(resolve_principal_people(&pool, "operator").await?, BTreeSet::from(["cameron".to_string()]));
-        assert_eq!(resolve_principal_people(&pool, "zach").await?, BTreeSet::from(["zach".to_string()]));
+        assert_eq!(
+            resolve_principal_people(&pool, "operator").await?,
+            BTreeSet::from(["cameron".to_string()])
+        );
+        assert_eq!(
+            resolve_principal_people(&pool, "zach").await?,
+            BTreeSet::from(["zach".to_string()])
+        );
         assert_eq!(
             resolve_principal_people(&pool, "v-some-agent").await?,
             BTreeSet::from(["v-some-agent".to_string()])
@@ -10591,19 +14366,31 @@ mod tests {
         // Deleting a team cascades its membership edges: 'leads' is dropped both as a member of eng
         // and as a team that had members. After it, eng no longer lists leads.
         delete_team(&pool, "leads").await?;
-        assert!(get_team(&pool, "leads").await.is_err(), "deleted team is gone");
+        assert!(
+            get_team(&pool, "leads").await.is_err(),
+            "deleted team is gone"
+        );
         let eng_members: Vec<String> = get_team(&pool, "eng").await?["members"]
             .as_array()
             .unwrap()
             .iter()
             .map(|m| m["member_id"].as_str().unwrap().to_string())
             .collect();
-        assert!(!eng_members.contains(&"leads".to_string()), "leads edge cascaded out of eng");
-        assert!(delete_team(&pool, "leads").await.is_err(), "deleting a missing team errors");
+        assert!(
+            !eng_members.contains(&"leads".to_string()),
+            "leads edge cascaded out of eng"
+        );
+        assert!(
+            delete_team(&pool, "leads").await.is_err(),
+            "deleting a missing team errors"
+        );
 
         // Deleting a person cascades their memberships: zach drops out of eng's resolution.
         delete_person(&pool, "zach").await?;
-        assert!(get_person(&pool, "zach").await.is_err(), "deleted person is gone");
+        assert!(
+            get_person(&pool, "zach").await.is_err(),
+            "deleted person is gone"
+        );
         assert_eq!(
             resolve_team_people(&pool, "eng").await?,
             BTreeSet::from(["cameron".to_string()]),

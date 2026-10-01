@@ -88,12 +88,18 @@ pub fn try_wake(agent_id: &str, body: &Value) {
 /// (no live tunnel for a recipient means wakes fall back to the poll). Reads the global registry
 /// so the REST layer needn't thread it through app state.
 pub fn live_agents() -> Vec<Value> {
-    let Some(reg) = TUNNELS.get() else { return Vec::new() };
+    let Some(reg) = TUNNELS.get() else {
+        return Vec::new();
+    };
     let map = reg.lock().unwrap();
-    let mut out: Vec<(String, String)> =
-        map.iter().map(|(a, e)| (a.clone(), e.host.clone())).collect();
+    let mut out: Vec<(String, String)> = map
+        .iter()
+        .map(|(a, e)| (a.clone(), e.host.clone()))
+        .collect();
     out.sort();
-    out.into_iter().map(|(agent_id, host)| json!({ "agent_id": agent_id, "host": host })).collect()
+    out.into_iter()
+        .map(|(agent_id, host)| json!({ "agent_id": agent_id, "host": host }))
+        .collect()
 }
 
 /// Push `body` (the notification JSON a webhook would carry) to `agent_id` as an HTTP `req`
@@ -126,7 +132,9 @@ pub fn wake_on(reg: &TunnelRegistry, agent_id: &str, body: &Value) -> bool {
 /// can be merged into the top-level app router (it is NOT under `/api` — the daemon dials
 /// `/tunnel/ws` directly, and it's a WS upgrade, not part of the REST catalog).
 pub fn ws_router(reg: TunnelRegistry) -> Router {
-    Router::new().route("/tunnel/ws", get(ws_upgrade)).with_state(reg)
+    Router::new()
+        .route("/tunnel/ws", get(ws_upgrade))
+        .with_state(reg)
 }
 
 async fn ws_upgrade(State(reg): State<TunnelRegistry>, ws: WebSocketUpgrade) -> Response {
@@ -184,10 +192,21 @@ async fn handle_tunnel(reg: TunnelRegistry, mut socket: WebSocket) {
     {
         let mut map = reg.lock().unwrap();
         for a in &hello.agents {
-            map.insert(a.clone(), TunnelEntry { id, host: hello.host.clone(), tx: tx.clone() });
+            map.insert(
+                a.clone(),
+                TunnelEntry {
+                    id,
+                    host: hello.host.clone(),
+                    tx: tx.clone(),
+                },
+            );
         }
     }
-    tracing::info!("[tunnel] host {:?} up, serving {} agent(s)", hello.host, hello.agents.len());
+    tracing::info!(
+        "[tunnel] host {:?} up, serving {} agent(s)",
+        hello.host,
+        hello.agents.len()
+    );
 
     // 3) hello_ok.
     let ok = json!({ "t": "hello_ok", "keepalive": KEEPALIVE_SECS }).to_string();
@@ -249,7 +268,11 @@ async fn handle_tunnel(reg: TunnelRegistry, mut socket: WebSocket) {
 
 /// A one-off error frame (used before a rejected connection drops).
 fn err_frame(msg: &str) -> Message {
-    Message::Text(json!({ "t": "err", "id": 0, "code": "hello", "msg": msg }).to_string().into())
+    Message::Text(
+        json!({ "t": "err", "id": 0, "code": "hello", "msg": msg })
+            .to_string()
+            .into(),
+    )
 }
 
 /// Remove this tunnel's agent claims — but only entries still pointing at THIS socket (`id`),
@@ -305,7 +328,10 @@ mod tests {
         .await?;
         let ok: serde_json::Value = serde_json::from_str(&next_text(&mut ws).await)?;
         assert_eq!(ok["t"], "hello_ok");
-        assert!(ok["keepalive"].as_u64().is_some(), "hello_ok carries a keepalive");
+        assert!(
+            ok["keepalive"].as_u64().is_some(),
+            "hello_ok carries a keepalive"
+        );
 
         // Both declared agents are now live on this tunnel, mapped to the right host.
         {
@@ -328,7 +354,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(reg.lock().unwrap().is_empty(), "agents deregistered on disconnect");
+        assert!(
+            reg.lock().unwrap().is_empty(),
+            "agents deregistered on disconnect"
+        );
         Ok(())
     }
 
@@ -355,7 +384,10 @@ mod tests {
         // Wake a live agent: it accepts, and the daemon sees a `req` frame whose base64 body
         // decodes back to the exact notification we handed in.
         let body = json!({"type":"task.assigned","recipient":"agent:a","task_id":7});
-        assert!(wake_on(&reg, "agent:a", &body), "live agent accepts the wake");
+        assert!(
+            wake_on(&reg, "agent:a", &body),
+            "live agent accepts the wake"
+        );
 
         let req: serde_json::Value = serde_json::from_str(&next_text(&mut ws).await)?;
         assert_eq!(req["t"], "req");
@@ -365,10 +397,16 @@ mod tests {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(req["body"].as_str().expect("body is a base64 string"))?;
         let decoded: serde_json::Value = serde_json::from_slice(&decoded)?;
-        assert_eq!(decoded, body, "the daemon receives the verbatim notification JSON");
+        assert_eq!(
+            decoded, body,
+            "the daemon receives the verbatim notification JSON"
+        );
 
         // An agent with no live tunnel: no-op, so the caller falls back to the poll.
-        assert!(!wake_on(&reg, "agent:absent", &body), "no tunnel -> not delivered");
+        assert!(
+            !wake_on(&reg, "agent:absent", &body),
+            "no tunnel -> not delivered"
+        );
         Ok(())
     }
 

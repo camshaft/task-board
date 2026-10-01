@@ -137,14 +137,21 @@ mod tests {
     #[tokio::test]
     async fn resolve_cid_content_without_backend_is_a_client_error() {
         // Content but no configured backend: a 400-mapped "give a `cid`" error, no network.
-        let err = resolve_cid(None, Some("hello"), None).await.unwrap_err().to_string();
+        let err = resolve_cid(None, Some("hello"), None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.starts_with("give a `cid`"), "got: {err}");
     }
 
     #[test]
     fn is_probable_cid_guards_junk() {
-        assert!(is_probable_cid("QmVnKtNdzF7NEr7wQVjy8oUjRs9co9DbURhB5y1Q6ByEve")); // base58 v0
-        assert!(is_probable_cid("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")); // base32 v1
+        assert!(is_probable_cid(
+            "QmVnKtNdzF7NEr7wQVjy8oUjRs9co9DbURhB5y1Q6ByEve"
+        )); // base58 v0
+        assert!(is_probable_cid(
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+        )); // base32 v1
         assert!(!is_probable_cid("")); // empty
         assert!(!is_probable_cid("../../etc/passwd")); // path traversal
         assert!(!is_probable_cid("bafy with space"));
@@ -153,10 +160,16 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_cid_requires_cid_or_content() {
-        let err = resolve_cid(None, None, Some("http://x")).await.unwrap_err().to_string();
+        let err = resolve_cid(None, None, Some("http://x"))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.starts_with("give either"), "got: {err}");
         // A blank cid is treated as absent.
-        let err = resolve_cid(Some("   "), None, None).await.unwrap_err().to_string();
+        let err = resolve_cid(Some("   "), None, None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.starts_with("give either"), "got: {err}");
     }
 }
