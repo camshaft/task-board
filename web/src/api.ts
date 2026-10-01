@@ -279,6 +279,21 @@ export interface DocumentVersion {
   created_at: string
 }
 
+// A document's body read inline (GET /documents/{id}/content). For a text document it carries the
+// resolved content plus the doc_7 A8 main-body word count against its budget (the same count the
+// conformance gate uses, task_933) -- so the doc view shows "N / budget words" without re-counting.
+// The word fields are absent for a binary document (content is then null + a note).
+export interface DocumentContent {
+  document_id: number
+  version_no: number
+  cid: string
+  content_type: string | null
+  content: string | null
+  main_body_word_count?: number
+  main_body_word_budget?: number
+  note?: string
+}
+
 // The row shape returned by listDocuments (no versions/metadata).
 export interface DocumentSummary {
   id: number
@@ -717,6 +732,9 @@ export const api = {
     return req<DocumentSummary[]>('GET', `/documents${qs ? `?${qs}` : ''}`)
   },
   getDocument: (id: number) => req<Document>('GET', `/documents/${id}`),
+  // A document's body read inline + its main-body word count (task_933). Defaults to the current
+  // version. Errors when the board has no IPFS backend (CID-only); callers degrade gracefully.
+  getDocumentContent: (id: number) => req<DocumentContent>('GET', `/documents/${id}/content`),
   // Path-filed documents as a wiki tree (optionally under a path prefix), ordered by path.
   listWiki: (prefix?: string) =>
     req<DocumentSummary[]>(

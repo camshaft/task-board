@@ -13,6 +13,7 @@ import {
   submitDocumentForReview,
   useDocument,
   useDocumentComments,
+  useDocumentContent,
   useDocumentExternalLinks,
   useExternalNameResolver,
 } from './resources'
@@ -29,6 +30,7 @@ export default function DocumentView() {
   const { actor } = useBoardContext()
   const id = Number(documentId)
   const { data: doc, error: docError, loading } = useDocument(id)
+  const { data: content } = useDocumentContent(id)
   const { data: comments = [] } = useDocumentComments(id)
   const { data: externalLinks = [] } = useDocumentExternalLinks(id)
   const extName = useExternalNameResolver()
@@ -216,6 +218,14 @@ export default function DocumentView() {
 
   const error = actionError ?? docError?.message ?? null
   const tags = Array.isArray(doc?.metadata?.tags) ? (doc!.metadata.tags as unknown[]) : []
+  // Show the doc_7 A8 main-body word-count badge only on design docs -- the ~700-word budget is the
+  // design-doc convention, so it would mislead on a charter/tenet/note (task_933). Design docs carry
+  // the "design" tag (the established doc-type tag convention); the count itself rides along on the
+  // content read, so no extra fetch beyond useDocumentContent.
+  const isDesignDoc = tags.some((t) => typeof t === 'string' && t.toLowerCase() === 'design')
+  const wordCount = content?.main_body_word_count
+  const wordBudget = content?.main_body_word_budget ?? 700
+  const overBudget = wordCount != null && wordCount > wordBudget
 
   // Available review actions depend on status: a draft (or one with changes requested) can be
   // submitted; a doc in review can be approved or bounced back. `operator_review` is the gated
@@ -315,6 +325,22 @@ export default function DocumentView() {
                 #{String(t)}
               </span>
             ))}
+            {isDesignDoc && wordCount != null && (
+              <span
+                title={
+                  overBudget
+                    ? `Main body is ${wordCount} prose words, over the ~${wordBudget}-word doc_7 A8 budget`
+                    : `Main-body word count (doc_7 A8), budget ~${wordBudget}`
+                }
+                className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium ring-1 ring-inset ${
+                  overBudget
+                    ? 'bg-amber-500/15 text-amber-300 ring-amber-500/30'
+                    : 'bg-[var(--color-panel-2)] text-[var(--color-muted)] ring-[var(--color-border)]'
+                }`}
+              >
+                {wordCount} / {wordBudget} words
+              </span>
+            )}
           </div>
 
           {/* External links (task 707): bridged URLs attached to this doc (e.g. a chorus page),
