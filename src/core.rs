@@ -6861,6 +6861,44 @@ pub async fn publish_version(
 }
 
 /// Fetch one document with its current version + version list.
+/// Resolve a document reference -- a numeric id OR a wiki path/slug -- to a document id. Agents cite
+/// docs by their wiki path (e.g. charters/v-nix, designs/...), so get_document / read_document accept
+/// either (task_738): a `path` takes precedence when given, matched exactly against the `path` column
+/// then `slug`; a bare integer path is used as the id directly. Errors if neither is given, or if the
+/// path matches no document.
+pub async fn resolve_document_ref(
+    pool: &Pool,
+    document_id: Option<i64>,
+    path: Option<&str>,
+) -> anyhow::Result<i64> {
+    if let Some(p) = path.map(str::trim).filter(|p| !p.is_empty()) {
+        if let Ok(id) = p.parse::<i64>() {
+            return Ok(id);
+        }
+        if let Some(row) = sqlx::query("SELECT id FROM documents WHERE path=?")
+            .bind(p)
+            .fetch_optional(pool)
+            .await?
+        {
+            return Ok(row.try_get("id")?);
+        }
+        if let Some(row) = sqlx::query("SELECT id FROM documents WHERE slug=?")
+            .bind(p)
+            .fetch_optional(pool)
+            .await?
+        {
+            return Ok(row.try_get("id")?);
+        }
+        anyhow::bail!(
+            "no document with path or slug '{p}' (pass a numeric document_id, or an exact wiki path like charters/v-nix)"
+        );
+    }
+    if let Some(id) = document_id {
+        return Ok(id);
+    }
+    anyhow::bail!("give a document_id or a path")
+}
+
 pub async fn get_document(pool: &Pool, document_id: i64) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
     let out = document_json(&mut tx, document_id).await?;
@@ -17752,6 +17790,58 @@ mod tests {
         )
         .await
         .is_ok());
+        Ok(())
+    }
+
+    /// resolve_document_ref accepts either a numeric id or a wiki path/slug, so a doc cited by path
+    /// can be read without an id lookup first (task_738).
+    #[tokio::test]
+    async fn resolve_document_ref_by_id_or_path() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "owner", None, None, None, None, None).await?;
+        let doc = create_document(
+            &pool,
+            "Charter v-nix",
+            None,
+            "Qm-cid",
+            None,
+            Some("owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = doc["id"].as_i64().unwrap();
+        let slug = doc["slug"].as_str().unwrap().to_string();
+        set_document_path(&pool, did, "charters/v-nix", Some("owner")).await?;
+
+        // By numeric id, by wiki path, and by slug all resolve to the same document.
+        assert_eq!(resolve_document_ref(&pool, Some(did), None).await?, did);
+        assert_eq!(
+            resolve_document_ref(&pool, None, Some("charters/v-nix")).await?,
+            did
+        );
+        assert_eq!(resolve_document_ref(&pool, None, Some(&slug)).await?, did);
+        // A numeric-looking path is treated as an id; path wins when both are given.
+        assert_eq!(
+            resolve_document_ref(&pool, None, Some(&did.to_string())).await?,
+            did
+        );
+        assert_eq!(
+            resolve_document_ref(&pool, Some(999), Some("charters/v-nix")).await?,
+            did
+        );
+        // A blank path falls through to document_id.
+        assert_eq!(
+            resolve_document_ref(&pool, Some(did), Some("  ")).await?,
+            did
+        );
+        // An unknown path errors; so does giving neither.
+        assert!(resolve_document_ref(&pool, None, Some("charters/nope"))
+            .await
+            .is_err());
+        assert!(resolve_document_ref(&pool, None, None).await.is_err());
         Ok(())
     }
 

@@ -1059,7 +1059,13 @@ pub struct ListWikiArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentArgs {
-    pub document_id: i64,
+    /// The document id. Omit if you pass `path` instead.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub document_id: Option<i64>,
+    /// The document's wiki path (e.g. charters/v-nix) or slug, as an alternative to document_id, so
+    /// a doc cited by path can be read without an id lookup first. If both are given, path wins.
+    #[serde(default, deserialize_with = "de_opt_string_scalar")]
+    pub path: Option<String>,
     /// When true, also fetch the current version's markdown from its pinned CID (server-side, via
     /// the board's IPFS backend) and inline it as `body` — so an agent building or reviewing from an
     /// approved doc gets the content in one call, whatever its own host can reach. Omit/false for
@@ -1071,7 +1077,13 @@ pub struct GetDocumentArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadDocumentArgs {
-    pub document_id: i64,
+    /// The document id. Omit if you pass `path` instead.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub document_id: Option<i64>,
+    /// The document's wiki path (e.g. charters/v-nix) or slug, as an alternative to document_id, so
+    /// a doc cited by path can be read without an id lookup first. If both are given, path wins.
+    #[serde(default, deserialize_with = "de_opt_string_scalar")]
+    pub path: Option<String>,
     /// Which version's body to read. Omit for the current version.
     #[serde(default)]
     pub version_no: Option<i64>,
@@ -2638,21 +2650,19 @@ impl Board {
     }
 
     #[tool(
-        description = "Get one document with its current version and full version list (each version is a bare CID + summary). Pass include_body=true to also inline the current version's markdown, fetched server-side from its pinned CID."
+        description = "Get one document with its current version and full version list (each version is a bare CID + summary). Identify it by document_id OR by its wiki path/slug (e.g. charters/v-nix) -- so a doc cited by path can be read without an id lookup first. Pass include_body=true to also inline the current version's markdown, fetched server-side from its pinned CID."
     )]
     async fn get_document(
         &self,
         Parameters(a): Parameters<GetDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_document_with_body(
-            &self.pool,
-            self.ipfs_api_url.as_deref(),
-            a.document_id,
-            a.include_body,
-        )
-        .await
-        .map_err(err)
-        .and_then(ok)
+        let id = core::resolve_document_ref(&self.pool, a.document_id, a.path.as_deref())
+            .await
+            .map_err(err)?;
+        core::get_document_with_body(&self.pool, self.ipfs_api_url.as_deref(), id, a.include_body)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(
@@ -2670,29 +2680,32 @@ impl Board {
     }
 
     #[tool(
-        description = "Read a document's body content from-session: resolves the version's CID and returns the text (the current version, or pass version_no). The board fetches it through its own IPFS backend, so you don't need local IPFS or a gateway. Binary content (image/pdf/...) returns a null content + the CID to fetch via the REST gateway instead."
+        description = "Read a document's body content from-session: resolves the version's CID and returns the text (the current version, or pass version_no). Identify the document by document_id OR by its wiki path/slug (e.g. charters/v-nix). The board fetches it through its own IPFS backend, so you don't need local IPFS or a gateway. Binary content (image/pdf/...) returns a null content + the CID to fetch via the REST gateway instead."
     )]
     async fn read_document(
         &self,
         Parameters(a): Parameters<ReadDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::read_document_content(
-            &self.pool,
-            self.ipfs_api_url.as_deref(),
-            a.document_id,
-            a.version_no,
-        )
-        .await
-        .map_err(err)
-        .and_then(ok)
+        let id = core::resolve_document_ref(&self.pool, a.document_id, a.path.as_deref())
+            .await
+            .map_err(err)?;
+        core::read_document_content(&self.pool, self.ipfs_api_url.as_deref(), id, a.version_no)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
-    #[tool(description = "List a document's versions (immutable), newest first.")]
+    #[tool(
+        description = "List a document's versions (immutable), newest first. Identify it by document_id OR by its wiki path/slug (e.g. charters/v-nix)."
+    )]
     async fn get_document_versions(
         &self,
         Parameters(a): Parameters<GetDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_document_versions(&self.pool, a.document_id)
+        let id = core::resolve_document_ref(&self.pool, a.document_id, a.path.as_deref())
+            .await
+            .map_err(err)?;
+        core::get_document_versions(&self.pool, id)
             .await
             .map_err(err)
             .and_then(ok)
