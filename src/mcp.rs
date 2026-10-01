@@ -2098,7 +2098,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Dry-run the pre-submit content lint on arbitrary text WITHOUT writing anything. Returns {clean, banned_phrases:[..], non_ascii:[{char, codepoint, line, column}, ..]} against the authoritative live banned-phrases list + ASCII-only rule. Use this to pre-check content before publishing (especially before a publish_version by CID, which the write-path gate does not scan) instead of a hand-maintained local list that drifts from the source of truth."
+        description = "Dry-run the FULL pre-submit content lint on arbitrary text WITHOUT writing anything. Returns {clean, banned_phrases:[..], non_ascii:[{char, codepoint, line, column}, ..], bare_refs:[{ref, suggestions:[..]}, ..]} against the authoritative live banned-phrases list, the ASCII-only rule, AND the ambiguous bare-\"#N\" typed-ref rule the write path hard-rejects. Use this as a PRE-SEND lint on any composed body (comment/message/task/doc) before the write, so a bare \"#N\" or a banned phrase is caught and fixed with no rejected-write round-trip; each bare_refs hit carries the ready-to-paste typed forms (task_N / owner-repo#N / drop the # for a plain ordinal). Especially useful before a publish_version by CID, which the write-path gate does not scan."
     )]
     async fn lint_text(
         &self,

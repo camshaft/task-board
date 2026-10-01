@@ -5601,10 +5601,28 @@ pub async fn lint_text(pool: &Pool, text: &str) -> anyhow::Result<Value> {
             })
         })
         .collect();
+    // The same ambiguous bare-"#N" check the write path hard-rejects (check_bare_refs), surfaced
+    // here so lint_text is a complete PRE-SEND lint (task 616): an agent (or a client wrapping its
+    // board MCP calls) can lint a composed body before the write and fix a bare ref with no server
+    // round-trip + lost-body recompose. Each hit carries the ready-to-paste typed forms.
+    let bare_refs: Vec<Value> = detect_bare_task_refs(&strip_code_regions(text))
+        .into_iter()
+        .map(|n| {
+            json!({
+                "ref": format!("#{n}"),
+                "suggestions": [
+                    format!("task_{n}"),
+                    format!("camshaft/task-board#{n}"),
+                    format!("{n} (drop the # if it is a plain ordinal, e.g. a board message or sequence number)"),
+                ],
+            })
+        })
+        .collect();
     Ok(json!({
-        "clean": banned.is_empty() && non_ascii.is_empty(),
+        "clean": banned.is_empty() && non_ascii.is_empty() && bare_refs.is_empty(),
         "banned_phrases": banned,
         "non_ascii": non_ascii,
+        "bare_refs": bare_refs,
     }))
 }
 
@@ -16373,11 +16391,38 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         add_banned_phrase(&pool, "robust", None, Some("tester")).await?;
 
-        // Clean ASCII text with no banned phrase: clean=true, both lists empty.
+        // Clean ASCII text with no banned phrase: clean=true, all lists empty.
         let clean = lint_text(&pool, "a perfectly fine sentence").await?;
         assert_eq!(clean["clean"], json!(true), "clean text: {clean}");
         assert_eq!(clean["banned_phrases"].as_array().unwrap().len(), 0);
         assert_eq!(clean["non_ascii"].as_array().unwrap().len(), 0);
+        assert_eq!(clean["bare_refs"].as_array().unwrap().len(), 0);
+
+        // task 616: lint_text surfaces the same bare-"#N" the write path hard-rejects, so it is a
+        // complete pre-send lint. A bare ref -> clean=false with ready-to-paste typed forms; a
+        // typed form or a #N inside code is clean (matching check_bare_refs).
+        let bare = lint_text(&pool, "duplicate of #190, see also task_7").await?;
+        assert_eq!(bare["clean"], json!(false), "bare ref: {bare}");
+        let refs = bare["bare_refs"].as_array().unwrap();
+        assert_eq!(
+            refs.len(),
+            1,
+            "only the bare #190 flagged, not task_7: {bare}"
+        );
+        assert_eq!(refs[0]["ref"], json!("#190"));
+        let sugg = refs[0]["suggestions"].as_array().unwrap();
+        assert!(
+            sugg.iter().any(|s| s == &json!("task_190"))
+                && sugg.iter().any(|s| s == &json!("camshaft/task-board#190")),
+            "suggestions carry the typed forms: {bare}"
+        );
+        assert!(
+            lint_text(&pool, "the `#190` token and task_7").await?["bare_refs"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "a #N inside code is not flagged"
+        );
 
         // A banned phrase plus two non-ASCII chars: all reported, clean=false, and no early bail
         // means the em dash on line 2 is caught even though the banned phrase came first.
