@@ -139,6 +139,33 @@
         "required": ["recipient"],
         "additionalProperties": false
       }
+    },
+    "string-list": {
+      "title": "List of strings",
+      "description": "Enter an arbitrary, dynamically-sized list of strings (add / remove rows), submitted as an array of strings. The response schema is an array of strings. Optional min_items / max_items bound how many rows, placeholder sets the per-row hint, and item_label names a row (e.g. \"item\" -> \"Add item\").",
+      "component": "StringList",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "min_items": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Minimum number of non-empty rows required (UI defaults to 1 if omitted)."
+          },
+          "max_items": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of rows that may be submitted (omit for no ceiling)."
+          },
+          "placeholder": { "type": "string" },
+          "item_label": {
+            "type": "string",
+            "description": "Singular noun for a row, e.g. \"item\" so the add button reads \"Add item\"."
+          }
+        },
+        "additionalProperties": false
+      }
     }
   }
 }
