@@ -1145,6 +1145,43 @@ pub struct ExternalRef {
     pub external_parent_id: Option<String>,
 }
 
+/// If `assignee` names someone the board does not recognize as a principal, return a human-facing
+/// warning (task 340). The assignment is still ACCEPTED (an agent may be assigned before its first
+/// register, and we never reject) -- the warning just surfaces that a non-recognized owner will not
+/// be notified or auto-pick-up, so an orchestrator catches a typo'd / repo-name / dead owner like
+/// "dotfiles" (which silently dead-lettered a task) at assign time. A principal is a registered
+/// agent, or a known identity alias / its canonical target (so humans like "cameron" and aliases
+/// like "operator" do not false-warn). When teams land (task 542) this check extends to team names.
+/// The empty-string unassign sentinel and a `None` (unchanged) assignee never warn.
+async fn assignee_registration_warning(
+    tx: &mut Transaction<'_, Sqlite>,
+    assignee: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(a) = assignee else { return Ok(None) };
+    if a.is_empty() {
+        return Ok(None); // unassign sentinel
+    }
+    let known = sqlx::query(
+        "SELECT 1 FROM agents WHERE id=? \
+         UNION SELECT 1 FROM identity_aliases WHERE alias=? OR canonical=? LIMIT 1",
+    )
+    .bind(a)
+    .bind(a)
+    .bind(a)
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some();
+    if known {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "assignee \"{a}\" is not a registered agent or known identity; the task is assigned but \
+             this owner will not be notified or auto-pick-up until it registers. If \"{a}\" is a \
+             repo/role name or a typo, reassign to a registered agent."
+        )))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_task(
     pool: &Pool,
@@ -1266,8 +1303,12 @@ pub async fn create_task(
     let mut out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", tid)
         .await?
         .unwrap_or(Value::Null);
+    let assignee_warning = assignee_registration_warning(&mut tx, assignee).await?;
     if let Value::Object(ref mut m) = out {
         m.insert("created".into(), json!(true));
+        if let Some(w) = assignee_warning {
+            m.insert("assignee_warning".into(), json!(w));
+        }
     }
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
@@ -1627,9 +1668,13 @@ pub async fn update_task(
         )
         .await?;
     }
-    let out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", task_id)
+    let assignee_warning = assignee_registration_warning(&mut tx, assignee).await?;
+    let mut out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", task_id)
         .await?
         .unwrap_or(Value::Null);
+    if let (Value::Object(ref mut m), Some(w)) = (&mut out, assignee_warning) {
+        m.insert("assignee_warning".into(), json!(w));
+    }
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
@@ -10044,5 +10089,54 @@ mod tests {
             normalize_presence("idle: drained", Some("real note")),
             ("idle".to_string(), Some("real note".to_string()))
         );
+    }
+
+    /// create_task/update_task annotate (never reject) when the assignee is not a recognized
+    /// principal -- a registered agent or a known identity alias / canonical (task 340), so an
+    /// orchestrator catches a dead-letter owner like "dotfiles" at assign time.
+    #[tokio::test]
+    async fn assignee_warning_flags_unregistered_non_principal() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "real-agent", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("real-agent"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+
+        // Unregistered, non-alias assignee -> warning present (the "dotfiles" dead-letter case).
+        let t1 =
+            create_task(&pool, pid, "T1", None, Some("dotfiles"), None, Some("real-agent"), None, None, None)
+                .await?;
+        assert!(t1.get("assignee_warning").is_some(), "unregistered assignee warns: {t1}");
+
+        // Registered agent -> no warning.
+        let t2 = create_task(
+            &pool, pid, "T2", None, Some("real-agent"), None, Some("real-agent"), None, None, None,
+        )
+        .await?;
+        assert!(t2.get("assignee_warning").is_none(), "registered assignee: no warning: {t2}");
+
+        // Seeded alias "operator" (-> cameron) and its canonical "cameron" are known identities.
+        let t3 =
+            create_task(&pool, pid, "T3", None, Some("operator"), None, Some("real-agent"), None, None, None)
+                .await?;
+        assert!(t3.get("assignee_warning").is_none(), "alias assignee: no warning: {t3}");
+        let t4 =
+            create_task(&pool, pid, "T4", None, Some("cameron"), None, Some("real-agent"), None, None, None)
+                .await?;
+        assert!(t4.get("assignee_warning").is_none(), "canonical identity: no warning: {t4}");
+
+        // update_task: setting an unregistered assignee warns; unassigning (empty sentinel) does not.
+        let tid = t2["id"].as_i64().unwrap();
+        let u = update_task(
+            &pool, tid, None, Some("ghost-xyz"), None, None, None, Some("real-agent"), None, None, None,
+        )
+        .await?;
+        assert!(u.get("assignee_warning").is_some(), "update to unregistered warns: {u}");
+        let un = update_task(
+            &pool, tid, None, Some(""), None, None, None, Some("real-agent"), None, None, None,
+        )
+        .await?;
+        assert!(un.get("assignee_warning").is_none(), "unassign: no warning: {un}");
+        Ok(())
     }
 }
