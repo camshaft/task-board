@@ -67,9 +67,11 @@ pub fn is_probable_cid(cid: &str) -> bool {
 /// return the raw bytes. This is the READ half of the CID-only exception (see `add`): it lets
 /// the same-origin web app fetch a document's content to render it, without a separate gateway.
 /// Deliberately scoped — it only cats content by CID; it never exposes the node's RPC (pin
-/// management, config, ...). Caps the response at `max_bytes` so the board never buffers a
-/// runaway blob. The caller supplies the content-type (the board doesn't sniff bytes).
-pub async fn cat(api_url: &str, cid: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+/// management, config, ...). The caller supplies the content-type (the board doesn't sniff bytes).
+/// No size ceiling (task_754): the response body is read in full. (This never bounded peak memory
+/// anyway -- the HTTP body is buffered whole before any check -- so a true memory bound would need
+/// streaming, which is out of scope.)
+pub async fn cat(api_url: &str, cid: &str) -> anyhow::Result<Vec<u8>> {
     let url = format!("{}/api/v0/cat", api_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -88,12 +90,6 @@ pub async fn cat(api_url: &str, cid: &str, max_bytes: usize) -> anyhow::Result<V
         anyhow::bail!("ipfs cat returned {code}: {body}");
     }
     let bytes = resp.bytes().await.context("reading ipfs cat response")?;
-    if bytes.len() > max_bytes {
-        anyhow::bail!(
-            "content behind {cid} is {} bytes, over the {max_bytes}-byte read-gateway cap",
-            bytes.len()
-        );
-    }
     Ok(bytes.to_vec())
 }
 
