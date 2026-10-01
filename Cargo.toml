@@ -31,7 +31,7 @@ serde_json = "1"
 toml = "0.8"
 schemars = "1"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 anyhow = "1"
 thiserror = "2"
 base64 = "0.22"

@@ -2390,13 +2390,15 @@ async fn ipfs_cat(
             "give a valid `cid` (a bare content id)"
         )));
     }
-    let bytes = ipfs::cat(url, &cid).await?;
+    let upstream = ipfs::fetch(url, &cid).await?;
     let ct = q
         .content_type
         .as_deref()
         .and_then(|s| axum::http::HeaderValue::from_str(s).ok())
         .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/octet-stream"));
-    let mut resp = Response::new(axum::body::Body::from(bytes));
+    // Stream the body straight through (task_757): the board holds one chunk at a time, so a large
+    // blob never buffers in memory here. The content-type is the one the client already knows.
+    let mut resp = Response::new(axum::body::Body::from_stream(upstream.bytes_stream()));
     resp.headers_mut()
         .insert(axum::http::header::CONTENT_TYPE, ct);
     resp.headers_mut().insert(

@@ -63,15 +63,14 @@ pub fn is_probable_cid(cid: &str) -> bool {
     !cid.is_empty() && cid.len() <= 256 && cid.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// Read the content behind `cid` back through the configured IPFS API (`/api/v0/cat`) and
-/// return the raw bytes. This is the READ half of the CID-only exception (see `add`): it lets
-/// the same-origin web app fetch a document's content to render it, without a separate gateway.
-/// Deliberately scoped — it only cats content by CID; it never exposes the node's RPC (pin
-/// management, config, ...). The caller supplies the content-type (the board doesn't sniff bytes).
-/// No size ceiling (task_754): the response body is read in full. (This never bounded peak memory
-/// anyway -- the HTTP body is buffered whole before any check -- so a true memory bound would need
-/// streaming, which is out of scope.)
-pub async fn cat(api_url: &str, cid: &str) -> anyhow::Result<Vec<u8>> {
+/// Send an `/api/v0/cat` request for `cid` and return the response for STREAMING its body, so the
+/// board never buffers a whole blob (task_757). This is the READ half of the CID-only exception
+/// (see `add`): it lets the same-origin web app fetch a document's content to render it, without a
+/// separate gateway. Deliberately scoped — it only cats content by CID; it never exposes the node's
+/// RPC (pin management, config, ...). Status is checked here so callers only handle a 2xx body; the
+/// caller either streams `.bytes_stream()` straight through (the pass-through gateway, bounded
+/// memory regardless of blob size) or accumulates it under a per-call-site bound via `cat`.
+pub async fn fetch(api_url: &str, cid: &str) -> anyhow::Result<reqwest::Response> {
     let url = format!("{}/api/v0/cat", api_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -89,8 +88,44 @@ pub async fn cat(api_url: &str, cid: &str) -> anyhow::Result<Vec<u8>> {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("ipfs cat returned {code}: {body}");
     }
-    let bytes = resp.bytes().await.context("reading ipfs cat response")?;
-    Ok(bytes.to_vec())
+    Ok(resp)
+}
+
+/// Read the content behind `cid` into memory for an in-process consumer, STREAMING it under an
+/// incremental per-call-site `max_bytes` ceiling: it accumulates chunks and aborts the moment the
+/// total would exceed `max_bytes`, so a runaway blob stops early instead of being buffered whole
+/// and only then rejected (task_757). Each call site passes the bound appropriate to what it reads.
+/// The pass-through gateway has no reason to hold the whole blob and streams `fetch` directly.
+pub async fn cat(api_url: &str, cid: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let stream = Box::pin(fetch(api_url, cid).await?.bytes_stream());
+    collect_capped(stream, cid, max_bytes).await
+}
+
+/// Accumulate a byte stream into a Vec, aborting as soon as it would exceed `max_bytes`. Generic
+/// over the chunk + error types so it is unit-testable without a live IPFS backend.
+async fn collect_capped<S, B, E>(
+    mut stream: S,
+    cid: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>>
+where
+    S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use futures_util::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading ipfs cat response")?;
+        let bytes = chunk.as_ref();
+        if buf.len() + bytes.len() > max_bytes {
+            anyhow::bail!(
+                "content behind {cid} exceeds the {max_bytes}-byte read limit for this consumer"
+            );
+        }
+        buf.extend_from_slice(bytes);
+    }
+    Ok(buf)
 }
 
 /// Resolve the CID to store for a document version. Prefer an explicit precomputed `cid`;
@@ -121,6 +156,25 @@ pub async fn resolve_cid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn collect_capped_aborts_over_limit() {
+        // Under the limit: the whole stream is accumulated.
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(vec![1u8; 10]), Ok(vec![2u8; 10])];
+        let got = collect_capped(tokio_stream::iter(chunks), "cidA", 100)
+            .await
+            .expect("under the limit should accumulate");
+        assert_eq!(got.len(), 20);
+        // Over the limit: aborts early with a clear error naming the limit.
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(vec![1u8; 10]), Ok(vec![2u8; 10])];
+        let err = collect_capped(tokio_stream::iter(chunks), "cidA", 15)
+            .await
+            .expect_err("over the limit must abort")
+            .to_string();
+        assert!(err.contains("15") && err.contains("exceeds"), "got: {err}");
+    }
 
     #[tokio::test]
     async fn resolve_cid_prefers_explicit_cid() -> anyhow::Result<()> {
