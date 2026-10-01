@@ -85,6 +85,7 @@ fn err(e: anyhow::Error) -> McpError {
 // --- Parameter structs (one per tool that takes args) ---
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterAgentArgs {
     /// Stable handle others address you by (e.g. 'agent:fixer-3').
     pub agent_id: String,
@@ -110,11 +111,13 @@ pub struct RegisterAgentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetAgentArgs {
     pub agent_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListAgentsArgs {
     /// Filter by exact presence status (online / idle / busy / blocked / away / offline).
     #[serde(default)]
@@ -140,6 +143,7 @@ pub struct ListAgentsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateAgentArgs {
     pub agent_id: String,
     #[serde(default)]
@@ -185,6 +189,7 @@ pub struct SetStatusArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestStandDownArgs {
     /// The agent asked to wind down.
     pub agent_id: String,
@@ -197,6 +202,7 @@ pub struct RequestStandDownArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateProjectArgs {
     pub name: String,
     #[serde(default)]
@@ -209,6 +215,7 @@ pub struct CreateProjectArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateProjectArgs {
     pub project_id: i64,
     /// New name (must be unique case-insensitively).
@@ -228,6 +235,7 @@ pub struct UpdateProjectArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MoveTaskArgs {
     pub task_id: i64,
     /// The project to move the task into.
@@ -238,17 +246,20 @@ pub struct MoveTaskArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListProjectsArgs {
     #[serde(default)]
     pub status: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetProjectArgs {
     pub project_id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTaskArgs {
     /// The project to create the task in. Optional when `parent_id` is given -- a child lives in its
     /// parent's project, so it is inherited. Required for a top-level task (no parent).
@@ -334,6 +345,7 @@ pub struct UpdateTaskArgs {
 /// kind=agent that agent is notified they are blocking; when kind=team every person the team resolves
 /// to is notified.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BlockedOnArgs {
     pub kind: String,
     /// The blocking id (a task id for kind=task, agent id for kind=agent, team id for kind=team).
@@ -495,6 +507,7 @@ fn de_opt_blocked_on_lenient<'de, D: serde::Deserializer<'de>>(
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetTaskPropsArgs {
     pub task_id: i64,
     /// Key/value properties to merge into the task's metadata.
@@ -502,6 +515,7 @@ pub struct SetTaskPropsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetDocumentPropsArgs {
     /// The document id. Omit if you pass `path` instead.
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
@@ -516,6 +530,7 @@ pub struct SetDocumentPropsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetTaskArgs {
     pub task_id: i64,
     /// How many of the most-recent comments to inline (chronological within the slice). Omit for
@@ -528,6 +543,7 @@ pub struct GetTaskArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveTaskArgs {
     pub task_id: i64,
     /// The agent performing the archive/restore (for the event actor). Defaults to the
@@ -537,6 +553,7 @@ pub struct ArchiveTaskArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListTasksArgs {
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub project_id: Option<i64>,
@@ -576,6 +593,7 @@ pub struct ListTasksArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CommentTaskArgs {
     pub task_id: i64,
     pub body: String,
@@ -601,6 +619,7 @@ pub struct CommentTaskArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SubscribeArgs {
     /// The agent to (un)subscribe. Defaults to the agent this session registered as.
     /// `agent_id`/`actor` are accepted as aliases, since those are the identity field names
@@ -640,6 +659,7 @@ pub struct SubscribeArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MuteTaskArgs {
     pub task_id: i64,
     /// The agent to mute/unmute the task for. Defaults to the agent this session registered as.
@@ -648,6 +668,7 @@ pub struct MuteTaskArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateChannelArgs {
     /// Channel name (unique case-insensitively; e.g. 'general', 'planning').
     pub name: String,
@@ -662,6 +683,7 @@ pub struct CreateChannelArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListChannelsArgs {
     /// If set, list channels this agent belongs to (incl. private/DM). Omit for public only.
     #[serde(default)]
@@ -669,11 +691,13 @@ pub struct ListChannelsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetChannelArgs {
     pub channel_id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PostToChannelArgs {
     pub channel_id: i64,
     /// The poster. Defaults to the agent this session registered as.
@@ -696,6 +720,7 @@ pub struct PostToChannelArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetChannelPostsArgs {
     pub channel_id: i64,
     #[serde(default)]
@@ -713,6 +738,7 @@ pub struct GetChannelPostsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertExternalIdentityArgs {
     /// Namespaced id `source:handle`, e.g. "slack:U123ABC". Idempotent upsert (re-registering
     /// refreshes the display name / metadata).
@@ -727,6 +753,7 @@ pub struct UpsertExternalIdentityArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListExternalIdentitiesArgs {
     /// Filter by originating system (e.g. "slack"). Omit to list all.
     #[serde(default)]
@@ -734,6 +761,7 @@ pub struct ListExternalIdentitiesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetWorkspaceKindArgs {
     /// The kind key an agent's `metadata.workspace_kind` references.
     pub name: String,
@@ -751,12 +779,14 @@ pub struct SetWorkspaceKindArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceKindNameArgs {
     /// The workspace kind's name.
     pub name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddBannedPhraseArgs {
     /// The phrase to ban. Stored lowercased; matched case-insensitively and whole-phrase, so
     /// "the floor" does not match inside "the floorboard".
@@ -769,6 +799,7 @@ pub struct AddBannedPhraseArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetIdentityAliasArgs {
     /// The alias to map (stored lowercased; the lookup key), e.g. "operator".
     pub alias: String,
@@ -779,6 +810,7 @@ pub struct SetIdentityAliasArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BannedPhraseArgs {
     /// The phrase to remove from the banned list.
     pub phrase: String,
@@ -787,6 +819,7 @@ pub struct BannedPhraseArgs {
 // --- People / teams (multi-operator model, task 542 Phase 1b) ---
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePersonArgs {
     /// Stable string handle for the person (e.g. "cameron"). Upserts if it already exists.
     pub id: String,
@@ -799,6 +832,7 @@ pub struct CreatePersonArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTeamArgs {
     /// Stable string handle for the team (e.g. "operator"). Upserts if it already exists.
     pub id: String,
@@ -811,18 +845,21 @@ pub struct CreateTeamArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PersonIdArgs {
     /// The person's stable string handle.
     pub id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TeamIdArgs {
     /// The team's stable string handle.
     pub team_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TeamMemberArgs {
     /// The team to add to / remove from.
     pub team_id: String,
@@ -835,12 +872,14 @@ pub struct TeamMemberArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LintTextArgs {
     /// The text to dry-run against the live content gate (banned-phrase list + ASCII-only rule).
     pub text: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GradeDocumentArgs {
     /// The document body (markdown) to grade against the mechanical doc_7 A8 conformance rubric.
     pub content: String,
@@ -853,6 +892,7 @@ pub struct GradeDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestSecretArgs {
     /// The secret's name (e.g. the durable filename it will land as).
     pub name: String,
@@ -875,6 +915,7 @@ pub struct RequestSecretArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FulfillSecretArgs {
     pub id: i64,
     /// The fulfiller capability token returned when the request was created.
@@ -882,6 +923,7 @@ pub struct FulfillSecretArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetChannelPropsArgs {
     pub channel_id: i64,
     /// Key/value properties to merge into the channel's metadata — e.g. the outbound
@@ -890,6 +932,7 @@ pub struct SetChannelPropsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetChannelAutoJoinArgs {
     pub channel_id: i64,
     /// true = every agent is a member (existing agents joined now + new agents auto-join on
@@ -902,6 +945,7 @@ pub struct SetChannelAutoJoinArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertExternalLinkArgs {
     /// Originating system, e.g. "slack" or "github".
     pub source: String,
@@ -920,6 +964,7 @@ pub struct UpsertExternalLinkArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListExternalLinksArgs {
     #[serde(default)]
     pub source: Option<String>,
@@ -930,6 +975,7 @@ pub struct ListExternalLinksArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PromoteThreadArgs {
     pub channel_id: i64,
     /// The seq of the thread's root post (its replies — posts with reply_to == this — are
@@ -943,6 +989,7 @@ pub struct PromoteThreadArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InviteToChannelArgs {
     pub channel_id: i64,
     /// The agent to invite (auto-joined).
@@ -953,6 +1000,7 @@ pub struct InviteToChannelArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CheckNotificationsArgs {
     /// Whose inbox to drain. Defaults to the agent this session registered as.
     #[serde(default)]
@@ -964,6 +1012,7 @@ pub struct CheckNotificationsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SendMessageArgs {
     /// Sender. Defaults to the agent this session registered as.
     #[serde(default)]
@@ -973,6 +1022,7 @@ pub struct SendMessageArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OpenDmArgs {
     /// The other agent in the 1:1 DM.
     pub with_agent: String,
@@ -982,6 +1032,7 @@ pub struct OpenDmArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetMessagesArgs {
     /// Whose messages. Defaults to the agent this session registered as.
     #[serde(default)]
@@ -993,6 +1044,7 @@ pub struct GetMessagesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetEventsArgs {
     #[serde(default)]
     pub since_seq: i64,
@@ -1008,6 +1060,7 @@ pub struct GetEventsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateDocumentArgs {
     pub title: String,
     /// Bare IPFS content id for version 1. Stored verbatim; the board never resolves it.
@@ -1043,6 +1096,7 @@ pub struct CreateDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PublishVersionArgs {
     pub document_id: i64,
     /// Bare IPFS content id for the new version. Stored verbatim; the board never resolves it.
@@ -1070,6 +1124,7 @@ pub struct PublishVersionArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetDocumentPathArgs {
     pub document_id: i64,
     /// The wiki path to file this document under (e.g. architecture/board/events). An empty
@@ -1080,6 +1135,7 @@ pub struct SetDocumentPathArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListWikiArgs {
     /// Only documents filed under this path prefix (e.g. architecture returns architecture and
     /// everything beneath it). Omit for the whole wiki tree. Results are ordered by path.
@@ -1091,6 +1147,7 @@ pub struct ListWikiArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetDocumentArgs {
     /// The document id. Omit if you pass `path` instead.
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
@@ -1109,6 +1166,7 @@ pub struct GetDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadDocumentArgs {
     /// The document id. Omit if you pass `path` instead.
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
@@ -1123,6 +1181,7 @@ pub struct ReadDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateDocumentArgs {
     pub document_id: i64,
     /// New title — a short, specific noun phrase; the viewer renders the title as the page header.
@@ -1132,6 +1191,7 @@ pub struct UpdateDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListDocumentsArgs {
     #[serde(default)]
     pub project_id: Option<i64>,
@@ -1163,6 +1223,7 @@ pub struct ListDocumentsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CommentDocumentArgs {
     pub document_id: i64,
     pub body: String,
@@ -1191,6 +1252,7 @@ pub struct CommentDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResolveCommentArgs {
     pub comment_id: i64,
     #[serde(default)]
@@ -1198,6 +1260,7 @@ pub struct ResolveCommentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetDocumentCommentsArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -1207,11 +1270,13 @@ pub struct GetDocumentCommentsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetCommentArgs {
     pub comment_id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PoseQuestionArgs {
     pub task_id: i64,
     /// Legacy kind -- one of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list. OMIT it for a CID-keyed question that instead carries its own `response_schema` plus a `ui.element_schema_cid` (the element's content id, its canonical type identifier).
@@ -1244,6 +1309,7 @@ pub struct PoseQuestionArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AnswerQuestionArgs {
     /// The question comment id to answer.
     pub comment_id: i64,
@@ -1256,6 +1322,7 @@ pub struct AnswerQuestionArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeclineQuestionArgs {
     pub comment_id: i64,
     /// Why the question is declined; delivered to the asker and recorded on the task.
@@ -1265,6 +1332,7 @@ pub struct DeclineQuestionArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CancelQuestionArgs {
     pub comment_id: i64,
     #[serde(default)]
@@ -1272,6 +1340,7 @@ pub struct CancelQuestionArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SupersedeQuestionArgs {
     pub comment_id: i64,
     /// The prompt for the replacement question (the old one is kept immutable + linked).
@@ -1281,6 +1350,7 @@ pub struct SupersedeQuestionArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListTasksBlockingMeArgs {
     /// The principal to view for (defaults to you). A team-routed question surfaces for its members.
     #[serde(default)]
@@ -1292,6 +1362,7 @@ pub struct ListTasksBlockingMeArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListAwaitingArgs {
     /// The principal whose awaiting-decision queue to return (defaults to you). "operator" is the
     /// seeded operator team; a team-targeted block or team-routed question surfaces for members.
@@ -1304,6 +1375,7 @@ pub struct ListAwaitingArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DocumentActorArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -1311,6 +1383,7 @@ pub struct DocumentActorArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeprecateDocumentArgs {
     pub document_id: i64,
     /// Mark deprecated (default) or, when false, clear the deprecation + supersede link.
@@ -1324,6 +1397,7 @@ pub struct DeprecateDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestChangesArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -1334,6 +1408,7 @@ pub struct RequestChangesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitToOperatorReviewArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -1349,6 +1424,7 @@ pub struct SubmitToOperatorReviewArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AttachDocumentArgs {
     pub document_id: i64,
     pub task_id: i64,
@@ -1357,6 +1433,7 @@ pub struct AttachDocumentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateReviewArgs {
     /// What is being reviewed: document | code | design | agent-session | task.
     pub kind: String,
@@ -1391,11 +1468,13 @@ pub struct CreateReviewArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetReviewArgs {
     pub review_id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListReviewsArgs {
     #[serde(default)]
     pub status: Option<String>,
@@ -1406,6 +1485,7 @@ pub struct ListReviewsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewTrendArgs {
     /// Restrict the trend to one review kind (document / code / design / ...).
     #[serde(default)]
@@ -1416,6 +1496,7 @@ pub struct ReviewTrendArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetReviewStatusArgs {
     pub review_id: i64,
     /// The new A2 status: open / in_review / changes_requested / approved / closed. Re-applying
@@ -1430,6 +1511,7 @@ pub struct SetReviewStatusArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetReviewVettedArgs {
     pub review_id: i64,
     /// true = mark the review vetted (adversarial review run + addressed); false = clear it.
@@ -1444,6 +1526,7 @@ pub struct SetReviewVettedArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AppendReviewLogArgs {
     pub review_id: i64,
     /// The entry type: submitted / revised / finding / finding_resolved / comment / state_change /
@@ -3431,10 +3514,12 @@ mod tests {
     use rmcp::schemars::schema_for;
     use serde_json::{from_value, json};
 
-    /// Write-tool arg structs reject unknown/misnamed params instead of silently dropping them
-    /// (task 759): the historical bite was set_status(note=...) when the field is status_message,
-    /// and update_task typos -- both returned success while the value vanished. deny_unknown_fields
-    /// makes serde name the offending field. Valid params still parse.
+    /// Arg structs reject unknown/misnamed params instead of silently dropping them (task 759 /
+    /// task_914): the historical bite was set_status(note=...) when the field is status_message, and
+    /// update_task typos -- both returned success while the value vanished. deny_unknown_fields makes
+    /// serde name the offending field. task_914 generalized it across the whole tool-arg family, so a
+    /// misnamed param on ANY tool fails loud; this spot-checks a representative sample. Valid params
+    /// still parse, and recognized aliases (agent_id -> author/subscriber) are NOT "unknown".
     #[test]
     fn write_tool_args_reject_unknown_fields() {
         // set_status: the real param is status_message; a stray `note` must fail loud, not drop.
@@ -3451,6 +3536,26 @@ mod tests {
         assert!(
             from_value::<UpdateTaskArgs>(json!({"task_id": 1, "statuss": "done"})).is_err(),
             "unknown field on UpdateTaskArgs must be rejected"
+        );
+        // task_914: a representative sample across the create / comment / post / message / document /
+        // question / review write surface -- a stray key fails loud on each.
+        assert!(from_value::<CreateTaskArgs>(json!({"project_id": 1, "titel": "x"})).is_err());
+        assert!(from_value::<CommentTaskArgs>(json!({"task_id": 1, "txt": "x"})).is_err());
+        assert!(from_value::<PostToChannelArgs>(json!({"channel_id": 1, "msg": "x"})).is_err());
+        assert!(from_value::<SendMessageArgs>(json!({"to_agent": "a", "message": "x"})).is_err());
+        assert!(from_value::<CreateDocumentArgs>(json!({"title": "t", "contents": "x"})).is_err());
+        assert!(from_value::<PoseQuestionArgs>(json!({"prompt": "p", "route_to": "x"})).is_err());
+        assert!(from_value::<CreateReviewArgs>(json!({"kind": "k", "targetref": "x"})).is_err());
+        // A recognized alias is NOT an unknown field: comment_task still takes agent_id for author,
+        // and subscribe still takes agent_id for subscriber (task_531 / task_901), under deny.
+        assert!(
+            from_value::<CommentTaskArgs>(json!({"task_id": 1, "body": "x", "agent_id": "a"}))
+                .is_ok(),
+            "a known alias (agent_id) is not rejected by deny_unknown_fields"
+        );
+        assert!(
+            from_value::<SubscribeArgs>(json!({"task_id": 1, "agent_id": "a"})).is_ok(),
+            "subscribe agent_id alias still parses under deny_unknown_fields"
         );
     }
 
