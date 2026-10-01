@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "elements": {
+    "yes-no": {
+      "title": "Yes / no",
+      "description": "A boolean choice. The question's inline response schema is a boolean; this element renders Yes / No controls. Optional custom button labels.",
+      "component": "YesNo",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "yes_label": { "type": "string" },
+          "no_label": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "single-select": {
+      "title": "Single choice",
+      "description": "Pick exactly one option (multiple-choice). The response schema is an enum of option ids; the options live in props.",
+      "component": "SingleSelect",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["options"],
+        "additionalProperties": false
+      }
+    },
+    "multi-select": {
+      "title": "Select all that apply",
+      "description": "Pick any number of options (select-all). The response schema is an array of option ids; the options live in props.",
+      "component": "MultiSelect",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["options"],
+        "additionalProperties": false
+      }
+    },
+    "text": {
+      "title": "Fill in the blank",
+      "description": "A free-text answer (fill-in-the-blank). The response schema is a string; optional placeholder and multiline hints are props.",
+      "component": "TextInput",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "placeholder": { "type": "string" },
+          "multiline": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "rank": {
+      "title": "Rank list",
+      "description": "Order the options by preference (rank-list). The response schema is an ordered permutation of the option ids; the options live in props.",
+      "component": "RankList",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["options"],
+        "additionalProperties": false
+      }
+    },
+    "age-request": {
+      "title": "Encrypted secret request",
+      "description": "Request a secret encrypted to an age recipient (replaces the dedicated secret-request path, task_713). The response schema is a string holding the age ciphertext, produced client-side, so no plaintext is ever stored on the board. props.recipient is the age public key to encrypt to.",
+      "component": "AgeRequest",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "recipient": {
+            "type": "string",
+            "description": "age public key (recipient) the secret is encrypted to, client-side"
+          },
+          "label": { "type": "string" }
+        },
+        "required": ["recipient"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
