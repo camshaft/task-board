@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
+import { encryptToRecipients } from './age'
 import { api, type SecretRequest } from './api'
 
 // Standalone secret-submission page (no board chrome), reached via the single-use capability
@@ -37,16 +38,9 @@ export default function SecretSubmit() {
     setBusy(true)
     setSubmitError(null)
     try {
-      if (req.recipients.length === 0) {
-        throw new Error('this request has no recipients to encrypt to')
-      }
       // Encrypt in the browser to the request's age recipients, then armor to text. The board
       // receives only this ciphertext — the pasted value never leaves the tab in the clear.
-      const age = await import('age-encryption')
-      const encrypter = new age.Encrypter()
-      for (const recipient of req.recipients) encrypter.addRecipient(recipient)
-      const ciphertext = await encrypter.encrypt(value)
-      const armored = age.armor.encode(ciphertext)
+      const armored = await encryptToRecipients(value, req.recipients)
       await api.submitSecret(id, { token, ciphertext: armored })
       setDone(true)
     } catch (e) {

@@ -7,6 +7,7 @@ import {
   type QuestionPayload,
   type QuestionState,
 } from './api'
+import { AgeAnswer } from './age-answer'
 import { Markdown } from './markdown'
 import { AuthorLabel, AutoGrowTextarea, relTime } from './ui'
 import { elementMeta, elementNameForCid } from './ui-registry'
@@ -102,6 +103,7 @@ type FormSpec =
   | { shape: 'choice'; multi: boolean; options: QuestionOption[]; min?: number; max?: number }
   | { shape: 'text'; placeholder?: string }
   | { shape: 'ranked'; options: QuestionOption[]; maxRanked?: number }
+  | { shape: 'age'; recipient: string }
 
 function formSpecFor(q: QuestionPayload): FormSpec | null {
   const name = elementNameForCid(q.ui?.element_schema_cid)
@@ -124,8 +126,13 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
         return { shape: 'text', placeholder: asText(p.placeholder) }
       case 'rank':
         return { shape: 'ranked', options: asOptions(p.options), maxRanked: asCount(p.max_ranked) }
+      case 'age-request': {
+        const recipient = asText(p.recipient)
+        // With a recipient we can encrypt in-browser; without one, fall back to the free-text escape.
+        return recipient ? { shape: 'age', recipient } : null
+      }
       default:
-        // age-request and any future element with no inline form: handled read-only + free text.
+        // Any future element with no inline form: handled read-only + free text.
         return null
     }
   }
@@ -402,8 +409,13 @@ function AnswerForm({
         </div>
       )}
 
+      {spec?.shape === 'age' && (
+        <AgeAnswer recipient={spec.recipient} busy={busy} onSubmit={onSubmit} />
+      )}
+
       {/* Out-of-frame escape: answer in free text when there is no inline text field (so a bool /
-          choice / ranked / formless question can still be answered in words). */}
+          choice / ranked / age / formless question can still be answered in words -- for an
+          age-request that means pasting ciphertext encrypted out of band). */}
       {spec?.shape !== 'text' && (
         <div className={spec ? 'mt-2 border-t border-[var(--color-border)] pt-2' : ''}>
           {showFree ? (
@@ -412,7 +424,9 @@ function AnswerForm({
                 value={freeText}
                 onChange={setFreeText}
                 onSubmit={() => freeText.trim() && onSubmit('text', freeText.trim())}
-                placeholder="Answer in your own words..."
+                placeholder={
+                  spec?.shape === 'age' ? 'Paste pre-encrypted ciphertext...' : 'Answer in your own words...'
+                }
                 className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
               />
               <button
@@ -428,7 +442,11 @@ function AnswerForm({
               onClick={() => setShowFree(true)}
               className="text-xs text-sky-400 hover:text-sky-300"
             >
-              {spec ? 'Answer in your own words instead' : 'Answer in your own words'}
+              {spec?.shape === 'age'
+                ? 'Paste pre-encrypted ciphertext instead'
+                : spec
+                  ? 'Answer in your own words instead'
+                  : 'Answer in your own words'}
             </button>
           )}
         </div>
