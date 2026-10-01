@@ -3232,15 +3232,43 @@ pub async fn list_awaiting(
     Ok(Value::Array(out))
 }
 
+/// A UI crash report (task_879). All fields but `message` are optional, matching the browser-side
+/// reporter: `kind` distinguishes an uncaught error from an unhandled promise rejection;
+/// `component_stack` is React's component stack (present only for an ErrorBoundary capture); `url`
+/// is the route the crash happened on; `build` is the loaded bundle hash so a crash pins to a
+/// deploy; `occurred_at` is the client timestamp (the board stamps its own `last_seen` regardless).
+#[derive(Default)]
+pub struct CrashReport<'a> {
+    pub kind: Option<&'a str>,
+    pub message: &'a str,
+    pub stack: Option<&'a str>,
+    pub component_stack: Option<&'a str>,
+    pub url: Option<&'a str>,
+    pub build: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+    pub occurred_at: Option<&'a str>,
+}
+
 /// A stable dedup signature for a UI crash (task_879): the build hash plus the first couple of
-/// non-empty stack lines (or the message when there is no stack), so the same crash recurring from
+/// non-empty stack lines, falling back to the component stack and then the message when there is no
+/// JS stack (a React render error may carry only a component stack). The same crash recurring from
 /// the same build collapses onto one investigation task instead of filing a new one each time.
 /// Bounded in length so a pathological stack cannot bloat the stored metadata.
-pub fn crash_signature(message: &str, stack: Option<&str>, build: Option<&str>) -> String {
+pub fn crash_signature(
+    message: &str,
+    stack: Option<&str>,
+    component_stack: Option<&str>,
+    build: Option<&str>,
+) -> String {
     let mut frames: Vec<&str> = Vec::new();
-    if let Some(s) = stack {
-        for l in s.lines().map(str::trim).filter(|l| !l.is_empty()).take(2) {
-            frames.push(l);
+    for src in [stack, component_stack] {
+        if !frames.is_empty() {
+            break;
+        }
+        if let Some(s) = src {
+            for l in s.lines().map(str::trim).filter(|l| !l.is_empty()).take(2) {
+                frames.push(l);
+            }
         }
     }
     if frames.is_empty() {
@@ -3256,15 +3284,18 @@ pub fn crash_signature(message: &str, stack: Option<&str>, build: Option<&str>) 
 /// bumped instead of filing a duplicate; otherwise a new unassigned task is created in the intake
 /// project for board-triage to route. Returns the task id, whether it was newly created, and the
 /// occurrence count. Not content-gated, since a stack trace is arbitrary text rather than board prose.
-pub async fn ingest_crash_report(
-    pool: &Pool,
-    message: &str,
-    stack: Option<&str>,
-    route: Option<&str>,
-    build: Option<&str>,
-    user_agent: Option<&str>,
-) -> anyhow::Result<Value> {
-    let sig = crash_signature(message, stack, build);
+pub async fn ingest_crash_report(pool: &Pool, report: &CrashReport<'_>) -> anyhow::Result<Value> {
+    let CrashReport {
+        kind,
+        message,
+        stack,
+        component_stack,
+        url,
+        build,
+        user_agent,
+        occurred_at,
+    } = *report;
+    let sig = crash_signature(message, stack, component_stack, build);
     // Dedup / rate-limit: one open task per signature. Bump the existing one if present.
     if let Some(row) = sqlx::query(
         "SELECT id, metadata FROM tasks WHERE json_extract(metadata,'$.crash_signature')=? \
@@ -3298,18 +3329,24 @@ pub async fn ingest_crash_report(
     let short: String = message.trim().chars().take(120).collect();
     let title = format!("UI crash: {short}");
     let body = format!(
-        "Auto-filed by UI crash telemetry (task_879).\n\nMessage: {message}\nRoute: {}\nBuild: {}\nUser-agent: {}\n\nStack:\n{}",
-        route.unwrap_or("(none)"),
+        "Auto-filed by UI crash telemetry (task_879).\n\nKind: {}\nMessage: {message}\nURL: {}\n\
+         Build: {}\nUser-agent: {}\nOccurred-at: {}\n\nStack:\n{}\n\nComponent stack:\n{}",
+        kind.unwrap_or("error"),
+        url.unwrap_or("(none)"),
         build.unwrap_or("(none)"),
         user_agent.unwrap_or("(none)"),
+        occurred_at.unwrap_or("(none)"),
         stack.unwrap_or("(none)"),
+        component_stack.unwrap_or("(none)"),
     );
     let meta = json!({
         "crash_signature": sig,
         "occurrences": 1,
         "source": "ui-crash-telemetry",
+        "kind": kind,
         "build": build,
-        "route": route,
+        "url": url,
+        "occurred_at": occurred_at,
         "last_seen": now_iso(),
     });
     let task = create_task(
@@ -19175,13 +19212,19 @@ mod tests {
         .await?;
 
         let stack = "TypeError: undefined is not a function\n    at reduce (index-abc.js:40)";
+        let rep = |msg: &'static str, stack: &'static str, url: &'static str| CrashReport {
+            kind: Some("error"),
+            message: msg,
+            stack: Some(stack),
+            url: Some(url),
+            build: Some("index-abc.js"),
+            user_agent: Some("UA/1"),
+            occurred_at: Some("2026-10-01T00:00:00Z"),
+            ..Default::default()
+        };
         let r1 = ingest_crash_report(
             &pool,
-            "TypeError: undefined is not a function",
-            Some(stack),
-            Some("/awaiting"),
-            Some("index-abc.js"),
-            Some("UA/1"),
+            &rep("TypeError: undefined is not a function", stack, "/awaiting"),
         )
         .await?;
         assert_eq!(r1["created"], json!(true));
@@ -19196,11 +19239,7 @@ mod tests {
         // Same crash again -> bump the same task, no duplicate.
         let r2 = ingest_crash_report(
             &pool,
-            "TypeError: undefined is not a function",
-            Some(stack),
-            Some("/awaiting"),
-            Some("index-abc.js"),
-            Some("UA/1"),
+            &rep("TypeError: undefined is not a function", stack, "/awaiting"),
         )
         .await?;
         assert_eq!(r2["created"], json!(false));
@@ -19214,20 +19253,47 @@ mod tests {
         // A distinct crash (different stack top) -> a new task.
         let r3 = ingest_crash_report(
             &pool,
-            "RangeError: bad",
-            Some("RangeError: bad\n    at x (index-abc.js:9)"),
-            Some("/x"),
-            Some("index-abc.js"),
-            None,
+            &rep(
+                "RangeError: bad",
+                "RangeError: bad\n    at x (index-abc.js:9)",
+                "/x",
+            ),
         )
         .await?;
         assert_eq!(r3["created"], json!(true));
         assert_ne!(r3["task_id"].as_i64(), Some(tid));
 
-        // Signature is deterministic and build-sensitive.
-        let s1 = crash_signature("m", Some("line1\nline2"), Some("b1"));
-        assert_eq!(s1, crash_signature("m", Some("line1\nline2"), Some("b1")));
-        assert_ne!(s1, crash_signature("m", Some("line1\nline2"), Some("b2")));
+        // A React error with only a component stack still dedups off that fallback.
+        let react = CrashReport {
+            message: "render failed",
+            component_stack: Some("    at Awaiting\n    at Router"),
+            build: Some("index-abc.js"),
+            ..Default::default()
+        };
+        assert_eq!(
+            ingest_crash_report(&pool, &react).await?["created"],
+            json!(true)
+        );
+        assert_eq!(
+            ingest_crash_report(&pool, &react).await?["occurrences"],
+            json!(2)
+        );
+
+        // Signature is deterministic and build-sensitive, and falls back to the component stack.
+        let s1 = crash_signature("m", Some("line1\nline2"), None, Some("b1"));
+        assert_eq!(
+            s1,
+            crash_signature("m", Some("line1\nline2"), None, Some("b1"))
+        );
+        assert_ne!(
+            s1,
+            crash_signature("m", Some("line1\nline2"), None, Some("b2"))
+        );
+        assert_ne!(
+            crash_signature("m", None, Some("compA"), Some("b1")),
+            crash_signature("m", None, None, Some("b1")),
+            "component stack contributes when no JS stack"
+        );
         Ok(())
     }
 
