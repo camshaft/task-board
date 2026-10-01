@@ -1699,6 +1699,7 @@ async fn open_dm(State(st): State<AppState>, Json(b): Json<OpenDmBody>) -> ApiRe
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EventsQuery {
     #[serde(default)]
     since_seq: i64,

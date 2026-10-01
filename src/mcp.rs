@@ -168,6 +168,7 @@ pub struct UpdateAgentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetStatusArgs {
     /// Defaults to the agent this session registered as; pass to act for another.
     #[serde(default)]
@@ -273,6 +274,7 @@ pub struct CreateTaskArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateTaskArgs {
     pub task_id: i64,
     /// todo / in_progress / blocked / done / cancelled
@@ -313,6 +315,11 @@ pub struct UpdateTaskArgs {
     pub blocked_on_kind: Option<String>,
     #[serde(default)]
     pub blocked_on_ref: Option<String>,
+    /// Optional note recorded with the flat blocked_on form -- what/why it is waiting, free text.
+    /// Paired with `blocked_on_kind`/`blocked_on_ref`; ignored when the nested `blocked_on` object
+    /// is given (put the note in that object instead). Example: blocked_on_note="waiting on CAS".
+    #[serde(default)]
+    pub blocked_on_note: Option<String>,
     /// Return the full task (including the `description`) in the response. Default false — the
     /// response omits the description to keep a looping caller's context light; fetch it with get_task.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
@@ -1689,7 +1696,7 @@ impl Board {
             if kind.is_empty() || kind == "none" || kind == "clear" {
                 Value::Null
             } else {
-                serde_json::json!({ "kind": kind, "target": a.blocked_on_ref, "note": null })
+                serde_json::json!({ "kind": kind, "target": a.blocked_on_ref, "note": a.blocked_on_note })
             }
         });
         let blocked_on = a
@@ -3340,6 +3347,49 @@ mod tests {
     use super::*;
     use rmcp::schemars::schema_for;
     use serde_json::{from_value, json};
+
+    /// Write-tool arg structs reject unknown/misnamed params instead of silently dropping them
+    /// (task 759): the historical bite was set_status(note=...) when the field is status_message,
+    /// and update_task typos -- both returned success while the value vanished. deny_unknown_fields
+    /// makes serde name the offending field. Valid params still parse.
+    #[test]
+    fn write_tool_args_reject_unknown_fields() {
+        // set_status: the real param is status_message; a stray `note` must fail loud, not drop.
+        assert!(
+            from_value::<SetStatusArgs>(json!({"status": "online", "note": "oops"})).is_err(),
+            "unknown field on SetStatusArgs must be rejected"
+        );
+        assert!(
+            from_value::<SetStatusArgs>(json!({"status": "online", "status_message": "ok"}))
+                .is_ok(),
+            "valid SetStatusArgs still parses"
+        );
+        // update_task: a misspelled field must fail loud rather than no-op.
+        assert!(
+            from_value::<UpdateTaskArgs>(json!({"task_id": 1, "statuss": "done"})).is_err(),
+            "unknown field on UpdateTaskArgs must be rejected"
+        );
+    }
+
+    /// A note sent via the FLAT blocked_on form (blocked_on_note, paired with blocked_on_kind/ref)
+    /// is now a recognized field, not silently dropped (task 802): the flat path previously had no
+    /// note sibling and hardcoded note=null, so a blocked task filed via the flat form lost its
+    /// stated reason.
+    #[test]
+    fn update_task_flat_blocked_on_note_parses() {
+        let a = from_value::<UpdateTaskArgs>(json!({
+            "task_id": 1,
+            "status": "blocked",
+            "blocked_on_kind": "agent",
+            "blocked_on_ref": "v-board-ui",
+            "blocked_on_note": "waiting on the CAS endpoint"
+        }))
+        .expect("flat blocked_on with a note parses");
+        assert_eq!(
+            a.blocked_on_note.as_deref(),
+            Some("waiting on the CAS endpoint")
+        );
+    }
 
     /// MCP arg fields tolerate a client that JSON-stringifies scalar/struct values (task 351):
     /// include_body (bool), comments_limit (i64), the list_tasks scalar filters, and blocked_on
