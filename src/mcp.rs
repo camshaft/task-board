@@ -813,6 +813,18 @@ pub struct LintTextArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GradeDocumentArgs {
+    /// The document body (markdown) to grade against the mechanical doc_7 A8 conformance rubric.
+    pub content: String,
+    /// The document title, graded separately from the body (title/heading rules). Optional.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Override the main-body prose-word budget. Defaults to the locked ~700-word basis.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub body_length_budget_words: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestSecretArgs {
     /// The secret's name (e.g. the durable filename it will land as).
     pub name: String,
@@ -2108,6 +2120,24 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(
+        description = "Grade a design document against the mechanical doc_7 A8 conformance rubric WITHOUT writing anything. Returns {clean, has_hard_fail, findings:[{check, severity (hard_fail|warn), line, message}]} with actionable-remedy messages, over 8 checks: ascii-only, required-sections-in-order, banned-phrases, title/heading rules, body-hygiene (no tables/images in the main body), status/provenance markers, caps-for-emphasis, and main-body prose length. Pass the document `content` (markdown) and its `title` (graded separately); optionally override `body_length_budget_words`. This is the single grading source of truth -- use it as a pre-submit self-check before publishing a design doc."
+    )]
+    async fn grade_document(
+        &self,
+        Parameters(a): Parameters<GradeDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::grade_document(
+            &self.pool,
+            &a.content,
+            a.title.as_deref().unwrap_or(""),
+            a.body_length_budget_words,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "Remove a phrase from the fleet banned-phrases list.")]

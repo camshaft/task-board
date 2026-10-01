@@ -204,6 +204,7 @@ pub fn router(state: AppState) -> Router {
             get(get_workspace_kind).delete(delete_workspace_kind),
         )
         .route("/lint", post(lint_text))
+        .route("/grade-document", post(grade_document))
         .route(
             "/banned-phrases",
             get(list_banned_phrases).post(add_banned_phrase),
@@ -419,7 +420,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/workspace-kinds", summary: "Define/update a workspace kind (setup_script + config an agent is configured with); idempotent on name, config merges.", query: "", body: Some("SetWorkspaceKindBody") },
     Endpoint { method: "GET", path: "/api/workspace-kinds/{name}", summary: "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize a workspace.", query: "", body: None },
     Endpoint { method: "DELETE", path: "/api/workspace-kinds/{name}", summary: "Retire a workspace kind by name.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/lint", summary: "Dry-run the pre-submit content lint on arbitrary text without writing: returns {clean, banned_phrases, non_ascii} against the authoritative live banned-phrases list + ASCII-only rule. Use this to pre-check content (incl. before a CID publish, which the write-path gate does not cover) instead of a drift-prone local copy.", query: "", body: Some("LintTextBody") },
+    Endpoint { method: "POST", path: "/api/lint", summary: "Dry-run the pre-submit content lint on arbitrary text without writing: returns {clean, banned_phrases, non_ascii, bare_refs} against the authoritative live banned-phrases list, the ASCII-only rule, and the ambiguous bare-#N typed-ref rule. Use this to pre-check content (incl. before a CID publish, which the write-path gate does not cover) instead of a drift-prone local copy.", query: "", body: Some("LintTextBody") },
+    Endpoint { method: "POST", path: "/api/grade-document", summary: "Grade a design document against the mechanical doc_7 A8 conformance rubric (ascii, required-sections-in-order, banned-phrases, title/heading rules, body-hygiene, status/provenance, caps-emphasis, body-length). Returns {clean, has_hard_fail, findings:[{check, severity, line, message}]} with actionable-remedy messages. The single grading source of truth: the board submit path and any client (fleet check-doc, the reviewer) call this one endpoint.", query: "", body: Some("GradeDocumentBody") },
     Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list (what the pre-submit content lint checks docs and comments against).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
     Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None },
@@ -522,6 +524,7 @@ fn body_schemas() -> Value {
         SetWorkspaceKindBody,
         AddBannedPhraseBody,
         LintTextBody,
+        GradeDocumentBody,
         UpdateDocumentBody,
         CreateSecretRequestBody,
         SubmitSecretBody,
@@ -1820,6 +1823,33 @@ struct LintTextBody {
 /// here instead of a hand-maintained local copy that drifts.
 async fn lint_text(State(st): State<AppState>, Json(b): Json<LintTextBody>) -> ApiResult {
     Ok(Json(core::lint_text(&st.pool, &b.text).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GradeDocumentBody {
+    /// The document body (markdown) to grade against the mechanical doc_7 A8 rubric.
+    content: String,
+    /// The document title, graded separately from the body (A1 title/heading rules). Optional;
+    /// defaults to empty (title-specific checks are skipped when absent).
+    #[serde(default)]
+    title: Option<String>,
+    /// Override the main-body prose-word budget (A8 #8). Defaults to the locked ~700-word basis.
+    #[serde(default)]
+    body_length_budget_words: Option<i64>,
+}
+
+/// Grade a design document against the mechanical doc_7 A8 conformance rubric without writing
+/// anything: returns `{clean, has_hard_fail, findings:[{check, severity, line, message}]}`.
+async fn grade_document(State(st): State<AppState>, Json(b): Json<GradeDocumentBody>) -> ApiResult {
+    Ok(Json(
+        core::grade_document(
+            &st.pool,
+            &b.content,
+            b.title.as_deref().unwrap_or(""),
+            b.body_length_budget_words,
+        )
+        .await?,
+    ))
 }
 
 // --- Identity aliases (task 532) ---
