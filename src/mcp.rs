@@ -1118,6 +1118,21 @@ pub struct RequestChangesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubmitToOperatorReviewArgs {
+    pub document_id: i64,
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// The doc template you read and followed (e.g. the design-doc template id/name). Required
+    /// unless you give a `template_waiver_reason`.
+    #[serde(default)]
+    pub template_followed: Option<String>,
+    /// If no template applies, a non-empty reason why (a weak reason becomes a conformance finding,
+    /// so make it substantive). Required only when `template_followed` is absent.
+    #[serde(default)]
+    pub template_waiver_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AttachDocumentArgs {
     pub document_id: i64,
     pub task_id: i64,
@@ -2603,6 +2618,25 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(
+        description = "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator first sees it. REJECTED unless BOTH hold: (1) you name the doc template you followed (template_followed) or give a non-empty template_waiver_reason, and (2) a design-conformance review has run against the CURRENT version (an adversarial_review summary entry recording reviewed_version == the current version) with zero open findings (every finding's child task done/cancelled). Fail-closed: a doc can never reach the operator un-reviewed. Notifies the document's subscribers."
+    )]
+    async fn submit_to_operator_review(
+        &self,
+        Parameters(a): Parameters<SubmitToOperatorReviewArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::submit_to_operator_review(
+            &self.pool,
+            a.document_id,
+            s(&a.actor),
+            s(&a.template_followed),
+            s(&a.template_waiver_reason),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(
