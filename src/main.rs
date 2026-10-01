@@ -212,11 +212,38 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             ct.cancel();
         })
         .await?;
     Ok(())
+}
+
+/// Resolve when the process should begin a graceful shutdown: on SIGINT (ctrl_c, dev/foreground) OR
+/// SIGTERM (what systemd / a `colmena switch` / `kill` send on a redeploy). Catching SIGTERM is the
+/// point -- otherwise a managed restart terminates the process on the default signal disposition,
+/// severing in-flight requests mid-response (the deploy-time "incomplete response" 502). Reaching
+/// here instead lets axum drain in-flight requests and the caller cancel the SSE tailer first.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // If we can't install the handler, never resolve on this arm (fall back to ctrl_c).
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 /// Serve index.html with a `<base href>` injected so relative asset/API URLs resolve
