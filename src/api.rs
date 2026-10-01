@@ -262,6 +262,7 @@ pub fn router(state: AppState) -> Router {
             get(read_document_content),
         )
         .route("/documents/{document_id}/path", post(set_document_path))
+        .route("/documents/{document_id}/props", patch(set_document_props))
         .route(
             "/documents/{document_id}/versions",
             get(get_document_versions).post(publish_version),
@@ -467,6 +468,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list. Pass ?include_body=true to also inline the current version's markdown (resolved server-side from its CID; body:null + body_error on fetch failure).", query: "include_body=bool", body: None },
     Endpoint { method: "PATCH", path: "/api/documents/{document_id}", summary: "Rename a document (set its title; metadata-only — versions/content/path/status untouched). Emits document.updated.", query: "", body: Some("UpdateDocumentBody") },
+    Endpoint { method: "PATCH", path: "/api/documents/{document_id}/props", summary: "Merge a JSON object into a document's metadata (description, type, tags, provenance) without cutting a content version. The list + wiki index project metadata.description. Emits document.updated.", query: "", body: Some("SetDocumentPropsBody") },
     Endpoint { method: "DELETE", path: "/api/documents/{document_id}", summary: "HARD-DELETE a document + all dependents (versions/comments/attachments/links/embeds). IRREVERSIBLE; requires the doc be archived first. Use only for true garbage; prefer archive otherwise. Emits document.deleted.", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version. Requires ipfs_api_url.", query: "version_no=int", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
@@ -518,6 +520,7 @@ fn body_schemas() -> Value {
         CreateDocumentBody,
         PublishVersionBody,
         SetDocumentPathBody,
+        SetDocumentPropsBody,
         CommentDocumentBody,
         ResolveCommentBody,
         DocumentActorBody,
@@ -2560,6 +2563,31 @@ struct UpdateDocumentBody {
     /// New title — a short, specific noun phrase; the viewer renders the title as the page header.
     title: String,
     actor: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetDocumentPropsBody {
+    /// Key/value properties to shallow-merge into the document's metadata (e.g. description, type,
+    /// tags, provenance). Keys overwrite; unmentioned keys are left as-is.
+    #[serde(default)]
+    props: serde_json::Map<String, Value>,
+    actor: Option<String>,
+}
+
+async fn set_document_props(
+    State(st): State<AppState>,
+    Path(DocRef(document_id)): Path<DocRef>,
+    Json(b): Json<SetDocumentPropsBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_document_props(
+            &st.pool,
+            document_id,
+            Value::Object(b.props),
+            b.actor.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 async fn update_document(
