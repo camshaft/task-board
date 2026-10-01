@@ -148,6 +148,11 @@ CREATE TABLE IF NOT EXISTS documents (
     -- Soft-archive stamp. NULL = live; a timestamp = retired (hidden from listings by default,
     -- reversible, and the append-only event log is preserved). Orthogonal to the review status.
     archived_at         TEXT,
+    -- Deprecate/supersede marking (task 694a), ORTHOGONAL to archive: a deprecated doc stays
+    -- VISIBLE (clients show a banner) but is flagged retired/replaced. NULL = live; a timestamp =
+    -- deprecated. superseded_by points at the replacing document (NULL = deprecated with no successor).
+    deprecated_at       TEXT,
+    superseded_by       INTEGER REFERENCES documents(id),
     created_by          TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
@@ -803,6 +808,23 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
         .any(|r| r.get::<String, _>("name") == "archived_at");
     if !documents_have_archived_at {
         sqlx::query("ALTER TABLE documents ADD COLUMN archived_at TEXT")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill documents.{deprecated_at,superseded_by} (task 694a: deprecate/supersede marking,
+    // orthogonal to archive). deprecated_at NULL = live; superseded_by = the replacing document id.
+    let doc_cols = sqlx::query("PRAGMA table_info(documents)")
+        .fetch_all(&pool)
+        .await?;
+    let doc_has = |c: &str| doc_cols.iter().any(|r| r.get::<String, _>("name") == c);
+    if !doc_has("deprecated_at") {
+        sqlx::query("ALTER TABLE documents ADD COLUMN deprecated_at TEXT")
+            .execute(&pool)
+            .await?;
+    }
+    if !doc_has("superseded_by") {
+        sqlx::query("ALTER TABLE documents ADD COLUMN superseded_by INTEGER")
             .execute(&pool)
             .await?;
     }

@@ -1236,6 +1236,19 @@ pub struct DocumentActorArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeprecateDocumentArgs {
+    pub document_id: i64,
+    /// Mark deprecated (default) or, when false, clear the deprecation + supersede link.
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub deprecated: Option<bool>,
+    /// The document that supersedes this one (recorded only when deprecating). Must exist.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub superseded_by: Option<i64>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestChangesArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -2985,6 +2998,25 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(
+        description = "Mark a document deprecated (optionally recording the document that supersedes it), or pass deprecated=false to clear it. ORTHOGONAL to archive: a deprecated doc stays VISIBLE in listings (a client shows a deprecated / superseded-by banner) rather than being hidden -- use archive_document to hide. deprecated defaults to true; superseded_by is recorded only when deprecating and must reference an existing document. Notifies subscribers."
+    )]
+    async fn deprecate_document(
+        &self,
+        Parameters(a): Parameters<DeprecateDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::set_document_deprecated(
+            &self.pool,
+            a.document_id,
+            a.deprecated.unwrap_or(true),
+            a.superseded_by,
+            s(&a.actor),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(

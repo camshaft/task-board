@@ -285,6 +285,10 @@ pub fn router(state: AppState) -> Router {
         .route("/documents/{document_id}/detach", post(detach_document))
         .route("/documents/{document_id}/archive", post(archive_document))
         .route("/documents/{document_id}/restore", post(restore_document))
+        .route(
+            "/documents/{document_id}/deprecate",
+            post(deprecate_document),
+        )
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
@@ -472,6 +476,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents/{document_id}/detach", summary: "Detach a document from a task.", query: "", body: Some("AttachDocumentBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/archive", summary: "Soft-archive (retire) a document: hidden from listings by default, reversible, history preserved.", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/restore", summary: "Restore a previously archived document (clears the archive stamp).", query: "", body: Some("DocumentActorBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/deprecate", summary: "Mark a document deprecated (optionally superseded_by a replacing document id), or deprecated=false to clear it. Orthogonal to archive: a deprecated doc stays VISIBLE (clients show a banner) rather than hidden. deprecated defaults to true.", query: "", body: Some("DeprecateDocumentBody") },
     Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
 ];
 
@@ -509,6 +514,7 @@ fn body_schemas() -> Value {
         CommentDocumentBody,
         ResolveCommentBody,
         DocumentActorBody,
+        DeprecateDocumentBody,
         SubmitToOperatorReviewBody,
         PoseQuestionBody,
         AnswerQuestionBody,
@@ -2806,6 +2812,34 @@ async fn restore_document(
 ) -> ApiResult {
     Ok(Json(
         core::set_document_archived(&st.pool, document_id, false, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DeprecateDocumentBody {
+    /// Mark deprecated (default true) or, when false, clear the deprecation + supersede link.
+    #[serde(default)]
+    deprecated: Option<bool>,
+    /// The document that supersedes this one (recorded only when deprecating; must exist).
+    #[serde(default)]
+    superseded_by: Option<i64>,
+    actor: Option<String>,
+}
+
+async fn deprecate_document(
+    State(st): State<AppState>,
+    Path(DocRef(document_id)): Path<DocRef>,
+    Json(b): Json<DeprecateDocumentBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_document_deprecated(
+            &st.pool,
+            document_id,
+            b.deprecated.unwrap_or(true),
+            b.superseded_by,
+            b.actor.as_deref(),
+        )
+        .await?,
     ))
 }
 
