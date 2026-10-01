@@ -6545,55 +6545,89 @@ struct WikiEdge {
     region: Option<String>,
 }
 
-/// Extract `[[wiki-link]]` / `[[path|label]]` and `![[embed]]` / `![[path@vN#region]]` targets
-/// from a document's raw content. Returns edges de-duplicated by target_path (first occurrence
-/// wins -- so a doc that both links AND embeds the same path records the first-seen edge only;
-/// lifting that needs a composite-key migration), each path normalized like a document path.
-fn extract_wiki_edges(content: &str) -> Vec<WikiEdge> {
-    let bytes = content.as_bytes();
-    let mut out: Vec<WikiEdge> = Vec::new();
-    // De-dup per (kind, path) so a doc that BOTH [[links]] and ![[embeds]] the same path keeps
-    // both edges (links and embeds live in separate tables — task 108).
-    let mut seen: BTreeSet<(&str, String)> = BTreeSet::new();
+/// If `s` is EXACTLY one `![[ ... ]]` token (the standalone block / transclusion form), return its
+/// inner `path[@vN][#region][|label]`. Anything else -- surrounding text, or a second token --
+/// yields None, so an inline `![[...]]` mid-paragraph is NOT treated as an embed; it demotes to a
+/// plain link, matching the frontend renderer, which only renders a transclusion when a paragraph
+/// is exactly the embed token. Pinned by tests/fixtures/wiki-refs.md.
+fn standalone_embed_inner(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix("![[")?.strip_suffix("]]")?;
+    // A single token only: no nested opener/closer hiding more content.
+    if inner.contains("[[") || inner.contains("]]") {
+        return None;
+    }
+    Some(inner)
+}
+
+/// Peel a wiki token `path[@vN][#region][|label]` into a `WikiEdge` of the given kind. `version_no`
+/// (`@vN`) and `region` (`#frag`) are only meaningful for an embed and are dropped for a link
+/// (matching the stored schema). None when the path is empty after normalization.
+fn parse_wiki_token(inner: &str, kind: &'static str) -> Option<WikiEdge> {
+    let (left, label) = match inner.split_once('|') {
+        Some((l, r)) => (l, Some(r.trim().to_string())),
+        None => (inner, None),
+    };
+    let (left, region) = match left.split_once('#') {
+        Some((l, r)) => (l, Some(r.trim().to_string())),
+        None => (left, None),
+    };
+    let (raw_path, version_no) = match left.split_once('@') {
+        Some((p, v)) => (
+            p,
+            v.trim().trim_start_matches(['v', 'V']).parse::<i64>().ok(),
+        ),
+        None => (left, None),
+    };
+    let path = normalize_wiki_path(raw_path);
+    if path.is_empty() {
+        return None;
+    }
+    let is_embed = kind == "embed";
+    Some(WikiEdge {
+        path,
+        label: label.filter(|l| !l.is_empty()),
+        kind,
+        // A pin/region only makes sense for an embed; ignore them on a link.
+        version_no: if is_embed { version_no } else { None },
+        region: if is_embed {
+            region.filter(|r| !r.is_empty())
+        } else {
+            None
+        },
+    })
+}
+
+/// Process one block of inline text (a paragraph, heading, list item, or table cell) for wiki
+/// edges. If the whole block is a standalone `![[...]]` it records an embed; otherwise every
+/// `[[...]]` in it records a link (a leading `!` is literal in inline position). De-dups per
+/// (kind, path), first occurrence wins, via `seen`.
+fn flush_wiki_block(
+    buf: &str,
+    out: &mut Vec<WikiEdge>,
+    seen: &mut BTreeSet<(&'static str, String)>,
+) {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some(inner) = standalone_embed_inner(trimmed) {
+        if let Some(edge) = parse_wiki_token(inner, "embed") {
+            if seen.insert((edge.kind, edge.path.clone())) {
+                out.push(edge);
+            }
+        }
+        return;
+    }
+    let bytes = trimmed.as_bytes();
     let mut i = 0usize;
     while i + 1 < bytes.len() {
         if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-            // A leading '!' makes it an embed (![[...]]) rather than a plain link.
-            let is_embed = i > 0 && bytes[i - 1] == b'!';
-            if let Some(close) = content[i + 2..].find("]]") {
-                let inner = &content[i + 2..i + 2 + close];
-                // inner = path[@vN][#region][|label]. Peel from the right: label, then region,
-                // then a version pin, leaving the bare path.
-                let (left, label) = match inner.split_once('|') {
-                    Some((l, r)) => (l, Some(r.trim().to_string())),
-                    None => (inner, None),
-                };
-                let (left, region) = match left.split_once('#') {
-                    Some((l, r)) => (l, Some(r.trim().to_string())),
-                    None => (left, None),
-                };
-                let (raw_path, version_no) = match left.split_once('@') {
-                    Some((p, v)) => (
-                        p,
-                        v.trim().trim_start_matches(['v', 'V']).parse::<i64>().ok(),
-                    ),
-                    None => (left, None),
-                };
-                let path = normalize_wiki_path(raw_path);
-                let kind = if is_embed { "embed" } else { "link" };
-                if !path.is_empty() && seen.insert((kind, path.clone())) {
-                    out.push(WikiEdge {
-                        path,
-                        label: label.filter(|l| !l.is_empty()),
-                        kind,
-                        // A pin/region only makes sense for an embed; ignore them on a link.
-                        version_no: if is_embed { version_no } else { None },
-                        region: if is_embed {
-                            region.filter(|r| !r.is_empty())
-                        } else {
-                            None
-                        },
-                    });
+            if let Some(close) = trimmed[i + 2..].find("]]") {
+                let inner = &trimmed[i + 2..i + 2 + close];
+                if let Some(edge) = parse_wiki_token(inner, "link") {
+                    if seen.insert((edge.kind, edge.path.clone())) {
+                        out.push(edge);
+                    }
                 }
                 i += 2 + close + 2;
                 continue;
@@ -6601,6 +6635,46 @@ fn extract_wiki_edges(content: &str) -> Vec<WikiEdge> {
         }
         i += 1;
     }
+}
+
+/// Extract `[[wiki-link]]` / `[[path|label]]` (jumps) and standalone `![[embed]]` /
+/// `![[path@vN#region|label]]` (transclusions) from a document's raw markdown. Walks the
+/// pulldown-cmark event stream rather than scanning raw bytes, so (a) a `[[...]]` written inside an
+/// inline code span or a fenced code block is NOT indexed (it is example text, not an edge), and
+/// (b) `![[...]]` is an embed only when it is a whole text block on its own -- an inline `![[...]]`
+/// demotes to a link, matching the frontend renderer (web/src/markdown.tsx). Edges de-dup per
+/// (kind, path), first occurrence wins (links and embeds live in separate tables -- task 108 -- so
+/// a doc that both links AND embeds one path keeps both edges). The agreed semantics are pinned by
+/// the shared corpus tests/fixtures/wiki-refs.{md,expected.json} (task 785 / task 770).
+fn extract_wiki_edges(content: &str) -> Vec<WikiEdge> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut out: Vec<WikiEdge> = Vec::new();
+    let mut seen: BTreeSet<(&'static str, String)> = BTreeSet::new();
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    let mut buf = String::new();
+    let mut code_depth = 0usize;
+    for ev in Parser::new_ext(content, opts) {
+        match ev {
+            Event::Start(Tag::CodeBlock(_)) => code_depth += 1,
+            Event::End(TagEnd::CodeBlock) => code_depth = code_depth.saturating_sub(1),
+            // Inline code (Event::Code) and raw HTML are skipped entirely -- never scanned.
+            Event::Text(t) if code_depth == 0 => buf.push_str(&t),
+            Event::SoftBreak | Event::HardBreak if code_depth == 0 => buf.push(' '),
+            // End of a leaf block holding inline text: process what we accumulated. (A list item
+            // wrapping a paragraph flushes on the inner paragraph; the item then sees empty text.)
+            Event::End(
+                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::TableCell | TagEnd::Item,
+            ) => {
+                flush_wiki_block(&buf, &mut out, &mut seen);
+                buf.clear();
+            }
+            _ => {}
+        }
+    }
+    // Defensive: flush any trailing text (all inline text is normally inside a flushed block).
+    flush_wiki_block(&buf, &mut out, &mut seen);
     out
 }
 
@@ -11467,7 +11541,8 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
         // Source doc A links to two paths and embeds a third (the embed must NOT become a link).
-        let content = "See [[guide/setup]] and [[guide/advanced|Advanced Guide]].\n![[guide/diagram]]\nDup [[guide/setup]] again.";
+        // The embed is its own paragraph: ![[...]] is only a transclusion in standalone-block form.
+        let content = "See [[guide/setup]] and [[guide/advanced|Advanced Guide]].\n\n![[guide/diagram]]\n\nDup [[guide/setup]] again.";
         let a = create_document(
             &pool,
             "Intro",
@@ -11591,6 +11666,35 @@ mod tests {
         Ok(())
     }
 
+    /// extract_wiki_edges matches the shared anti-drift corpus (tests/fixtures/wiki-refs.*) agreed
+    /// with the frontend renderer (task 785 / task 770): code-span/code-fence-aware (a `[[x]]` in
+    /// code is not an edge), block-only embeds (an inline `![[x]]` demotes to a link), and dedup
+    /// per (kind, path) first-wins. The .expected.json is the canonical server output; keeping this
+    /// green keeps the server extractor and the frontend parser from silently diverging.
+    #[test]
+    fn extract_wiki_edges_matches_shared_fixture() {
+        let md = include_str!("../tests/fixtures/wiki-refs.md");
+        let expected: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/wiki-refs.expected.json"))
+                .expect("fixture expected.json parses");
+        let got: Vec<serde_json::Value> = extract_wiki_edges(md)
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "path": e.path,
+                    "label": e.label,
+                    "kind": e.kind,
+                    "version_no": e.version_no,
+                    "region": e.region,
+                })
+            })
+            .collect();
+        assert_eq!(
+            got, expected,
+            "extract_wiki_edges must match the shared wiki-refs fixture (order + fields)"
+        );
+    }
+
     /// Embeds (transclusion): ![[path]] floats to the target's current version, ![[path@vN]]
     /// pins to an immutable version, ![[path#region]] carries a region fragment; get_document
     /// separates embeds from links and surfaces embedded_by ("what embeds this").
@@ -11624,8 +11728,11 @@ mod tests {
             .as_i64()
             .unwrap();
 
-        // Source doc: one plain link, one floating embed, one pinned embed, one region embed.
-        let content = "[[lib/widget]] jump\n![[lib/widget]] float\n![[lib/widget@v1]] pinned\n![[lib/notes#intro]] region";
+        // Source doc: one plain link, one floating embed, one pinned embed, one region embed. Each
+        // embed is its own standalone-block paragraph (an embed is a transclusion only in that
+        // form); the float ![[lib/widget]] precedes the @v1 pin so it wins that path.
+        let content =
+            "[[lib/widget]] jump\n\n![[lib/widget]]\n\n![[lib/widget@v1]]\n\n![[lib/notes#intro]]";
         let s = create_document(
             &pool,
             "Page",
@@ -11676,8 +11783,9 @@ mod tests {
             "lib/notes dangles (unfiled)"
         );
 
-        // Now a doc where the embed path is distinct so pinning resolves to a version id.
-        let content2 = "![[lib/widget@v1]] pinned\n![[lib/widget-x]] float-dangling";
+        // Now a doc where the embed path is distinct so pinning resolves to a version id. Each
+        // embed is its own standalone-block paragraph.
+        let content2 = "![[lib/widget@v1]]\n\n![[lib/widget-x]]";
         let s2 = create_document(
             &pool,
             "Page2",
