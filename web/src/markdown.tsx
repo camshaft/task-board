@@ -5,17 +5,27 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ReactNode,
 } from 'react'
 import { Link } from 'react-router-dom'
+import ReactMarkdown, { type Components, type ExtraProps } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { visit } from 'unist-util-visit'
+import { findAndReplace } from 'mdast-util-find-and-replace'
+import { toString as mdastToString } from 'mdast-util-to-string'
+import type { Root as MdastRoot, Paragraph as MdastParagraph } from 'mdast'
+import type { Element as HastElement } from 'hast'
 import { api, ipfsUrl, type DocumentVersion } from './api'
 
-// Minimal, dependency-free Markdown renderer. It emits a React element tree (never
-// dangerouslySetInnerHTML), so all text is escaped by React and link hrefs are sanitized —
-// safe for rendering agent-authored task descriptions and comments. Supports the common
-// subset: ATX headings, fenced + inline code, bold, italic, links, [[wiki-links]], blockquotes,
-// ordered / unordered lists, horizontal rules, and paragraphs. Not a full CommonMark
-// implementation; anything it doesn't recognize degrades to plain text.
+// Markdown renderer: a real CommonMark parser (remark/unified via react-markdown + remark-gfm),
+// extended with a small remark plugin for the board's own non-standard inline/block syntax
+// ([[wiki-links]], ![[transclusion embeds]], @mentions, typed-ref / bare-#N / owner/repo#N
+// linkify). The custom syntax is lowered to standard hast `a` (inline refs) or `div` (embed
+// blocks) elements carrying a `boardKind` discriminant in their properties, so TypeScript's
+// `Components` map only ever needs real tag-name keys — see AnchorRenderer / DivRenderer below.
+// Never uses dangerouslySetInnerHTML for parsed markdown (all text is escaped by React); the one
+// exception is Mermaid's own sanitized SVG output, unchanged from before.
 
 // Resolves a [[wiki-path]] to the document filed there, or null when nothing is (a dangling
 // link, rendered as a wiki "red link"). Provided app-wide from the live wiki listing; the
@@ -39,25 +49,42 @@ const MAX_EMBED_DEPTH = 4
 const EmbedContext = createContext<{ depth: number; chain: string[] }>({ depth: 0, chain: [] })
 
 // A block-level transclusion: ![[path]], ![[path@vN]] (pinned version), ![[path#region]], and an
-// optional |label. Matched only when it's the whole line (block construct, like an image embed).
+// optional |label. Matched only when it's the whole paragraph (block construct, like an image
+// embed) — see remarkEmbedBlocks.
 const EMBED_RE =
   /^!\[\[\s*([^\]#@|]+?)\s*(?:@v(\d+))?\s*(?:#([^\]|]+?))?\s*(?:\|\s*([^\]]+?)\s*)?\]\]$/
 
-// Shared link styling (sky underline) — used by markdown links and the bare-URL / task-ref
-// autolinkers below.
-const LINK_CLS = 'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
+// [[path]] or [[path|label]] — an internal wiki link.
+const WIKILINK_RE = /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g
 
-// A bare #N still resolves to a board task (no break, per #504), but it's ambiguous versus the
-// typed task_N / external owner/repo#N forms. Mark it with an amber dotted underline + help cursor
-// (the title tooltip carries the nudge) so it reads as "resolvable, but prefer the typed form",
-// visually distinct from the confident sky links — the display-time half of task 517 (layer 2),
-// complementing the backend's author-time ref_warnings (layer 1).
-const AMBIGUOUS_REF_CLS =
-  'text-amber-300/90 underline decoration-dotted decoration-amber-400/60 underline-offset-2 cursor-help hover:text-amber-200'
+// External GitHub PR/issue reference: <owner>/<repo>#<N> (e.g. camshaft/fleet#183) → the PR URL
+// (GitHub redirects /pull/<N> to /issues/<N> when it's an issue). Repo-qualified ONLY — a bare
+// #N is a board task (below). The lookbehind rejects a preceding path/word char (a '/' or letter)
+// so it never matches inside a longer path or URL (e.g. ".com/owner/repo#5").
+const GITHUB_REF_RE = /(?<![\w./@-])([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*)#(\d+)\b/g
 
-// Typed resource id prefix -> the client route it deep-links to (task 504). The typed form
-// (task_472, doc_23, project_16, channel_123) is the canonical id the API returns; the linkifier
-// resolves it to the in-app route so a self-describing reference is clickable anywhere it's written.
+// Internal typed resource id: task_472 / doc_23 / project_16 / channel_123 → the board deep-link
+// (task 504). This is the canonical id the API returns and accepts in URLs. The lookbehind
+// rejects a leading word char / hyphen so "subtask_5" / "todoc_3" don't match; \b after the
+// digits rejects "task_12ab".
+const TYPED_REF_RE = /(?<![\w-])(task|doc|project|channel)_(\d+)\b/g
+
+// Bare task reference (#123) → the task redirect route (which resolves the task's project). The
+// lookbehind rejects a leading word char / another # / & so "abc#1", "##", and numeric HTML
+// entities like "&#123;" don't match; \b after the digits rejects "#12ab". Still resolves to task
+// N, but carries the ambiguity affordance (task 517 layer 2): amber dotted underline + help
+// cursor + a tooltip nudging the typed form. Message mirrors the backend's layer-1 ref_warnings
+// text. Note GITHUB_REF_RE above always wins on "owner/repo#N" since the '#' there is preceded by
+// a word char, which this pattern's lookbehind already excludes — no explicit ordering needed.
+const BARE_REF_RE = /(?<![\w#&])#(\d+)\b/g
+
+// @agent mention → the agent's page, but ONLY when it names a known agent (per the app-wide
+// resolver, checked at render time in MentionRef); an unknown @word stays plain text (no dead
+// links). The lookbehind rejects a leading word char / @ so emails (a@b.com) and @@ don't match.
+// Agent ids may contain hyphens (e.g. v-board-ui).
+const MENTION_RE = /(?<![\w@])@([a-z0-9][\w-]*)/gi
+
+// Typed resource id prefix -> the client route it deep-links to (task 504).
 const REF_ROUTE: Record<string, string> = {
   task: 'tasks',
   doc: 'documents',
@@ -65,235 +92,127 @@ const REF_ROUTE: Record<string, string> = {
   channel: 'channels',
 }
 
-// Inline spans, in priority order: code (verbatim), wiki-links, links, bold, italic, and then
-// autolinkers for bare URLs + task refs. Returns a mix of strings (React escapes them) and
-// elements. `gen` yields globally-unique keys; `resolve` maps a [[wiki-path]] to its document
-// (or null → dangling red-link). The earliest match across all patterns wins, so an explicit
-// [text](url) link (its `[` comes first) always beats the bare-URL autolinker on the same URL.
-function inline(
-  text: string,
-  gen: () => number,
-  resolve: WikiResolver,
-  mentions: AgentResolver,
-): ReactNode[] {
-  const patterns: [RegExp, (m: RegExpExecArray) => ReactNode][] = [
-    [
-      /`([^`]+)`/,
-      (m) => (
-        <code
-          key={gen()}
-          className="rounded bg-[var(--color-panel-2)] px-1 py-0.5 font-mono text-[0.85em]"
-        >
-          {m[1]}
-        </code>
-      ),
-    ],
-    [
-      // [[path]] or [[path|label]] — an internal wiki link. Resolves to the doc filed at that
-      // path; a dangling target renders as a distinct "red link" (like a real wiki).
-      /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/,
-      (m) => {
-        const path = m[1].trim()
-        const label = (m[2] ?? m[1]).trim()
-        const hit = resolve(path)
-        return hit ? (
-          <Link
-            key={gen()}
-            to={`/documents/${hit.id}`}
-            title={path}
-            className="text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
-          >
-            {label}
-          </Link>
-        ) : (
-          <Link
-            key={gen()}
-            to={`/wiki`}
-            title={`No page filed at "${path}" yet`}
-            className="text-rose-400/90 underline decoration-dotted underline-offset-2 hover:text-rose-300"
-          >
-            {label}
-          </Link>
-        )
-      },
-    ],
-    [
-      /\[([^\]]+)\]\(([^)\s]+)\)/,
-      (m) => {
-        const href = m[2]
-        const cls =
-          'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
-        // Links stay in the same tab; the operator opts into a new tab via cmd/ctrl/middle-click
-        // (#453). External URLs use a plain <a>; an in-app path navigates client-side via <Link>
-        // so the router basename (e.g. a /board sub-path) is preserved — a raw
-        // <a href="/documents/2"> would drop the prefix and navigate to a broken URL (#185).
-        if (/^(https?:\/\/|mailto:)/i.test(href)) {
-          return (
-            <a key={gen()} href={href} className={cls}>
-              {inline(m[1], gen, resolve, mentions)}
-            </a>
-          )
-        }
-        if (href.startsWith('/') && !href.startsWith('//')) {
-          return (
-            <Link key={gen()} to={href} className={cls}>
-              {inline(m[1], gen, resolve, mentions)}
-            </Link>
-          )
-        }
-        if (href.startsWith('#')) {
-          // Intra-doc anchor (e.g. a main-body -> appendix link). Two layers (task 706):
-          // 1. href is an ABSOLUTE-path form (current path + search + fragment), NOT the bare
-          //    `#frag`: the app injects a <base href> for sub-path (/board) proxying, against which
-          //    a bare fragment resolves to the BASE url (a different path) and navigates away from
-          //    the document -> a full SPA reload / blank screen, instead of scrolling.
-          // 2. onClick scrolls the target heading into view DIRECTLY (and reflects the fragment via
-          //    replaceState, no navigation), so in-doc jumps never depend on base-href / proxy /
-          //    router resolution at all. The href remains as a correct no-JS fallback.
-          const frag = href.slice(1)
-          return (
-            <a
-              key={gen()}
-              href={`${window.location.pathname}${window.location.search}${href}`}
-              className={cls}
-              onClick={(e) => {
-                let target: HTMLElement | null = null
-                try {
-                  target = document.getElementById(decodeURIComponent(frag))
-                } catch {
-                  target = document.getElementById(frag)
-                }
-                if (target) {
-                  e.preventDefault()
-                  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                  history.replaceState(
-                    null,
-                    '',
-                    `${window.location.pathname}${window.location.search}#${frag}`,
-                  )
-                }
-              }}
-            >
-              {inline(m[1], gen, resolve, mentions)}
-            </a>
-          )
-        }
-        // Relative / unsafe scheme (javascript:, data:, protocol-relative //) → inert text.
-        return <span key={gen()}>{m[0]}</span>
-      },
-    ],
-    [/\*\*([^*]+)\*\*/, (m) => <strong key={gen()}>{inline(m[1], gen, resolve, mentions)}</strong>],
-    [
-      /\*([^*]+)\*|_([^_]+)_/,
-      (m) => <em key={gen()}>{inline(m[1] ?? m[2], gen, resolve, mentions)}</em>,
-    ],
-    [
-      // Bare URL autolink. Only http/https, so the resulting href is always a safe scheme (no
-      // javascript:/data:). The greedy body stops at whitespace; the final char class trims the
-      // sentence punctuation that commonly trails a URL in prose (".", ")", ",", …).
-      /https?:\/\/[^\s]+[^\s.,;:!?)\]}'"]/,
-      (m) => (
-        <a key={gen()} href={m[0]} className={LINK_CLS}>
-          {m[0]}
-        </a>
-      ),
-    ],
-    [
-      // External GitHub PR/issue reference: <owner>/<repo>#<N> (e.g. camshaft/fleet#183) → the PR
-      // URL (GitHub redirects /pull/<N> to /issues/<N> when it's an issue). Repo-qualified ONLY —
-      // a bare #N is a board task (below). The lookbehind rejects a preceding path/word char (a '/'
-      // or letter) so it never matches inside a longer path or URL (e.g. ".com/owner/repo#5").
-      /(?<![\w./@-])([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*)#(\d+)\b/,
-      (m) => (
-        <a key={gen()} href={`https://github.com/${m[1]}/${m[2]}/pull/${m[3]}`} className={LINK_CLS}>
-          {m[0]}
-        </a>
-      ),
-    ],
-    [
-      // Internal typed resource id: task_472 / doc_23 / project_16 / channel_123 → the board
-      // deep-link (task 504). This is the canonical id the API returns and accepts in URLs. The
-      // lookbehind rejects a leading word char / hyphen so "subtask_5" / "todoc_3" don't match;
-      // \b after the digits rejects "task_12ab".
-      /(?<![\w-])(task|doc|project|channel)_(\d+)\b/,
-      (m) => (
-        <Link key={gen()} to={`/${REF_ROUTE[m[1]]}/${m[2]}`} className={LINK_CLS}>
-          {m[0]}
-        </Link>
-      ),
-    ],
-    [
-      // Bare task reference (#123) → the task redirect route (which resolves the task's project).
-      // The lookbehind rejects a leading word char / another # / & so "abc#1", "##", and numeric
-      // HTML entities like "&#123;" don't match; \b after the digits rejects "#12ab".
-      // Still resolves to task N, but carries the ambiguity affordance (task 517 layer 2): amber
-      // dotted underline + help cursor + a tooltip nudging the typed form. Message mirrors the
-      // backend's layer-1 ref_warnings text.
-      /(?<![\w#&])#(\d+)\b/,
-      (m) => (
-        <Link
-          key={gen()}
-          to={`/tasks/${m[1]}`}
-          title={`bare ${m[0]} is ambiguous: it resolves to board task_${m[1]}. Write task_${m[1]} for a board task, or owner/repo#${m[1]} for an external GitHub reference.`}
-          className={AMBIGUOUS_REF_CLS}
-        >
-          {m[0]}
-        </Link>
-      ),
-    ],
-    [
-      // @agent mention → the agent's page, but ONLY when it names a known agent (per the app-wide
-      // resolver); an unknown @word stays plain text (no dead links). The lookbehind rejects a
-      // leading word char / @ so emails (a@b.com) and @@ don't match. Agent ids may contain
-      // hyphens (e.g. v-board-ui).
-      /(?<![\w@])@([a-z0-9][\w-]*)/i,
-      (m) => {
-        // The target is the agent id, or an alias's canonical (@operator -> cameron). Keep the
-        // literal typed text (@operator) but link to the canonical page, with a tooltip noting the
-        // alias so the resolution is discoverable.
-        const target = mentions(m[1])
-        return target ? (
-          <Link
-            key={gen()}
-            to={`/agents/${target}`}
-            title={target !== m[1] ? `alias: @${m[1]} -> ${target}` : undefined}
-            className={LINK_CLS}
-          >
-            {m[0]}
-          </Link>
-        ) : (
-          m[0]
-        )
-      },
-    ],
-  ]
+// Shared link styling (sky underline) — used by markdown links and the bare-URL / task-ref
+// autolinkers below.
+const LINK_CLS = 'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
+const RED_LINK_CLS =
+  'text-rose-400/90 underline decoration-dotted underline-offset-2 hover:text-rose-300'
+// A bare #N still resolves to a board task (no break, per #504), but it's ambiguous versus the
+// typed task_N / external owner/repo#N forms. Mark it with an amber dotted underline + help
+// cursor (the title tooltip carries the nudge) so it reads as "resolvable, but prefer the typed
+// form", visually distinct from the confident sky links — the display-time half of task 517
+// (layer 2), complementing the backend's author-time ref_warnings (layer 1).
+const AMBIGUOUS_REF_CLS =
+  'text-amber-300/90 underline decoration-dotted decoration-amber-400/60 underline-offset-2 cursor-help hover:text-amber-200'
 
-  const nodes: ReactNode[] = []
-  let remaining = text
-  while (remaining.length > 0) {
-    // Earliest match across all patterns wins, so bold (**) beats italic (*) at the same spot.
-    let best: { idx: number; len: number; node: ReactNode } | null = null
-    for (const [re, make] of patterns) {
-      const m = re.exec(remaining)
-      if (m && (best == null || m.index < best.idx)) {
-        best = { idx: m.index, len: m[0].length, node: make(m) }
-      }
-    }
-    if (!best) break
-    if (best.idx > 0) nodes.push(remaining.slice(0, best.idx))
-    nodes.push(best.node)
-    remaining = remaining.slice(best.idx + best.len)
+// remark plugin: recognizes a paragraph consisting of exactly one text node matching EMBED_RE and
+// replaces it with a block-level embed node, lowered to a hast <div boardKind="embed-block" ...>
+// via data.hName/hProperties (mdast-util-to-hast's generic extension point) so DivRenderer below
+// can dispatch to the Embed component.
+function remarkEmbedBlocks() {
+  return (tree: MdastRoot) => {
+    visit(tree, 'paragraph', (node: MdastParagraph, index, parent) => {
+      if (!parent || index == null) return
+      if (node.children.length !== 1 || node.children[0].type !== 'text') return
+      const value = node.children[0].value.trim()
+      const m = EMBED_RE.exec(value)
+      if (!m) return
+      // A custom mdast node type outside the standard union; data.hName above fully overrides
+      // how mdast-util-to-hast renders it, so it never needs to satisfy a built-in node shape —
+      // hence the `unknown` round-trip cast.
+      parent.children[index] = {
+        type: 'boardEmbed',
+        data: {
+          hName: 'div',
+          hProperties: {
+            boardKind: 'embed-block',
+            path: m[1].trim(),
+            versionNo: m[2] ? Number(m[2]) : null,
+            region: m[3] ?? null,
+            label: m[4] ?? null,
+          },
+        },
+        children: [],
+      } as unknown as MdastParagraph
+    })
   }
-  if (remaining) nodes.push(remaining)
-  return nodes
 }
 
-// Block-rendering options threaded through blocks(): `anchors` turns headings into linkable
-// sections (a slug id + a clickable `#`/`##` depth marker), and `slugs` dedupes ids within one
-// render (a repeated heading text gets `-1`, `-2`, …). Only the document viewer opts in.
-interface BlockOpts {
-  anchors: boolean
-  slugs: Map<string, number>
+// remark plugin: lowers the board's custom inline tokens ([[wiki-links]], owner/repo#N,
+// task_N/doc_N/..., bare #N, @mentions) to hast <a boardKind="..." ...> elements (see above) so
+// AnchorRenderer below can dispatch each to its own small component. Order matters only in that
+// each pattern's own lookbehind/word-boundary guards already make them mutually exclusive on
+// overlapping text (e.g. GITHUB_REF_RE's "owner/repo#N" is never reachable by BARE_REF_RE, whose
+// lookbehind rejects a word-char-preceded '#') — native CommonMark constructs (links, emphasis,
+// code spans, autolinks) are handled by remark-parse / remark-gfm and never reach this plugin.
+function remarkBoardRefs() {
+  return (tree: MdastRoot) => {
+    findAndReplace(tree, [
+      [
+        WIKILINK_RE,
+        (_full: string, pathRaw: string, labelRaw?: string) => ({
+          type: 'boardRef',
+          data: {
+            hName: 'a',
+            hProperties: {
+              boardKind: 'wiki-link',
+              path: pathRaw.trim(),
+              label: (labelRaw ?? pathRaw).trim(),
+            },
+          },
+        }),
+      ],
+      [
+        GITHUB_REF_RE,
+        (full: string, owner: string, repo: string, num: string) => ({
+          type: 'boardRef',
+          data: {
+            hName: 'a',
+            hProperties: { boardKind: 'github-ref', owner, repo, num: Number(num), raw: full },
+          },
+        }),
+      ],
+      [
+        TYPED_REF_RE,
+        (full: string, kind: string, num: string) => ({
+          type: 'boardRef',
+          data: {
+            hName: 'a',
+            hProperties: { boardKind: 'typed-ref', kind, num: Number(num), raw: full },
+          },
+        }),
+      ],
+      [
+        BARE_REF_RE,
+        (full: string, num: string) => ({
+          type: 'boardRef',
+          data: { hName: 'a', hProperties: { boardKind: 'bare-ref', num: Number(num), raw: full } },
+        }),
+      ],
+      [
+        MENTION_RE,
+        (full: string, id: string) => ({
+          type: 'boardRef',
+          data: { hName: 'a', hProperties: { boardKind: 'mention', agentId: id, raw: full } },
+        }),
+      ],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ] as any)
+  }
+}
+
+// remark plugin: assigns a GitHub-style slug id to each heading (same algorithm as before:
+// lowercase, strip punctuation, spaces→hyphens, dedupe within one render via `-1`, `-2`, …), only
+// when the Markdown caller opts in via `anchors` — see uniqueSlug / slugify.
+function remarkHeadingSlugs(slugs: Map<string, number>) {
+  return (tree: MdastRoot) => {
+    visit(tree, 'heading', (node) => {
+      const raw = mdastToString(node)
+      const slug = uniqueSlug(raw, slugs)
+      const data = (node.data ??= {})
+      data.hProperties = { ...(data.hProperties ?? {}), id: slug }
+    })
+  }
 }
 
 // GitHub-style heading slug: lowercase, drop punctuation/markdown markers, spaces→hyphens.
@@ -314,213 +233,272 @@ function uniqueSlug(text: string, slugs: Map<string, number>): string {
   return n === 0 ? base : `${base}-${n}`
 }
 
-// Heading sizes give a clear, readable hierarchy (bigger than the old flat text-sm). scroll-mt
-// keeps a deep-linked heading clear of the sticky header. With opts.anchors, a monospace `#`×level
-// marker precedes the text and links to the section (doubles as a visible depth indicator).
-function heading(
-  level: number,
-  children: ReactNode,
-  key: number,
-  raw: string,
-  opts: BlockOpts,
-): ReactNode {
-  const cls =
-    level === 1
-      ? 'text-xl font-bold'
-      : level === 2
-        ? 'text-lg font-semibold'
-        : level === 3
-          ? 'text-base font-semibold'
-          : level === 4
-            ? 'text-sm font-semibold'
-            : level === 5
-              ? 'text-sm font-medium'
-              : 'text-sm font-medium text-[var(--color-muted)]'
-  const slug = opts.anchors ? uniqueSlug(raw, opts.slugs) : undefined
-  // Use an ABSOLUTE-path href (current path + #slug), not a bare `#slug`: the app injects a
-  // <base href> for sub-path proxying, and a bare fragment link resolves against the base (→ the
-  // root), navigating away from the doc. An absolute path is left alone by <base>, and since the
-  // path is unchanged it's a same-document fragment scroll (no reload, so react-router is fine).
-  const marker =
-    opts.anchors && slug ? (
-      <a
-        href={`${window.location.pathname}${window.location.search}#${slug}`}
-        aria-label="Link to this section"
-        className="mr-2 select-none font-mono font-normal text-[var(--color-muted)] opacity-50 hover:text-sky-300 hover:opacity-100"
-      >
-        {'#'.repeat(level)}
-      </a>
-    ) : null
-  const full = `scroll-mt-16 ${cls}`
-  switch (level) {
-    case 1:
-      return <h1 key={key} id={slug} className={full}>{marker}{children}</h1>
-    case 2:
-      return <h2 key={key} id={slug} className={full}>{marker}{children}</h2>
-    case 3:
-      return <h3 key={key} id={slug} className={full}>{marker}{children}</h3>
-    case 4:
-      return <h4 key={key} id={slug} className={full}>{marker}{children}</h4>
-    case 5:
-      return <h5 key={key} id={slug} className={full}>{marker}{children}</h5>
-    default:
-      return <h6 key={key} id={slug} className={full}>{marker}{children}</h6>
+// Intra-doc anchor click handler, shared by the heading marker and the `a` component's `#frag`
+// branch. Two layers (task 706): 1. the href is an ABSOLUTE-path form (current path + search +
+// fragment), NOT the bare `#frag`: the app injects a <base href> for sub-path (/board) proxying,
+// against which a bare fragment resolves to the BASE url (a different path) and navigates away
+// from the document -> a full SPA reload / blank screen, instead of scrolling. 2. onClick scrolls
+// the target heading into view DIRECTLY (and reflects the fragment via replaceState, no
+// navigation), so in-doc jumps never depend on base-href / proxy / router resolution at all. The
+// href remains as a correct no-JS fallback.
+function scrollToFragment(frag: string, e: React.MouseEvent) {
+  let target: HTMLElement | null = null
+  try {
+    target = document.getElementById(decodeURIComponent(frag))
+  } catch {
+    target = document.getElementById(frag)
+  }
+  if (target) {
+    e.preventDefault()
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${frag}`)
   }
 }
 
-function isBlockStart(line: string): boolean {
-  const t = line.trim()
+function fragmentHref(frag: string): string {
+  return `${window.location.pathname}${window.location.search}#${frag}`
+}
+
+type BoardAnchorProps = ComponentProps<'a'> &
+  ExtraProps & {
+    boardKind?: string
+    path?: string
+    label?: string
+    agentId?: string
+    raw?: string
+    kind?: string
+    num?: number
+    owner?: string
+    repo?: string
+  }
+
+// Dispatches every `a` element: the board's own lowered ref kinds (wiki-link / github-ref /
+// typed-ref / bare-ref / mention), plus the three cases a native markdown link or remark-gfm
+// bare-URL autolink can produce (external, in-app absolute path, intra-doc fragment) — ported
+// unchanged from the old inline() link branch.
+function AnchorRenderer(props: BoardAnchorProps) {
+  const { boardKind, path, label, agentId, raw, kind, num, owner, repo, href, children } = props
+  const resolve = useContext(WikiLinkContext)
+  const mentions = useContext(AgentMentionContext)
+
+  if (boardKind === 'wiki-link' && path != null) {
+    const hit = resolve(path)
+    return hit ? (
+      <Link to={`/documents/${hit.id}`} title={path} className={LINK_CLS}>
+        {label}
+      </Link>
+    ) : (
+      <Link to="/wiki" title={`No page filed at "${path}" yet`} className={RED_LINK_CLS}>
+        {label}
+      </Link>
+    )
+  }
+  if (boardKind === 'github-ref' && owner != null && repo != null) {
+    return (
+      <a href={`https://github.com/${owner}/${repo}/pull/${num}`} className={LINK_CLS}>
+        {raw}
+      </a>
+    )
+  }
+  if (boardKind === 'typed-ref' && kind != null) {
+    return (
+      <Link to={`/${REF_ROUTE[kind]}/${num}`} className={LINK_CLS}>
+        {raw}
+      </Link>
+    )
+  }
+  if (boardKind === 'bare-ref') {
+    return (
+      <Link
+        to={`/tasks/${num}`}
+        title={`bare #${num} is ambiguous: it resolves to board task_${num}. Write task_${num} for a board task, or owner/repo#${num} for an external GitHub reference.`}
+        className={AMBIGUOUS_REF_CLS}
+      >
+        {raw}
+      </Link>
+    )
+  }
+  if (boardKind === 'mention' && agentId != null) {
+    const target = mentions(agentId)
+    return target ? (
+      <Link
+        to={`/agents/${target}`}
+        title={target !== agentId ? `alias: @${agentId} -> ${target}` : undefined}
+        className={LINK_CLS}
+      >
+        {raw}
+      </Link>
+    ) : (
+      <>{raw}</>
+    )
+  }
+
+  // Native markdown link / remark-gfm bare-URL autolink.
+  if (!href) return <span>{children}</span>
+  if (/^(https?:\/\/|mailto:)/i.test(href)) {
+    return (
+      <a href={href} className={LINK_CLS}>
+        {children}
+      </a>
+    )
+  }
+  // Links stay in the same tab; the operator opts into a new tab via cmd/ctrl/middle-click
+  // (#453). External URLs use a plain <a>; an in-app path navigates client-side via <Link> so the
+  // router basename (e.g. a /board sub-path) is preserved — a raw <a href="/documents/2"> would
+  // drop the prefix and navigate to a broken URL (#185).
+  if (href.startsWith('/') && !href.startsWith('//')) {
+    return (
+      <Link to={href} className={LINK_CLS}>
+        {children}
+      </Link>
+    )
+  }
+  if (href.startsWith('#')) {
+    const frag = href.slice(1)
+    return (
+      <a href={fragmentHref(frag)} className={LINK_CLS} onClick={(e) => scrollToFragment(frag, e)}>
+        {children}
+      </a>
+    )
+  }
+  // Relative / unsafe scheme (javascript:, data:, protocol-relative //) → inert text.
+  return <span>{children}</span>
+}
+
+// Heading sizes give a clear, readable hierarchy. scroll-mt keeps a deep-linked heading clear of
+// the sticky header. With `anchors`, a monospace `#`×level marker precedes the text (from the id
+// remarkHeadingSlugs assigned) and links to the section (doubles as a visible depth indicator).
+const HEADING_CLS: Record<number, string> = {
+  1: 'text-xl font-bold',
+  2: 'text-lg font-semibold',
+  3: 'text-base font-semibold',
+  4: 'text-sm font-semibold',
+  5: 'text-sm font-medium',
+  6: 'text-sm font-medium text-[var(--color-muted)]',
+}
+
+function makeHeading(level: 1 | 2 | 3 | 4 | 5 | 6, anchors: boolean) {
+  const Tag = `h${level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6'
+  function Heading({ id, children }: ComponentProps<'h1'> & ExtraProps) {
+    const marker =
+      anchors && id ? (
+        <a
+          href={fragmentHref(id)}
+          aria-label="Link to this section"
+          className="mr-2 select-none font-mono font-normal text-[var(--color-muted)] opacity-50 hover:text-sky-300 hover:opacity-100"
+        >
+          {'#'.repeat(level)}
+        </a>
+      ) : null
+    return (
+      <Tag id={anchors ? id : undefined} className={`scroll-mt-16 ${HEADING_CLS[level]}`}>
+        {marker}
+        {children}
+      </Tag>
+    )
+  }
+  return Heading
+}
+
+// Fenced code: dispatches ```mermaid / ```vega-lite (or ```vega) to the matching lazy-loaded
+// component, else a plain styled code block. Reads the raw text + language straight off the hast
+// node (not the rendered `children`), so this never depends on how/whether `code` is overridden.
+function PreBlock({ node }: ExtraProps) {
+  const el = node as HastElement | undefined
+  const codeNode = el?.children.find(
+    (c): c is HastElement => c.type === 'element' && c.tagName === 'code',
+  )
+  const classNames = (codeNode?.properties?.className as string[] | undefined) ?? []
+  const langClass = classNames.find((c) => c.startsWith('language-'))
+  const lang = langClass ? langClass.slice('language-'.length).toLowerCase() : ''
+  const textChild = codeNode?.children[0]
+  const code = textChild && textChild.type === 'text' ? textChild.value : ''
+
+  if (lang === 'mermaid') return <Mermaid code={code} />
+  if (lang === 'vega-lite' || lang === 'vegalite' || lang === 'vega') return <VegaLite code={code} />
   return (
-    t.startsWith('```') ||
-    EMBED_RE.test(t) ||
-    /^#{1,6}\s/.test(line) ||
-    /^>\s?/.test(line) ||
-    /^\s*[-*+]\s+/.test(line) ||
-    /^\s*\d+\.\s+/.test(line) ||
-    /^(---+|\*\*\*+|___+)$/.test(t)
+    <pre className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 font-mono text-xs">
+      <code>{code}</code>
+    </pre>
   )
 }
 
-function blocks(
-  src: string,
-  resolve: WikiResolver,
-  mentions: AgentResolver,
-  opts: BlockOpts,
-): ReactNode[] {
-  const lines = src.replace(/\r\n?/g, '\n').split('\n')
-  const out: ReactNode[] = []
-  let i = 0
-  let k = 0
-  let ikey = 0
-  const gen = () => ikey++
-
-  while (i < lines.length) {
-    const line = lines[i]
-    if (line.trim() === '') {
-      i++
-      continue
-    }
-    const t = line.trim()
-
-    const embed = EMBED_RE.exec(t)
-    if (embed) {
-      out.push(
-        <Embed
-          key={k++}
-          path={embed[1]}
-          versionNo={embed[2] ? Number(embed[2]) : null}
-          region={embed[3] ?? null}
-          label={embed[4] ?? null}
-        />,
-      )
-      i++
-      continue
-    }
-
-    if (t.startsWith('```')) {
-      const lang = t.slice(3).trim().toLowerCase()
-      const buf: string[] = []
-      i++
-      while (i < lines.length && !lines[i].trim().startsWith('```')) {
-        buf.push(lines[i])
-        i++
-      }
-      if (i < lines.length) i++ // consume closing fence
-      // ```mermaid → diagram, ```vega-lite / ```vega → chart (both lazy-loaded); else code block.
-      const code = buf.join('\n')
-      out.push(
-        lang === 'mermaid' ? (
-          <Mermaid key={k++} code={code} />
-        ) : lang === 'vega-lite' || lang === 'vegalite' || lang === 'vega' ? (
-          <VegaLite key={k++} code={code} />
-        ) : (
-          <pre
-            key={k++}
-            className="overflow-x-auto rounded-md bg-[var(--color-panel-2)] p-3 font-mono text-xs"
-          >
-            <code>{code}</code>
-          </pre>
-        ),
-      )
-      continue
-    }
-
-    const h = /^(#{1,6})\s+(.*)$/.exec(line)
-    if (h) {
-      out.push(heading(h[1].length, inline(h[2], gen, resolve, mentions), k++, h[2], opts))
-      i++
-      continue
-    }
-
-    if (/^(---+|\*\*\*+|___+)$/.test(t)) {
-      out.push(<hr key={k++} className="border-[var(--color-border)]" />)
-      i++
-      continue
-    }
-
-    if (/^>\s?/.test(line)) {
-      const buf: string[] = []
-      while (i < lines.length && /^>\s?/.test(lines[i])) {
-        buf.push(lines[i].replace(/^>\s?/, ''))
-        i++
-      }
-      out.push(
-        <blockquote
-          key={k++}
-          className="border-l-2 border-[var(--color-border)] pl-3 text-[var(--color-muted)]"
-        >
-          {blocks(buf.join('\n'), resolve, mentions, opts)}
-        </blockquote>,
-      )
-      continue
-    }
-
-    if (/^\s*[-*+]\s+/.test(line)) {
-      const items: string[] = []
-      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\s*[-*+]\s+/, ''))
-        i++
-      }
-      out.push(
-        <ul key={k++} className="list-disc space-y-0.5 pl-5">
-          {items.map((it, j) => (
-            <li key={j}>{inline(it, gen, resolve, mentions)}</li>
-          ))}
-        </ul>,
-      )
-      continue
-    }
-
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const items: string[] = []
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''))
-        i++
-      }
-      out.push(
-        <ol key={k++} className="list-decimal space-y-0.5 pl-5">
-          {items.map((it, j) => (
-            <li key={j}>{inline(it, gen, resolve, mentions)}</li>
-          ))}
-        </ol>,
-      )
-      continue
-    }
-
-    // Paragraph: gather consecutive non-blank lines that don't start a new block.
-    const buf: string[] = []
-    while (i < lines.length && lines[i].trim() !== '' && !isBlockStart(lines[i])) {
-      buf.push(lines[i])
-      i++
-    }
-    out.push(<p key={k++}>{inline(buf.join(' '), gen, resolve, mentions)}</p>)
-  }
-  return out
+// Inline code span only (fenced blocks are fully handled by PreBlock, which never renders this).
+function InlineCode({ children }: ComponentProps<'code'> & ExtraProps) {
+  return (
+    <code className="rounded bg-[var(--color-panel-2)] px-1 py-0.5 font-mono text-[0.85em]">
+      {children}
+    </code>
+  )
 }
 
-// Render `source` as Markdown. The wrapper spaces block elements; callers set the text size.
-// [[wiki-links]] resolve against the app-wide WikiLinkContext (dangling → red-link).
-// `anchors` (document viewer) makes headings linkable sections with a `#`-depth margin marker.
+type BoardDivProps = ComponentProps<'div'> &
+  ExtraProps & {
+    boardKind?: string
+    path?: string
+    versionNo?: number | null
+    region?: string | null
+    label?: string | null
+  }
+
+// Dispatches the lowered block-level ![[transclusion]] to the Embed component; any other `div`
+// (markdown itself never produces one) passes through unchanged.
+function DivRenderer({ boardKind, path, versionNo, region, label, children, className }: BoardDivProps) {
+  if (boardKind === 'embed-block' && path != null) {
+    return <Embed path={path} versionNo={versionNo ?? null} region={region ?? null} label={label ?? null} />
+  }
+  return <div className={className}>{children}</div>
+}
+
+function Table({ children }: ComponentProps<'table'> & ExtraProps) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="border-collapse text-sm">{children}</table>
+    </div>
+  )
+}
+function Th({ children }: ComponentProps<'th'> & ExtraProps) {
+  return (
+    <th className="border border-[var(--color-border)] px-2 py-1 text-left font-semibold">
+      {children}
+    </th>
+  )
+}
+function Td({ children }: ComponentProps<'td'> & ExtraProps) {
+  return <td className="border border-[var(--color-border)] px-2 py-1">{children}</td>
+}
+
+function makeComponents(anchors: boolean): Components {
+  return {
+    a: AnchorRenderer,
+    div: DivRenderer,
+    pre: PreBlock,
+    code: InlineCode,
+    ul: ({ children }) => <ul className="list-disc space-y-0.5 pl-5">{children}</ul>,
+    ol: ({ children }) => <ol className="list-decimal space-y-0.5 pl-5">{children}</ol>,
+    blockquote: ({ children }) => (
+      <blockquote className="border-l-2 border-[var(--color-border)] pl-3 text-[var(--color-muted)]">
+        {children}
+      </blockquote>
+    ),
+    hr: () => <hr className="border-[var(--color-border)]" />,
+    img: ({ src, alt }) => <img src={src} alt={alt} className="max-h-[70vh] rounded" />,
+    table: Table,
+    th: Th,
+    td: Td,
+    h1: makeHeading(1, anchors),
+    h2: makeHeading(2, anchors),
+    h3: makeHeading(3, anchors),
+    h4: makeHeading(4, anchors),
+    h5: makeHeading(5, anchors),
+    h6: makeHeading(6, anchors),
+  }
+}
+
+// Render `source` as Markdown via remark/unified (react-markdown + remark-gfm), extended with the
+// board's own syntax (see remarkBoardRefs / remarkEmbedBlocks above). [[wiki-links]] resolve
+// against the app-wide WikiLinkContext (dangling → red-link). `anchors` (document viewer) makes
+// headings linkable sections with a `#`-depth margin marker.
 export function Markdown({
   source,
   className,
@@ -530,11 +508,23 @@ export function Markdown({
   className?: string
   anchors?: boolean
 }) {
-  const resolve = useContext(WikiLinkContext)
-  const mentions = useContext(AgentMentionContext)
-  const opts: BlockOpts = { anchors, slugs: new Map() }
+  const components = useMemo(() => makeComponents(anchors), [anchors])
+  // Rebuilt every render (not memoized): a fresh heading-slug Map per render matches the old
+  // per-call `opts.slugs = new Map()` dedup scope — reusing one across a changed `source` would
+  // leak dedupe suffixes from a previous document into a new one.
+  const remarkPlugins: NonNullable<ComponentProps<typeof ReactMarkdown>['remarkPlugins']> = [
+    remarkGfm,
+    remarkEmbedBlocks,
+    remarkBoardRefs,
+  ]
+  if (anchors) remarkPlugins.push([remarkHeadingSlugs, new Map<string, number>()])
+
   return (
-    <div className={`space-y-2 ${className ?? ''}`}>{blocks(source, resolve, mentions, opts)}</div>
+    <div className={`space-y-2 ${className ?? ''}`}>
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+        {source}
+      </ReactMarkdown>
+    </div>
   )
 }
 
