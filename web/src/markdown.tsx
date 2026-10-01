@@ -142,17 +142,37 @@ function inline(
           )
         }
         if (href.startsWith('#')) {
-          // Intra-doc anchor (e.g. a main-body -> appendix link). Use an ABSOLUTE-path href
-          // (current path + search + the fragment), NOT the bare `#frag`: the app injects a
-          // <base href> for sub-path proxying, against which a bare fragment resolves to the base
-          // URL and navigates away from the document (task 706). Same path + fragment scrolls to
-          // the target heading's slug id without a reload, matching the heading anchor markers
-          // (which already set scroll-margin-top to clear the sticky header).
+          // Intra-doc anchor (e.g. a main-body -> appendix link). Two layers (task 706):
+          // 1. href is an ABSOLUTE-path form (current path + search + fragment), NOT the bare
+          //    `#frag`: the app injects a <base href> for sub-path (/board) proxying, against which
+          //    a bare fragment resolves to the BASE url (a different path) and navigates away from
+          //    the document -> a full SPA reload / blank screen, instead of scrolling.
+          // 2. onClick scrolls the target heading into view DIRECTLY (and reflects the fragment via
+          //    replaceState, no navigation), so in-doc jumps never depend on base-href / proxy /
+          //    router resolution at all. The href remains as a correct no-JS fallback.
+          const frag = href.slice(1)
           return (
             <a
               key={gen()}
               href={`${window.location.pathname}${window.location.search}${href}`}
               className={cls}
+              onClick={(e) => {
+                let target: HTMLElement | null = null
+                try {
+                  target = document.getElementById(decodeURIComponent(frag))
+                } catch {
+                  target = document.getElementById(frag)
+                }
+                if (target) {
+                  e.preventDefault()
+                  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                  history.replaceState(
+                    null,
+                    '',
+                    `${window.location.pathname}${window.location.search}#${frag}`,
+                  )
+                }
+              }}
             >
               {inline(m[1], gen, resolve, mentions)}
             </a>
