@@ -699,6 +699,56 @@ pub struct BannedPhraseArgs {
     pub phrase: String,
 }
 
+// --- People / teams (multi-operator model, task 542 Phase 1b) ---
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreatePersonArgs {
+    /// Stable string handle for the person (e.g. "cameron"). Upserts if it already exists.
+    pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateTeamArgs {
+    /// Stable string handle for the team (e.g. "operator"). Upserts if it already exists.
+    pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PersonIdArgs {
+    /// The person's stable string handle.
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TeamIdArgs {
+    /// The team's stable string handle.
+    pub team_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TeamMemberArgs {
+    /// The team to add to / remove from.
+    pub team_id: String,
+    /// The member's handle: a person id (member_kind "person") or a team id (member_kind "team").
+    pub member_id: String,
+    /// "person" or "team".
+    pub member_kind: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LintTextArgs {
     /// The text to dry-run against the live content gate (banned-phrase list + ASCII-only rule).
@@ -1746,6 +1796,88 @@ impl Board {
     ) -> Result<CallToolResult, McpError> {
         let creator = self.me_opt(s(&a.created_by));
         core::set_identity_alias(&self.pool, &a.alias, &a.canonical, creator.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    // --- People / teams (multi-operator model, task 542) ---
+    #[tool(description = "List people (first-class human identities, multi-operator model). A separate registry from agents; a principal resolves across people/agents/teams at read time.")]
+    async fn list_people(&self) -> Result<CallToolResult, McpError> {
+        core::list_people(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Create or upsert a person by stable string handle (e.g. \"cameron\"). Idempotent on the id; display_name/metadata are updated on re-create.")]
+    async fn create_person(
+        &self,
+        Parameters(a): Parameters<CreatePersonArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let created_by = self.me_opt(s(&a.created_by));
+        core::create_person(&self.pool, &a.id, s(&a.display_name), created_by.as_deref(), a.metadata.map(Value::Object))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Delete a person and drop their team memberships. Errors if the person does not exist.")]
+    async fn delete_person(
+        &self,
+        Parameters(a): Parameters<PersonIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::delete_person(&self.pool, &a.id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "List teams (addressable groups whose members are people OR other teams).")]
+    async fn list_teams(&self) -> Result<CallToolResult, McpError> {
+        core::list_teams(&self.pool).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Create or upsert a team by stable string handle (e.g. \"operator\"). Idempotent on the id; display_name/metadata are updated on re-create.")]
+    async fn create_team(
+        &self,
+        Parameters(a): Parameters<CreateTeamArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let created_by = self.me_opt(s(&a.created_by));
+        core::create_team(&self.pool, &a.id, s(&a.display_name), created_by.as_deref(), a.metadata.map(Value::Object))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Get a team with its direct members and its fully-resolved person set (nested teams expanded, cycle-guarded): returns the team row + members:[{member_id, member_kind}] + resolved_people:[..].")]
+    async fn get_team(
+        &self,
+        Parameters(a): Parameters<TeamIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_team(&self.pool, &a.team_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Delete a team and drop its memberships (its members and its membership in parent teams). Errors if the team does not exist.")]
+    async fn delete_team(
+        &self,
+        Parameters(a): Parameters<TeamIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::delete_team(&self.pool, &a.team_id).await.map_err(err).and_then(ok)
+    }
+
+    #[tool(description = "Add a person or team as a member of a team (idempotent). member_kind is \"person\" or \"team\". Rejects a sub-team add that would create a membership cycle, a self-add, and a member that does not exist in its registry.")]
+    async fn add_team_member(
+        &self,
+        Parameters(a): Parameters<TeamMemberArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let created_by = self.me_opt(s(&a.created_by));
+        core::add_team_member(&self.pool, &a.team_id, &a.member_id, &a.member_kind, created_by.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(description = "Remove a member (person or team) from a team (idempotent). member_kind is \"person\" or \"team\".")]
+    async fn remove_team_member(
+        &self,
+        Parameters(a): Parameters<TeamMemberArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::remove_team_member(&self.pool, &a.team_id, &a.member_id, &a.member_kind)
             .await
             .map_err(err)
             .and_then(ok)
