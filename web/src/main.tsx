@@ -11,6 +11,7 @@ import Documents from './Documents.tsx'
 import DocumentView from './DocumentView.tsx'
 import Home from './Home.tsx'
 import Layout from './Layout.tsx'
+import People from './People.tsx'
 import ReviewView from './ReviewView.tsx'
 import Reviews from './Reviews.tsx'
 import Search from './Search.tsx'
@@ -45,6 +46,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="reviews/:reviewId" element={<ReviewView />} />
           <Route path="agents" element={<Agents />} />
           <Route path="agents/:agentId" element={<AgentView />} />
+          <Route path="people" element={<People />} />
           <Route path="channels" element={<Channels />} />
           <Route path="channels/:channelId" element={<ChannelView />} />
           {/* Bare task deep-link: resolves the task's project and redirects to the nested URL. */}

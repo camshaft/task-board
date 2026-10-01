@@ -173,6 +173,12 @@ export default function Layout() {
           Channels
         </Link>
         <Link
+          to="/people"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        >
+          People
+        </Link>
+        <Link
           to="/agents"
           className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
         >
