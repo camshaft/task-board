@@ -499,6 +499,20 @@ pub struct SetTaskPropsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetDocumentPropsArgs {
+    /// The document id. Omit if you pass `path` instead.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub document_id: Option<i64>,
+    /// The document's wiki path or slug, as an alternative to document_id (path wins if both given).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Key/value properties to merge into the document's metadata (e.g. description, type, tags).
+    pub props: JsonObject,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetTaskArgs {
     pub task_id: i64,
     /// How many of the most-recent comments to inline (chronological within the slice). Omit for
@@ -2704,6 +2718,22 @@ impl Board {
     }
 
     #[tool(
+        description = "Merge key/value properties into a document's metadata (description, type, tags, provenance) WITHOUT cutting a content version -- the document analog of set_task_props. Identify the document by document_id OR by its wiki path/slug. Use this to refresh an evolving description or tags (the list + wiki index project metadata.description); publish_version is for content, this is for metadata. Emits document.updated."
+    )]
+    async fn set_document_props(
+        &self,
+        Parameters(a): Parameters<SetDocumentPropsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = core::resolve_document_ref(&self.pool, a.document_id, a.path.as_deref())
+            .await
+            .map_err(err)?;
+        core::set_document_props(&self.pool, id, Value::Object(a.props), s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
         description = "List a document's versions (immutable), newest first. Identify it by document_id OR by its wiki path/slug (e.g. charters/v-nix)."
     )]
     async fn get_document_versions(
@@ -4016,6 +4046,10 @@ mod tests {
     fn free_form_json_args_have_object_schemas() {
         prop_type_is_object(
             serde_json::to_value(schema_for!(SetTaskPropsArgs)).unwrap(),
+            "props",
+        );
+        prop_type_is_object(
+            serde_json::to_value(schema_for!(SetDocumentPropsArgs)).unwrap(),
             "props",
         );
         prop_type_is_object(

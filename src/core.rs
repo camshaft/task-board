@@ -4044,6 +4044,66 @@ pub async fn set_task_props(pool: &Pool, task_id: i64, props: Value) -> anyhow::
     Ok(json!({ "task_id": task_id, "metadata": meta_val }))
 }
 
+/// Shallow-merge `props` into a document's `metadata` without touching its content or versions --
+/// the document analog of [`set_task_props`] / [`set_channel_props`]. Keys in `props` overwrite the
+/// matching metadata keys; keys not mentioned are left as-is. For board-backed memory (doc_102) this
+/// refreshes an evolving description / tags / type on an existing memory document -- which the list
+/// and wiki index project (task_824) and recall ranks on -- without cutting a content version. The
+/// dream pass (task_827) uses it to update a memory's metadata in place. Emits `document.updated`,
+/// actor-stamped. A non-object `props` is a no-op merge.
+pub async fn set_document_props(
+    pool: &Pool,
+    document_id: i64,
+    props: Value,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT project_id, metadata FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let project_id: Option<i64> = row.try_get("project_id")?;
+    let existing: Option<String> = row.try_get("metadata")?;
+    let mut meta: Map<String, Value> =
+        serde_json::from_str(existing.as_deref().unwrap_or("{}")).unwrap_or_default();
+    if let Value::Object(m) = props {
+        for (k, v) in m {
+            meta.insert(k, v);
+        }
+    }
+    let meta_val = Value::Object(meta);
+    sqlx::query("UPDATE documents SET metadata=?, updated_at=? WHERE id=?")
+        .bind(meta_val.to_string())
+        .bind(&ts)
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.updated",
+        actor,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        json!({ "document_id": document_id, "metadata": meta_val }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = document_json(&mut tx, document_id)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
 // --- Subscriptions ---
 
 pub async fn subscribe(
@@ -11595,6 +11655,73 @@ mod tests {
             .find(|x| x["title"] == json!("Mem One"))
             .unwrap();
         assert_eq!(one_d["description"], json!("a one-line memory summary"));
+        Ok(())
+    }
+
+    /// set_document_props shallow-merges into a document's metadata WITHOUT cutting a content
+    /// version: a set key overwrites, unmentioned keys survive, a new key is added, it emits
+    /// document.updated (actor-stamped), and the wiki index then projects the refreshed description
+    /// (task_834 completing task_824 -- the dream pass refreshes an evolving memory's metadata).
+    #[tokio::test]
+    async fn set_document_props_merges_metadata_and_emits() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(
+            &pool,
+            "Mem",
+            None,
+            "bafyM",
+            None,
+            Some("a"),
+            Some(json!({ "description": "old desc", "type": "project" })),
+            None,
+            None,
+        )
+        .await?;
+        let id = d["id"].as_i64().unwrap();
+        set_document_path(&pool, id, "agents/a/mem", None).await?;
+
+        // Merge: overwrite description, add tags, leave `type` untouched.
+        let out = set_document_props(
+            &pool,
+            id,
+            json!({ "description": "new desc", "tags": ["x"] }),
+            Some("dreamer"),
+        )
+        .await?;
+        assert_eq!(
+            out["metadata"]["description"],
+            json!("new desc"),
+            "set key overwritten"
+        );
+        assert_eq!(
+            out["metadata"]["type"],
+            json!("project"),
+            "unmentioned key survives"
+        );
+        assert_eq!(out["metadata"]["tags"], json!(["x"]), "new key added");
+
+        // The wiki index projects the refreshed description (no content version was cut).
+        let wiki = list_wiki(&pool, Some("agents/a"), false).await?;
+        let w = wiki
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["path"] == json!("agents/a/mem"))
+            .unwrap();
+        assert_eq!(w["description"], json!("new desc"));
+
+        // document.updated was emitted, actor-stamped.
+        let events = get_events(&pool, 0, 200, None, false).await?;
+        let ev = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == json!("document.updated"))
+            .next_back()
+            .expect("document.updated emitted");
+        assert_eq!(ev["actor"], json!("dreamer"));
+        assert_eq!(ev["data"]["document_id"].as_i64().unwrap(), id);
         Ok(())
     }
 
