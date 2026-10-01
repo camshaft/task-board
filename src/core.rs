@@ -1723,6 +1723,20 @@ pub async fn create_task(
     Ok(out)
 }
 
+/// Extract a numeric task id from a `blocked_on.target` written in any of the forms agents reach
+/// for (task 691): a bare `611`, `task_611`, `task:611`, or `#611`. Returns None if what remains
+/// after stripping a recognized prefix is not a plain integer.
+fn parse_task_target(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let t = t.strip_prefix('#').unwrap_or(t);
+    let t = t
+        .strip_prefix("task_")
+        .or_else(|| t.strip_prefix("task:"))
+        .or_else(|| t.strip_prefix("task "))
+        .unwrap_or(t);
+    t.trim().parse::<i64>().ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn update_task(
     pool: &Pool,
@@ -1883,7 +1897,7 @@ pub async fn update_task(
             note: Option<String>,
         },
     }
-    let change = match &blocked_on {
+    let mut change = match &blocked_on {
         None => BlockedChange::Leave,
         Some(Value::Null) => BlockedChange::Clear,
         Some(Value::Object(o)) => {
@@ -1909,19 +1923,27 @@ pub async fn update_task(
         }
         Some(_) => anyhow::bail!("give `blocked_on` as an object with a `kind`, or null to clear"),
     };
-    if let BlockedChange::Set { kind, target, .. } = &change {
+    if let BlockedChange::Set { kind, target, .. } = &mut change {
         match kind.as_str() {
             "task" => {
-                let Some(t) = target.as_deref().and_then(|s| s.parse::<i64>().ok()) else {
-                    anyhow::bail!("give a `blocked_on.target` task id when kind=task");
+                let Some(t) = target.as_deref().and_then(parse_task_target) else {
+                    anyhow::bail!(
+                        "give a `blocked_on.target` task id when kind=task -- a numeric task id, e.g. blocked_on:\"task:611\" or {{\"kind\":\"task\",\"target\":611}} (a bare `611`, `task_611`, or `#611` are all accepted)"
+                    );
                 };
                 if sqlx::query("SELECT 1 FROM tasks WHERE id=?").bind(t).fetch_optional(&mut *tx).await?.is_none() {
                     anyhow::bail!("no task {t}");
                 }
+                // Persist the canonical bare id, so the "what is blocked on task X" view
+                // (list_tasks blocked_on_ref=<id>) matches regardless of how it was written
+                // (task_611 / #611 / "611").
+                *target = Some(t.to_string());
             }
             "agent" => {
                 let Some(a) = target.as_deref() else {
-                    anyhow::bail!("give a `blocked_on.target` agent id when kind=agent");
+                    anyhow::bail!(
+                        "give a `blocked_on.target` agent id when kind=agent, e.g. blocked_on:\"agent:v-foo\" or {{\"kind\":\"agent\",\"target\":\"v-foo\"}}"
+                    );
                 };
                 if sqlx::query("SELECT 1 FROM agents WHERE id=?").bind(a).fetch_optional(&mut *tx).await?.is_none() {
                     anyhow::bail!("no agent {a}");
@@ -1932,7 +1954,9 @@ pub async fn update_task(
             // this generalizes the operator-queue concept to any addressable team.
             "team" => {
                 let Some(t) = target.as_deref() else {
-                    anyhow::bail!("give a `blocked_on.target` team id when kind=team");
+                    anyhow::bail!(
+                        "give a `blocked_on.target` team id when kind=team, e.g. blocked_on:\"team:operators\" or {{\"kind\":\"team\",\"target\":\"operators\"}}"
+                    );
                 };
                 if sqlx::query("SELECT 1 FROM teams WHERE id=?").bind(t).fetch_optional(&mut *tx).await?.is_none() {
                     anyhow::bail!("no team {t}");
@@ -1957,7 +1981,7 @@ pub async fn update_task(
     };
     if new_status == "blocked" && !will_have_blocked_on {
         anyhow::bail!(
-            "give a `blocked_on` (kind: task, agent, team, operator, or external) -- a blocked task must record what it is waiting on"
+            "give a `blocked_on` recording what this blocked task is waiting on. kind is one of: task, agent, team, operator, external. Examples: blocked_on:\"operator\" | blocked_on:\"task:611\" | blocked_on:{{\"kind\":\"agent\",\"target\":\"<agent-id>\"}}. The flat form blocked_on_kind:\"task\", blocked_on_ref:\"611\" also works; pass kind=\"none\" to clear."
         );
     }
     let mut blocked_changed = false;
@@ -15385,6 +15409,125 @@ mod tests {
         assert!(
             get_task(&pool, tid).await?["blocked_on"].is_null(),
             "unblocking clears blocked_on"
+        );
+        Ok(())
+    }
+
+    // The parse_task_target normalizer (task 691): a blocked_on task target written as a bare id,
+    // task_-prefixed, task:-prefixed, or #-prefixed all resolve to the numeric id; junk does not.
+    #[test]
+    fn parse_task_target_accepts_the_forms_agents_write() {
+        assert_eq!(parse_task_target("611"), Some(611));
+        assert_eq!(parse_task_target("task_611"), Some(611));
+        assert_eq!(parse_task_target("task:611"), Some(611));
+        assert_eq!(parse_task_target("task 611"), Some(611));
+        assert_eq!(parse_task_target("#611"), Some(611));
+        assert_eq!(parse_task_target("  611  "), Some(611));
+        assert_eq!(parse_task_target("foo"), None);
+        assert_eq!(parse_task_target(""), None);
+    }
+
+    // task 691: the blocked_on friction fixes end-to-end. (1) the missing-blocked_on error is
+    // self-documenting -- it carries a copy-pasteable example; (2) a task target written as
+    // `task_<id>` or `#<id>` (not just the bare id) is accepted.
+    #[tokio::test]
+    async fn blocked_on_error_is_self_documenting_and_target_forms_are_accepted(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let dep = create_task(
+            &pool,
+            pid,
+            "Dep",
+            None,
+            None,
+            None,
+            Some("bob"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let dep_id = dep["id"].as_i64().unwrap();
+
+        // (1) The missing-blocked_on error advertises a working, copy-pasteable form.
+        let e = update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("blocked_on"), "names the field: {e}");
+        assert!(
+            e.contains("task:611"),
+            "shows a copy-pasteable example: {e}"
+        );
+        assert!(e.contains("none"), "says how to clear it: {e}");
+
+        // (2) A task_-prefixed target resolves to the bare id.
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(json!({"kind": "task", "target": format!("task_{dep_id}")})),
+        )
+        .await?;
+        assert_eq!(
+            get_task(&pool, tid).await?["blocked_on"]["target"],
+            json!(dep_id.to_string())
+        );
+
+        // ... and a #-prefixed target works too.
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            None,
+            None,
+            Some(json!({"kind": "task", "target": format!("#{dep_id}")})),
+        )
+        .await?;
+        assert_eq!(
+            get_task(&pool, tid).await?["blocked_on"]["target"],
+            json!(dep_id.to_string())
         );
         Ok(())
     }
