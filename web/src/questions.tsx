@@ -322,6 +322,7 @@ export function QuestionComment({
   onAnswer,
   onDecline,
   onCancel,
+  onSupersede,
 }: {
   comment: Comment
   answers: Comment[]
@@ -331,6 +332,7 @@ export function QuestionComment({
   onAnswer?: (shape: string, value: unknown) => void
   onDecline?: () => void
   onCancel?: () => void
+  onSupersede?: () => void
 }) {
   const q = asQuestion(comment.payload)
   const state = (comment.state ?? 'open') as string
@@ -403,7 +405,7 @@ export function QuestionComment({
 
       {/* Open question: inline answer form + decline / cancel controls (slice 2). */}
       {isOpen && onAnswer && q && <AnswerForm q={q} busy={!!busy} onSubmit={onAnswer} />}
-      {isOpen && (onDecline || (isAsker && onCancel)) && (
+      {isOpen && (onDecline || (isAsker && (onCancel || onSupersede))) && (
         <div className="mt-2 flex items-center gap-3 text-xs">
           {onDecline && (
             <button
@@ -412,6 +414,15 @@ export function QuestionComment({
               className="text-amber-400 hover:text-amber-300 disabled:opacity-40"
             >
               Decline
+            </button>
+          )}
+          {isAsker && onSupersede && (
+            <button
+              disabled={busy}
+              onClick={onSupersede}
+              className="text-sky-400 hover:text-sky-300 disabled:opacity-40"
+            >
+              Supersede
             </button>
           )}
           {isAsker && onCancel && (
