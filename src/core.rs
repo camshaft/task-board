@@ -7835,6 +7835,29 @@ pub async fn read_document_content(
     document_content_value(ipfs_api_url, document_id, vn, cid, ct).await
 }
 
+/// Resolve the (non-archived) document currently filed at `path` and read its CURRENT-version body
+/// server-side -- like [`read_document_content`] but keyed by a stable reserved wiki path rather than
+/// a numeric id, so a caller (the ui-element catalog MCP resource, task_820) serves "the doc at
+/// system/ui-elements" without pinning a doc id that would change if the doc is ever re-created. The
+/// path is normalized the same way `set_document_path` stores it. Errors if no document is filed
+/// there (distinct from the backend/version errors `read_document_content` raises after resolution).
+pub async fn read_document_content_at_path(
+    pool: &Pool,
+    ipfs_api_url: Option<&str>,
+    path: &str,
+) -> anyhow::Result<Value> {
+    let norm = normalize_wiki_path(path);
+    let id: i64 = sqlx::query(
+        "SELECT id FROM documents WHERE path=? AND archived_at IS NULL ORDER BY id LIMIT 1",
+    )
+    .bind(&norm)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("no document filed at path '{norm}'"))?
+    .try_get("id")?;
+    read_document_content(pool, ipfs_api_url, id, None).await
+}
+
 /// Resolve a document's APPROVED version `(version_no, cid, content_type)`, or `None` when the
 /// document exists but has no approved version yet (`approved_version_id IS NULL`). A missing
 /// document is an error (`no document {id}`), kept distinct from the no-approved-version case so a
@@ -12820,6 +12843,28 @@ mod tests {
         assert!(is_text_content_type(""));
         assert!(!is_text_content_type("image/png"));
         assert!(!is_text_content_type("application/pdf"));
+
+        // read_document_content_at_path (task_820) resolves the doc by its stable filed path, then
+        // reads its current version (reaching the same backend-required step). Filing Spec at
+        // system/ui-elements: a read by that path reaches content (backend-required error, i.e. it
+        // RESOLVED the doc), while an unfiled path errors distinctly with "no document filed".
+        set_document_path(&pool, did, "system/ui-elements", Some("alice")).await?;
+        let by_path = read_document_content_at_path(&pool, None, "/system/ui-elements/")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            by_path.contains("no IPFS backend"),
+            "path resolved to the doc (reached the content step), got: {by_path}"
+        );
+        let missing = read_document_content_at_path(&pool, None, "system/does-not-exist")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("no document filed at path"),
+            "an unfiled path is a distinct error, got: {missing}"
+        );
         Ok(())
     }
 
