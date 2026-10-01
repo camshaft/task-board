@@ -3151,6 +3151,7 @@ impl Board {
             s(&a.actor),
             s(&a.template_followed),
             s(&a.template_waiver_reason),
+            self.ipfs_api_url.as_deref(),
         )
         .await
         .map_err(err)

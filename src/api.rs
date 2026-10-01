@@ -2973,6 +2973,7 @@ async fn submit_to_operator_review(
             b.actor.as_deref(),
             b.template_followed.as_deref(),
             b.template_waiver_reason.as_deref(),
+            st.ipfs_api_url.as_deref(),
         )
         .await?,
     ))
