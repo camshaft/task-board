@@ -159,6 +159,8 @@ pub fn router(state: AppState) -> Router {
         .route("/comments/{comment_id}/answer", post(answer_question))
         .route("/comments/{comment_id}/decline", post(decline_question))
         .route("/comments/{comment_id}/cancel", post(cancel_question))
+        .route("/comments/{comment_id}/supersede", post(supersede_question))
+        .route("/tasks/blocking-me", get(list_tasks_blocking_me))
         .route("/tasks/{task_id}/props", patch(set_task_props))
         .route("/tasks/{task_id}/move", post(move_task))
         .route("/tasks/{task_id}/archive", post(archive_task))
@@ -387,6 +389,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/answer", summary: "Answer an open question. A framed answer (shape matching the kind) marks it answered; a text answer to a non-text kind is the out-of-frame escape (answered-outside-frame). Returns the answer comment.", query: "", body: Some("AnswerQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/decline", summary: "Decline an open question with feedback (an explicit refusal, distinct from an out-of-frame answer).", query: "", body: Some("DeclineQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") },
+    Endpoint { method: "POST", path: "/api/comments/{comment_id}/supersede", summary: "Supersede an open question with a replacement (doc_33 A6): the old is kept immutable + linked, the new copies its payload with a new prompt. Asker-only.", query: "", body: Some("SupersedeQuestionBody") },
+    Endpoint { method: "GET", path: "/api/tasks/blocking-me", summary: "Tasks with an open blocking question routed to `viewer` (team-expanded) -- the question-based waiting-on-me view.", query: "viewer=str&project_id=int&include_archived=bool", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/archive", summary: "Soft-archive a task: hide it from the default list_tasks view (still fetchable by id and with include_archived). Orthogonal to status; reversible with restore.", query: "", body: Some("ArchiveTaskBody") },
@@ -508,6 +512,7 @@ fn body_schemas() -> Value {
         AnswerQuestionBody,
         DeclineQuestionBody,
         CancelQuestionBody,
+        SupersedeQuestionBody,
         RequestChangesBody,
         AttachDocumentBody,
         IpfsAddBody,
@@ -1267,6 +1272,41 @@ async fn cancel_question(
 ) -> ApiResult {
     Ok(Json(
         core::cancel_question(&st.pool, comment_id, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SupersedeQuestionBody {
+    /// The prompt for the replacement question (the old one is kept immutable + linked).
+    new_prompt: String,
+    actor: Option<String>,
+}
+
+async fn supersede_question(
+    State(st): State<AppState>,
+    Path(comment_id): Path<i64>,
+    Json(b): Json<SupersedeQuestionBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::supersede_question(&st.pool, comment_id, &b.new_prompt, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct BlockingMeQuery {
+    /// The principal to view for; a team-routed question surfaces for its members.
+    viewer: String,
+    project_id: Option<i64>,
+    #[serde(default)]
+    include_archived: bool,
+}
+
+async fn list_tasks_blocking_me(
+    State(st): State<AppState>,
+    Query(q): Query<BlockingMeQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_tasks_blocking_me(&st.pool, &q.viewer, q.project_id, q.include_archived).await?,
     ))
 }
 
