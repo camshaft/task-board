@@ -396,7 +396,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "GET", path: "/api/comments/{comment_id}", summary: "Read one comment by id, with its type (plain/question/answer), parsed payload, lifecycle state, and reply_to/supersedes links.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task (kind yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list), routed to a principal; blocking by default. Optionally carry an inline response_schema (validated generically) plus a ui descriptor. Returns the question comment.", query: "", body: Some("PoseQuestionBody") },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task, routed to a principal; blocking by default. Give EITHER a legacy kind (yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list) OR omit kind for a CID-keyed question carrying an inline response_schema + ui.element_schema_cid (its canonical type id). Answers validated against the response_schema generically. Returns the question comment.", query: "", body: Some("PoseQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/answer", summary: "Answer an open question. For a kind-based question a framed answer (shape matching the kind) marks it answered and a text answer to a non-text kind is the out-of-frame escape; for a schema-driven question the value is validated against its response_schema generically. Returns the answer comment.", query: "", body: Some("AnswerQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/decline", summary: "Decline an open question with feedback (an explicit refusal, distinct from an out-of-frame answer).", query: "", body: Some("DeclineQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") },
@@ -1208,8 +1208,9 @@ async fn get_comment(State(st): State<AppState>, Path(comment_id): Path<i64>) ->
 
 #[derive(Deserialize, JsonSchema)]
 struct PoseQuestionBody {
-    /// One of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list.
-    kind: String,
+    /// Legacy kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list). Omit for a CID-keyed question carrying its own response_schema + ui.element_schema_cid (the canonical type id).
+    #[serde(default)]
+    kind: Option<String>,
     prompt: String,
     /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list.
     options: Option<Value>,
@@ -1237,7 +1238,7 @@ async fn pose_question(
         core::pose_question_full(
             &st.pool,
             task_id,
-            &b.kind,
+            b.kind.as_deref(),
             &b.prompt,
             b.options,
             &b.routed_to,
