@@ -3708,6 +3708,39 @@ pub async fn seed_ui_elements(
 /// regenerating the catalog is a pure function of them. An element present in ui-elements.json but
 /// missing from the manifest is an error (the two have drifted and must be reseeded together) rather
 /// than a silently CID-less catalog entry an agent could not actually use.
+/// The inline `response_schema` SHAPE an author stamps for each element type (doc_728 A2,
+/// v-board-ui-confirmed). A `<...>` placeholder marks a part filled from the question's own props
+/// (option ids, or a count N). Returned per element in the catalog so an agent copies the shape
+/// rather than deriving it. `None` for an element with no known template (a newly added element not
+/// yet mapped here still appears in the catalog, just without this hint -- graceful, not an error).
+/// NOTE: these mirror the per-type answer contract; a future refinement moves them into
+/// ui-elements.json for a single source, but they are stable per element type.
+fn response_schema_template_for(name: &str) -> Option<Value> {
+    let opt_id_array = || {
+        json!({
+            "type": "array",
+            "items": { "type": "string", "enum": ["<option id>"] },
+            "uniqueItems": true
+        })
+    };
+    Some(match name {
+        "yes-no" => json!({ "type": "boolean" }),
+        "single-select" => json!({ "type": "string", "enum": ["<option id>"] }),
+        "multi-select" => opt_id_array(),
+        "rank" => {
+            let mut v = opt_id_array();
+            // An ordered permutation of the option ids (or the top max_ranked); N from props.
+            v["minItems"] = json!("<N>");
+            v["maxItems"] = json!("<N>");
+            v
+        }
+        "text" => json!({ "type": "string" }),
+        "age-request" => json!({ "type": "string" }),
+        "string-list" => json!({ "type": "array", "items": { "type": "string" } }),
+        _ => return None,
+    })
+}
+
 pub fn build_ui_element_catalog(
     elements_json: &[u8],
     manifest_json: &[u8],
@@ -3748,15 +3781,19 @@ pub fn build_ui_element_catalog(
         if let Some(ps) = def.get("props_schema") {
             rec.insert("props_schema".into(), ps.clone());
         }
+        if let Some(rs) = response_schema_template_for(name) {
+            rec.insert("response_schema_template".into(), rs);
+        }
         records.push(Value::Object(rec));
     }
 
     Ok(json!({
         "generated_from": ["ui-elements.json", "ui-element-cids.json"],
         "note": "Resolve a UI element by name, stamp its cid as ui.element_schema_cid on a CID-keyed \
-                 pose_question, set ui.props per props_schema, and supply an inline response_schema \
-                 (see each element's description for its answer shape). The component field is \
-                 frontend-only and is not served.",
+                 pose_question, set ui.props per props_schema, and supply the inline response_schema \
+                 from response_schema_template -- replacing any <...> placeholder (option ids, or a \
+                 count N) with values from your question's props. The component field is frontend-only \
+                 and is not served.",
         "elements": records,
     }))
 }
@@ -10548,8 +10585,27 @@ mod tests {
             els[0].get("component").is_none(),
             "frontend-only component is not surfaced"
         );
+        // response_schema_template is folded in per element type (doc_728 A2).
+        assert_eq!(
+            els[0]["response_schema_template"],
+            json!({ "type": "string" })
+        );
         assert_eq!(els[1]["name"], json!("yes-no"));
         assert_eq!(els[1]["cid"], json!("QmYesNo"));
+        assert_eq!(
+            els[1]["response_schema_template"],
+            json!({ "type": "boolean" })
+        );
+        // An element with no mapped template still appears, just without the hint (graceful).
+        let unmapped = build_ui_element_catalog(
+            br#"{"elements": {"novel": {"props_schema": {"type": "object"}}}}"#,
+            br#"{"novel": "QmNovel"}"#,
+        )
+        .expect("unmapped element still builds");
+        assert_eq!(unmapped["elements"][0]["name"], json!("novel"));
+        assert!(unmapped["elements"][0]
+            .get("response_schema_template")
+            .is_none());
         // Drift: an element with no manifest CID is a hard error, not a CID-less entry.
         let no_cid = br#"{"elements": {"yes-no": {"props_schema": {"type": "object"}}}}"#;
         let err = build_ui_element_catalog(no_cid, br#"{}"#)
