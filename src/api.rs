@@ -211,6 +211,7 @@ pub fn router(state: AppState) -> Router {
             get(get_workspace_kind).delete(delete_workspace_kind),
         )
         .route("/lint", post(lint_text))
+        .route("/crash-reports", post(ingest_crash_report))
         .route("/grade-document", post(grade_document))
         .route(
             "/banned-phrases",
@@ -436,6 +437,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/workspace-kinds/{name}", summary: "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize a workspace.", query: "", body: None },
     Endpoint { method: "DELETE", path: "/api/workspace-kinds/{name}", summary: "Retire a workspace kind by name.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/lint", summary: "Dry-run the pre-submit content lint on arbitrary text without writing: returns {clean, banned_phrases, non_ascii, bare_refs} against the authoritative live banned-phrases list, the ASCII-only rule, and the ambiguous bare-#N typed-ref rule. Use this to pre-check content (incl. before a CID publish, which the write-path gate does not cover) instead of a drift-prone local copy.", query: "", body: Some("LintTextBody") },
+    Endpoint { method: "POST", path: "/api/crash-reports", summary: "Ingest a UI crash report (task_879): auto-file (or bump) an investigation task for an uncaught browser exception. Body {message, stack?, route?, build?, user_agent?}. Deduped by build + stack signature -- a recurring crash bumps one open task's occurrence count rather than spawning duplicates; a new signature files an unassigned task in intake (project 29) for board-triage to route. Returns {task_id, created, occurrences}.", query: "", body: Some("CrashReportBody") },
     Endpoint { method: "POST", path: "/api/grade-document", summary: "Grade a design document against the mechanical doc_7 A8 conformance rubric (ascii, required-sections-in-order, banned-phrases, title/heading rules, body-hygiene, status/provenance, caps-emphasis, body-length). Returns {clean, has_hard_fail, findings:[{check, severity, line, message}]} with actionable-remedy messages. The single grading source of truth: the board submit path and any client (fleet check-doc, the reviewer) call this one endpoint.", query: "", body: Some("GradeDocumentBody") },
     Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list (what the pre-submit content lint checks docs and comments against).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
@@ -511,6 +513,7 @@ fn body_schemas() -> Value {
         UpdateProjectBody,
         CreateTaskBody,
         UpdateTaskBody,
+        CrashReportBody,
         MoveTaskBody,
         ArchiveTaskBody,
         MuteTaskBody,
@@ -1858,6 +1861,41 @@ async fn add_banned_phrase(
 
 async fn list_banned_phrases(State(st): State<AppState>) -> ApiResult {
     Ok(Json(core::list_banned_phrases(&st.pool).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CrashReportBody {
+    /// The uncaught error message (e.g. "TypeError: undefined is not a function").
+    message: String,
+    /// The error stack trace, if any.
+    stack: Option<String>,
+    /// The route / URL where the crash occurred (e.g. "/awaiting").
+    route: Option<String>,
+    /// The build hash of the bundle that crashed (e.g. "index-DZQnJBiy.js"), for dedup + triage.
+    build: Option<String>,
+    /// The reporting browser's user agent.
+    user_agent: Option<String>,
+}
+
+/// `POST /api/crash-reports` — ingest a UI crash report (task_879): auto-file (or bump) an
+/// investigation task for an uncaught browser exception, deduped by build + stack signature so a
+/// recurring crash updates one task rather than spawning duplicates. Open to the board's own UI
+/// (unauthenticated); not content-gated (a stack trace is arbitrary text).
+async fn ingest_crash_report(
+    State(st): State<AppState>,
+    Json(b): Json<CrashReportBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::ingest_crash_report(
+            &st.pool,
+            &b.message,
+            b.stack.as_deref(),
+            b.route.as_deref(),
+            b.build.as_deref(),
+            b.user_agent.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
