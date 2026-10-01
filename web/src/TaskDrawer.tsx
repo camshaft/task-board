@@ -21,6 +21,7 @@ import {
   useTasks,
 } from './resources'
 import { Markdown } from './markdown'
+import { QuestionComment } from './questions'
 import {
   AuthorLabel,
   AutoGrowTextarea,
@@ -652,6 +653,17 @@ export function TaskDrawer() {
                     task.comments.slice(0, Math.max(0, hidden)).some((c) => String(c.id) === targetId)
                   const collapsed = !showAllComments && hidden >= 2 && !targetHidden
                   const shown = collapsed ? task.comments.slice(-VISIBLE) : task.comments
+                  // Operator-questions (task_629): group answers under their question, and track
+                  // which comments are in view so a nested answer isn't also rendered standalone.
+                  const answersByQ = new Map<number, typeof task.comments>()
+                  for (const c of task.comments) {
+                    if (c.type === 'answer' && c.reply_to != null) {
+                      const arr = answersByQ.get(c.reply_to) ?? []
+                      arr.push(c)
+                      answersByQ.set(c.reply_to, arr)
+                    }
+                  }
+                  const shownIds = new Set(shown.map((c) => c.id))
                   return (
                     <ul className="space-y-3">
                       {collapsed && (
@@ -664,23 +676,40 @@ export function TaskDrawer() {
                           </button>
                         </li>
                       )}
-                      {shown.map((c) => (
-                        <li
-                          key={c.id}
-                          id={`comment-${c.id}`}
-                          className="scroll-mt-4 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3"
-                        >
-                          <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
-                            <AuthorLabel
-                              author={c.author}
-                              externalAuthor={c.external_author}
-                              resolveExternal={extName}
-                            />
-                            <span>{relTime(c.created_at)}</span>
-                          </div>
-                          <Markdown source={c.body} className="text-sm" />
-                        </li>
-                      ))}
+                      {shown.map((c) => {
+                        // An answer renders nested under its question when that question is in
+                        // view; skip it at the top level to avoid showing it twice.
+                        if (c.type === 'answer' && c.reply_to != null && shownIds.has(c.reply_to)) {
+                          return null
+                        }
+                        return (
+                          <li
+                            key={c.id}
+                            id={`comment-${c.id}`}
+                            className="scroll-mt-4 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3"
+                          >
+                            {c.type === 'question' ? (
+                              <QuestionComment
+                                comment={c}
+                                answers={answersByQ.get(c.id) ?? []}
+                                resolveExternal={extName}
+                              />
+                            ) : (
+                              <>
+                                <div className="mb-1 flex items-center justify-between text-xs text-[var(--color-muted)]">
+                                  <AuthorLabel
+                                    author={c.author}
+                                    externalAuthor={c.external_author}
+                                    resolveExternal={extName}
+                                  />
+                                  <span>{relTime(c.created_at)}</span>
+                                </div>
+                                <Markdown source={c.body} className="text-sm" />
+                              </>
+                            )}
+                          </li>
+                        )
+                      })}
                       {task.comments.length === 0 && (
                         <li className="text-sm text-[var(--color-muted)]">No comments yet.</li>
                       )}
