@@ -540,7 +540,13 @@ export default function DocumentView() {
               >
                 {showDiff ? 'Hide diff' : 'Compare versions →'}
               </button>
-              {showDiff && <DocDiff versions={doc.versions} currentId={doc.current_version_id} />}
+              {showDiff && (
+                <DocDiff
+                  versions={doc.versions}
+                  currentId={doc.current_version_id}
+                  approvedId={doc.approved_version_id}
+                />
+              )}
             </div>
           )}
 
@@ -1244,20 +1250,117 @@ function lineDiff(a: string[], b: string[]): DiffLine[] {
   return out
 }
 
+// One run of a line, flagged `changed` when it differs between the paired versions. Rendering
+// gives changed runs a stronger inline highlight so a reader sees the altered spans within a
+// modified block, not the whole line.
+type DiffPart = { text: string; changed: boolean }
+
+// Split into word and whitespace runs so a reconstruction is loss-free (whitespace is preserved
+// as its own token rather than collapsed).
+function tokenize(s: string): string[] {
+  return s.match(/\s+|\S+/g) ?? []
+}
+
+// Word-level diff of two single lines via an LCS over tokens. Shared tokens are unchanged on both
+// sides; a token present only in `a` is a changed run on the removed side, only in `b` a changed
+// run on the added side. Adjacent same-flag tokens are merged so the markup stays compact.
+function tokenDiff(a: string, b: string): { aParts: DiffPart[]; bParts: DiffPart[] } {
+  const ta = tokenize(a)
+  const tb = tokenize(b)
+  const n = ta.length
+  const m = tb.length
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0))
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = ta[i] === tb[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+    }
+  }
+  const push = (arr: DiffPart[], text: string, changed: boolean) => {
+    const last = arr[arr.length - 1]
+    if (last && last.changed === changed) last.text += text
+    else arr.push({ text, changed })
+  }
+  const aParts: DiffPart[] = []
+  const bParts: DiffPart[] = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (ta[i] === tb[j]) {
+      push(aParts, ta[i], false)
+      push(bParts, tb[j], false)
+      i++
+      j++
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      push(aParts, ta[i++], true)
+    } else {
+      push(bParts, tb[j++], true)
+    }
+  }
+  while (i < n) push(aParts, ta[i++], true)
+  while (j < m) push(bParts, tb[j++], true)
+  return { aParts, bParts }
+}
+
+// A rendered diff row: a context line, or a removed/added line carried as parts. Within a change
+// block, each removed line is paired with the corresponding added line and word-diffed so only
+// the altered spans highlight; unpaired removals/insertions carry the whole line as one part.
+type DiffRow =
+  | { kind: 'ctx'; text: string }
+  | { kind: 'del' | 'add'; parts: DiffPart[] }
+
+// Turn a flat line diff into rows, pairing removals with insertions inside each change block so a
+// modified paragraph renders as a del line + an add line with inline chunk highlights, instead of
+// one whole replaced line (task 747).
+function buildRows(lines: DiffLine[]): DiffRow[] {
+  const rows: DiffRow[] = []
+  let i = 0
+  while (i < lines.length) {
+    if (lines[i].type === 'ctx') {
+      rows.push({ kind: 'ctx', text: lines[i].text })
+      i++
+      continue
+    }
+    // A maximal run of consecutive non-context lines is one change block.
+    const dels: string[] = []
+    const adds: string[] = []
+    while (i < lines.length && lines[i].type !== 'ctx') {
+      if (lines[i].type === 'del') dels.push(lines[i].text)
+      else adds.push(lines[i].text)
+      i++
+    }
+    const pairs = Math.min(dels.length, adds.length)
+    for (let k = 0; k < pairs; k++) {
+      const { aParts, bParts } = tokenDiff(dels[k], adds[k])
+      rows.push({ kind: 'del', parts: aParts })
+      rows.push({ kind: 'add', parts: bParts })
+    }
+    for (let k = pairs; k < dels.length; k++) rows.push({ kind: 'del', parts: [{ text: dels[k], changed: false }] })
+    for (let k = pairs; k < adds.length; k++) rows.push({ kind: 'add', parts: [{ text: adds[k], changed: false }] })
+  }
+  return rows
+}
+
 // Compare two document versions: pick a base + a compare version (default previous → current),
 // fetch both through the IPFS gateway, and render an added/removed/context line diff client-side.
 function DocDiff({
   versions,
   currentId,
+  approvedId,
 }: {
   versions: DocumentVersion[]
   currentId: number | null
+  approvedId?: number | null
 }) {
   const sorted = [...versions].sort((a, b) => a.version_no - b.version_no)
   const current = sorted.find((v) => v.id === currentId) ?? sorted[sorted.length - 1]
   const curIdx = sorted.indexOf(current)
   const prev = sorted[curIdx - 1] ?? sorted[0]
-  const [baseId, setBaseId] = useState<number>(prev.id)
+  // Default baseline: the approved version vs current (what review actually changed since sign-off),
+  // falling back to the previous version when the doc has no approval or current *is* the approved
+  // one (so the diff is never empty by default). The picker can still choose any pair (task 747).
+  const approved = approvedId != null ? sorted.find((v) => v.id === approvedId) : undefined
+  const defaultBase = approved && approved.id !== current.id ? approved : prev
+  const [baseId, setBaseId] = useState<number>(defaultBase.id)
   const [cmpId, setCmpId] = useState<number>(current.id)
   const key = `${baseId}:${cmpId}`
   // Keyed so `loading` is derived (result.key !== key) rather than set synchronously in the effect.
@@ -1289,6 +1392,10 @@ function DocDiff({
   const adds = result.lines?.filter((l) => l.type === 'add').length ?? 0
   const dels = result.lines?.filter((l) => l.type === 'del').length ?? 0
 
+  // Annotate the approved / current versions in the picker so the default baseline reads clearly.
+  const label = (v: DocumentVersion) =>
+    `v${v.version_no}${v.id === approvedId ? ' (approved)' : ''}${v.id === currentId ? ' (current)' : ''}`
+
   return (
     <div className="mt-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-3">
       <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-[var(--color-muted)]">
@@ -1300,7 +1407,7 @@ function DocDiff({
         >
           {sorted.map((v) => (
             <option key={v.id} value={v.id}>
-              v{v.version_no}
+              {label(v)}
             </option>
           ))}
         </select>
@@ -1312,7 +1419,7 @@ function DocDiff({
         >
           {sorted.map((v) => (
             <option key={v.id} value={v.id}>
-              v{v.version_no}
+              {label(v)}
             </option>
           ))}
         </select>
@@ -1330,25 +1437,46 @@ function DocDiff({
       ) : baseId === cmpId ? (
         <p className="text-xs text-[var(--color-muted)]">Pick two different versions to compare.</p>
       ) : (
-        <pre className="max-h-[60vh] overflow-auto rounded bg-[var(--color-panel-2)] p-2 text-xs leading-relaxed">
-          {result.lines!.map((l, idx) => (
+        // Word-wrapped so long lines stay in the viewport (no horizontal scroll); each row carries
+        // its parts, with changed spans given a stronger inline highlight for per-block chunk diffs.
+        <div className="max-h-[60vh] overflow-y-auto overflow-x-hidden rounded bg-[var(--color-panel-2)] p-2 font-mono text-xs leading-relaxed">
+          {buildRows(result.lines!).map((r, idx) => (
             <div
               key={idx}
-              className={
-                l.type === 'add'
+              className={`flex gap-1 whitespace-pre-wrap break-words ${
+                r.kind === 'add'
                   ? 'bg-emerald-500/10 text-emerald-300'
-                  : l.type === 'del'
+                  : r.kind === 'del'
                     ? 'bg-red-500/10 text-red-300'
                     : 'text-[var(--color-muted)]'
-              }
+              }`}
             >
-              <span className="select-none opacity-60">
-                {l.type === 'add' ? '+ ' : l.type === 'del' ? '− ' : '  '}
+              <span className="shrink-0 select-none opacity-60">
+                {r.kind === 'add' ? '+' : r.kind === 'del' ? '−' : ' '}
               </span>
-              {l.text || ' '}
+              <span className="min-w-0 flex-1">
+                {r.kind === 'ctx'
+                  ? r.text || ' '
+                  : r.parts.map((p, pi) =>
+                      p.changed ? (
+                        <span
+                          key={pi}
+                          className={
+                            r.kind === 'add'
+                              ? 'rounded-sm bg-emerald-500/30 text-emerald-200'
+                              : 'rounded-sm bg-red-500/30 text-red-200'
+                          }
+                        >
+                          {p.text}
+                        </span>
+                      ) : (
+                        <span key={pi}>{p.text}</span>
+                      ),
+                    )}
+              </span>
             </div>
           ))}
-        </pre>
+        </div>
       )}
     </div>
   )
