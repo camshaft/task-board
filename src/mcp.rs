@@ -2877,7 +2877,8 @@ impl ServerHandler for Board {
             .with_description(
                 "How to write a fleet document and get it reviewed: the required outline \
                  (Background / Problem Statement / Requirements-Goals-Non-Goals / Solutions with \
-                 pros-cons / Recommendation), the ASCII-only and no-banned-phrases format rules, \
+                 pros-cons that cite the goals / Recommendation), the ASCII-only and \
+                 no-banned-phrases format rules, \
                  and the judgment-layer humanizing patterns a scanner cannot catch. The board \
                  Document doc_7 is the authoritative source; this resource serves its current text.",
             )
