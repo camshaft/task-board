@@ -3232,6 +3232,103 @@ pub async fn list_awaiting(
     Ok(Value::Array(out))
 }
 
+/// A stable dedup signature for a UI crash (task_879): the build hash plus the first couple of
+/// non-empty stack lines (or the message when there is no stack), so the same crash recurring from
+/// the same build collapses onto one investigation task instead of filing a new one each time.
+/// Bounded in length so a pathological stack cannot bloat the stored metadata.
+pub fn crash_signature(message: &str, stack: Option<&str>, build: Option<&str>) -> String {
+    let mut frames: Vec<&str> = Vec::new();
+    if let Some(s) = stack {
+        for l in s.lines().map(str::trim).filter(|l| !l.is_empty()).take(2) {
+            frames.push(l);
+        }
+    }
+    if frames.is_empty() {
+        frames.push(message.trim());
+    }
+    let sig = format!("{}|{}", build.unwrap_or("").trim(), frames.join(" | "));
+    sig.chars().take(300).collect()
+}
+
+/// Ingest a UI crash report (task_879): file an investigation task for an uncaught browser
+/// exception, deduped by [`crash_signature`]. If an OPEN task already carries the same signature
+/// anywhere (board-triage may have routed it out of intake), its occurrence count and last_seen are
+/// bumped instead of filing a duplicate; otherwise a new unassigned task is created in the intake
+/// project for board-triage to route. Returns the task id, whether it was newly created, and the
+/// occurrence count. Not content-gated, since a stack trace is arbitrary text rather than board prose.
+pub async fn ingest_crash_report(
+    pool: &Pool,
+    message: &str,
+    stack: Option<&str>,
+    route: Option<&str>,
+    build: Option<&str>,
+    user_agent: Option<&str>,
+) -> anyhow::Result<Value> {
+    let sig = crash_signature(message, stack, build);
+    // Dedup / rate-limit: one open task per signature. Bump the existing one if present.
+    if let Some(row) = sqlx::query(
+        "SELECT id, metadata FROM tasks WHERE json_extract(metadata,'$.crash_signature')=? \
+         AND status NOT IN ('done','cancelled','canceled') ORDER BY id LIMIT 1",
+    )
+    .bind(&sig)
+    .fetch_optional(pool)
+    .await?
+    {
+        let task_id: i64 = row.try_get("id")?;
+        let meta_str: String = row.try_get("metadata")?;
+        let mut meta: Value = serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({}));
+        let occurrences = meta
+            .get("occurrences")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1)
+            + 1;
+        if let Value::Object(ref mut m) = meta {
+            m.insert("occurrences".into(), json!(occurrences));
+            m.insert("last_seen".into(), json!(now_iso()));
+        }
+        sqlx::query("UPDATE tasks SET metadata=?, updated_at=? WHERE id=?")
+            .bind(meta.to_string())
+            .bind(now_iso())
+            .bind(task_id)
+            .execute(pool)
+            .await?;
+        return Ok(json!({ "task_id": task_id, "created": false, "occurrences": occurrences }));
+    }
+
+    let short: String = message.trim().chars().take(120).collect();
+    let title = format!("UI crash: {short}");
+    let body = format!(
+        "Auto-filed by UI crash telemetry (task_879).\n\nMessage: {message}\nRoute: {}\nBuild: {}\nUser-agent: {}\n\nStack:\n{}",
+        route.unwrap_or("(none)"),
+        build.unwrap_or("(none)"),
+        user_agent.unwrap_or("(none)"),
+        stack.unwrap_or("(none)"),
+    );
+    let meta = json!({
+        "crash_signature": sig,
+        "occurrences": 1,
+        "source": "ui-crash-telemetry",
+        "build": build,
+        "route": route,
+        "last_seen": now_iso(),
+    });
+    let task = create_task(
+        pool,
+        29,
+        &title,
+        Some(&body),
+        None,
+        None,
+        Some("ui-crash-telemetry"),
+        Some(meta),
+        None,
+        None,
+    )
+    .await?;
+    let task_id = task.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    Ok(json!({ "task_id": task_id, "created": true, "occurrences": 1 }))
+}
+
 // --- Operator-question comment types: core operations (doc_33 / task_628, slice 2 + 5) ---
 
 /// The launch question kinds (doc_33 A2); the set is extensible by adding a kind here + its shape.
@@ -18930,6 +19027,80 @@ mod tests {
                 .all(|r| r["kind"] != json!("document")),
             "document rows are operator-only"
         );
+        Ok(())
+    }
+
+    /// task_879: a UI crash report files an investigation task in intake, deduped by build+stack
+    /// signature -- a recurring identical crash bumps the one task's occurrence count instead of
+    /// filing duplicates, and a distinct crash files a new task.
+    #[tokio::test]
+    async fn ingest_crash_report_dedups_by_signature() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let now = now_iso();
+        // Intake project (29) must exist for the auto-filed task's FK.
+        sqlx::query(
+            "INSERT INTO projects(id, name, created_at, updated_at) VALUES(29, 'intake', ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await?;
+
+        let stack = "TypeError: undefined is not a function\n    at reduce (index-abc.js:40)";
+        let r1 = ingest_crash_report(
+            &pool,
+            "TypeError: undefined is not a function",
+            Some(stack),
+            Some("/awaiting"),
+            Some("index-abc.js"),
+            Some("UA/1"),
+        )
+        .await?;
+        assert_eq!(r1["created"], json!(true));
+        assert_eq!(r1["occurrences"], json!(1));
+        let tid = r1["task_id"].as_i64().unwrap();
+        assert!(tid > 0);
+        let t = get_task(&pool, tid).await?;
+        assert_eq!(t["project_id"], json!(29));
+        assert!(t["assignee"].is_null(), "auto-filed unassigned for triage");
+        assert!(t["title"].as_str().unwrap().starts_with("UI crash:"));
+
+        // Same crash again -> bump the same task, no duplicate.
+        let r2 = ingest_crash_report(
+            &pool,
+            "TypeError: undefined is not a function",
+            Some(stack),
+            Some("/awaiting"),
+            Some("index-abc.js"),
+            Some("UA/1"),
+        )
+        .await?;
+        assert_eq!(r2["created"], json!(false));
+        assert_eq!(r2["occurrences"], json!(2));
+        assert_eq!(
+            r2["task_id"].as_i64(),
+            Some(tid),
+            "same signature -> same task"
+        );
+
+        // A distinct crash (different stack top) -> a new task.
+        let r3 = ingest_crash_report(
+            &pool,
+            "RangeError: bad",
+            Some("RangeError: bad\n    at x (index-abc.js:9)"),
+            Some("/x"),
+            Some("index-abc.js"),
+            None,
+        )
+        .await?;
+        assert_eq!(r3["created"], json!(true));
+        assert_ne!(r3["task_id"].as_i64(), Some(tid));
+
+        // Signature is deterministic and build-sensitive.
+        let s1 = crash_signature("m", Some("line1\nline2"), Some("b1"));
+        assert_eq!(s1, crash_signature("m", Some("line1\nline2"), Some("b1")));
+        assert_ne!(s1, crash_signature("m", Some("line1\nline2"), Some("b2")));
         Ok(())
     }
 
