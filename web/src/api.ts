@@ -56,6 +56,20 @@ export interface TaskSummary {
   // monitor / nudge daemon (task 520 family / #506 guard).
   monitor_exempt?: boolean
 }
+// One row of the unified "awaiting you" queue (task_860): a task awaiting a principal's decision --
+// either blocked_on that principal (blocked_on_principal, with blocked_on_note) or carrying open
+// blocking questions routed to it (questions, full question comment objects), or both. Keyed
+// independent of assignee (owner-held tasks are not assigned to the principal) and team-expanded.
+export interface AwaitingTask {
+  task_id: number
+  task_title: string
+  project_id: number | null
+  status: TaskStatus
+  updated_at?: string
+  blocked_on_principal: boolean
+  blocked_on_note: string | null
+  questions: Comment[]
+}
 
 // Operator-questions (task_628 / doc_33). A comment is a plain note, a structured question, or an
 // answer replying to one. The backend stores `payload` + `state` + `type` + `reply_to` verbatim and
@@ -577,6 +591,16 @@ export const api = {
     if (q.project_id != null) p.set('project_id', String(q.project_id))
     if (q.include_archived) p.set('include_archived', 'true')
     return req<TaskSummary[]>('GET', `/tasks/blocking-me?${p.toString()}`)
+  },
+  // The unified "awaiting you" queue (task_860): tasks blocked_on `viewer` UNION tasks with an open
+  // blocking question routed to it, keyed independent of assignee + team-expanded + deduped. Each row
+  // is task-centric with its open questions nested as full comment objects (so they render + answer
+  // inline). Supersedes listTasksBlockingMe.
+  listAwaiting: (viewer: string, q: { project_id?: number; include_archived?: boolean } = {}) => {
+    const p = new URLSearchParams({ viewer })
+    if (q.project_id != null) p.set('project_id', String(q.project_id))
+    if (q.include_archived) p.set('include_archived', 'true')
+    return req<AwaitingTask[]>('GET', `/tasks/awaiting?${p.toString()}`)
   },
   getTask: (id: number) => req<Task>('GET', `/tasks/${id}`),
   createTask: (b: {

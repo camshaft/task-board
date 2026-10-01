@@ -141,19 +141,13 @@ export default function Search() {
           >
             Search
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              setQ('')
-              setAssignee(actor)
-              setStatus('blocked')
-              syncUrl({ q: '', assignee: actor, status: 'blocked' })
-              void run({ q: '', assignee: actor, status: 'blocked' })
-            }}
+          <Link
+            to="/awaiting"
+            title="Everything awaiting your decision: blocked-on-you tasks + questions routed to you (team-expanded, not just tasks assigned to you)"
             className="rounded-md px-2 py-1 text-xs text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]"
           >
-            blocked on me
-          </button>
+            awaiting you
+          </Link>
         </form>
       </div>
 

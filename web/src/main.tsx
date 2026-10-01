@@ -4,6 +4,7 @@ import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from 'react
 import './index.css'
 import AgentView from './AgentView.tsx'
 import Agents from './Agents.tsx'
+import Awaiting from './Awaiting.tsx'
 import Board from './Board.tsx'
 import ChannelView from './ChannelView.tsx'
 import Channels from './Channels.tsx'
@@ -63,6 +64,7 @@ createRoot(document.getElementById('root')!).render(
         <Route path="secret-requests/:id" element={<SecretSubmit />} />
         <Route element={<Layout />}>
           <Route index element={<Home />} />
+          <Route path="awaiting" element={<Awaiting />} />
           <Route path="search" element={<Search />} />
           <Route path="settings" element={<Settings />} />
           <Route path="documents" element={<Documents />} />

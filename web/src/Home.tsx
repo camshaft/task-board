@@ -5,9 +5,9 @@ import {
   eventHref,
   useAgents,
   useAgentTasks,
+  useAwaiting,
   useEvents,
   useProjects,
-  useTasksBlockingMe,
 } from './resources'
 import { AGENT_DOT, relTime, StatusChip, STATUS_CHIP, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
@@ -23,7 +23,7 @@ export default function Home() {
   const { data: agents = [] } = useAgents()
   const { data: events = [] } = useEvents()
   const { data: myTasks = [] } = useAgentTasks(actor)
-  const { data: waitingOnMe = [] } = useTasksBlockingMe(actor)
+  const { data: waitingOnMe = [] } = useAwaiting(actor)
 
   if (!loading && projects.length === 0) {
     return (
@@ -75,35 +75,46 @@ export default function Home() {
         ))}
       </div>
 
-      {/* Waiting on you: tasks blocked by an open question routed to the current actor. Shown
-          prominently (actionable) only when there are any; opening a task jumps to its question. */}
+      {/* Awaiting you: everything awaiting the current actor's decision — tasks blocked on them and
+          open questions routed to them (the unified task_860 queue). Shown prominently only when
+          there are any; the full answerable view is at /awaiting. */}
       {waitingOnMe.length > 0 && (
         <section className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
           <h2 className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-amber-300">
-            Waiting on you
+            Awaiting you
             <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px]">
               {waitingOnMe.length}
             </span>
+            <Link to="/awaiting" className="ml-auto text-[11px] normal-case text-amber-300 hover:text-amber-200">
+              answer all →
+            </Link>
           </h2>
           <p className="mb-2 text-xs text-[var(--color-muted)]">
-            Open questions routed to <span className="font-mono">{actor}</span> are blocking these
-            tasks.
+            Tasks blocked on <span className="font-mono">{actor}</span> and open questions routed to
+            you.
           </p>
           <ul className="space-y-1.5">
             {waitingOnMe.map((t) => (
-              <li key={t.id}>
+              <li key={t.task_id}>
                 <Link
-                  to={t.project_id != null ? `/projects/${t.project_id}/tasks/${t.id}` : '#'}
+                  to={`/tasks/${t.task_id}`}
                   className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 hover:border-amber-500/50"
                 >
                   <StatusChip status={t.status} />
-                  <span className="min-w-0 flex-1 truncate text-sm">{t.title}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm">{t.task_title}</span>
+                  {t.questions.length > 0 && (
+                    <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">
+                      {t.questions.length} q
+                    </span>
+                  )}
                   {t.project_id != null && (
                     <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
                       {projectName(t.project_id)}
                     </span>
                   )}
-                  <span className="font-mono text-[11px] text-[var(--color-muted)]">#{t.id}</span>
+                  <span className="font-mono text-[11px] text-[var(--color-muted)]">
+                    task_{t.task_id}
+                  </span>
                 </Link>
               </li>
             ))}

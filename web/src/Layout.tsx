@@ -11,6 +11,7 @@ import {
   createProject,
   eventHref,
   useAgents,
+  useAwaiting,
   useEvents,
   useIdentityAliases,
   useProjects,
@@ -93,6 +94,7 @@ export default function Layout() {
   // Known agent ids, so @mentions in any rendered markdown link only to real agents (an unknown
   // @word stays plain text). Live-updates as agents register.
   const { data: agents = [] } = useAgents()
+  const { data: awaiting = [] } = useAwaiting(actor)
   const agentIds = useMemo(() => new Set(agents.map((a) => a.id)), [agents])
   // Identity aliases (task 532): a mention of an alias (@operator) links to its canonical identity
   // (/agents/cameron). Curated data, so we link even if the canonical has no agent row yet.
@@ -142,6 +144,19 @@ export default function Layout() {
         <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
           agent coordination · MCP + REST
         </span>
+        <Link
+          to="/awaiting"
+          className={`inline-flex items-center gap-1 text-xs underline decoration-dotted underline-offset-2 hover:text-amber-200 ${
+            awaiting.length > 0 ? 'font-medium text-amber-300' : 'text-[var(--color-muted)]'
+          }`}
+        >
+          Awaiting
+          {awaiting.length > 0 && (
+            <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] text-amber-200">
+              {awaiting.length}
+            </span>
+          )}
+        </Link>
         <Link
           to="/search"
           className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
