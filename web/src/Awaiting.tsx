@@ -22,7 +22,13 @@ import { relTime, StatusChip } from './ui'
 export default function Awaiting() {
   const scrollRef = useScrollRestoration<HTMLElement>()
   const { actor } = useBoardContext()
-  const { data: awaiting = [], loading } = useAwaiting(actor)
+  const { data: awaiting = [], loading, error: loadError } = useAwaiting(actor)
+  // Defensive: never trust the shape of the fetched array. The queue is a discriminated union
+  // (task | document rows); older deployed bundles reduced `item.questions.length` across every
+  // row and crashed on document rows, which have no `questions` field (task_876). Coerce to an
+  // array and treat `questions` as optional everywhere below so a partial/novel row renders rather
+  // than throwing during the reduce/map.
+  const items = Array.isArray(awaiting) ? awaiting : []
   const resolveExternal = useExternalNameResolver()
   const [busyId, setBusyId] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -57,10 +63,10 @@ export default function Awaiting() {
     void run(commentId, () => supersedeQuestion(taskId, commentId, { new_prompt, actor }))
   }
 
-  const taskCount = awaiting.filter((it) => it.kind === 'task').length
-  const docCount = awaiting.filter((it) => it.kind === 'document').length
-  const totalQuestions = awaiting.reduce(
-    (a, it) => a + (it.kind === 'task' ? it.questions.length : 0),
+  const taskCount = items.filter((it) => it.kind === 'task').length
+  const docCount = items.filter((it) => it.kind === 'document').length
+  const totalQuestions = items.reduce(
+    (a, it) => a + (it.kind === 'task' ? (it.questions?.length ?? 0) : 0),
     0,
   )
 
@@ -81,9 +87,13 @@ export default function Awaiting() {
         </p>
       )}
 
-      {awaiting.length === 0 ? (
+      {items.length === 0 ? (
         <p className="text-sm text-[var(--color-muted)]">
-          {loading ? 'Loading…' : 'Nothing awaiting you right now.'}
+          {loading
+            ? 'Loading…'
+            : loadError
+              ? "Couldn't load your queue right now — retrying."
+              : 'Nothing awaiting you right now.'}
         </p>
       ) : (
         <>
@@ -94,7 +104,7 @@ export default function Awaiting() {
             {docCount > 0 && `, ${docCount} doc approval${docCount === 1 ? '' : 's'}`}.
           </p>
           <ul className="space-y-3">
-            {awaiting.map((it) =>
+            {items.map((it) =>
               it.kind === 'document' ? (
                 <li
                   key={`doc-${it.document_id}`}
@@ -160,9 +170,9 @@ export default function Awaiting() {
                     </p>
                   )}
 
-                  {it.questions.length > 0 && (
+                  {(it.questions?.length ?? 0) > 0 && (
                     <div className="space-y-3">
-                      {it.questions.map((q) => (
+                      {(it.questions ?? []).map((q) => (
                         <QuestionComment
                           key={q.id}
                           comment={q}
@@ -179,7 +189,7 @@ export default function Awaiting() {
                     </div>
                   )}
 
-                  {it.questions.length === 0 && (
+                  {(it.questions?.length ?? 0) === 0 && (
                     <Link
                       to={`/tasks/${it.task_id}`}
                       className="text-xs text-sky-400 hover:text-sky-300"

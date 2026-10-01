@@ -23,7 +23,11 @@ export default function Home() {
   const { data: agents = [] } = useAgents()
   const { data: events = [] } = useEvents()
   const { data: myTasks = [] } = useAgentTasks(actor)
-  const { data: waitingOnMe = [] } = useAwaiting(actor)
+  const { data: waitingOnMeRaw = [] } = useAwaiting(actor)
+  // Defensive: the awaiting queue is a discriminated union (task | document rows); document rows
+  // carry no `questions` field. Coerce to an array and optional-chain `questions` below so a
+  // partial/novel row never throws while rendering the banner (task_876).
+  const waitingOnMe = Array.isArray(waitingOnMeRaw) ? waitingOnMeRaw : []
 
   if (!loading && projects.length === 0) {
     return (
@@ -121,9 +125,9 @@ export default function Home() {
                   >
                     <StatusChip status={t.status} />
                     <span className="min-w-0 flex-1 truncate text-sm">{t.task_title}</span>
-                    {t.questions.length > 0 && (
+                    {(t.questions?.length ?? 0) > 0 && (
                       <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">
-                        {t.questions.length} q
+                        {t.questions?.length} q
                       </span>
                     )}
                     {t.project_id != null && (
