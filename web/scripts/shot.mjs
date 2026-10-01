@@ -21,6 +21,12 @@
 //                                 --match-media "(pointer: coarse)=true" for a touch-device check
 //                                 (task 537; proven pattern from the mobile-Enter / ambiguity work).
 //                                 Non-matching queries fall through to the real matchMedia.
+//     --contrast-audit            assert WCAG AA contrast on every visible text node vs its
+//                                 effective (alpha-composited) background; prints a JSON summary
+//                                 {sampled, failingCount, worst, failing[]} and EXITS NON-ZERO if
+//                                 any node fails (>=4.5:1 normal, >=3:1 large text). Run it on any
+//                                 theme/color/palette/token change so an AA regression fails the
+//                                 verify instead of shipping on an eyeball check (task 701).
 //
 // Requires a headless_shell already listening on the CDP port (default 9222), e.g.:
 //   headless_shell --headless --no-sandbox --disable-gpu \
@@ -48,11 +54,13 @@ let waitMs = 4000
 let port = 9222
 let colorScheme = null // 'light' | 'dark'
 let viewport = null // { width, height }
+let contrastAudit = false // assert WCAG AA contrast on every visible text node
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i]
   if (a === '--wait') waitMs = Number(argv[++i])
   else if (a === '--port') port = Number(argv[++i])
   else if (a === '--eval') evals.push(argv[++i])
+  else if (a === '--contrast-audit') contrastAudit = true
   else if (a === '--color-scheme') colorScheme = argv[++i]
   else if (a === '--viewport') {
     const m = /^(\d+)x(\d+)$/.exec(argv[++i] ?? '')
@@ -74,7 +82,7 @@ for (let i = 0; i < argv.length; i++) {
 const [url, outArg] = positionals
 if (!url || !outArg) {
   console.error(
-    'usage: shot.mjs <url> <out.png> [--wait ms] [--eval "expr"]... [--port n] [--color-scheme light|dark] [--viewport WxH] [--match-media "<query>=<bool>"]...',
+    'usage: shot.mjs <url> <out.png> [--wait ms] [--eval "expr"]... [--port n] [--color-scheme light|dark] [--viewport WxH] [--match-media "<query>=<bool>"]... [--contrast-audit]',
   )
   process.exit(2)
 }
@@ -164,8 +172,52 @@ for (const expr of evals) {
   console.log(typeof v === 'string' ? v : JSON.stringify(v))
 }
 
+let exitCode = 0
+if (contrastAudit) {
+  // Compute WCAG contrast for every visible text node against its effective background (ancestor
+  // backgrounds alpha-composited over white), and against the text color composited over that bg
+  // when the text itself is translucent. Fails on any node under AA (4.5:1 normal, 3:1 large text:
+  // >=24px, or >=18.66px bold). This is the already-proven ratio snippet from the task_520 light-
+  // contrast fix (camshaft/task-board#171), now reusable so a palette regression is caught here.
+  const auditExpr = `(() => {
+    const parse = (s) => { const m = /rgba?\\(([^)]+)\\)/.exec(s || ''); if (!m) return null;
+      const p = m[1].split(',').map((x) => parseFloat(x)); return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 }; };
+    const over = (fg, bg) => ({ r: fg.r*fg.a + bg.r*(1-fg.a), g: fg.g*fg.a + bg.g*(1-fg.a), b: fg.b*fg.a + bg.b*(1-fg.a), a: 1 });
+    const effBg = (el) => { const chain = []; for (let n = el; n; n = n.parentElement) chain.push(n);
+      let acc = { r: 255, g: 255, b: 255, a: 1 };
+      for (let i = chain.length - 1; i >= 0; i--) { const c = parse(getComputedStyle(chain[i]).backgroundColor); if (c && c.a > 0) acc = over(c, acc); }
+      return acc; };
+    const lin = (v) => { v /= 255; return v <= 0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); };
+    const lum = (c) => 0.2126*lin(c.r) + 0.7152*lin(c.g) + 0.0722*lin(c.b);
+    const ratio = (a, b) => { const h = Math.max(lum(a), lum(b)), l = Math.min(lum(a), lum(b)); return (h+0.05)/(l+0.05); };
+    const hasText = (el) => [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim());
+    const visible = (el) => { const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const out = [];
+    for (const el of document.querySelectorAll('body *')) {
+      if (!hasText(el) || !visible(el)) continue;
+      const s = getComputedStyle(el); const fg = parse(s.color); if (!fg) continue;
+      const bg = effBg(el); const text = fg.a < 1 ? over(fg, bg) : fg;
+      const size = parseFloat(s.fontSize); const bold = (parseInt(s.fontWeight, 10) || 400) >= 700;
+      const large = size >= 24 || (size >= 18.66 && bold); const required = large ? 3 : 4.5;
+      out.push({ text: el.textContent.trim().slice(0, 40), ratio: Math.round(ratio(text, bg) * 100) / 100, required,
+        color: s.color, bg: 'rgb(' + [bg.r, bg.g, bg.b].map((x) => Math.round(x)).join(',') + ')' });
+    }
+    const failing = out.filter((r) => r.ratio < r.required).sort((a, b) => a.ratio - b.ratio);
+    const worst = out.reduce((w, r) => (!w || r.ratio < w.ratio ? r : w), null);
+    return JSON.stringify({ sampled: out.length, failingCount: failing.length, worst, failing: failing.slice(0, 25) });
+  })()`
+  const r = await send('Runtime.evaluate', { expression: auditExpr, returnByValue: true })
+  const summary = r?.result?.value
+  console.log(`contrast-audit: ${typeof summary === 'string' ? summary : JSON.stringify(summary)}`)
+  try {
+    if (summary && JSON.parse(summary).failingCount > 0) exitCode = 1
+  } catch {
+    exitCode = 1 // audit itself failed to run -> treat as a failed verify
+  }
+}
+
 const shot = await send('Page.captureScreenshot', { format: 'png' })
 writeFileSync(out, Buffer.from(shot.data, 'base64'))
 console.log(`wrote ${out}`)
 ws.close()
-process.exit(0)
+process.exit(exitCode)
