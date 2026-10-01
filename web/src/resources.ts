@@ -47,6 +47,9 @@ const keys = {
   agent: (id: string) => `agent:${id}`,
   // Keyed under the `tasks:` prefix so touched()'s task-list invalidation refreshes it too.
   agentTasks: (id: string) => `tasks:agent:${id}`,
+  // The question-based "waiting on you" view, same `tasks:` prefix so answering/declining a
+  // question (which touches the task) refreshes it.
+  tasksBlockingMe: (id: string) => `tasks:blocking-me:${id}`,
   channels: (member?: string) => (member ? `channels:${member}` : 'channels'),
   channel: (id: number) => `channel:${id}`,
   channelPosts: (id: number) => `channelPosts:${id}`,
@@ -76,6 +79,13 @@ export function useAgent(id: string) {
 // An agent's assigned tasks across every project (assignee filter, no project_id).
 export function useAgentTasks(id: string) {
   return useResource<TaskSummary[]>(keys.agentTasks(id), () => api.listTasks({ assignee: id }))
+}
+
+// Tasks with an open blocking question routed to the viewer (team-expanded) — "waiting on you".
+export function useTasksBlockingMe(viewer: string) {
+  return useResource<TaskSummary[]>(keys.tasksBlockingMe(viewer), () =>
+    api.listTasksBlockingMe(viewer),
+  )
 }
 
 // Channels: public list, or a member's list (incl. private/DMs) when `member` is given.

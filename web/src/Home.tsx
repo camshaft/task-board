@@ -1,7 +1,14 @@
 import { Link } from 'react-router-dom'
 import { useScrollRestoration } from './scrollRestore'
 import { useBoardContext } from './Layout'
-import { eventHref, useAgents, useAgentTasks, useEvents, useProjects } from './resources'
+import {
+  eventHref,
+  useAgents,
+  useAgentTasks,
+  useEvents,
+  useProjects,
+  useTasksBlockingMe,
+} from './resources'
 import { AGENT_DOT, relTime, StatusChip, STATUS_CHIP, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // The index route (`/`): an at-a-glance fleet dashboard — cross-project task totals, the
@@ -16,6 +23,7 @@ export default function Home() {
   const { data: agents = [] } = useAgents()
   const { data: events = [] } = useEvents()
   const { data: myTasks = [] } = useAgentTasks(actor)
+  const { data: waitingOnMe = [] } = useTasksBlockingMe(actor)
 
   if (!loading && projects.length === 0) {
     return (
@@ -66,6 +74,42 @@ export default function Home() {
           </span>
         ))}
       </div>
+
+      {/* Waiting on you: tasks blocked by an open question routed to the current actor. Shown
+          prominently (actionable) only when there are any; opening a task jumps to its question. */}
+      {waitingOnMe.length > 0 && (
+        <section className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
+          <h2 className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-amber-300">
+            Waiting on you
+            <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px]">
+              {waitingOnMe.length}
+            </span>
+          </h2>
+          <p className="mb-2 text-xs text-[var(--color-muted)]">
+            Open questions routed to <span className="font-mono">{actor}</span> are blocking these
+            tasks.
+          </p>
+          <ul className="space-y-1.5">
+            {waitingOnMe.map((t) => (
+              <li key={t.id}>
+                <Link
+                  to={t.project_id != null ? `/projects/${t.project_id}/tasks/${t.id}` : '#'}
+                  className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 hover:border-amber-500/50"
+                >
+                  <StatusChip status={t.status} />
+                  <span className="min-w-0 flex-1 truncate text-sm">{t.title}</span>
+                  {t.project_id != null && (
+                    <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
+                      {projectName(t.project_id)}
+                    </span>
+                  )}
+                  <span className="font-mono text-[11px] text-[var(--color-muted)]">#{t.id}</span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* My open work. */}
