@@ -1,0 +1,6 @@
+[
+  { "path": "alpha", "label": "Alpha Doc", "kind": "link", "version_no": null, "region": null },
+  { "path": "alpha", "label": "Alpha intro", "kind": "embed", "version_no": 2, "region": "intro" },
+  { "path": "nowhere", "label": null, "kind": "link", "version_no": null, "region": null },
+  { "path": "beta", "label": null, "kind": "link", "version_no": null, "region": null }
+]
