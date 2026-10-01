@@ -218,10 +218,14 @@ export default function DocumentView() {
   const tags = Array.isArray(doc?.metadata?.tags) ? (doc!.metadata.tags as unknown[]) : []
 
   // Available review actions depend on status: a draft (or one with changes requested) can be
-  // submitted; a doc in review can be approved or bounced back.
+  // submitted; a doc in review can be approved or bounced back. `operator_review` is the gated
+  // operator-approval state (submit-to-operator-review -> operator_review -> approved); it is the
+  // state cameron's pending docs sit in, so the Approve / Request-changes controls must show there
+  // too, not only in the earlier agent `in_review` stage (task_881 -- the control had gone missing
+  // for the entire operator-approval queue).
   const status = doc?.status
   const canSubmit = status === 'draft' || status === 'changes_requested'
-  const inReview = status === 'in_review'
+  const canReview = status === 'in_review' || status === 'operator_review'
 
   // Thread the comments: top-level ones in order, each followed by its (one-level) replies.
   const topLevel = comments.filter((c) => c.reply_to == null)
@@ -260,7 +264,7 @@ export default function DocumentView() {
                 Submit for review
               </button>
             )}
-            {inReview && (
+            {canReview && (
               <>
                 <button
                   disabled={busy}
