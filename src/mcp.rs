@@ -7,9 +7,11 @@
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
+    CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ServerCapabilities, ServerConfig,
 };
-use rmcp::service::NotificationContext;
+use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
@@ -2805,6 +2807,19 @@ impl Board {
     }
 }
 
+/// The board's canonical writing-guidance document: the Fleet Doc-Writing Style Guide (`doc_7`,
+/// filed at the `guides/doc-writing-style-guide` wiki path). Exposed over MCP as a discoverable
+/// resource (task_369) so a skills-aware client can find and load the guidance natively, without a
+/// bespoke registration surface. A plain MCP resource is deliberately standard-agnostic: if the MCP
+/// skills extension (`io.modelcontextprotocol/skills`, SEP-2640) later stabilizes with host
+/// support, this is cheap to repoint to a `skill://` manifest. The board Document stays the
+/// authoring + storage layer; this is only the discovery surface over it.
+const WRITING_SKILL_DOC_ID: i64 = 7;
+
+/// Stable resource URI for [`WRITING_SKILL_DOC_ID`]. The `skill://` scheme mirrors the MCP skills
+/// extension in spirit so a future upgrade can keep the same identifier.
+const WRITING_SKILL_URI: &str = "skill://fleet/doc-writing-style-guide";
+
 #[tool_handler]
 impl ServerHandler for Board {
     fn get_info(&self) -> ServerConfig {
@@ -2812,6 +2827,7 @@ impl ServerHandler for Board {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
+                .enable_resources()
                 .build(),
         )
         .with_server_info(Implementation::from_build_env())
@@ -2845,6 +2861,61 @@ impl ServerHandler for Board {
         if let Err(e) = context.peer.notify_tool_list_changed().await {
             tracing::warn!("failed to send tools/list_changed on initialize: {e}");
         }
+    }
+
+    /// Advertise the board's discoverable resources. Currently one entry: the Fleet Doc-Writing
+    /// Style Guide ([`WRITING_SKILL_DOC_ID`]), so a skills-aware MCP client can find the writing
+    /// guidance without a bespoke registration. The set is static, so pagination and
+    /// list_changed/subscribe are intentionally not wired (task_369).
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let resource = Resource::new(WRITING_SKILL_URI, "fleet-doc-writing-style-guide")
+            .with_title("Fleet Doc-Writing Style Guide")
+            .with_description(
+                "How to write a fleet document and get it reviewed: the required outline \
+                 (Background / Problem Statement / Requirements-Goals-Non-Goals / Solutions with \
+                 pros-cons that cite the goals / Recommendation), the ASCII-only and \
+                 no-banned-phrases format rules, \
+                 and the judgment-layer humanizing patterns a scanner cannot catch. The board \
+                 Document doc_7 is the authoritative source; this resource serves its current text.",
+            )
+            .with_mime_type("text/markdown");
+        Ok(ListResourcesResult::with_all_items(vec![resource]))
+    }
+
+    /// Read a discoverable resource's content. Resolves the writing-skill URI to the current
+    /// version's markdown of [`WRITING_SKILL_DOC_ID`], fetched server-side from its pinned CID (the
+    /// same read path as the read_document tool), so a client gets the guidance text in one call
+    /// regardless of its host. Any other URI is a resource-not-found.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if request.uri != WRITING_SKILL_URI {
+            return Err(McpError::resource_not_found(
+                format!("no resource {}", request.uri),
+                None,
+            ));
+        }
+        let doc = core::read_document_content(
+            &self.pool,
+            self.ipfs_api_url.as_deref(),
+            WRITING_SKILL_DOC_ID,
+            None,
+        )
+        .await
+        .map_err(err)?;
+        let body = doc.get("content").and_then(Value::as_str).ok_or_else(|| {
+            McpError::internal_error("writing-skill document has no readable text content", None)
+        })?;
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(body, WRITING_SKILL_URI).with_mime_type("text/markdown")
+        ])
+        .into())
     }
 }
 
