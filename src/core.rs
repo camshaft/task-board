@@ -7446,6 +7446,20 @@ pub fn parse_status_filter(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Reserved tag for agent-memory documents (task_826): board-memory stamps `metadata.tags` with
+/// this on every memory document, and the default document feed hides anything carrying it. This is
+/// the operator-preferred, durable exclusion mechanism (cameron) -- tag-based, so it is independent
+/// of where the doc is filed.
+pub const RESERVED_MEMORY_TAG: &str = "agent-memory";
+
+/// Reserved document path prefixes for agent memory (task_826): memory documents are filed under
+/// `repos/<repo>/...` and `agents/<agent>/...`. The default feed also hides these prefixes as a
+/// belt-and-suspenders alongside [`RESERVED_MEMORY_TAG`] -- it gives immediate relief for memory
+/// docs created before the tag mechanism landed (which are untagged until re-versioned), at zero
+/// per-doc cost. They stay reachable by an explicit prefix query via `list_wiki`, or by
+/// `include_memory=true` on the filter.
+pub const RESERVED_MEMORY_PATH_PREFIXES: &[&str] = &["repos/", "agents/"];
+
 /// Filters for [`list_documents_filtered`] (task 694c). All optional; an empty `statuses` matches
 /// any status. `tag` includes docs carrying the tag; `exclude_tag` drops docs carrying it (the
 /// primitive the UI composes default-hide from, e.g. hide the "charter" tag).
@@ -7458,6 +7472,10 @@ pub struct DocListFilter<'a> {
     pub task_id: Option<i64>,
     pub author: Option<&'a str>,
     pub include_archived: bool,
+    /// Include documents under the reserved agent-memory path prefixes (`repos/`, `agents/`).
+    /// Default false: those namespaces are hidden from the default feed (task_826). A NULL-path
+    /// (unfiled) document always shows regardless.
+    pub include_memory: bool,
 }
 
 /// List documents with the full filter set (task 694c). Multi-value status (IN), tag include +
@@ -7498,6 +7516,23 @@ pub async fn list_documents_filtered(pool: &Pool, f: &DocListFilter<'_>) -> anyh
                 .into(),
         );
     }
+    if !f.include_memory {
+        // Hide agent-memory docs from the default feed (task_826). Primary mechanism (cameron's
+        // steer): the reserved tag, which board-memory stamps on every memory doc.
+        conds.push(
+            "NOT EXISTS (SELECT 1 FROM json_each(documents.metadata, '$.tags') WHERE value=?)"
+                .into(),
+        );
+        // Belt-and-suspenders: also hide the reserved path prefixes, so memory docs created before
+        // the tag landed (still untagged until re-versioned) drop out immediately. A NULL-path
+        // (unfiled) doc always shows; a doc filed under a reserved prefix is hidden.
+        let not_likes = RESERVED_MEMORY_PATH_PREFIXES
+            .iter()
+            .map(|_| "path NOT LIKE ?")
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        conds.push(format!("(path IS NULL OR ({not_likes}))"));
+    }
     if !conds.is_empty() {
         q.push_str(" WHERE ");
         q.push_str(&conds.join(" AND "));
@@ -7521,6 +7556,12 @@ pub async fn list_documents_filtered(pool: &Pool, f: &DocListFilter<'_>) -> anyh
     }
     if let Some(xt) = f.exclude_tag {
         query = query.bind(xt);
+    }
+    if !f.include_memory {
+        query = query.bind(RESERVED_MEMORY_TAG);
+        for prefix in RESERVED_MEMORY_PATH_PREFIXES {
+            query = query.bind(format!("{prefix}%"));
+        }
     }
     let rows = query.fetch_all(pool).await?;
     Ok(Value::Array(
@@ -7552,6 +7593,7 @@ pub async fn list_documents(
             task_id,
             author,
             include_archived,
+            include_memory: false,
         },
     )
     .await
@@ -11718,8 +11760,18 @@ mod tests {
             "absent description projects as null, not a missing key"
         );
 
-        // list_documents projects it too (same json_extract fragment).
-        let docs = list_documents(&pool, None, None, None, None, Some("a"), false).await?;
+        // list_documents projects it too (same json_extract fragment). These docs live under the
+        // agents/ memory namespace, which the default feed now hides (task_826), so opt in with
+        // include_memory to list them.
+        let docs = list_documents_filtered(
+            &pool,
+            &DocListFilter {
+                author: Some("a"),
+                include_memory: true,
+                ..Default::default()
+            },
+        )
+        .await?;
         let one_d = docs
             .as_array()
             .unwrap()
@@ -18298,6 +18350,139 @@ mod tests {
         )
         .await?;
         assert_eq!(ids(&non_charter), vec![cid]);
+        Ok(())
+    }
+
+    /// Agent-memory docs (filed under the reserved repos/ and agents/ prefixes) are hidden from the
+    /// default document feed (task_826), but still reachable with include_memory=true and via
+    /// list_wiki by prefix (the recall path). A NULL-path doc and a non-memory filed doc always show.
+    #[tokio::test]
+    async fn list_documents_hides_reserved_memory_prefixes_by_default() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let mem_repo = create_document(
+            &pool,
+            "repo mem",
+            None,
+            "cid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let mem_agent = create_document(
+            &pool,
+            "agent mem",
+            None,
+            "cid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let design = create_document(
+            &pool,
+            "a design",
+            None,
+            "cid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let unfiled = create_document(
+            &pool,
+            "unfiled",
+            None,
+            "cid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        // Tagged agent-memory but filed at a NON-reserved path: the tag alone must hide it.
+        let tagged = create_document(
+            &pool,
+            "tagged mem",
+            None,
+            "cid",
+            None,
+            Some("u"),
+            Some(json!({ "tags": [RESERVED_MEMORY_TAG] })),
+            None,
+            None,
+        )
+        .await?;
+        let (mr, ma, dz, uf, tg) = (
+            mem_repo["id"].as_i64().unwrap(),
+            mem_agent["id"].as_i64().unwrap(),
+            design["id"].as_i64().unwrap(),
+            unfiled["id"].as_i64().unwrap(),
+            tagged["id"].as_i64().unwrap(),
+        );
+        set_document_path(&pool, mr, "repos/cadenza/some-fact", Some("u")).await?;
+        set_document_path(&pool, ma, "agents/v-x/some-fact", Some("u")).await?;
+        set_document_path(&pool, dz, "designs/d1", Some("u")).await?;
+        set_document_path(&pool, tg, "notes/tagged-mem", Some("u")).await?;
+        // `unfiled` keeps a NULL path.
+
+        let ids = |v: &Value| -> Vec<i64> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_i64().unwrap())
+                .collect()
+        };
+
+        // Default feed: the memory namespaces are hidden; the non-memory filed doc + the unfiled
+        // (NULL-path) doc show.
+        let feed = list_documents_filtered(&pool, &DocListFilter::default()).await?;
+        let got = ids(&feed);
+        assert!(
+            got.contains(&dz) && got.contains(&uf),
+            "non-memory + unfiled docs show: {got:?}"
+        );
+        assert!(
+            !got.contains(&mr) && !got.contains(&ma),
+            "repos/ and agents/ memory docs are hidden: {got:?}"
+        );
+        assert!(
+            !got.contains(&tg),
+            "a doc tagged agent-memory is hidden by the tag even at a non-reserved path: {got:?}"
+        );
+
+        // Opt-in: include_memory=true returns all of them.
+        let all = list_documents_filtered(
+            &pool,
+            &DocListFilter {
+                include_memory: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let got_all = ids(&all);
+        for id in [mr, ma, dz, uf, tg] {
+            assert!(
+                got_all.contains(&id),
+                "include_memory returns {id}: {got_all:?}"
+            );
+        }
+
+        // The recall path is unaffected: list_wiki by prefix still resolves the memory doc.
+        let wiki = list_wiki(&pool, Some("agents/v-x"), false).await?;
+        assert_eq!(
+            ids(&wiki),
+            vec![ma],
+            "list_wiki(prefix) still resolves memory"
+        );
         Ok(())
     }
 
