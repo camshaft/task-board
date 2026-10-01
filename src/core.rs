@@ -3668,6 +3668,111 @@ pub async fn cancel_question(
     get_comment(pool, comment_id).await
 }
 
+/// Supersede an open question (doc_33 A6): the ASKER replaces a question it needs to correct or
+/// restate with a fresh one, preserving the audit trail. The old question is kept IMMUTABLE -- it
+/// moves to state `superseded` (payload + any answers untouched) and gains `superseded_by` pointing
+/// at the replacement; the new question is a fresh OPEN question comment carrying a verbatim COPY of
+/// the old payload (routing, blocking, kind/options, default, wait period -- all preserved) with the
+/// new prompt, and `supersedes` pointing back. Copying the payload wholesale keeps supersede
+/// agnostic to the answer-model shape (task_628: the pose payload may move to a JSON-schema + UI
+/// descriptor; re-pose just carries whatever is there forward). Only the asking author may
+/// supersede (mirrors cancel). If the old question was blocking, the task stays blocked on the
+/// replacement -- the terminal recompute sees the fresh open blocking question and emits no spurious
+/// unblock. Best-effort notifies the routed-to agents (one event carries both ids). Returns the NEW
+/// question comment.
+// allow(dead_code): landed ahead of its mcp/api wiring (same pattern as the other ops before slice
+// 2 wired them). v-task-board wires supersede_question into an MCP tool + REST endpoint (the one
+// shared append-point); drop this allow when wired.
+#[allow(dead_code)]
+pub async fn supersede_question(
+    pool: &Pool,
+    comment_id: i64,
+    new_prompt: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    check_bare_refs(new_prompt)?;
+    let new_prompt = new_prompt.trim();
+    if new_prompt.is_empty() {
+        anyhow::bail!("give a non-empty prompt for the superseding question");
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let (task_id, author, payload) = load_open_question(&mut tx, comment_id).await?;
+    // Only the asker may supersede their own question (mirrors cancel_question).
+    if actor.is_none() || author.as_deref() != actor {
+        anyhow::bail!(
+            "only the asking agent can supersede a question (it was posed by {})",
+            author.as_deref().unwrap_or("someone else")
+        );
+    }
+    let blocking = payload
+        .get("blocking")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let routed_to = payload
+        .get("routed_to")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let project_id: i64 = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("project_id")?;
+    // Re-pose: a fresh OPEN question comment carrying a copy of the old payload + the new prompt,
+    // linked back to the old via `supersedes`.
+    let payload_str = payload.to_string();
+    let new_cid: i64 = sqlx::query(
+        "INSERT INTO comments(task_id, author, body, type, payload, state, supersedes, created_at) \
+         VALUES(?,?,?,'question',?,'open',?,?) RETURNING id",
+    )
+    .bind(task_id)
+    .bind(actor)
+    .bind(new_prompt)
+    .bind(&payload_str)
+    .bind(comment_id)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    // The old question becomes immutable + superseded, pointing forward at its replacement.
+    sqlx::query("UPDATE comments SET state='superseded', superseded_by=? WHERE id=?")
+        .bind(new_cid)
+        .bind(comment_id)
+        .execute(&mut *tx)
+        .await?;
+    // Terminal recompute: the old blocking question resolved, but the fresh one keeps the task
+    // blocked, so this sees a surviving open blocking question and emits no task.unblocked.
+    if blocking {
+        recompute_question_block(&mut tx, &mut hooks, task_id, actor).await?;
+    }
+    // Best-effort notify the routed-to agents: the question is superseded by new_comment_id. routed_to
+    // is unchanged (payload copied), so recipients mirror the original pose.
+    let recips = if routed_to.is_empty() {
+        BTreeSet::new()
+    } else {
+        let kind = principal_kind(&mut tx, &routed_to).await.unwrap_or("agent");
+        resolve_routed_to_agents(&mut tx, &routed_to, kind).await?
+    };
+    emit(
+        &mut tx,
+        &mut hooks,
+        "question.superseded",
+        actor,
+        Some(task_id),
+        Some(project_id),
+        None,
+        None,
+        json!({ "question_comment_id": comment_id, "new_comment_id": new_cid, "task_id": task_id, "routed_to": routed_to, "blocking": blocking, "prompt": new_prompt }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    get_comment(pool, new_cid).await
+}
+
 /// Merge arbitrary key/value properties into a task's metadata (JSON). Returns the
 /// merged metadata. Used for pipeline state (ipfs_cid, collection, stage, ...).
 pub async fn set_task_props(pool: &Pool, task_id: i64, props: Value) -> anyhow::Result<Value> {
@@ -8995,6 +9100,131 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+        Ok(())
+    }
+
+    /// task_628 slice 4: supersede_question re-poses a fresh open question carrying a verbatim copy
+    /// of the old payload, keeps the old one immutable + linked (state=superseded, superseded_by),
+    /// is author-only, keeps a blocking task blocked across the swap (no spurious unblock), notifies
+    /// the routed-to principal, and refuses to supersede a non-open question.
+    #[tokio::test]
+    async fn supersede_question_re_poses_and_links() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "rev", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("asker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("asker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Pose a blocking yes_no question routed to agent "rev".
+        let q = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "ship v1?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some("asker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+
+        // Only the asking author may supersede.
+        assert!(supersede_question(&pool, qid, "ship v2?", Some("rev"))
+            .await
+            .is_err());
+        // A non-empty prompt is required.
+        assert!(supersede_question(&pool, qid, "   ", Some("asker"))
+            .await
+            .is_err());
+
+        // Author supersedes with a corrected prompt.
+        let new = supersede_question(&pool, qid, "ship v2 (clarified)?", Some("asker")).await?;
+        let new_cid = new["id"].as_i64().unwrap();
+        assert_eq!(new["type"], json!("question"));
+        assert_eq!(new["state"], json!("open"));
+        assert_eq!(new["body"], json!("ship v2 (clarified)?"));
+        assert_eq!(new["supersedes"], json!(qid));
+        // Payload copied verbatim (routing + blocking + kind preserved).
+        assert_eq!(new["payload"]["kind"], json!("yes_no"));
+        assert_eq!(new["payload"]["blocking"], json!(true));
+        assert_eq!(new["payload"]["routed_to"], json!("rev"));
+
+        // The old question is immutable + superseded, pointing forward at its replacement.
+        let old = get_comment(&pool, qid).await?;
+        assert_eq!(old["state"], json!("superseded"));
+        assert_eq!(old["superseded_by"], json!(new_cid));
+        assert_eq!(old["body"], json!("ship v1?"), "old prompt untouched");
+        assert_eq!(
+            old["payload"]["blocking"],
+            json!(true),
+            "old payload untouched"
+        );
+
+        // The task stays blocked across the swap: the only open blocking question is now the new one
+        // (so the terminal recompute saw a surviving block and emitted no task.unblocked).
+        let mut tx = pool.begin().await?;
+        let obq = open_blocking_questions(&mut tx, tid).await?;
+        tx.rollback().await?;
+        assert_eq!(obq, vec![(new_cid, "rev".to_string())]);
+
+        // The routed-to principal is notified of the supersede, with the replacement id.
+        let notes = check_notifications(&pool, "rev", true, 50, None).await?;
+        assert!(
+            notes["notifications"].as_array().unwrap().iter().any(|n| {
+                n["type"] == json!("question.superseded")
+                    && n["data"]["new_comment_id"] == json!(new_cid)
+                    && n["data"]["question_comment_id"] == json!(qid)
+            }),
+            "routed-to agent is notified of the supersede: {notes}"
+        );
+
+        // A superseded (non-open) question cannot be superseded again.
+        assert!(supersede_question(&pool, qid, "ship v3?", Some("asker"))
+            .await
+            .is_err());
+
+        // Non-blocking supersede carries the default + wait period forward and needs no recompute.
+        let nb = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "nice to have?",
+            None,
+            "rev",
+            false,
+            Some(json!(true)),
+            Some(3600),
+            Some("asker"),
+        )
+        .await?;
+        let nb_new = supersede_question(
+            &pool,
+            nb["id"].as_i64().unwrap(),
+            "still nice to have?",
+            Some("asker"),
+        )
+        .await?;
+        assert_eq!(nb_new["state"], json!("open"));
+        assert_eq!(nb_new["payload"]["blocking"], json!(false));
+        assert_eq!(nb_new["payload"]["default"], json!(true));
+        assert_eq!(nb_new["payload"]["wait_period_seconds"], json!(3600));
         Ok(())
     }
 
