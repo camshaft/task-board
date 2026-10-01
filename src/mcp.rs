@@ -263,7 +263,7 @@ pub struct CreateTaskArgs {
     #[serde(default)]
     pub metadata: Option<JsonObject>,
     /// Optional parent task (makes this a child/subtask). The parent must be in the same project.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub parent_id: Option<i64>,
     /// Optional external reference for idempotent ingest (bridge adapters). If a task is already
     /// linked on (source, external_id) it's returned with `created:false` instead of a duplicate;
@@ -299,7 +299,7 @@ pub struct UpdateTaskArgs {
     #[serde(default)]
     pub metadata: Option<JsonObject>,
     /// Reparent: set a parent task id (same project), or 0 to clear the parent (make top-level).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub parent_id: Option<i64>,
     /// What this task is blocked on. REQUIRED when setting status=blocked — a blocked task must
     /// record what it is waiting on. Omit to leave unchanged; pass kind="none" to clear.
@@ -3315,6 +3315,31 @@ mod tests {
                 .comments_limit,
             None
         );
+
+        // task 715: create_task / update_task parent_id tolerates a stringified int (the shape the
+        // MCP harness handed the server as "628", which previously failed "expected i64").
+        assert_eq!(
+            from_value::<CreateTaskArgs>(json!({"title": "t", "parent_id": "628"}))
+                .unwrap()
+                .parent_id,
+            Some(628)
+        );
+        assert_eq!(
+            from_value::<CreateTaskArgs>(json!({"title": "t", "parent_id": 628}))
+                .unwrap()
+                .parent_id,
+            Some(628)
+        );
+        assert_eq!(
+            from_value::<UpdateTaskArgs>(json!({"task_id": 1, "parent_id": "5"}))
+                .unwrap()
+                .parent_id,
+            Some(5)
+        );
+        assert!(from_value::<CreateTaskArgs>(json!({"title": "t"}))
+            .unwrap()
+            .parent_id
+            .is_none());
 
         // list_tasks scalar filters: stringified bool + i64.
         let lt = from_value::<ListTasksArgs>(
