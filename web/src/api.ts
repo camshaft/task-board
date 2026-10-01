@@ -192,6 +192,10 @@ export interface DocumentSummary {
   approved_version_id: number | null
   created_by: string | null
   updated_at: string
+  // Deprecate/supersede (task 722): a deprecated doc stays visible but carries a banner; when it
+  // was superseded, superseded_by points at the replacing document. Both null when not deprecated.
+  deprecated_at?: string | null
+  superseded_by?: number | null
 }
 
 // An outbound wiki link from a document ([[target_path]] / [[target_path|label]] in its content).
@@ -532,14 +536,26 @@ export const api = {
     ),
 
   listDocuments: (
-    q: { project_id?: number; status?: string; tag?: string; task_id?: number; author?: string } = {},
+    q: {
+      project_id?: number
+      // A single status, or a comma-separated set (match any). Accepts the operator vocabulary
+      // pending-review / published (mapped server-side), per task 724.
+      status?: string
+      tag?: string
+      exclude_tag?: string
+      task_id?: number
+      author?: string
+      include_archived?: boolean
+    } = {},
   ) => {
     const p = new URLSearchParams()
     if (q.project_id != null) p.set('project_id', String(q.project_id))
     if (q.status) p.set('status', q.status)
     if (q.tag) p.set('tag', q.tag)
+    if (q.exclude_tag) p.set('exclude_tag', q.exclude_tag)
     if (q.task_id != null) p.set('task_id', String(q.task_id))
     if (q.author) p.set('author', q.author)
+    if (q.include_archived) p.set('include_archived', 'true')
     const qs = p.toString()
     return req<DocumentSummary[]>('GET', `/documents${qs ? `?${qs}` : ''}`)
   },
