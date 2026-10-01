@@ -4543,7 +4543,7 @@ pub async fn lint_text(pool: &Pool, text: &str) -> anyhow::Result<Value> {
 // --- External links (bridged mappings: channel-map, issue↔task, thread↔task) ---
 
 /// The board entity kinds an external link may target.
-const EXTERNAL_LINK_KINDS: &[&str] = &["channel", "task", "thread", "comment"];
+const EXTERNAL_LINK_KINDS: &[&str] = &["channel", "task", "thread", "comment", "document"];
 
 /// Create or update a mapping between a board entity and an external one — the generic link
 /// behind the Slack channel-map, the GitHub issue↔task bridge, and thread promotion. Idempotent
@@ -4568,7 +4568,7 @@ pub async fn upsert_external_link(
         anyhow::bail!("give an `external_id` for the external link (the external system's key)");
     }
     if !EXTERNAL_LINK_KINDS.contains(&board_kind) {
-        anyhow::bail!("give a `board_kind` of one of: channel, task, thread, comment");
+        anyhow::bail!("give a `board_kind` of one of: channel, task, thread, comment, document");
     }
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -4602,6 +4602,16 @@ pub async fn upsert_external_link(
                 .is_none()
             {
                 anyhow::bail!("no comment {board_id}");
+            }
+        }
+        "document" => {
+            if sqlx::query("SELECT 1 FROM documents WHERE id=?")
+                .bind(board_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_none()
+            {
+                anyhow::bail!("no document {board_id}");
             }
         }
         _ => {}
@@ -12722,6 +12732,57 @@ mod tests {
             upsert_external_link(&pool, "slack", "  ", None, "channel", cid, None)
                 .await
                 .is_err()
+        );
+
+        // "document" kind (task 578 chorus board-side): attach a chorus URL to a doc and read the
+        // whole sync set inline via list_external_links(source, board_kind), no get_document per doc.
+        let doc = create_document(
+            &pool,
+            "Spec",
+            None,
+            "bafycid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let doc_id = doc["id"].as_i64().unwrap();
+        upsert_external_link(
+            &pool,
+            "chorus",
+            "chorus-doc-7",
+            None,
+            "document",
+            doc_id,
+            Some(json!({ "url": "https://chorus.example/d/7" })),
+        )
+        .await?;
+        let synced = list_external_links(&pool, Some("chorus"), Some("document"), None).await?;
+        let arr = synced.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "the chorus sync set is one call: {synced}");
+        assert_eq!(arr[0]["board_id"], json!(doc_id));
+        assert_eq!(arr[0]["external_id"], json!("chorus-doc-7"));
+        assert_eq!(
+            arr[0]["metadata"]["url"],
+            json!("https://chorus.example/d/7"),
+            "url inline"
+        );
+        // A nonexistent document target is rejected (the existence-check arm).
+        assert!(
+            upsert_external_link(
+                &pool,
+                "chorus",
+                "chorus-doc-x",
+                None,
+                "document",
+                999999,
+                None
+            )
+            .await
+            .is_err(),
+            "unknown document rejected"
         );
         Ok(())
     }

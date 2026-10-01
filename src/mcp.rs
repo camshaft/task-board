@@ -2170,7 +2170,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Map a board entity to an entity in a bridged external system (the generic link behind the Slack channel-map, GitHub issue↔task, and thread↔task). `board_kind` is channel|task|thread, `board_id` the board-side id; `source`+`external_id` identify the external side. Idempotent on (source, external_id). This is how a bridge adapter resolves e.g. a board channel to its Slack channel."
+        description = "Map a board entity to an entity in a bridged external system (the generic link behind the Slack channel-map, GitHub issue↔task, thread↔task, and the chorus doc-attach). `board_kind` is channel|task|thread|comment|document, `board_id` the board-side id; `source`+`external_id` identify the external side. Idempotent on (source, external_id); metadata merges. This is how a bridge adapter resolves e.g. a board channel to its Slack channel, or attaches a chorus URL to a document (board_kind=document, metadata={url})."
     )]
     async fn upsert_external_link(
         &self,
