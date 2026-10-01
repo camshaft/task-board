@@ -21,6 +21,11 @@ import SecretSubmit from './SecretSubmit.tsx'
 import Settings from './Settings.tsx'
 import Wiki from './Wiki.tsx'
 import { TaskDrawer, TaskRedirect } from './TaskDrawer.tsx'
+import { installCrashReporting } from './crash-report'
+
+// Install global uncaught-error / unhandled-rejection telemetry before anything renders (task_879),
+// so an early crash still auto-files. The ErrorBoundary reports render crashes separately.
+installCrashReporting()
 
 // The app may be served under a reverse-proxy sub-path (e.g. /board), which the backend
 // signals via the <base href> it injects from X-Forwarded-Prefix. document.baseURI

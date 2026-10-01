@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
+import { reportCrash } from './crash-report'
 
 // A top-level error boundary so an uncaught render error degrades to a recoverable screen instead
 // of the blank white page cameron hit on /awaiting (task_876). This is the capture half of UI
@@ -22,9 +23,15 @@ export default class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    // Surface the crash in the console until the board crash-ingest endpoint lands (task_879,
-    // v-task-board); this is where the reporter POST will hook in.
     console.error('Uncaught UI error:', error, info.componentStack)
+    // Auto-file the crash for investigation (task_879). Fire-and-forget; reportCrash swallows its
+    // own failures, so a reporting error can't compound the one we're already handling.
+    reportCrash({
+      kind: 'error',
+      message: error.message || error.name,
+      stack: error.stack,
+      component_stack: info.componentStack ?? undefined,
+    })
   }
 
   render() {
