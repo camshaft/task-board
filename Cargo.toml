@@ -42,6 +42,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 jsonschema = "0.58.3"
 futures-util = "0.3"
+# CommonMark parser: extract_wiki_edges walks its event stream so [[links]]/![[embeds]] are
+# recognized with code-span/code-fence awareness and block-only embed semantics (task 785),
+# matching the frontend renderer instead of a raw-byte regex scan.
+pulldown-cmark = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
