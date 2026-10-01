@@ -1129,7 +1129,7 @@ pub struct CreateReviewArgs {
     /// What is being reviewed: document | code | design | agent-session | task.
     pub kind: String,
     /// The source classifying where the artifact lives (e.g. board-document, github-pull-request,
-    /// code-amazon-change-request, url, agent-session, task). Metadata — the board doesn't fetch it.
+    /// url, agent-session, task). Metadata — the board doesn't fetch it.
     #[serde(default)]
     pub source: Option<String>,
     /// A pointer to the artifact within its source (a doc id, a PR url, a change-request id, ...).

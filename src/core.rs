@@ -7786,7 +7786,7 @@ mod tests {
         let t = create_task(
             &pool,
             pid,
-            "blocked on brazil merge",
+            "blocked on upstream merge",
             None,
             None,
             None,
@@ -7800,7 +7800,7 @@ mod tests {
 
         // Block on external with a free-text note, no target.
         update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("a"), None, None,
-            Some(json!({ "kind": "external", "note": "daily Brazil TPCII->VS merge / stale CratesIoIndex" }))).await?;
+            Some(json!({ "kind": "external", "note": "daily upstream dependency sync / stale package index" }))).await?;
         let got = get_task(&pool, tid).await?;
         assert_eq!(got["status"], json!("blocked"));
         assert_eq!(got["blocked_on"]["kind"], json!("external"));
@@ -7812,7 +7812,7 @@ mod tests {
         assert!(got["blocked_on"]["note"]
             .as_str()
             .unwrap()
-            .contains("Brazil"));
+            .contains("upstream"));
 
         // OFF the operator queue; ON the external filter.
         let op = list_tasks(

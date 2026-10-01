@@ -1908,8 +1908,8 @@ async fn cancel_secret_request(
 struct CreateReviewBody {
     /// What is being reviewed: document | code | design | agent-session | task.
     kind: String,
-    /// Where the artifact lives (board-document, github-pull-request, code-amazon-change-request,
-    /// url, agent-session, task). Metadata — the board never dereferences it.
+    /// Where the artifact lives (board-document, github-pull-request, url, agent-session, task).
+    /// Metadata — the board never dereferences it.
     source: Option<String>,
     /// A pointer to the artifact within its source (a doc id, a PR url, a change-request id, ...).
     target_ref: Option<String>,
