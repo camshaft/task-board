@@ -43,7 +43,7 @@
     },
     "multi-select": {
       "title": "Select all that apply",
-      "description": "Pick any number of options (select-all). The response schema is an array of option ids; the options live in props.",
+      "description": "Pick any number of options (select-all). The response schema is an array of option ids; the options live in props. Optional min_selections / max_selections bound how many may be chosen.",
       "component": "MultiSelect",
       "props_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -61,6 +61,16 @@
               "required": ["id", "label"],
               "additionalProperties": false
             }
+          },
+          "min_selections": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Minimum number of options that must be selected (omit for no floor)."
+          },
+          "max_selections": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of options that may be selected (omit for no ceiling)."
           }
         },
         "required": ["options"],
@@ -83,7 +93,7 @@
     },
     "rank": {
       "title": "Rank list",
-      "description": "Order the options by preference (rank-list). The response schema is an ordered permutation of the option ids; the options live in props.",
+      "description": "Order the options by preference (rank-list). The response schema is an ordered permutation of the option ids; the options live in props. Optional max_ranked limits the answer to the top N (omit to rank them all).",
       "component": "RankList",
       "props_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -101,6 +111,11 @@
               "required": ["id", "label"],
               "additionalProperties": false
             }
+          },
+          "max_ranked": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Rank only the top N options rather than the full list (omit to rank all)."
           }
         },
         "required": ["options"],
