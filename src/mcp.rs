@@ -302,6 +302,14 @@ pub struct UpdateTaskArgs {
     /// record what it is waiting on. Omit to leave unchanged; pass kind="none" to clear.
     #[serde(default, deserialize_with = "de_opt_blocked_on_lenient")]
     pub blocked_on: Option<BlockedOnArgs>,
+    /// Flat alternative to `blocked_on` for a client that cannot nest an object: pass
+    /// `blocked_on_kind` (task | agent | team | operator | external, or "none" to clear) together
+    /// with `blocked_on_ref` (the blocking task/agent/team id). Ignored when `blocked_on` is given.
+    /// Example: blocked_on_kind="task", blocked_on_ref="611".
+    #[serde(default)]
+    pub blocked_on_kind: Option<String>,
+    #[serde(default)]
+    pub blocked_on_ref: Option<String>,
     /// Return the full task (including the `description`) in the response. Default false — the
     /// response omits the description to keep a looping caller's context light; fetch it with get_task.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
@@ -315,7 +323,9 @@ pub struct UpdateTaskArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockedOnArgs {
     pub kind: String,
-    #[serde(default)]
+    /// The blocking id (a task id for kind=task, agent id for kind=agent, team id for kind=team).
+    /// A client may send it as a string OR a bare number (e.g. target:611) -- both are accepted.
+    #[serde(default, deserialize_with = "de_opt_string_scalar")]
     pub target: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
@@ -381,6 +391,31 @@ fn de_opt_i64_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i
         }
         Some(other) => Err(serde::de::Error::custom(format!(
             "expected an integer, got {other}"
+        ))),
+    }
+}
+
+/// An `Option<String>` where the client may have sent the value as a bare number instead of a
+/// string (task 691): accepts null/absent -> None, a string (empty/whitespace -> None), or an
+/// integer/number coerced to its decimal string. This lets `blocked_on.target: 611` (an int) work,
+/// not just `"611"` -- an agent that writes the bare task id as a number no longer gets "expected a
+/// string".
+fn de_opt_string_scalar<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            Ok(if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            })
+        }
+        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected a string id (or a bare number), got {other}"
         ))),
     }
 }
@@ -1575,7 +1610,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. To CLEAR the owner (unassign), set `unassign: true` — this emits task.unassigned. (Prefer `unassign: true` over an empty-string `assignee`: the server treats `assignee=\"\"` as unassign too, but some clients can't serialize an empty string and produce malformed JSON.) Setting a non-empty `assignee` reassigns and emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent. When you set status=blocked you MUST pass `blocked_on` (kind: task, agent, operator, or external) recording what it waits on — kind=agent notifies that agent they are blocking; kind=external is for an infra/no-owner dependency (put what it waits on in blocked_on.note, no target) and stays OFF the operator queue; blocked_on auto-clears when the task leaves the blocked state. The response omits the (potentially large) `description` unless you pass verbose:true; fetch the full task with get_task."
+        description = "Update a task. Pass only the fields you're changing. Statuses: todo / in_progress / blocked / done / cancelled. To CLEAR the owner (unassign), set `unassign: true` — this emits task.unassigned. (Prefer `unassign: true` over an empty-string `assignee`: the server treats `assignee=\"\"` as unassign too, but some clients can't serialize an empty string and produce malformed JSON.) Setting a non-empty `assignee` reassigns and emits task.assigned. `metadata` is MERGED into the task's props. Set `actor` to your agent id so you aren't notified of your own change. Notifies subscribers on status/assignee changes (e.g. reassign to hand a ticket to the next pipeline stage). Pass `parent_id` to reparent under an epic (same project), or 0 to clear the parent. When you set status=blocked you MUST pass `blocked_on` (kind: task, agent, team, operator, or external) recording what it waits on. Accepted forms: a bare kind string `blocked_on:\"operator\"`; the shorthand `blocked_on:\"task:611\"`; the object `blocked_on:{kind:\"task\",target:\"611\"}` (target may be a string OR a bare number, and a task target may be written `611`, `task_611`, or `#611`); or the flat pair `blocked_on_kind:\"task\"` + `blocked_on_ref:\"611\"` for clients that cannot nest. kind=agent notifies that agent they are blocking; kind=external is for an infra/no-owner dependency (put what it waits on in blocked_on.note, no target) and stays OFF the operator queue; blocked_on auto-clears when the task leaves the blocked state. The response omits the (potentially large) `description` unless you pass verbose:true; fetch the full task with get_task."
     )]
     async fn update_task(
         &self,
@@ -1589,13 +1624,26 @@ impl Board {
         } else {
             s(&a.assignee)
         };
-        let blocked_on = a.blocked_on.map(|bo| {
-            if bo.kind.is_empty() || bo.kind == "none" || bo.kind == "clear" {
+        // `blocked_on` (nested object / string) is preferred; the flat `blocked_on_kind` +
+        // `blocked_on_ref` pair is the fallback for a client that cannot send a nested object
+        // (task 691). A "none"/"clear"/empty kind maps to Value::Null (clear).
+        let flat_blocked_on = a.blocked_on_kind.as_deref().map(|kind| {
+            if kind.is_empty() || kind == "none" || kind == "clear" {
                 Value::Null
             } else {
-                serde_json::json!({ "kind": bo.kind, "target": bo.target, "note": bo.note })
+                serde_json::json!({ "kind": kind, "target": a.blocked_on_ref, "note": null })
             }
         });
+        let blocked_on = a
+            .blocked_on
+            .map(|bo| {
+                if bo.kind.is_empty() || bo.kind == "none" || bo.kind == "clear" {
+                    Value::Null
+                } else {
+                    serde_json::json!({ "kind": bo.kind, "target": bo.target, "note": bo.note })
+                }
+            })
+            .or(flat_blocked_on);
         let verbose = a.verbose.unwrap_or(false);
         core::update_task(
             &self.pool,
@@ -3311,6 +3359,37 @@ mod tests {
             .unwrap()
             .blocked_on
             .is_none());
+
+        // task 691: an INTEGER target (the shape an agent naturally writes for a task id) is
+        // coerced to its string form, both as a native object and as a JSON-string of the object --
+        // previously this failed with "expected a string".
+        let int_obj = from_value::<UpdateTaskArgs>(
+            json!({"task_id": 1, "blocked_on": {"kind": "task", "target": 611}}),
+        )
+        .unwrap()
+        .blocked_on
+        .unwrap();
+        assert_eq!(
+            (int_obj.kind.as_str(), int_obj.target.as_deref()),
+            ("task", Some("611"))
+        );
+        let int_jstr = from_value::<UpdateTaskArgs>(
+            json!({"task_id": 1, "blocked_on": "{\"kind\":\"task\",\"target\":611}"}),
+        )
+        .unwrap()
+        .blocked_on
+        .unwrap();
+        assert_eq!(int_jstr.target.as_deref(), Some("611"));
+
+        // task 691: the flat blocked_on_kind + blocked_on_ref pair (for clients that cannot nest an
+        // object) is carried on the args; the handler folds it into blocked_on when the nested form
+        // is absent.
+        let flat = from_value::<UpdateTaskArgs>(
+            json!({"task_id": 1, "blocked_on_kind": "task", "blocked_on_ref": "611"}),
+        )
+        .unwrap();
+        assert_eq!(flat.blocked_on_kind.as_deref(), Some("task"));
+        assert_eq!(flat.blocked_on_ref.as_deref(), Some("611"));
     }
 
     /// comment_task / comment_document accept the fleet-habit identity field (agent_id / actor) as an
@@ -3426,6 +3505,64 @@ mod tests {
         assert!(
             core::get_task(&pool, tid).await?["assignee"].is_null(),
             "unassign takes precedence over assignee"
+        );
+        Ok(())
+    }
+
+    // task 691: the flat blocked_on_kind + blocked_on_ref pair blocks a task end-to-end over the
+    // MCP handler (for a client that cannot nest an object), equivalent to the nested blocked_on.
+    #[tokio::test]
+    async fn update_task_flat_blocked_on_pair_blocks_the_task() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool.clone(), None);
+        let mkfail = |e: McpError| anyhow::anyhow!("{e:?}");
+
+        let p = core::create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = core::create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("alice"),
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let dep = core::create_task(
+            &pool,
+            pid,
+            "Dep",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let dep_id = dep["id"].as_i64().unwrap();
+
+        // Flat pair with a bare id ref -> the task is blocked on the dependency.
+        board
+            .update_task(Parameters(serde_json::from_value(serde_json::json!({
+                "task_id": tid, "status": "blocked",
+                "blocked_on_kind": "task", "blocked_on_ref": dep_id.to_string(), "actor": "u",
+            }))?))
+            .await
+            .map_err(mkfail)?;
+        let task = core::get_task(&pool, tid).await?;
+        assert_eq!(task["status"], serde_json::json!("blocked"));
+        assert_eq!(task["blocked_on"]["kind"], serde_json::json!("task"));
+        assert_eq!(
+            task["blocked_on"]["target"],
+            serde_json::json!(dep_id.to_string())
         );
         Ok(())
     }
