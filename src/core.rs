@@ -6989,7 +6989,7 @@ pub async fn list_documents(
 ) -> anyhow::Result<Value> {
     let mut q = String::from(
         "SELECT id, title, slug, path, project_id, status, current_version_id, approved_version_id, \
-         created_by, updated_at, archived_at FROM documents",
+         created_by, updated_at, archived_at, deprecated_at, superseded_by FROM documents",
     );
     // conds and the binds below MUST stay in the same order. (A cond that binds no value — like
     // the archived filter — can go anywhere without disturbing that order.)
@@ -7678,6 +7678,79 @@ pub async fn set_document_archived(
         None,
         Some(document_id),
         json!({ "archived": archived }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+    let out = document_json(&mut tx, document_id)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Mark a document deprecated (or clear it), optionally recording the document that supersedes it
+/// (task 694a). ORTHOGONAL to archive: a deprecated doc stays visible in listings (a client shows a
+/// "deprecated / superseded by X" banner) rather than being hidden. `deprecated=false` clears both
+/// the deprecation stamp and the superseded_by link. `superseded_by` is only recorded when
+/// deprecating, must exist, and cannot be the document itself. Emits document.deprecated /
+/// document.undeprecated and returns the updated document.
+pub async fn set_document_deprecated(
+    pool: &Pool,
+    document_id: i64,
+    deprecated: bool,
+    superseded_by: Option<i64>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT project_id FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let project_id: Option<i64> = row.try_get("project_id")?;
+    // superseded_by only applies while deprecated; clearing deprecation drops it too.
+    let superseded_by = if deprecated { superseded_by } else { None };
+    if let Some(by) = superseded_by {
+        if by == document_id {
+            anyhow::bail!("a document cannot supersede itself");
+        }
+        if sqlx::query("SELECT 1 FROM documents WHERE id=?")
+            .bind(by)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none()
+        {
+            anyhow::bail!("no superseding document {by}");
+        }
+    }
+    let stamp = deprecated.then(|| ts.clone());
+    sqlx::query("UPDATE documents SET deprecated_at=?, superseded_by=?, updated_at=? WHERE id=?")
+        .bind(stamp.as_deref())
+        .bind(superseded_by)
+        .bind(&ts)
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    let event_type = if deprecated {
+        "document.deprecated"
+    } else {
+        "document.undeprecated"
+    };
+    emit(
+        &mut tx,
+        &mut hooks,
+        event_type,
+        actor,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        json!({ "deprecated": deprecated, "superseded_by": superseded_by }),
         Recipients::FromDocument(document_id),
     )
     .await?;
@@ -16849,6 +16922,77 @@ mod tests {
         // check_non_ascii (the bailing path) agrees on the first offender: same source of truth.
         assert!(check_non_ascii("ok \u{2014} no", false).is_err());
         assert!(check_non_ascii("all ascii here", false).is_ok());
+        Ok(())
+    }
+
+    // task 694a: a document can be marked deprecated + superseded-by another (orthogonal to
+    // archive -- it stays visible), the fields surface in get/list, self/unknown supersede is
+    // rejected, and clearing deprecation drops both the stamp and the link.
+    #[tokio::test]
+    async fn deprecate_and_supersede_document() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let old = create_document(
+            &pool,
+            "Old",
+            Some(pid),
+            "bafold",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let old_id = old["id"].as_i64().unwrap();
+        let new = create_document(
+            &pool,
+            "New",
+            Some(pid),
+            "bafnew",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let new_id = new["id"].as_i64().unwrap();
+
+        // Self-supersede and an unknown successor are rejected.
+        assert!(
+            set_document_deprecated(&pool, old_id, true, Some(old_id), Some("u"))
+                .await
+                .is_err()
+        );
+        assert!(
+            set_document_deprecated(&pool, old_id, true, Some(999_999), Some("u"))
+                .await
+                .is_err()
+        );
+
+        // Deprecate old, superseded by new.
+        let d = set_document_deprecated(&pool, old_id, true, Some(new_id), Some("u")).await?;
+        assert!(d["deprecated_at"].is_string(), "deprecated_at stamped: {d}");
+        assert_eq!(d["superseded_by"], json!(new_id));
+
+        // Still VISIBLE in the default listing (deprecate is orthogonal to archive), with the fields.
+        let listed = list_documents(&pool, Some(pid), None, None, None, None, false).await?;
+        let row = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_i64() == Some(old_id))
+            .expect("deprecated doc still listed by default");
+        assert!(row["deprecated_at"].is_string());
+        assert_eq!(row["superseded_by"], json!(new_id));
+
+        // Clearing deprecation drops both the stamp and the link.
+        let cleared = set_document_deprecated(&pool, old_id, false, None, Some("u")).await?;
+        assert!(cleared["deprecated_at"].is_null());
+        assert!(cleared["superseded_by"].is_null());
         Ok(())
     }
 
