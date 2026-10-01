@@ -154,6 +154,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
         .route("/tasks/{task_id}/comments", post(comment_task))
+        .route("/comments/{comment_id}", get(get_comment))
         .route("/tasks/{task_id}/props", patch(set_task_props))
         .route("/tasks/{task_id}/move", post(move_task))
         .route("/tasks/{task_id}/archive", post(archive_task))
@@ -377,6 +378,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
+    Endpoint { method: "GET", path: "/api/comments/{comment_id}", summary: "Read one comment by id, with its type (plain/question/answer), parsed payload, lifecycle state, and reply_to/supersedes links.", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/archive", summary: "Soft-archive a task: hide it from the default list_tasks view (still fetchable by id and with include_archived). Orthogonal to status; reversible with restore.", query: "", body: Some("ArchiveTaskBody") },
@@ -1160,6 +1162,10 @@ async fn comment_task(
         )
         .await?,
     ))
+}
+
+async fn get_comment(State(st): State<AppState>, Path(comment_id): Path<i64>) -> ApiResult {
+    Ok(Json(core::get_comment(&st.pool, comment_id).await?))
 }
 
 async fn set_task_props(

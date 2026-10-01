@@ -2385,6 +2385,7 @@ pub async fn get_task_limited(
             Some(n) if n > 0 => {
                 let rows = sqlx::query(
                     "SELECT c.id, c.author, c.body, c.created_at, c.external_author, c.origin_ref, \
+                     c.type, c.payload, c.state, c.reply_to, c.supersedes, c.superseded_by, \
                      ei.display_name AS external_author_name \
                      FROM comments c LEFT JOIN external_identities ei ON ei.id = c.external_author \
                      WHERE c.task_id=? ORDER BY c.id DESC LIMIT ?",
@@ -2393,12 +2394,13 @@ pub async fn get_task_limited(
                 .bind(n)
                 .fetch_all(pool)
                 .await?;
-                rows.iter().rev().map(row_to_json).collect()
+                rows.iter().rev().map(comment_row_json).collect()
             }
             // None (or a non-positive n other than 0): the whole thread, chronological.
             _ => {
                 let rows = sqlx::query(
                     "SELECT c.id, c.author, c.body, c.created_at, c.external_author, c.origin_ref, \
+                     c.type, c.payload, c.state, c.reply_to, c.supersedes, c.superseded_by, \
                      ei.display_name AS external_author_name \
                      FROM comments c LEFT JOIN external_identities ei ON ei.id = c.external_author \
                      WHERE c.task_id=? ORDER BY c.id",
@@ -2406,7 +2408,7 @@ pub async fn get_task_limited(
                 .bind(task_id)
                 .fetch_all(pool)
                 .await?;
-                rows.iter().map(row_to_json).collect()
+                rows.iter().map(comment_row_json).collect()
             }
         };
         let inlined = comments.len() as i64;
@@ -2817,6 +2819,43 @@ pub async fn comment_task(
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(json!({ "comment_id": cid, "task_id": task_id, "created": true }))
+}
+
+/// Serialize a comment row to JSON with the rich-comment-type fields normalized (doc_33 / task_628):
+/// the `payload` TEXT column is parsed from a JSON string into an object (mirroring how get_task /
+/// get_project surface their metadata), the typed fields (type/state/reply_to/supersedes/
+/// superseded_by) pass through, and a canonical `comment_<id>` ref is attached. A row selected
+/// without the `payload` column (a narrow/legacy select) is returned unchanged.
+pub fn comment_row_json(row: &SqliteRow) -> Value {
+    let mut v = row_to_json(row);
+    if let Value::Object(ref mut m) = v {
+        if let Some(payload_str) = m.get("payload").and_then(|p| p.as_str()) {
+            let parsed = serde_json::from_str::<Value>(payload_str).unwrap_or_else(|_| json!({}));
+            m.insert("payload".into(), parsed);
+        }
+        insert_ref(m, "comment");
+    }
+    v
+}
+
+/// Read one comment by id as JSON (with its parsed `payload` and typed fields), for a machine read
+/// of a question/answer comment outside its task thread (task_628). The external author's display
+/// name is joined as in the task-comment list. Errors if the comment does not exist.
+pub async fn get_comment(pool: &Pool, comment_id: i64) -> anyhow::Result<Value> {
+    let Some(row) = sqlx::query(
+        "SELECT c.id, c.task_id, c.author, c.body, c.created_at, c.external_author, c.origin_ref, \
+         c.type, c.payload, c.state, c.reply_to, c.supersedes, c.superseded_by, \
+         ei.display_name AS external_author_name \
+         FROM comments c LEFT JOIN external_identities ei ON ei.id = c.external_author \
+         WHERE c.id=?",
+    )
+    .bind(comment_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        anyhow::bail!("no comment {comment_id}");
+    };
+    Ok(comment_row_json(&row))
 }
 
 /// Merge arbitrary key/value properties into a task's metadata (JSON). Returns the
@@ -7725,6 +7764,68 @@ mod tests {
         let wrapped = get_task(&pool, tid).await?;
         assert_eq!(wrapped["comments"].as_array().unwrap().len(), 5);
         assert_eq!(wrapped["comments_truncated"], json!(false));
+        Ok(())
+    }
+
+    /// Slice 1 (task_628): the additive comment-type columns default a plain comment to type=plain
+    /// with an empty parsed payload, get_comment reads one comment with a canonical comment_<id>
+    /// ref, and a comment carrying a question-shaped type/payload/state surfaces parsed in both
+    /// get_comment and the task's comment list.
+    #[tokio::test]
+    async fn comment_type_columns_and_get_comment() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        let c = comment_task(&pool, tid, "plain one", Some("a"), None, None).await?;
+        let cid = c["comment_id"].as_i64().unwrap();
+
+        // A plain comment: type defaults to plain, payload parses to an empty object, ref present.
+        let got = get_comment(&pool, cid).await?;
+        assert_eq!(got["type"], json!("plain"));
+        assert_eq!(got["payload"], json!({}));
+        assert_eq!(got["body"], json!("plain one"));
+        assert_eq!(got["ref"], json!(format!("comment_{cid}")));
+        assert!(got["state"].is_null());
+
+        // Simulate a question-typed comment (the ops slice will write these): the payload JSON is
+        // surfaced parsed, and the lifecycle state passes through.
+        sqlx::query(
+            "UPDATE comments SET type='question', state='open', \
+             payload='{\"kind\":\"yes_no\",\"routed_to\":\"operator\",\"blocking\":true}' WHERE id=?",
+        )
+        .bind(cid)
+        .execute(&pool)
+        .await?;
+        let q = get_comment(&pool, cid).await?;
+        assert_eq!(q["type"], json!("question"));
+        assert_eq!(q["state"], json!("open"));
+        assert_eq!(q["payload"]["kind"], json!("yes_no"));
+        assert_eq!(q["payload"]["blocking"], json!(true));
+
+        // The task's comment list surfaces the same typed/parsed fields.
+        let task = get_task(&pool, tid).await?;
+        let listed = &task["comments"].as_array().unwrap()[0];
+        assert_eq!(listed["type"], json!("question"));
+        assert_eq!(listed["payload"]["routed_to"], json!("operator"));
+
+        // Unknown comment id errors.
+        assert!(get_comment(&pool, 99999).await.is_err());
         Ok(())
     }
 

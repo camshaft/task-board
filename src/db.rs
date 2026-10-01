@@ -708,6 +708,51 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
             .await?;
     }
 
+    // Back-fill the rich comment-type columns (doc_33 / task_628): a comment is 'plain' (default,
+    // unchanged behavior), 'question' (kind/options/routed-to/blocking/default/wait-period live in
+    // `payload`, with a lifecycle `state`), or 'answer' (replies via `reply_to` to a question, its
+    // typed answer in `payload`). `supersedes`/`superseded_by` link a question to the one that
+    // replaces it. All additive and defaulted/nullable, so existing comments and the plain-comment
+    // path are untouched.
+    let comments_cols = sqlx::query("PRAGMA table_info(comments)")
+        .fetch_all(&pool)
+        .await?;
+    let comments_has = |c: &str| {
+        comments_cols
+            .iter()
+            .any(|r| r.get::<String, _>("name") == c)
+    };
+    if !comments_has("type") {
+        sqlx::query("ALTER TABLE comments ADD COLUMN type TEXT NOT NULL DEFAULT 'plain'")
+            .execute(&pool)
+            .await?;
+    }
+    if !comments_has("payload") {
+        sqlx::query("ALTER TABLE comments ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'")
+            .execute(&pool)
+            .await?;
+    }
+    if !comments_has("state") {
+        sqlx::query("ALTER TABLE comments ADD COLUMN state TEXT")
+            .execute(&pool)
+            .await?;
+    }
+    if !comments_has("reply_to") {
+        sqlx::query("ALTER TABLE comments ADD COLUMN reply_to INTEGER")
+            .execute(&pool)
+            .await?;
+    }
+    if !comments_has("supersedes") {
+        sqlx::query("ALTER TABLE comments ADD COLUMN supersedes INTEGER")
+            .execute(&pool)
+            .await?;
+    }
+    if !comments_has("superseded_by") {
+        sqlx::query("ALTER TABLE comments ADD COLUMN superseded_by INTEGER")
+            .execute(&pool)
+            .await?;
+    }
+
     // Back-fill document_comments.external_author (bridged/ingested attribution, mirroring the
     // task-comment + channel-post columns) — an ingested human's review comment renders as them.
     let doc_comments_have_ext_author = sqlx::query("PRAGMA table_info(document_comments)")
