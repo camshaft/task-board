@@ -876,7 +876,7 @@ struct ListTasksQuery {
     top_level: Option<bool>,
     /// Free-text search over title + description (across all projects when project_id omitted).
     q: Option<String>,
-    /// What blocked tasks are waiting on: filter by blocked_on kind (task|agent|operator|external).
+    /// What blocked tasks are waiting on: filter by blocked_on kind (task|agent|team|operator|external).
     blocked_on_kind: Option<String>,
     /// Filter by blocked_on ref (a blocking task id or agent id) — e.g. "what is blocked on me".
     blocked_on_ref: Option<String>,
@@ -962,9 +962,9 @@ async fn get_task(
     found(core::get_task_limited(&st.pool, task_id, q.comments_limit).await?)
 }
 
-/// What a blocked task is waiting on. `kind` is task | agent | operator | external (or "none"/"" to clear).
-/// `target` is the blocking task id or agent id (ignored for operator). A blocked task must
-/// carry one.
+/// What a blocked task is waiting on. `kind` is task | agent | team | operator | external (or "none"/""
+/// to clear). `target` is the blocking task id, agent id, or team id (ignored for operator/external).
+/// A blocked task must carry one. When kind=team, every person the team resolves to is notified.
 #[derive(Deserialize, JsonSchema)]
 struct BlockedOnBody {
     kind: String,

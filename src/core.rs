@@ -1240,6 +1240,19 @@ pub async fn get_team(pool: &Pool, team_id: &str) -> anyhow::Result<Value> {
 /// Expand a team to the set of PERSON ids it contains, following nested teams. Cycle-guarded by a
 /// visited-set so a cyclic membership graph still terminates (doc_26 appendix A1).
 async fn resolve_team_people(pool: &Pool, team_id: &str) -> anyhow::Result<BTreeSet<String>> {
+    let mut tx = pool.begin().await?;
+    let out = resolve_team_people_tx(&mut tx, team_id).await;
+    tx.commit().await?;
+    out
+}
+
+/// `resolve_team_people` against an open transaction, so a write path that already holds the
+/// (single) connection can expand a team WITHOUT grabbing a second pool connection -- grabbing one
+/// while the write tx is open deadlocks the pool.
+async fn resolve_team_people_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    team_id: &str,
+) -> anyhow::Result<BTreeSet<String>> {
     let mut people: BTreeSet<String> = BTreeSet::new();
     let mut visited: BTreeSet<String> = BTreeSet::new();
     let mut stack = vec![team_id.to_string()];
@@ -1249,7 +1262,7 @@ async fn resolve_team_people(pool: &Pool, team_id: &str) -> anyhow::Result<BTree
         }
         for r in sqlx::query("SELECT member_id, member_kind FROM team_members WHERE team_id=?")
             .bind(&tid)
-            .fetch_all(pool)
+            .fetch_all(&mut **tx)
             .await?
         {
             let mid: String = r.try_get("member_id")?;
@@ -1767,6 +1780,17 @@ pub async fn update_task(
                     anyhow::bail!("no agent {a}");
                 }
             }
+            // A team (multi-operator model, task 542): the task is blocked waiting on a GROUP, and
+            // every person the team resolves to is notified. "operator" is just the seeded team, so
+            // this generalizes the operator-queue concept to any addressable team.
+            "team" => {
+                let Some(t) = target.as_deref() else {
+                    anyhow::bail!("give a `blocked_on.target` team id when kind=team");
+                };
+                if sqlx::query("SELECT 1 FROM teams WHERE id=?").bind(t).fetch_optional(&mut *tx).await?.is_none() {
+                    anyhow::bail!("no team {t}");
+                }
+            }
             "operator" => {}
             // External/infra dependency with no board owner (task_112): the free-text blocked_on.note
             // says what it waits on; no target. A DISTINCT kind from operator, so it stays OFF the
@@ -1774,7 +1798,7 @@ pub async fn update_task(
             // truthfully blocked without wrongly pinging the operator dashboard.
             "external" => {}
             other => anyhow::bail!(
-                "give a valid `blocked_on.kind` (task, agent, operator, or external), not '{other}'"
+                "give a valid `blocked_on.kind` (task, agent, team, operator, or external), not '{other}'"
             ),
         }
     }
@@ -1786,11 +1810,13 @@ pub async fn update_task(
     };
     if new_status == "blocked" && !will_have_blocked_on {
         anyhow::bail!(
-            "give a `blocked_on` (kind: task, agent, operator, or external) — a blocked task must record what it is waiting on"
+            "give a `blocked_on` (kind: task, agent, team, operator, or external) -- a blocked task must record what it is waiting on"
         );
     }
     let mut blocked_changed = false;
-    let mut notify_agent: Option<(String, Option<String>)> = None; // (agent id, note) to notify
+    // Recipients to ping with task.blocked_on_you when the task newly blocks on them: a single agent
+    // (kind=agent), or every person a team resolves to (kind=team).
+    let mut notify_blocked: Option<(BTreeSet<String>, Option<String>)> = None;
     if new_status != "blocked" {
         // Not blocked -> carry no blocked_on. Clear if there was one (or a set was attempted).
         if old_blocked_kind.is_some() || matches!(change, BlockedChange::Set { .. }) {
@@ -1816,20 +1842,25 @@ pub async fn update_task(
         .execute(&mut *tx)
         .await?;
         blocked_changed = true;
-        // Notify a newly-blocking agent (skip if it's already blocked on the same agent).
-        if kind == "agent" {
-            if let Some(agent) = &stored_ref {
-                let already = old_blocked_kind.as_deref() == Some("agent")
-                    && old_blocked_ref.as_deref() == Some(agent.as_str());
-                if !already {
-                    notify_agent = Some((agent.clone(), note.clone()));
+        // Notify the newly-blocking party (skip if the block already pointed at the same target).
+        if let Some(target) = &stored_ref {
+            let already = old_blocked_kind.as_deref() == Some(kind.as_str())
+                && old_blocked_ref.as_deref() == Some(target.as_str());
+            if !already {
+                if kind == "agent" {
+                    notify_blocked = Some((BTreeSet::from([target.clone()]), note.clone()));
+                } else if kind == "team" {
+                    // Fan out to every person the team resolves to (nested teams expanded). Resolve
+                    // on the open tx -- a second pool connection here would deadlock the pool.
+                    let people = resolve_team_people_tx(&mut tx, target).await?;
+                    if !people.is_empty() {
+                        notify_blocked = Some((people, note.clone()));
+                    }
                 }
             }
         }
     }
-    if let Some((agent, note)) = notify_agent {
-        let mut set = BTreeSet::new();
-        set.insert(agent);
+    if let Some((set, note)) = notify_blocked {
         emit(
             &mut tx,
             &mut hooks,
@@ -9881,6 +9912,30 @@ mod tests {
         assert!(bo["target"].is_null());
         let on_op = list_tasks(&pool, None, None, None, false, None, false, None, Some("operator"), None, None, None, false).await?;
         assert!(on_op.as_array().unwrap().iter().any(|t| t["id"] == json!(tid)));
+
+        // Block on a TEAM -> every person the team resolves to is notified (task 542 Phase 2).
+        create_person(&pool, "pat", Some("Pat"), Some("u"), None).await?;
+        create_person(&pool, "sam", Some("Sam"), Some("u"), None).await?;
+        create_team(&pool, "reviewers", Some("Reviewers"), Some("u"), None).await?;
+        add_team_member(&pool, "reviewers", "pat", "person", Some("u")).await?;
+        add_team_member(&pool, "reviewers", "sam", "person", Some("u")).await?;
+        update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
+            Some(json!({"kind": "team", "target": "reviewers", "note": "need a review"}))).await?;
+        let bo = get_task(&pool, tid).await?["blocked_on"].clone();
+        assert_eq!(bo["kind"], json!("team"));
+        assert_eq!(bo["target"], json!("reviewers"));
+        for who in ["pat", "sam"] {
+            let notes = check_notifications(&pool, who, true, 50, None).await?;
+            assert!(
+                notes["notifications"].as_array().unwrap().iter().any(
+                    |n| n["type"] == json!("task.blocked_on_you") && n["task_id"] == json!(tid)
+                ),
+                "team member {who} is notified of the block: {notes}"
+            );
+        }
+        // A nonexistent team target is rejected.
+        assert!(update_task(&pool, tid, Some("blocked"), None, None, None, None, Some("alice"), None, None,
+            Some(json!({"kind": "team", "target": "ghosts"}))).await.is_err(), "unknown team rejected");
 
         // Leaving blocked clears blocked_on.
         update_task(&pool, tid, Some("in_progress"), None, None, None, None, Some("alice"), None, None, None).await?;

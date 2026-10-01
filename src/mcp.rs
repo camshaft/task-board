@@ -306,9 +306,10 @@ pub struct UpdateTaskArgs {
     pub verbose: Option<bool>,
 }
 
-/// What a blocked task is waiting on: kind is task | agent | operator | external (or "none" to clear),
-/// target is the blocking task id or agent id (ignored for operator). When kind=agent, that
-/// agent is notified they are blocking.
+/// What a blocked task is waiting on: kind is task | agent | team | operator | external (or "none" to
+/// clear), target is the blocking task id, agent id, or team id (ignored for operator/external). When
+/// kind=agent that agent is notified they are blocking; when kind=team every person the team resolves
+/// to is notified.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockedOnArgs {
     pub kind: String,
