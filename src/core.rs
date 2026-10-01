@@ -7832,6 +7832,98 @@ pub async fn set_document_deprecated(
     Ok(out)
 }
 
+/// HARD-DELETE a document and all its dependent rows (task 694b). IRREVERSIBLE -- unlike
+/// archive_document (reversible soft-hide), this removes the row for good. Guard: the document must
+/// be ARCHIVED first, so a hard-delete is always a deliberate two-step (archive, then delete) and
+/// never fires on a live doc by accident. Deletes in FK-safe order (foreign_keys is ON): first drop
+/// references INTO this doc (its own current/approved version pointers, other docs' superseded_by,
+/// other docs' link/embed version pins, this doc's comment self-threading), then its comments,
+/// links, embeds, attachments, versions, and finally the row. Also prunes the non-FK orphans
+/// (external_links + subscriptions targeting it). The append-only `events` log keeps its
+/// document_id (history is preserved). Emits document.deleted (while subscribers still resolve).
+pub async fn delete_document(
+    pool: &Pool,
+    document_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT project_id, archived_at FROM documents WHERE id=?")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no document {document_id}");
+    };
+    let project_id: Option<i64> = row.try_get("project_id")?;
+    let archived_at: Option<String> = row.try_get("archived_at")?;
+    if archived_at.is_none() {
+        anyhow::bail!(
+            "cannot hard-delete a live document -- archive it first (archive_document), then delete. Hard-delete is irreversible."
+        );
+    }
+
+    // Notify subscribers BEFORE the rows (incl. subscriptions) go away.
+    emit(
+        &mut tx,
+        &mut hooks,
+        "document.deleted",
+        actor,
+        None,
+        project_id,
+        None,
+        Some(document_id),
+        json!({ "deleted": true }),
+        Recipients::FromDocument(document_id),
+    )
+    .await?;
+
+    // Drop references INTO this document / its versions so the deletes below don't trip FK checks.
+    sqlx::query(
+        "UPDATE documents SET current_version_id=NULL, approved_version_id=NULL WHERE id=?",
+    )
+    .bind(document_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE documents SET superseded_by=NULL WHERE superseded_by=?")
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    for tbl in ["document_links", "document_embeds"] {
+        sqlx::query(&format!(
+            "UPDATE {tbl} SET target_version_id=NULL WHERE target_version_id IN \
+             (SELECT id FROM document_versions WHERE document_id=?)"
+        ))
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE document_comments SET reply_to=NULL WHERE document_id=?")
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // Delete dependents, then orphans (no FK), then the row itself.
+    for stmt in [
+        "DELETE FROM document_comments WHERE document_id=?",
+        "DELETE FROM document_links WHERE source_document_id=?",
+        "DELETE FROM document_embeds WHERE source_document_id=?",
+        "DELETE FROM document_attachments WHERE document_id=?",
+        "DELETE FROM document_versions WHERE document_id=?",
+        "DELETE FROM external_links WHERE board_kind='document' AND board_id=?",
+        "DELETE FROM subscriptions WHERE target_type='document' AND target_id=?",
+        "DELETE FROM documents WHERE id=?",
+    ] {
+        sqlx::query(stmt)
+            .bind(document_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "deleted": true, "id": document_id }))
+}
+
 /// Attach a document to a task (many-to-many, idempotent). Emits document.attached to both the
 /// document's and the task's subscribers, so either side learns of the link.
 pub async fn attach_document(
@@ -17175,6 +17267,94 @@ mod tests {
         let cleared = set_document_deprecated(&pool, old_id, false, None, Some("u")).await?;
         assert!(cleared["deprecated_at"].is_null());
         assert!(cleared["superseded_by"].is_null());
+        Ok(())
+    }
+
+    // task 694b: delete_document hard-deletes AFTER archive (the guard), prunes dependents
+    // (versions/comments/attachments), and clears references INTO the doc (another doc's
+    // superseded_by pointer) so the FK-enforced delete does not trip.
+    #[tokio::test]
+    async fn delete_document_hard_deletes_after_archive_and_cleans_refs() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let a = create_document(
+            &pool,
+            "Doomed",
+            Some(pid),
+            "cidX",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let aid = a["id"].as_i64().unwrap();
+        // Another doc points at A as its successor; deleting A must NULL that pointer, not FK-fail.
+        let b = create_document(
+            &pool,
+            "Pointer holder",
+            Some(pid),
+            "cidY",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let bid = b["id"].as_i64().unwrap();
+        set_document_deprecated(&pool, bid, true, Some(aid), Some("u")).await?;
+        // Dependents on A: a task attachment + a comment (A already has version 1 from create).
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        attach_document(&pool, aid, tid, Some("u")).await?;
+        comment_document(&pool, aid, None, Some("u"), "a note", None, None, None).await?;
+
+        // Guard: a LIVE document cannot be hard-deleted.
+        assert!(
+            delete_document(&pool, aid, Some("u")).await.is_err(),
+            "live doc delete must be refused"
+        );
+
+        // Archive, then delete succeeds.
+        set_document_archived(&pool, aid, true, Some("u")).await?;
+        assert_eq!(
+            delete_document(&pool, aid, Some("u")).await?["deleted"],
+            json!(true)
+        );
+
+        // Gone: get errors, versions pruned, and B's dangling superseded_by was cleared.
+        assert!(
+            get_document(&pool, aid).await.is_err(),
+            "deleted doc should 404"
+        );
+        let vcount: i64 =
+            sqlx::query("SELECT COUNT(*) AS c FROM document_versions WHERE document_id=?")
+                .bind(aid)
+                .fetch_one(&pool)
+                .await?
+                .try_get("c")?;
+        assert_eq!(vcount, 0, "versions pruned");
+        let b_after = get_document(&pool, bid).await?;
+        assert!(
+            b_after["superseded_by"].is_null(),
+            "B.superseded_by cleared: {b_after}"
+        );
         Ok(())
     }
 

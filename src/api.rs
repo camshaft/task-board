@@ -249,7 +249,9 @@ pub fn router(state: AppState) -> Router {
         .route("/documents", get(list_documents).post(create_document))
         .route(
             "/documents/{document_id}",
-            get(get_document).patch(update_document),
+            get(get_document)
+                .patch(update_document)
+                .delete(delete_document),
         )
         .route(
             "/documents/{document_id}/content",
@@ -461,6 +463,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list. Pass ?include_body=true to also inline the current version's markdown (resolved server-side from its CID; body:null + body_error on fetch failure).", query: "include_body=bool", body: None },
     Endpoint { method: "PATCH", path: "/api/documents/{document_id}", summary: "Rename a document (set its title; metadata-only — versions/content/path/status untouched). Emits document.updated.", query: "", body: Some("UpdateDocumentBody") },
+    Endpoint { method: "DELETE", path: "/api/documents/{document_id}", summary: "HARD-DELETE a document + all dependents (versions/comments/attachments/links/embeds). IRREVERSIBLE; requires the doc be archived first. Use only for true garbage; prefer archive otherwise. Emits document.deleted.", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version. Requires ipfs_api_url.", query: "version_no=int", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
@@ -2836,6 +2839,16 @@ struct DeprecateDocumentBody {
     #[serde(default)]
     superseded_by: Option<i64>,
     actor: Option<String>,
+}
+
+async fn delete_document(
+    State(st): State<AppState>,
+    Path(DocRef(document_id)): Path<DocRef>,
+    Json(b): Json<DocumentActorBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::delete_document(&st.pool, document_id, b.actor.as_deref()).await?,
+    ))
 }
 
 async fn deprecate_document(

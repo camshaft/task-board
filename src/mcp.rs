@@ -3034,6 +3034,19 @@ impl Board {
     }
 
     #[tool(
+        description = "HARD-DELETE a document and all its dependent rows (versions, comments, attachments, links, embeds). IRREVERSIBLE -- unlike archive_document, this cannot be undone. Guarded: the document must be ARCHIVED first (archive_document), so deletion is always a deliberate two-step. Use only for true garbage (throwaway test docs); prefer archive for anything you might want back. Notifies subscribers (document.deleted)."
+    )]
+    async fn delete_document(
+        &self,
+        Parameters(a): Parameters<DocumentActorArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::delete_document(&self.pool, a.document_id, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
         description = "Attach a document to a task (many-to-many). Notifies both the document's and the task's subscribers, so a task watcher learns a design doc landed. Idempotent."
     )]
     async fn attach_document(
