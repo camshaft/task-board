@@ -128,7 +128,11 @@ pub async fn stream(
 
     let body = tokio_stream::iter(replay).chain(live);
     Sse::new(body)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive"))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
         .into_response()
 }
 
@@ -211,7 +215,19 @@ mod tests {
         // A task created after the tailer starts should arrive on the bus.
         let p = core::create_project(&pool, "live", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = core::create_task(&pool, pid, "T", None, None, None, Some("u"), None, None, None).await?;
+        let t = core::create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
 
         // Poll the bus (tailer wakes every TAIL_INTERVAL) until we see the task event.
@@ -238,7 +254,8 @@ mod tests {
         assert_eq!(task_ev.project_id, Some(pid));
         // The pre-tailer "old" project event was seeded past, so it never shows up.
         assert!(
-            got.iter().all(|e| e.r#type != "project.created" || e.project_id == Some(pid)),
+            got.iter()
+                .all(|e| e.r#type != "project.created" || e.project_id == Some(pid)),
             "should not replay events from before the tailer started"
         );
         Ok(())
@@ -252,7 +269,19 @@ mod tests {
         let p = core::create_project(&pool, "p", None, Some("u"), None).await?;
         let pid = p["id"].as_i64().unwrap();
         for i in 0..3 {
-            core::create_task(&pool, pid, &format!("t{i}"), None, None, None, Some("u"), None, None, None).await?;
+            core::create_task(
+                &pool,
+                pid,
+                &format!("t{i}"),
+                None,
+                None,
+                None,
+                Some("u"),
+                None,
+                None,
+                None,
+            )
+            .await?;
         }
 
         let all = fetch_since(&pool, 0, BATCH).await?;
@@ -273,19 +302,42 @@ mod tests {
     async fn review_events_carry_review_id() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
-        let r = core::create_review(&pool, "design", None, None, Some("d"), None, Some("author"), None, None, None).await?;
+        let r = core::create_review(
+            &pool,
+            "design",
+            None,
+            None,
+            Some("d"),
+            None,
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let rid = r["id"].as_i64().unwrap();
         core::set_review_status(&pool, rid, "in_review", Some("author"), None).await?;
 
         let evs = fetch_since(&pool, 0, BATCH).await?;
-        let review_evs: Vec<&StreamEvent> = evs.iter().filter(|e| e.r#type.starts_with("review.")).collect();
+        let review_evs: Vec<&StreamEvent> = evs
+            .iter()
+            .filter(|e| e.r#type.starts_with("review."))
+            .collect();
         assert!(!review_evs.is_empty(), "should have review.* events");
         for e in &review_evs {
-            assert_eq!(e.review_id, Some(rid), "review event carries review_id: {}", e.r#type);
+            assert_eq!(
+                e.review_id,
+                Some(rid),
+                "review event carries review_id: {}",
+                e.r#type
+            );
             assert!(e.task_id.is_none() && e.project_id.is_none());
         }
         // A non-review event has no review_id.
-        assert!(evs.iter().filter(|e| !e.r#type.starts_with("review.")).all(|e| e.review_id.is_none()));
+        assert!(evs
+            .iter()
+            .filter(|e| !e.r#type.starts_with("review."))
+            .all(|e| e.review_id.is_none()));
         Ok(())
     }
 }

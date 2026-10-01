@@ -140,11 +140,17 @@ pub fn router(state: AppState) -> Router {
         .route("/agents", get(list_agents).post(register_agent))
         .route("/agents/{agent_id}", get(get_agent).patch(update_agent))
         .route("/agents/{agent_id}/status", post(set_status))
-        .route("/agents/{agent_id}/request-stand-down", post(request_stand_down))
+        .route(
+            "/agents/{agent_id}/request-stand-down",
+            post(request_stand_down),
+        )
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/projects", get(list_projects).post(create_project))
-        .route("/projects/{project_id}", get(get_project).patch(update_project))
+        .route(
+            "/projects/{project_id}",
+            get(get_project).patch(update_project),
+        )
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
         .route("/tasks/{task_id}/comments", post(comment_task))
@@ -157,31 +163,70 @@ pub fn router(state: AppState) -> Router {
         .route("/subscriptions", post(subscribe).delete(unsubscribe))
         .route("/channels", get(list_channels).post(create_channel))
         .route("/channels/{channel_id}", get(get_channel))
-        .route("/channels/{channel_id}/posts", get(get_channel_posts).post(post_to_channel))
+        .route(
+            "/channels/{channel_id}/posts",
+            get(get_channel_posts).post(post_to_channel),
+        )
         .route("/channels/{channel_id}/props", patch(set_channel_props))
-        .route("/channels/{channel_id}/auto-join", post(set_channel_auto_join))
-        .route("/channels/{channel_id}/promote-thread", post(promote_thread))
+        .route(
+            "/channels/{channel_id}/auto-join",
+            post(set_channel_auto_join),
+        )
+        .route(
+            "/channels/{channel_id}/promote-thread",
+            post(promote_thread),
+        )
         .route("/channels/{channel_id}/invites", post(invite_to_channel))
         .route("/messages", post(send_message))
         .route("/dms", post(open_dm))
         .route("/events", get(get_events))
-        .route("/external-identities", get(list_external_identities).post(upsert_external_identity))
-        .route("/external-links", get(list_external_links).post(upsert_external_link))
-        .route("/workspace-kinds", get(list_workspace_kinds).post(set_workspace_kind))
-        .route("/workspace-kinds/{name}", get(get_workspace_kind).delete(delete_workspace_kind))
+        .route(
+            "/external-identities",
+            get(list_external_identities).post(upsert_external_identity),
+        )
+        .route(
+            "/external-links",
+            get(list_external_links).post(upsert_external_link),
+        )
+        .route(
+            "/workspace-kinds",
+            get(list_workspace_kinds).post(set_workspace_kind),
+        )
+        .route(
+            "/workspace-kinds/{name}",
+            get(get_workspace_kind).delete(delete_workspace_kind),
+        )
         .route("/lint", post(lint_text))
-        .route("/banned-phrases", get(list_banned_phrases).post(add_banned_phrase))
-        .route("/banned-phrases/{phrase}", axum::routing::delete(remove_banned_phrase))
-        .route("/identity-aliases", get(list_identity_aliases).post(set_identity_alias))
+        .route(
+            "/banned-phrases",
+            get(list_banned_phrases).post(add_banned_phrase),
+        )
+        .route(
+            "/banned-phrases/{phrase}",
+            axum::routing::delete(remove_banned_phrase),
+        )
+        .route(
+            "/identity-aliases",
+            get(list_identity_aliases).post(set_identity_alias),
+        )
         .route("/people", get(list_people).post(create_person))
         .route("/people/{id}", delete(delete_person))
         .route("/teams", get(list_teams).post(create_team))
         .route("/teams/{team_id}", get(get_team).delete(delete_team))
-        .route("/teams/{team_id}/members", post(add_team_member).delete(remove_team_member))
-        .route("/secret-requests", get(list_secret_requests).post(create_secret_request))
+        .route(
+            "/teams/{team_id}/members",
+            post(add_team_member).delete(remove_team_member),
+        )
+        .route(
+            "/secret-requests",
+            get(list_secret_requests).post(create_secret_request),
+        )
         .route("/secret-requests/{id}", get(get_secret_request))
         .route("/secret-requests/{id}/submit", post(submit_secret))
-        .route("/secret-requests/{id}/ciphertext", get(get_secret_ciphertext))
+        .route(
+            "/secret-requests/{id}/ciphertext",
+            get(get_secret_ciphertext),
+        )
         .route("/secret-requests/{id}/fulfill", post(fulfill_secret))
         .route("/secret-requests/{id}/cancel", post(cancel_secret_request))
         .route("/reviews", get(list_reviews).post(create_review))
@@ -194,14 +239,35 @@ pub fn router(state: AppState) -> Router {
         .route("/ipfs/{cid}", get(ipfs_cat))
         .route("/wiki", get(list_wiki))
         .route("/documents", get(list_documents).post(create_document))
-        .route("/documents/{document_id}", get(get_document).patch(update_document))
-        .route("/documents/{document_id}/content", get(read_document_content))
+        .route(
+            "/documents/{document_id}",
+            get(get_document).patch(update_document),
+        )
+        .route(
+            "/documents/{document_id}/content",
+            get(read_document_content),
+        )
         .route("/documents/{document_id}/path", post(set_document_path))
-        .route("/documents/{document_id}/versions", get(get_document_versions).post(publish_version))
-        .route("/documents/{document_id}/comments", get(get_document_comments).post(comment_document))
-        .route("/documents/{document_id}/comments/{comment_id}/resolve", post(resolve_comment))
-        .route("/documents/{document_id}/submit-review", post(submit_for_review))
-        .route("/documents/{document_id}/request-changes", post(request_changes))
+        .route(
+            "/documents/{document_id}/versions",
+            get(get_document_versions).post(publish_version),
+        )
+        .route(
+            "/documents/{document_id}/comments",
+            get(get_document_comments).post(comment_document),
+        )
+        .route(
+            "/documents/{document_id}/comments/{comment_id}/resolve",
+            post(resolve_comment),
+        )
+        .route(
+            "/documents/{document_id}/submit-review",
+            post(submit_for_review),
+        )
+        .route(
+            "/documents/{document_id}/request-changes",
+            post(request_changes),
+        )
         .route("/documents/{document_id}/approve", post(approve_document))
         .route("/documents/{document_id}/attach", post(attach_document))
         .route("/documents/{document_id}/detach", post(detach_document))
@@ -224,12 +290,20 @@ async fn api_not_found() -> Response {
 /// the request never reaches here and the proxy returns 502 — so a caller should treat ANY
 /// non-200 (502 or 503) as "board not ready: back off and retry", and a 200 as "safe to proceed".
 async fn health(State(st): State<AppState>) -> Response {
-    match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&st.pool).await {
-        Ok(_) => (StatusCode::OK, Json(json!({ "ok": true, "db": true, "commit": BUILD_COMMIT })))
+    match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&st.pool)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "db": true, "commit": BUILD_COMMIT })),
+        )
             .into_response(),
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ok": false, "db": false, "commit": BUILD_COMMIT, "error": e.to_string() })),
+            Json(
+                json!({ "ok": false, "db": false, "commit": BUILD_COMMIT, "error": e.to_string() }),
+            ),
         )
             .into_response(),
     }
@@ -524,7 +598,10 @@ fn render_index_html(doc: &Value, prefix: &str) -> String {
             format!("<div class=\"q\">?{}</div>", html_escape(query))
         };
         let body_html = match e["body_schema"].as_str() {
-            Some(name) => format!("<a class=\"schema\" href=\"#schema-{n}\">{n}</a>", n = html_escape(name)),
+            Some(name) => format!(
+                "<a class=\"schema\" href=\"#schema-{n}\">{n}</a>",
+                n = html_escape(name)
+            ),
             None => "<span class=\"muted\">—</span>".into(),
         };
         rows.push_str(&format!(
@@ -656,10 +733,7 @@ struct RegisterAgentBody {
     webhook_url: Option<String>,
 }
 
-async fn register_agent(
-    State(st): State<AppState>,
-    Json(b): Json<RegisterAgentBody>,
-) -> ApiResult {
+async fn register_agent(State(st): State<AppState>, Json(b): Json<RegisterAgentBody>) -> ApiResult {
     Ok(Json(
         core::register_agent(
             &st.pool,
@@ -756,8 +830,13 @@ async fn request_stand_down(
     Json(b): Json<RequestStandDownBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::request_stand_down(&st.pool, &agent_id, b.requested_by.as_deref(), b.reason.as_deref())
-            .await?,
+        core::request_stand_down(
+            &st.pool,
+            &agent_id,
+            b.requested_by.as_deref(),
+            b.reason.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -800,7 +879,9 @@ async fn list_projects(
     State(st): State<AppState>,
     Query(q): Query<ListProjectsQuery>,
 ) -> ApiResult {
-    Ok(Json(core::list_projects(&st.pool, q.status.as_deref()).await?))
+    Ok(Json(
+        core::list_projects(&st.pool, q.status.as_deref()).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -811,10 +892,7 @@ struct CreateProjectBody {
     metadata: Option<Value>,
 }
 
-async fn create_project(
-    State(st): State<AppState>,
-    Json(b): Json<CreateProjectBody>,
-) -> ApiResult {
+async fn create_project(State(st): State<AppState>, Json(b): Json<CreateProjectBody>) -> ApiResult {
     Ok(Json(
         core::create_project(
             &st.pool,
@@ -827,7 +905,10 @@ async fn create_project(
     ))
 }
 
-async fn get_project(State(st): State<AppState>, Path(ProjectRef(project_id)): Path<ProjectRef>) -> ApiResult {
+async fn get_project(
+    State(st): State<AppState>,
+    Path(ProjectRef(project_id)): Path<ProjectRef>,
+) -> ApiResult {
     found(core::get_project(&st.pool, project_id).await?)
 }
 
@@ -1063,7 +1144,15 @@ async fn comment_task(
 ) -> ApiResult {
     core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
     Ok(Json(
-        core::comment_task(&st.pool, task_id, &b.body, b.author.as_deref(), b.external_author.as_deref(), b.external_link).await?,
+        core::comment_task(
+            &st.pool,
+            task_id,
+            &b.body,
+            b.author.as_deref(),
+            b.external_author.as_deref(),
+            b.external_link,
+        )
+        .await?,
     ))
 }
 
@@ -1147,16 +1236,39 @@ async fn subscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> 
     let out = match (b.thread_root, b.event_classes.as_deref()) {
         (Some(root), _) => core::subscribe_thread(&st.pool, &b.subscriber, root).await?,
         (None, Some(ec)) if !ec.is_empty() => {
-            core::subscribe_classed(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id, b.document_id, board, ec).await?
+            core::subscribe_classed(
+                &st.pool,
+                &b.subscriber,
+                b.task_id,
+                b.project_id,
+                b.channel_id,
+                b.document_id,
+                board,
+                ec,
+            )
+            .await?
         }
-        _ => core::subscribe(&st.pool, &b.subscriber, b.task_id, b.project_id, b.channel_id, b.document_id, board).await?,
+        _ => {
+            core::subscribe(
+                &st.pool,
+                &b.subscriber,
+                b.task_id,
+                b.project_id,
+                b.channel_id,
+                b.document_id,
+                board,
+            )
+            .await?
+        }
     };
     Ok(Json(out))
 }
 
 async fn unsubscribe(State(st): State<AppState>, Json(b): Json<SubscribeBody>) -> ApiResult {
     if let Some(root) = b.thread_root {
-        return Ok(Json(core::unsubscribe_thread(&st.pool, &b.subscriber, root).await?));
+        return Ok(Json(
+            core::unsubscribe_thread(&st.pool, &b.subscriber, root).await?,
+        ));
     }
     Ok(Json(
         core::unsubscribe(
@@ -1206,7 +1318,9 @@ async fn list_channels(
     State(st): State<AppState>,
     Query(q): Query<ListChannelsQuery>,
 ) -> ApiResult {
-    Ok(Json(core::list_channels(&st.pool, q.member.as_deref()).await?))
+    Ok(Json(
+        core::list_channels(&st.pool, q.member.as_deref()).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1230,7 +1344,10 @@ async fn create_channel(State(st): State<AppState>, Json(b): Json<CreateChannelB
     ))
 }
 
-async fn get_channel(State(st): State<AppState>, Path(ChannelRef(channel_id)): Path<ChannelRef>) -> ApiResult {
+async fn get_channel(
+    State(st): State<AppState>,
+    Path(ChannelRef(channel_id)): Path<ChannelRef>,
+) -> ApiResult {
     found(core::get_channel(&st.pool, channel_id).await?)
 }
 
@@ -1255,7 +1372,15 @@ async fn get_channel_posts(
 ) -> ApiResult {
     let desc = q.order.as_deref() == Some("desc");
     Ok(Json(
-        core::get_channel_posts(&st.pool, channel_id, q.since_seq, q.before_seq, q.limit, desc).await?,
+        core::get_channel_posts(
+            &st.pool,
+            channel_id,
+            q.since_seq,
+            q.before_seq,
+            q.limit,
+            desc,
+        )
+        .await?,
     ))
 }
 
@@ -1297,7 +1422,9 @@ async fn set_channel_props(
     Path(ChannelRef(channel_id)): Path<ChannelRef>,
     Json(props): Json<Value>,
 ) -> ApiResult {
-    Ok(Json(core::set_channel_props(&st.pool, channel_id, props).await?))
+    Ok(Json(
+        core::set_channel_props(&st.pool, channel_id, props).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1333,8 +1460,14 @@ async fn promote_thread(
     Json(b): Json<PromoteThreadBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::promote_thread(&st.pool, channel_id, b.root_post_seq, b.project_id, b.actor.as_deref())
-            .await?,
+        core::promote_thread(
+            &st.pool,
+            channel_id,
+            b.root_post_seq,
+            b.project_id,
+            b.actor.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -1378,7 +1511,9 @@ struct OpenDmBody {
 }
 
 async fn open_dm(State(st): State<AppState>, Json(b): Json<OpenDmBody>) -> ApiResult {
-    Ok(Json(core::get_or_create_dm(&st.pool, &b.agent_a, &b.agent_b).await?))
+    Ok(Json(
+        core::get_or_create_dm(&st.pool, &b.agent_a, &b.agent_b).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1396,7 +1531,9 @@ struct EventsQuery {
 
 async fn get_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) -> ApiResult {
     let desc = q.order.as_deref() == Some("desc");
-    Ok(Json(core::get_events(&st.pool, q.since_seq, q.limit, q.actor.as_deref(), desc).await?))
+    Ok(Json(
+        core::get_events(&st.pool, q.since_seq, q.limit, q.actor.as_deref(), desc).await?,
+    ))
 }
 
 // --- External identities (bridged actors) ---
@@ -1410,7 +1547,9 @@ async fn list_external_identities(
     State(st): State<AppState>,
     Query(q): Query<ListExternalIdentitiesQuery>,
 ) -> ApiResult {
-    Ok(Json(core::list_external_identities(&st.pool, q.source.as_deref()).await?))
+    Ok(Json(
+        core::list_external_identities(&st.pool, q.source.as_deref()).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1429,8 +1568,14 @@ async fn upsert_external_identity(
     Json(b): Json<UpsertExternalIdentityBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::upsert_external_identity(&st.pool, &b.id, &b.source, b.display_name.as_deref(), b.metadata)
-            .await?,
+        core::upsert_external_identity(
+            &st.pool,
+            &b.id,
+            &b.source,
+            b.display_name.as_deref(),
+            b.metadata,
+        )
+        .await?,
     ))
 }
 
@@ -1486,9 +1631,18 @@ struct AddBannedPhraseBody {
     created_by: Option<String>,
 }
 
-async fn add_banned_phrase(State(st): State<AppState>, Json(b): Json<AddBannedPhraseBody>) -> ApiResult {
+async fn add_banned_phrase(
+    State(st): State<AppState>,
+    Json(b): Json<AddBannedPhraseBody>,
+) -> ApiResult {
     Ok(Json(
-        core::add_banned_phrase(&st.pool, &b.phrase, b.note.as_deref(), b.created_by.as_deref()).await?,
+        core::add_banned_phrase(
+            &st.pool,
+            &b.phrase,
+            b.note.as_deref(),
+            b.created_by.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -1524,7 +1678,10 @@ async fn list_identity_aliases(State(st): State<AppState>) -> ApiResult {
     Ok(Json(core::list_identity_aliases(&st.pool).await?))
 }
 
-async fn set_identity_alias(State(st): State<AppState>, Json(b): Json<SetIdentityAliasBody>) -> ApiResult {
+async fn set_identity_alias(
+    State(st): State<AppState>,
+    Json(b): Json<SetIdentityAliasBody>,
+) -> ApiResult {
     Ok(Json(
         core::set_identity_alias(&st.pool, &b.alias, &b.canonical, b.created_by.as_deref()).await?,
     ))
@@ -1547,8 +1704,14 @@ async fn list_people(State(st): State<AppState>) -> ApiResult {
 
 async fn create_person(State(st): State<AppState>, Json(b): Json<CreatePersonBody>) -> ApiResult {
     Ok(Json(
-        core::create_person(&st.pool, &b.id, b.display_name.as_deref(), b.created_by.as_deref(), b.metadata)
-            .await?,
+        core::create_person(
+            &st.pool,
+            &b.id,
+            b.display_name.as_deref(),
+            b.created_by.as_deref(),
+            b.metadata,
+        )
+        .await?,
     ))
 }
 
@@ -1571,8 +1734,14 @@ async fn list_teams(State(st): State<AppState>) -> ApiResult {
 
 async fn create_team(State(st): State<AppState>, Json(b): Json<CreateTeamBody>) -> ApiResult {
     Ok(Json(
-        core::create_team(&st.pool, &b.id, b.display_name.as_deref(), b.created_by.as_deref(), b.metadata)
-            .await?,
+        core::create_team(
+            &st.pool,
+            &b.id,
+            b.display_name.as_deref(),
+            b.created_by.as_deref(),
+            b.metadata,
+        )
+        .await?,
     ))
 }
 
@@ -1599,8 +1768,14 @@ async fn add_team_member(
     Json(b): Json<TeamMemberBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::add_team_member(&st.pool, &team_id, &b.member_id, &b.member_kind, b.created_by.as_deref())
-            .await?,
+        core::add_team_member(
+            &st.pool,
+            &team_id,
+            &b.member_id,
+            &b.member_kind,
+            b.created_by.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -1677,7 +1852,9 @@ async fn submit_secret(
     Path(id): Path<i64>,
     Json(b): Json<SubmitSecretBody>,
 ) -> ApiResult {
-    Ok(Json(core::submit_secret(&st.pool, id, &b.token, &b.ciphertext).await?))
+    Ok(Json(
+        core::submit_secret(&st.pool, id, &b.token, &b.ciphertext).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1690,7 +1867,9 @@ async fn get_secret_ciphertext(
     Path(id): Path<i64>,
     Query(q): Query<FulfillerTokenQuery>,
 ) -> ApiResult {
-    Ok(Json(core::get_secret_ciphertext(&st.pool, id, &q.token).await?))
+    Ok(Json(
+        core::get_secret_ciphertext(&st.pool, id, &q.token).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1718,7 +1897,9 @@ async fn cancel_secret_request(
     Path(id): Path<i64>,
     Json(b): Json<CancelSecretBody>,
 ) -> ApiResult {
-    Ok(Json(core::cancel_secret_request(&st.pool, id, b.actor.as_deref()).await?))
+    Ok(Json(
+        core::cancel_secret_request(&st.pool, id, b.actor.as_deref()).await?,
+    ))
 }
 
 // --- Reviews (Document #5, increment 1: a typed review over an artifact, A2 lifecycle + log) ---
@@ -1772,13 +1953,15 @@ struct ListReviewsQuery {
     assignee: Option<String>,
 }
 
-async fn list_reviews(
-    State(st): State<AppState>,
-    Query(q): Query<ListReviewsQuery>,
-) -> ApiResult {
+async fn list_reviews(State(st): State<AppState>, Query(q): Query<ListReviewsQuery>) -> ApiResult {
     Ok(Json(
-        core::list_reviews(&st.pool, q.status.as_deref(), q.kind.as_deref(), q.assignee.as_deref())
-            .await?,
+        core::list_reviews(
+            &st.pool,
+            q.status.as_deref(),
+            q.kind.as_deref(),
+            q.assignee.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -1792,10 +1975,7 @@ struct ReviewTrendQuery {
     area: Option<String>,
 }
 
-async fn review_trend(
-    State(st): State<AppState>,
-    Query(q): Query<ReviewTrendQuery>,
-) -> ApiResult {
+async fn review_trend(State(st): State<AppState>, Query(q): Query<ReviewTrendQuery>) -> ApiResult {
     Ok(Json(
         core::review_improvement_trend(&st.pool, q.kind.as_deref(), q.area.as_deref()).await?,
     ))
@@ -1818,8 +1998,14 @@ async fn set_review_status(
     Json(b): Json<SetReviewStatusBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::set_review_status(&st.pool, review_id, &b.status, b.actor.as_deref(), b.note.as_deref())
-            .await?,
+        core::set_review_status(
+            &st.pool,
+            review_id,
+            &b.status,
+            b.actor.as_deref(),
+            b.note.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -1839,8 +2025,14 @@ async fn set_review_vetted(
     Json(b): Json<SetReviewVettedBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::set_review_vetted(&st.pool, review_id, b.vetted, b.actor.as_deref(), b.note.as_deref())
-            .await?,
+        core::set_review_vetted(
+            &st.pool,
+            review_id,
+            b.vetted,
+            b.actor.as_deref(),
+            b.note.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -1891,8 +2083,13 @@ async fn list_external_links(
     Query(q): Query<ListExternalLinksQuery>,
 ) -> ApiResult {
     Ok(Json(
-        core::list_external_links(&st.pool, q.source.as_deref(), q.board_kind.as_deref(), q.board_id)
-            .await?,
+        core::list_external_links(
+            &st.pool,
+            q.source.as_deref(),
+            q.board_kind.as_deref(),
+            q.board_id,
+        )
+        .await?,
     ))
 }
 
@@ -1984,7 +2181,9 @@ async fn ipfs_cat(
         )));
     };
     if !ipfs::is_probable_cid(&cid) {
-        return Err(ApiError(anyhow::anyhow!("give a valid `cid` (a bare content id)")));
+        return Err(ApiError(anyhow::anyhow!(
+            "give a valid `cid` (a bare content id)"
+        )));
     }
     let bytes = ipfs::cat(url, &cid, IPFS_READ_CAP_BYTES).await?;
     let ct = q
@@ -1993,7 +2192,8 @@ async fn ipfs_cat(
         .and_then(|s| axum::http::HeaderValue::from_str(s).ok())
         .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/octet-stream"));
     let mut resp = Response::new(axum::body::Body::from(bytes));
-    resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, ct);
+    resp.headers_mut()
+        .insert(axum::http::header::CONTENT_TYPE, ct);
     resp.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -2068,14 +2268,21 @@ struct CreateDocumentBody {
     acknowledge_banned: Option<bool>,
 }
 
-async fn create_document(State(st): State<AppState>, Json(b): Json<CreateDocumentBody>) -> ApiResult {
+async fn create_document(
+    State(st): State<AppState>,
+    Json(b): Json<CreateDocumentBody>,
+) -> ApiResult {
     if let Some(c) = b.content.as_deref() {
         if core::is_text_content_type(b.content_type.as_deref().unwrap_or("text/markdown")) {
             core::check_content(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
         }
     }
-    let cid =
-        ipfs::resolve_cid(b.cid.as_deref(), b.content.as_deref(), st.ipfs_api_url.as_deref()).await?;
+    let cid = ipfs::resolve_cid(
+        b.cid.as_deref(),
+        b.content.as_deref(),
+        st.ipfs_api_url.as_deref(),
+    )
+    .await?;
     // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
     if b.content.is_none() {
         core::check_cid_content(
@@ -2117,8 +2324,13 @@ async fn get_document(
     Query(q): Query<GetDocumentQuery>,
 ) -> ApiResult {
     Ok(Json(
-        core::get_document_with_body(&st.pool, st.ipfs_api_url.as_deref(), document_id, q.include_body)
-            .await?,
+        core::get_document_with_body(
+            &st.pool,
+            st.ipfs_api_url.as_deref(),
+            document_id,
+            q.include_body,
+        )
+        .await?,
     ))
 }
 
@@ -2155,8 +2367,13 @@ async fn read_document_content(
     Query(q): Query<DocumentContentQuery>,
 ) -> ApiResult {
     Ok(Json(
-        core::read_document_content(&st.pool, st.ipfs_api_url.as_deref(), document_id, q.version_no)
-            .await?,
+        core::read_document_content(
+            &st.pool,
+            st.ipfs_api_url.as_deref(),
+            document_id,
+            q.version_no,
+        )
+        .await?,
     ))
 }
 
@@ -2164,7 +2381,9 @@ async fn get_document_versions(
     State(st): State<AppState>,
     Path(DocRef(document_id)): Path<DocRef>,
 ) -> ApiResult {
-    Ok(Json(core::get_document_versions(&st.pool, document_id).await?))
+    Ok(Json(
+        core::get_document_versions(&st.pool, document_id).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2194,8 +2413,12 @@ async fn publish_version(
             core::check_content(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
         }
     }
-    let cid =
-        ipfs::resolve_cid(b.cid.as_deref(), b.content.as_deref(), st.ipfs_api_url.as_deref()).await?;
+    let cid = ipfs::resolve_cid(
+        b.cid.as_deref(),
+        b.content.as_deref(),
+        st.ipfs_api_url.as_deref(),
+    )
+    .await?;
     // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
     if b.content.is_none() {
         core::check_cid_content(
@@ -2251,7 +2474,8 @@ async fn get_document_comments(
     Query(q): Query<DocumentCommentsQuery>,
 ) -> ApiResult {
     Ok(Json(
-        core::get_document_comments(&st.pool, document_id, q.version_id, q.status.as_deref()).await?,
+        core::get_document_comments(&st.pool, document_id, q.version_id, q.status.as_deref())
+            .await?,
     ))
 }
 
@@ -2445,7 +2669,11 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let (events_tx, _rx) = broadcast::channel(16);
-        let _app = router(AppState { pool, events_tx, ipfs_api_url: None });
+        let _app = router(AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+        });
         Ok(())
     }
 
@@ -2497,16 +2725,35 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = core::create_project(&pool, "P", None, Some("a"), None).await?;
         let pid = p["id"].as_i64().unwrap();
-        let t = core::create_task(&pool, pid, "T", None, None, None, Some("a"), None, None, None).await?;
+        let t = core::create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let tid = t["id"].as_i64().unwrap();
         let (events_tx, _rx) = broadcast::channel(16);
-        let state = AppState { pool, events_tx, ipfs_api_url: None };
+        let state = AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+        };
 
         let get = |uri: String| {
             let app = router(state.clone());
             async move {
                 app.oneshot(
-                    axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap(),
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
                 )
                 .await
                 .unwrap()
@@ -2543,7 +2790,11 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let (events_tx, _rx) = broadcast::channel(16);
-        let state = AppState { pool, events_tx, ipfs_api_url: None };
+        let state = AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+        };
         let resp = health(State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         Ok(())
@@ -2553,8 +2804,10 @@ mod tests {
     /// 503, not a generic 500 — the feature is unavailable, not faulted.
     #[test]
     fn no_ipfs_backend_maps_to_503() {
-        let resp =
-            ApiError(anyhow::anyhow!("no IPFS backend configured (set ipfs_api_url)")).into_response();
+        let resp = ApiError(anyhow::anyhow!(
+            "no IPFS backend configured (set ipfs_api_url)"
+        ))
+        .into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -2572,13 +2825,14 @@ mod tests {
         let end = body.find("\n}").expect("router fn end");
         let body = &body[..end];
 
-        // Each `.route("PATH", get(..).post(..))` line contributes one (METHOD, PATH)
-        // pair per HTTP-method combinator it names.
+        // Each `.route("PATH", get(..).post(..))` contributes one (METHOD, PATH) pair per
+        // HTTP-method combinator it names. Split on `.route(` rather than parsing per line so this
+        // tolerates rustfmt wrapping a route's path and method combinators across several lines:
+        // each segment runs from one `.route(` up to the next, so its method combinators are bounded
+        // to that route.
         let mut from_router: BTreeSet<(String, String)> = BTreeSet::new();
-        for line in body.lines() {
-            let Some(after) = line.split_once(".route(\"").map(|x| x.1) else {
-                continue;
-            };
+        for seg in body.split(".route(").skip(1) {
+            let after = seg.split_once('"').expect("opening quote on route path").1;
             let (path, rest) = after.split_once('"').expect("closing quote on route path");
             let full = if path == "/" {
                 "/api".to_string()

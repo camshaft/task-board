@@ -14,12 +14,12 @@ mod tunnel;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use axum::response::{Html, IntoResponse};
 use axum::Router;
+use listenfd::ListenFd;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
-use axum::response::{Html, IntoResponse};
-use listenfd::ListenFd;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -61,10 +61,16 @@ impl CliArgs {
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--config" => {
-                    config = Some(it.next().ok_or_else(|| anyhow::anyhow!("--config needs a path"))?);
+                    config = Some(
+                        it.next()
+                            .ok_or_else(|| anyhow::anyhow!("--config needs a path"))?,
+                    );
                 }
                 "--web-dir" => {
-                    web_dir = Some(it.next().ok_or_else(|| anyhow::anyhow!("--web-dir needs a path"))?);
+                    web_dir = Some(
+                        it.next()
+                            .ok_or_else(|| anyhow::anyhow!("--web-dir needs a path"))?,
+                    );
                 }
                 "--dedup-projects" => dedup_projects = true,
                 "-h" | "--help" => {
@@ -74,7 +80,11 @@ impl CliArgs {
                 other => anyhow::bail!("unknown argument `{other}`\n\n{USAGE}"),
             }
         }
-        Ok(Self { config, web_dir, dedup_projects })
+        Ok(Self {
+            config,
+            web_dir,
+            dedup_projects,
+        })
     }
 }
 
@@ -116,9 +126,12 @@ async fn main() -> anyhow::Result<()> {
     // rmcp defaults to a loopback-only Host allowlist (DNS-rebinding protection). Apply the
     // deployment's configured hosts: empty keeps the safe default, ["*"] disables the check,
     // otherwise use the explicit allowlist. See config::Settings::mcp_allowed_hosts.
-    let mut mcp_config = StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token());
+    let mut mcp_config =
+        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token());
     if cfg.mcp_allowed_hosts.iter().any(|h| h == "*") {
-        tracing::warn!("MCP Host validation disabled (mcp_allowed_hosts = [\"*\"]); any Host accepted");
+        tracing::warn!(
+            "MCP Host validation disabled (mcp_allowed_hosts = [\"*\"]); any Host accepted"
+        );
         mcp_config = mcp_config.disable_allowed_hosts();
     } else if !cfg.mcp_allowed_hosts.is_empty() {
         tracing::info!("MCP allowed hosts: {:?}", cfg.mcp_allowed_hosts);
@@ -185,7 +198,9 @@ async fn main() -> anyhow::Result<()> {
     let listener = match ListenFd::from_env().take_tcp_listener(0)? {
         Some(std_listener) => {
             std_listener.set_nonblocking(true)?;
-            tracing::info!("task-board listening on socket-activated fd (LISTEN_FDS)  (MCP: /mcp, API: /api)");
+            tracing::info!(
+                "task-board listening on socket-activated fd (LISTEN_FDS)  (MCP: /mcp, API: /api)"
+            );
             tokio::net::TcpListener::from_std(std_listener)?
         }
         None => {
@@ -208,12 +223,13 @@ async fn main() -> anyhow::Result<()> {
 /// under whatever path the app is mounted at. The mount is read from `X-Forwarded-Prefix`
 /// (set by a sub-path reverse proxy); absent that, the base is `/` (origin root). Returns
 /// 200 so client-side routing works on deep links.
-async fn serve_index(index_path: &str, headers: &axum::http::HeaderMap) -> axum::response::Response {
+async fn serve_index(
+    index_path: &str,
+    headers: &axum::http::HeaderMap,
+) -> axum::response::Response {
     let html = match tokio::fs::read_to_string(index_path).await {
         Ok(h) => h,
-        Err(_) => {
-            return (axum::http::StatusCode::NOT_FOUND, "index.html missing").into_response()
-        }
+        Err(_) => return (axum::http::StatusCode::NOT_FOUND, "index.html missing").into_response(),
     };
     // Normalize the forwarded prefix to exactly one leading and one trailing slash, e.g.
     // "/board" or "board/" -> "/board/", empty/unset -> "/". A trailing slash is required
