@@ -13,6 +13,7 @@ import {
   submitDocumentForReview,
   useDocument,
   useDocumentComments,
+  useDocumentExternalLinks,
   useExternalNameResolver,
 } from './resources'
 import { AuthorLabel, AutoGrowTextarea, relTime } from './ui'
@@ -29,6 +30,7 @@ export default function DocumentView() {
   const id = Number(documentId)
   const { data: doc, error: docError, loading } = useDocument(id)
   const { data: comments = [] } = useDocumentComments(id)
+  const { data: externalLinks = [] } = useDocumentExternalLinks(id)
   const extName = useExternalNameResolver()
   const [actionError, setActionError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -293,6 +295,29 @@ export default function DocumentView() {
               </span>
             ))}
           </div>
+
+          {/* External links (task 707): bridged URLs attached to this doc (e.g. a chorus page),
+              from the external-links model. Open in a new tab; labeled by source. */}
+          {externalLinks.some((l) => l.metadata?.url) && (
+            <div className="mb-4 flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-[var(--color-muted)]">External link</span>
+              {externalLinks
+                .filter((l) => l.metadata?.url)
+                .map((l) => (
+                  <a
+                    key={l.id}
+                    href={l.metadata.url}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    title={`${l.source}: ${l.metadata.url}`}
+                    className="inline-flex items-center gap-1 rounded bg-[var(--color-panel-2)] px-2 py-0.5 font-mono text-sky-400 hover:text-sky-300"
+                  >
+                    {l.source}
+                    <span aria-hidden>↗</span>
+                  </a>
+                ))}
+            </div>
+          )}
 
           {/* Wiki filing: the slash-path this doc lives under in the /wiki tree. Editable here;
               empty clears the filing. */}

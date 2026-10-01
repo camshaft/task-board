@@ -13,6 +13,7 @@ import {
   type DocumentSummary,
   type EventRow,
   type ExternalIdentity,
+  type ExternalLink,
   type IdentityAlias,
   type Person,
   type Project,
@@ -50,6 +51,7 @@ const keys = {
   channel: (id: number) => `channel:${id}`,
   channelPosts: (id: number) => `channelPosts:${id}`,
   externalIdentities: 'externalIdentities',
+  documentExternalLinks: (documentId: number) => `externalLinks:document:${documentId}`,
   identityAliases: 'identityAliases',
   people: 'people',
   teams: 'teams',
@@ -121,6 +123,14 @@ export function useTeams() {
 
 export function useTeam(id: string) {
   return useResource<TeamDetail>(keys.team(id), () => api.getTeam(id))
+}
+
+// A document's external links (task 707): bridged URLs attached to the doc (e.g. a chorus page),
+// surfaced in the doc view. Server-filtered to this document.
+export function useDocumentExternalLinks(documentId: number) {
+  return useResource<ExternalLink[]>(keys.documentExternalLinks(documentId), () =>
+    api.listExternalLinks({ board_kind: 'document', board_id: documentId }),
+  )
 }
 
 // A resolver from an external identity id (e.g. "slack:U123") to its display name, falling back
