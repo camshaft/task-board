@@ -2037,6 +2037,36 @@ pub async fn update_task(
         )
         .await?;
     }
+    // Auto-unblock fan-out (task 614): when THIS task completes, notify the subscribers of every task
+    // that was blocked_on it (kind=task, ref=this task) so they learn the blocker cleared and can
+    // start -- the durable auto-unblock mechanism, not a manual sweep. Keyed on "done" per the
+    // operator directive (a cancelled blocker is a re-plan, not an auto-start, so it is NOT fanned).
+    if status_changed && new_status == "done" {
+        let dependents = sqlx::query(
+            "SELECT id, project_id, title FROM tasks WHERE blocked_on_kind='task' AND blocked_on_ref=?",
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        for d in &dependents {
+            let dep_id: i64 = d.try_get("id")?;
+            let dep_project: i64 = d.try_get("project_id")?;
+            let dep_title: Option<String> = d.try_get("title").ok().flatten();
+            emit(
+                &mut tx,
+                &mut hooks,
+                "task.unblocked",
+                actor,
+                Some(dep_id),
+                Some(dep_project),
+                None,
+                None,
+                json!({ "blocker_task_id": task_id, "blocker_title": old_title, "title": dep_title }),
+                Recipients::FromTask,
+            )
+            .await?;
+        }
+    }
     if reassigned {
         emit(
             &mut tx,
@@ -7875,6 +7905,146 @@ mod tests {
         )
         .await
         .is_err());
+        Ok(())
+    }
+
+    /// Auto-unblock (task 614): completing a blocker task fans a task.unblocked notification out to
+    /// the subscribers of every task that was blocked_on it, so dependents learn the blocker cleared
+    /// without a manual sweep.
+    #[tokio::test]
+    async fn completing_a_blocker_notifies_dependents() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        // Blocker B (owned by b-owner) and two dependents D1/D2 (owned by d1/d2) blocked on it.
+        let b = create_task(
+            &pool,
+            pid,
+            "blocker",
+            None,
+            None,
+            None,
+            Some("b-owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let b_id = b["id"].as_i64().unwrap();
+        let d1 = create_task(
+            &pool,
+            pid,
+            "dep1",
+            None,
+            None,
+            None,
+            Some("d1"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let d1_id = d1["id"].as_i64().unwrap();
+        let d2 = create_task(
+            &pool,
+            pid,
+            "dep2",
+            None,
+            None,
+            None,
+            Some("d2"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let d2_id = d2["id"].as_i64().unwrap();
+        // `other` is blocked on D1 (a DIFFERENT task), so completing B must NOT notify it.
+        let other = create_task(
+            &pool,
+            pid,
+            "other",
+            None,
+            None,
+            None,
+            Some("o"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let other_id = other["id"].as_i64().unwrap();
+        for (dep, who, target) in [
+            (d1_id, "d1", b_id),
+            (d2_id, "d2", b_id),
+            (other_id, "o", d1_id),
+        ] {
+            update_task(
+                &pool,
+                dep,
+                Some("blocked"),
+                None,
+                None,
+                None,
+                None,
+                Some(who),
+                None,
+                None,
+                Some(json!({"kind": "task", "target": target.to_string(), "note": "waiting"})),
+            )
+            .await?;
+        }
+        // Drain pre-existing notifications so the only task.unblocked we see comes from completing B.
+        for who in ["d1", "d2", "o"] {
+            check_notifications(&pool, who, true, 100, None).await?;
+        }
+
+        // Complete the blocker (a real status change).
+        update_task(
+            &pool,
+            b_id,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("b-owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // Each dependent-on-B owner is notified task.unblocked for THEIR task, naming the blocker.
+        for (dep, who) in [(d1_id, "d1"), (d2_id, "d2")] {
+            let notes = check_notifications(&pool, who, true, 100, None).await?;
+            let hit = notes["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["type"] == json!("task.unblocked") && n["task_id"] == json!(dep));
+            assert!(
+                hit.is_some(),
+                "{who} notified task.unblocked for dep {dep}: {notes}"
+            );
+            assert_eq!(
+                hit.unwrap()["data"]["blocker_task_id"],
+                json!(b_id),
+                "names the blocker"
+            );
+        }
+
+        // `other` (blocked on D1, not B) is NOT spuriously unblocked by B completing.
+        let o_notes = check_notifications(&pool, "o", true, 100, None).await?;
+        assert!(
+            !o_notes["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["type"] == json!("task.unblocked")),
+            "a task blocked on a different blocker is not spuriously unblocked: {o_notes}"
+        );
         Ok(())
     }
 
