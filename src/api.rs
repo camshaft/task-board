@@ -470,7 +470,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "PATCH", path: "/api/documents/{document_id}", summary: "Rename a document (set its title; metadata-only — versions/content/path/status untouched). Emits document.updated.", query: "", body: Some("UpdateDocumentBody") },
     Endpoint { method: "PATCH", path: "/api/documents/{document_id}/props", summary: "Merge a JSON object into a document's metadata (description, type, tags, provenance) without cutting a content version. The list + wiki index project metadata.description. Emits document.updated.", query: "", body: Some("SetDocumentPropsBody") },
     Endpoint { method: "DELETE", path: "/api/documents/{document_id}", summary: "HARD-DELETE a document + all dependents (versions/comments/attachments/links/embeds). IRREVERSIBLE; requires the doc be archived first. Use only for true garbage; prefer archive otherwise. Emits document.deleted.", query: "", body: Some("DocumentActorBody") },
-    Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version. Requires ipfs_api_url.", query: "version_no=int", body: None },
+    Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version, or ?approved=true for the operator-approved version (404 'no approved version' when there is none -- never a silent fallback to the current draft). The response carries an ETag of the served version's CID; a matching If-None-Match returns 304. Requires ipfs_api_url.", query: "version_no=int&approved=bool", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/versions", summary: "Publish a new immutable version (bare CID).", query: "", body: Some("PublishVersionBody") },
@@ -2604,26 +2604,98 @@ async fn update_document(
 struct DocumentContentQuery {
     /// Which version's body to read. Omit for the current version.
     version_no: Option<i64>,
+    /// Read the operator-APPROVED version instead of the current one. When the document has no
+    /// approved version yet, the read returns 404 `{"error":"no approved version", ...}` (a
+    /// distinct not-available signal) rather than silently falling back to the current draft, so a
+    /// caller can keep its own fallback until an approved version lands. Mutually exclusive with
+    /// `version_no`.
+    #[serde(default)]
+    approved: Option<bool>,
+}
+
+/// Does an `If-None-Match` header match our ETag? Handles `*`, a comma-separated list, and a weak
+/// (`W/"..."`) validator prefix (we only emit strong ETags, but a client may echo a weak one).
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let strong = etag.trim_start_matches("W/");
+    header.split(',').any(|tok| {
+        let tok = tok.trim();
+        tok == "*" || tok.trim_start_matches("W/") == strong
+    })
 }
 
 /// `GET /api/documents/{id}/content` — read a document's body inline (resolves the version's CID
 /// through the board's IPFS backend server-side). The agent-usable read path: no local IPFS or
 /// separate gateway. Text content comes back as `content`; binary content returns a null `content`
 /// + the CID to fetch via `/api/ipfs/{cid}`. Requires `ipfs_api_url` (503 without one).
+///
+/// `?approved=true` reads the operator-approved version (404 `no approved version` when there is
+/// none — never a silent fallback to the current draft). The response carries an `ETag` of the
+/// served version's CID; a matching `If-None-Match` returns `304 Not Modified`. In approved mode
+/// the ETag is the approved version's CID, so an in-review draft advancing the current version
+/// never flips it — a conditional read stays 304 until a NEW version is approved.
 async fn read_document_content(
     State(st): State<AppState>,
     Path(DocRef(document_id)): Path<DocRef>,
     Query(q): Query<DocumentContentQuery>,
-) -> ApiResult {
-    Ok(Json(
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let value = if q.approved.unwrap_or(false) {
+        if q.version_no.is_some() {
+            return Err(ApiError(anyhow::anyhow!(
+                "give either `approved=true` or `version_no`, not both"
+            )));
+        }
+        match core::read_approved_document_content(
+            &st.pool,
+            st.ipfs_api_url.as_deref(),
+            document_id,
+        )
+        .await?
+        {
+            Some(v) => v,
+            None => {
+                // Distinct not-available: the document exists but has no operator-approved version
+                // yet. A caller (the task_815 contract materialize) keys its git-archive fallback
+                // off this 404 instead of projecting an unapproved draft.
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "no approved version", "document_id": document_id })),
+                )
+                    .into_response());
+            }
+        }
+    } else {
         core::read_document_content(
             &st.pool,
             st.ipfs_api_url.as_deref(),
             document_id,
             q.version_no,
         )
-        .await?,
-    ))
+        .await?
+    };
+
+    // Conditional read: the ETag is the CID of the version actually served (the approved CID in
+    // approved mode), so a client can revalidate cheaply with If-None-Match.
+    let etag = value
+        .get("cid")
+        .and_then(|c| c.as_str())
+        .map(|c| format!("\"{c}\""));
+    let Some(etag) = etag else {
+        return Ok(Json(value).into_response());
+    };
+    let not_modified = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|inm| if_none_match_matches(inm, &etag));
+    let mut resp = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        Json(value).into_response()
+    };
+    if let Ok(hv) = axum::http::HeaderValue::from_str(&etag) {
+        resp.headers_mut().insert(axum::http::header::ETAG, hv);
+    }
+    Ok(resp)
 }
 
 async fn get_document_versions(
@@ -3095,6 +3167,82 @@ mod tests {
         let resp = get(format!("/tasks/doc_{tid}")).await;
         assert!(resp.status().is_client_error(), "got {}", resp.status());
         Ok(())
+    }
+
+    /// The approved-version read convenience (task_842): `?approved=true` on a document with no
+    /// approved version returns a DISTINCT 404 `no approved version` (never a 503 and never a silent
+    /// 200 fall-through to the current draft), and `approved=true` together with `version_no` is a
+    /// 400. The 200 + ETag/304 path needs an IPFS backend, exercised at the core layer in
+    /// `approved_version_read_is_distinct_and_tracks_approval`; the header-matching logic is
+    /// unit-tested in `if_none_match_matches_handles_star_list_and_weak`.
+    #[tokio::test]
+    async fn content_approved_query_is_distinct_not_available() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = core::create_document(
+            &pool,
+            "Contract",
+            None,
+            "bafyv1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        let (events_tx, _rx) = broadcast::channel(16);
+        let state = AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+        let get = |uri: String| {
+            let app = router(state.clone());
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // No approved version yet -> a distinct 404 with an explicit no-approved-version body, not a
+        // 503 (backend) and not a silent 200 fall-through to the current draft.
+        let resp = get(format!("/documents/{did}/content?approved=true")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(v["error"], json!("no approved version"));
+        assert_eq!(v["document_id"].as_i64(), Some(did));
+
+        // approved=true AND version_no is a client error (mutually exclusive selectors).
+        let resp = get(format!(
+            "/documents/{did}/content?approved=true&version_no=1"
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    /// ETag / If-None-Match matching (task_842): `*` matches anything, a comma list matches any
+    /// member, a weak validator matches its strong form, and a non-member misses.
+    #[test]
+    fn if_none_match_matches_handles_star_list_and_weak() {
+        let etag = "\"bafyv1\"";
+        assert!(if_none_match_matches("*", etag));
+        assert!(if_none_match_matches("\"bafyv1\"", etag));
+        assert!(if_none_match_matches("\"other\", \"bafyv1\"", etag));
+        assert!(if_none_match_matches("W/\"bafyv1\"", etag));
+        assert!(!if_none_match_matches("\"other\"", etag));
+        assert!(!if_none_match_matches("\"bafyv2\"", etag));
     }
 
     /// The health beacon reports 200 when the database is reachable — the signal an agent checks
