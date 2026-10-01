@@ -46,6 +46,11 @@ OPTIONS:
                        One-shot: pin each UI element's props_schema from the given
                        ui-elements.json into the CAS and print the name->CID manifest to
                        stdout, then exit. Needs ipfs_api_url. Does not start the server.
+    --build-ui-catalog <ui-elements.json> <ui-element-cids.json>
+                       One-shot: join the ui-elements set with the name->CID manifest and
+                       print the agent-facing ui-element catalog JSON to stdout, then exit
+                       (task_820). Pure build-time join of the two committed files; needs no
+                       CAS and no DB. Publish the output as the system/ui-elements document.
     -h, --help         Print this help.
 ";
 
@@ -55,6 +60,8 @@ struct CliArgs {
     web_dir: Option<String>,
     dedup_projects: bool,
     seed_ui_elements: Option<String>,
+    /// (ui-elements.json path, ui-element-cids.json path) for the one-shot catalog build (task_820).
+    build_ui_catalog: Option<(String, String)>,
 }
 
 impl CliArgs {
@@ -63,6 +70,7 @@ impl CliArgs {
         let mut web_dir = None;
         let mut dedup_projects = false;
         let mut seed_ui_elements = None;
+        let mut build_ui_catalog = None;
         let mut it = args;
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -85,6 +93,19 @@ impl CliArgs {
                             .ok_or_else(|| anyhow::anyhow!("--seed-ui-elements needs a path"))?,
                     );
                 }
+                "--build-ui-catalog" => {
+                    let elements = it.next().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--build-ui-catalog needs <ui-elements.json> <ui-element-cids.json>"
+                        )
+                    })?;
+                    let manifest = it.next().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--build-ui-catalog needs <ui-elements.json> <ui-element-cids.json>"
+                        )
+                    })?;
+                    build_ui_catalog = Some((elements, manifest));
+                }
                 "-h" | "--help" => {
                     print!("{USAGE}");
                     std::process::exit(0);
@@ -97,6 +118,7 @@ impl CliArgs {
             web_dir,
             dedup_projects,
             seed_ui_elements,
+            build_ui_catalog,
         })
     }
 }
@@ -136,6 +158,20 @@ async fn main() -> anyhow::Result<()> {
         let set = core::parse_ui_element_set(&json)?;
         let manifest = core::seed_ui_elements(ipfs_url, &set).await?;
         println!("{}", serde_json::to_string_pretty(&manifest)?);
+        return Ok(());
+    }
+
+    // One-shot: build the agent-facing ui-element catalog (task_820) by joining the committed
+    // ui-elements.json with the name->CID manifest, and print it to stdout. Pure build-time join --
+    // no CAS, no DB. The output is published as the system/ui-elements document that the MCP
+    // ui-element resource serves.
+    if let Some((elements_path, manifest_path)) = &args.build_ui_catalog {
+        let elements = std::fs::read(elements_path)
+            .map_err(|e| anyhow::anyhow!("reading ui-elements file {elements_path}: {e}"))?;
+        let manifest = std::fs::read(manifest_path)
+            .map_err(|e| anyhow::anyhow!("reading manifest file {manifest_path}: {e}"))?;
+        let catalog = core::build_ui_element_catalog(&elements, &manifest)?;
+        println!("{}", serde_json::to_string_pretty(&catalog)?);
         return Ok(());
     }
 
