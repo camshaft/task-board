@@ -581,6 +581,19 @@ export const api = {
   moveTask: (id: number, b: { to_project_id: number; actor?: string }) =>
     req<Task>('POST', `/tasks/${id}/move`, b),
 
+  // Operator-questions actions (task_628 / task_629). Pose is agent-side (not surfaced in the UI
+  // yet); the UI drives answer / decline / cancel on a question comment. The backend validates the
+  // answer shape against the kind (and the inline response_schema when present) and transitions the
+  // question's lifecycle state.
+  answerQuestion: (
+    commentId: number,
+    b: { shape: string; value: unknown; actor?: string },
+  ) => req<Comment>('POST', `/comments/${commentId}/answer`, b),
+  declineQuestion: (commentId: number, b: { feedback: string; actor?: string }) =>
+    req<Comment>('POST', `/comments/${commentId}/decline`, b),
+  cancelQuestion: (commentId: number, b: { actor?: string } = {}) =>
+    req<Comment>('POST', `/comments/${commentId}/cancel`, b),
+
   // order='desc' returns the LATEST `limit` events, newest-first (for an activity feed); the
   // default 'asc' returns oldest-first above `since_seq` (for incremental tailing). Both compose
   // with `since_seq` and `actor`.

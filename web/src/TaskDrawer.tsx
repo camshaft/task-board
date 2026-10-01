@@ -10,8 +10,11 @@ import {
 import { type TaskStatus } from './api'
 import { DocStatusChip } from './Documents'
 import {
+  answerQuestion,
+  cancelQuestion,
   commentTask,
   createTask,
+  declineQuestion,
   moveTask,
   reparentTask,
   updateTask,
@@ -162,6 +165,43 @@ export function TaskDrawer() {
     try {
       await commentTask(task.id, { body, author: actor })
       setComment('')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Operator-questions actions (task_629 slice 2): answer / decline / cancel a question comment.
+  async function answerQ(commentId: number, shape: string, value: unknown) {
+    if (!task) return
+    setBusy(true)
+    try {
+      await answerQuestion(task.id, commentId, { shape, value, actor })
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  async function declineQ(commentId: number) {
+    if (!task) return
+    const feedback = window.prompt('Decline this question — a short note on why / what to do instead:')
+    if (feedback == null) return
+    setBusy(true)
+    try {
+      await declineQuestion(task.id, commentId, { feedback, actor })
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  async function cancelQ(commentId: number) {
+    if (!task || !window.confirm('Cancel this question? It will be marked cancelled.')) return
+    setBusy(true)
+    try {
+      await cancelQuestion(task.id, commentId, { actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -693,6 +733,11 @@ export function TaskDrawer() {
                                 comment={c}
                                 answers={answersByQ.get(c.id) ?? []}
                                 resolveExternal={extName}
+                                actor={actor}
+                                busy={busy}
+                                onAnswer={(shape, value) => void answerQ(c.id, shape, value)}
+                                onDecline={() => void declineQ(c.id)}
+                                onCancel={() => void cancelQ(c.id)}
                               />
                             ) : (
                               <>
