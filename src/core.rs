@@ -296,6 +296,30 @@ async fn auto_subscribe_document(
     Ok(())
 }
 
+/// Auto-subscribe any @mentioned REGISTERED agent in `text` to the DOCUMENT (idempotent) -- the
+/// document analog of subscribe_mentions for tasks. An @mention in a doc comment adds the agent to
+/// the doc's subscription list so the document.comment fan-out reaches them, i.e. a mention notifies
+/// the mentioned agent regardless of their prior subscription, matching task-comment @mentions.
+/// Without this, doc-comment @mentions were a silent black hole (operator-reported: an operator's
+/// @mention in a doc comment went completely unanswered). Unregistered @tokens are ignored.
+async fn subscribe_mentions_document(
+    tx: &mut Transaction<'_, Sqlite>,
+    text: &str,
+    document_id: i64,
+) -> anyhow::Result<()> {
+    for id in extract_mentions(text) {
+        let exists = sqlx::query("SELECT 1 FROM agents WHERE id=?")
+            .bind(&id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+        if exists {
+            auto_subscribe_document(tx, Some(&id), document_id).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_one_json(
     tx: &mut Transaction<'_, Sqlite>,
     sql: &str,
@@ -5762,6 +5786,11 @@ pub async fn comment_document(
     .await?
     .try_get("id")?;
     auto_subscribe_document(&mut tx, author, document_id).await?;
+    // An @mention in the comment subscribes that agent to the document, so the document.comment
+    // fan-out below reaches them -- a mention notifies the mentioned agent regardless of their prior
+    // subscription, matching task-comment @mentions. Without this, doc-comment @mentions were a
+    // silent black hole (operator-reported). Idempotent; unregistered @tokens ignored.
+    subscribe_mentions_document(&mut tx, body, document_id).await?;
     // Carry document_id + title in the payload so a drained notification identifies which document
     // the comment is on (the inbox row itself doesn't surface document_id), letting the owner
     // navigate straight to it to respond. The commenter is the event actor.
@@ -9064,6 +9093,68 @@ mod tests {
             bob["count"].as_i64(),
             Some(0),
             "actor excluded from own comment: {bob}"
+        );
+        Ok(())
+    }
+
+    /// An @mention in a DOCUMENT comment notifies the mentioned REGISTERED agent even with no prior
+    /// subscription -- the operator-reported silent black hole (doc-comment @mentions did not fire,
+    /// while task-comment ones did). Mirrors subscribe_mentions for tasks; unregistered @tokens are
+    /// ignored (no junk subscription).
+    #[tokio::test]
+    async fn document_comment_mention_notifies_mentioned_agent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "librarian", None, None, None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Spec",
+            None,
+            "bafy1",
+            None,
+            Some("cameron"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // cameron (owner) comments, @mentioning librarian (not the owner, no prior subscription) and
+        // an UNREGISTERED @token that must be ignored (no junk sub, no error).
+        comment_document(
+            &pool,
+            did,
+            None,
+            Some("cameron"),
+            "@librarian please review section 2, cc @ghost-nobody",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // librarian is notified of the doc comment despite never subscribing.
+        let lib = check_notifications(&pool, "librarian", true, 50, None).await?;
+        let hit = lib["notifications"].as_array().unwrap().iter().find(|n| {
+            n["type"] == json!("document.comment") && n["data"]["document_id"] == json!(did)
+        });
+        assert!(
+            hit.is_some(),
+            "mentioned agent notified of the doc comment: {lib}"
+        );
+
+        // The unregistered @token was ignored: no subscription row was created for it.
+        let ghost_subbed = sqlx::query(
+            "SELECT 1 FROM subscriptions WHERE subscriber='ghost-nobody' AND target_type='document' AND target_id=?",
+        )
+        .bind(did)
+        .fetch_optional(&pool)
+        .await?
+        .is_some();
+        assert!(
+            !ghost_subbed,
+            "unregistered @token must not create a subscription"
         );
         Ok(())
     }
