@@ -22,6 +22,12 @@ let
     mcp_allowed_hosts = cfg.mcpAllowedHosts;
   } // lib.optionalAttrs (cfg.ipfsApiUrl != null) {
     ipfs_api_url = cfg.ipfsApiUrl;
+  } // lib.optionalAttrs cfg.dbSnapshotEnabled {
+    db_snapshot_enabled = true;
+  } // lib.optionalAttrs (cfg.dbSnapshotUser != null) {
+    db_snapshot_user = cfg.dbSnapshotUser;
+  } // lib.optionalAttrs (cfg.dbSnapshotPassword != null) {
+    db_snapshot_password = cfg.dbSnapshotPassword;
   };
   configFile = (pkgs.formats.toml { }).generate "task-board.toml" settings;
 in
@@ -82,6 +88,39 @@ in
         document `content` server-side (pin via /api/v0/add and store the returned CID), so a
         client with no local IPFS can author a document. Typically the loopback Kubo API on
         this host. Null (the default) keeps the board strictly CID-only: callers supply a CID.
+      '';
+    };
+
+    dbSnapshotEnabled = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Enable the authenticated DB-snapshot download endpoint (GET /api/admin/db-snapshot): a
+        point-in-time-consistent VACUUM INTO copy of the SQLite database behind HTTP Basic auth --
+        the extraction primitive for host migration + DR. Off by default (the endpoint 404s).
+        Requires dbSnapshotUser + dbSnapshotPassword when enabled (otherwise the endpoint 503s).
+
+        SECURITY: this module store-renders its config into the WORLD-READABLE /nix/store, so a
+        dbSnapshotPassword set here lands as PLAINTEXT readable by any local user. Only acceptable
+        for a short-lived credential disabled again right after use (e.g. a one-off migration); do
+        NOT leave this enabled as a standing surface. The whole fleet's data (incl secret-broker
+        records) is in that file -- keep the endpoint behind the gateway / LAN-bound, never a bare
+        public path, and turn it back off (404) once the pull is done.
+      '';
+    };
+
+    dbSnapshotUser = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "HTTP Basic-auth username for the DB-snapshot endpoint. Required when dbSnapshotEnabled.";
+    };
+
+    dbSnapshotPassword = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        HTTP Basic-auth password for the DB-snapshot endpoint. Required when dbSnapshotEnabled.
+        NOTE: store-rendered as plaintext (see dbSnapshotEnabled) -- use only a temporary credential.
       '';
     };
 
