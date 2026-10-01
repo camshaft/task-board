@@ -3070,6 +3070,124 @@ pub async fn list_tasks_blocking_me(
     Ok(Value::Array(out))
 }
 
+/// The open blocking questions on `task_id` routed to one of `routed`, as full comment objects
+/// (parsed payload + ref), so a caller can render and answer them inline (task_860).
+async fn open_routed_questions(
+    pool: &Pool,
+    task_id: i64,
+    routed: &BTreeSet<String>,
+) -> anyhow::Result<Vec<Value>> {
+    let placeholders = std::iter::repeat_n("?", routed.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let q = format!(
+        "SELECT id, task_id, author, body, created_at, external_author, origin_ref, \
+         type, payload, state, reply_to, supersedes, superseded_by FROM comments \
+         WHERE task_id=? AND {OPEN_BLOCKING_QUESTION} \
+         AND json_extract(payload,'$.routed_to') IN ({placeholders}) ORDER BY id"
+    );
+    let mut query = sqlx::query(&q).bind(task_id);
+    for p in routed {
+        query = query.bind(p);
+    }
+    let rows = query.fetch_all(pool).await?;
+    Ok(rows.iter().map(comment_row_json).collect())
+}
+
+/// The unified "awaiting <principal>" queue (task_860): every task awaiting a decision from the
+/// principal `viewer`, keyed INDEPENDENT of assignee -- the owner-held model deliberately does NOT
+/// assign these to the principal, so an assignee-keyed view (the old Search "blocked on me"
+/// shortcut) misses them. A task qualifies if EITHER it is blocked_on the principal
+/// (blocked_on_kind='operator' when the principal resolves to the operator, or kind agent/team with
+/// blocked_on_ref in the doc_26 team-expanded principal set) OR it carries an open blocking question
+/// routed to the principal (as `list_tasks_blocking_me`). Returns one deduped task-centric row per
+/// task -- blocked_on_principal + blocked_on_note, plus questions[] carrying the FULL question
+/// comment objects so a client renders + answers them inline. Supersedes the questions-only
+/// `list_tasks_blocking_me`.
+pub async fn list_awaiting(
+    pool: &Pool,
+    viewer: &str,
+    project_id: Option<i64>,
+    include_archived: bool,
+) -> anyhow::Result<Value> {
+    let routed = principals_routing_to(pool, viewer).await?;
+    let resolves_to_operator = routed.contains("operator");
+    let placeholders = std::iter::repeat_n("?", routed.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // blocked_on branch: the operator kind (no ref) when the principal resolves to the operator,
+    // plus the agent/team kind matched by ref against the team-expanded principal set.
+    let mut blocked_branches: Vec<String> = Vec::new();
+    if resolves_to_operator {
+        blocked_branches.push("blocked_on_kind='operator'".into());
+    }
+    blocked_branches.push(format!(
+        "(blocked_on_kind IN ('agent','team') AND blocked_on_ref IN ({placeholders}))"
+    ));
+    let blocked_cond = blocked_branches.join(" OR ");
+    // question branch: an open blocking question routed to one of the expanded principals.
+    let question_cond = format!(
+        "EXISTS (SELECT 1 FROM comments c WHERE c.task_id = tasks.id AND c.{OPEN_BLOCKING_QUESTION} \
+         AND json_extract(c.payload,'$.routed_to') IN ({placeholders}))"
+    );
+
+    let mut conds: Vec<String> = Vec::new();
+    if !include_archived {
+        conds.push("archived_at IS NULL".into());
+    }
+    if project_id.is_some() {
+        conds.push("project_id=?".into());
+    }
+    conds.push(format!("(({blocked_cond}) OR {question_cond})"));
+
+    let q = format!(
+        "SELECT id, project_id, title, status, blocked_on_kind, blocked_on_ref, blocked_on_note, \
+         updated_at FROM tasks WHERE {} ORDER BY id",
+        conds.join(" AND "),
+    );
+    // Bind order mirrors cond order: project_id (if any), then the expanded principals for the
+    // blocked agent/team IN, then again for the question routed_to IN.
+    let mut query = sqlx::query(&q);
+    if let Some(pid) = project_id {
+        query = query.bind(pid);
+    }
+    for p in &routed {
+        query = query.bind(p);
+    }
+    for p in &routed {
+        query = query.bind(p);
+    }
+    let rows = query.fetch_all(pool).await?;
+
+    let mut out: Vec<Value> = Vec::new();
+    for r in &rows {
+        let task_id: i64 = r.try_get("id")?;
+        let bk: Option<String> = r.try_get("blocked_on_kind")?;
+        let br: Option<String> = r.try_get("blocked_on_ref")?;
+        let blocked_on_principal = match bk.as_deref() {
+            Some("operator") => resolves_to_operator,
+            Some("agent") | Some("team") => br.as_deref().is_some_and(|x| routed.contains(x)),
+            _ => false,
+        };
+        let note: Option<String> = r.try_get("blocked_on_note")?;
+        let questions = open_routed_questions(pool, task_id, &routed).await?;
+        out.push(json!({
+            "task_id": task_id,
+            "task_title": r.try_get::<Option<String>, _>("title")?,
+            "project_id": r.try_get::<Option<i64>, _>("project_id")?,
+            "status": r.try_get::<Option<String>, _>("status")?,
+            "updated_at": r.try_get::<Option<String>, _>("updated_at")?,
+            "blocked_on_principal": blocked_on_principal,
+            // Only surface the note when the block IS on this principal, so a task listed only for
+            // its routed question does not leak an unrelated block's note.
+            "blocked_on_note": if blocked_on_principal { note } else { None },
+            "questions": questions,
+        }));
+    }
+    Ok(Value::Array(out))
+}
+
 // --- Operator-question comment types: core operations (doc_33 / task_628, slice 2 + 5) ---
 
 /// The launch question kinds (doc_33 A2); the set is extensible by adding a kind here + its shape.
@@ -18483,6 +18601,162 @@ mod tests {
             vec![ma],
             "list_wiki(prefix) still resolves memory"
         );
+        Ok(())
+    }
+
+    /// The unified awaiting-operator queue (task_860): unions blocked_on=operator tasks and tasks
+    /// with an open blocking question routed_to=operator, keyed INDEPENDENT of assignee, deduped to
+    /// one task-centric row carrying blocked_on_principal + a full-payload questions[].
+    #[tokio::test]
+    async fn list_awaiting_unions_blocked_and_routed_questions() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let a = create_task(
+            &pool,
+            pid,
+            "A blocked on operator",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let b = create_task(
+            &pool,
+            pid,
+            "B operator question",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let c = create_task(
+            &pool,
+            pid,
+            "C both",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let d = create_task(
+            &pool,
+            pid,
+            "D blocked on another agent",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let e = create_task(
+            &pool,
+            pid,
+            "E neither",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let (aid, bid, cid, did, eid) = (
+            a["id"].as_i64().unwrap(),
+            b["id"].as_i64().unwrap(),
+            c["id"].as_i64().unwrap(),
+            d["id"].as_i64().unwrap(),
+            e["id"].as_i64().unwrap(),
+        );
+
+        // A: blocked_on operator, assigned to someone who is NOT the operator (prove the view is
+        // assignee-independent -- the task_311 bug was keying on assignee).
+        sqlx::query("UPDATE tasks SET blocked_on_kind='operator', blocked_on_note='needs a call', assignee='someone-else' WHERE id=?")
+            .bind(aid).execute(&pool).await?;
+        // C: also blocked_on operator.
+        sqlx::query("UPDATE tasks SET blocked_on_kind='operator' WHERE id=?")
+            .bind(cid)
+            .execute(&pool)
+            .await?;
+        // D: blocked on a DIFFERENT agent -- must not surface in the operator queue.
+        sqlx::query(
+            "UPDATE tasks SET blocked_on_kind='agent', blocked_on_ref='other-agent' WHERE id=?",
+        )
+        .bind(did)
+        .execute(&pool)
+        .await?;
+
+        // B + C: an open blocking question routed to operator.
+        let now = now_iso();
+        for tid in [bid, cid] {
+            sqlx::query("INSERT INTO comments(task_id, author, body, created_at, type, payload, state) VALUES(?,?,?,?,?,?,?)")
+                .bind(tid).bind("asker").bind("Approve the plan?").bind(&now).bind("question")
+                .bind(json!({ "blocking": true, "routed_to": "operator", "kind": "yes_no" }).to_string())
+                .bind("open")
+                .execute(&pool).await?;
+        }
+
+        let awaiting = list_awaiting(&pool, "operator", None, false).await?;
+        let rows = awaiting.as_array().unwrap();
+        let by_id = |tid: i64| rows.iter().find(|r| r["task_id"].as_i64() == Some(tid));
+
+        // A, B, C present; D (other agent) + E (neither) absent.
+        assert!(by_id(aid).is_some(), "A (blocked_on operator) present");
+        assert!(by_id(bid).is_some(), "B (operator question) present");
+        assert!(by_id(cid).is_some(), "C present");
+        assert!(by_id(did).is_none(), "D (blocked on another agent) absent");
+        assert!(by_id(eid).is_none(), "E (neither) absent");
+        // Dedup: C (both signals) appears exactly once.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["task_id"].as_i64() == Some(cid))
+                .count(),
+            1,
+            "C deduped to one row"
+        );
+
+        // A: blocked flag true (with note), no questions.
+        let ra = by_id(aid).unwrap();
+        assert_eq!(ra["blocked_on_principal"], json!(true));
+        assert_eq!(ra["blocked_on_note"], json!("needs a call"));
+        assert_eq!(ra["questions"].as_array().unwrap().len(), 0);
+        // B: not blocked_on operator, but a routed question carrying the FULL payload.
+        let rb = by_id(bid).unwrap();
+        assert_eq!(rb["blocked_on_principal"], json!(false));
+        assert!(
+            rb["blocked_on_note"].is_null(),
+            "no note leaked for a question-only task"
+        );
+        let bq = rb["questions"].as_array().unwrap();
+        assert_eq!(bq.len(), 1);
+        assert_eq!(bq[0]["type"], json!("question"));
+        assert_eq!(bq[0]["payload"]["routed_to"], json!("operator"));
+        assert_eq!(bq[0]["payload"]["blocking"], json!(true));
+        assert!(
+            bq[0]["id"].as_i64().is_some(),
+            "question carries its comment id"
+        );
+        // C: both signals on one row.
+        let rc = by_id(cid).unwrap();
+        assert_eq!(rc["blocked_on_principal"], json!(true));
+        assert_eq!(rc["questions"].as_array().unwrap().len(), 1);
         Ok(())
     }
 

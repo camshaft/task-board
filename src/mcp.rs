@@ -1280,6 +1280,18 @@ pub struct ListTasksBlockingMeArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListAwaitingArgs {
+    /// The principal whose awaiting-decision queue to return (defaults to you). "operator" is the
+    /// seeded operator team; a team-targeted block or team-routed question surfaces for members.
+    #[serde(default)]
+    pub viewer: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub include_archived: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DocumentActorArgs {
     pub document_id: i64,
     #[serde(default)]
@@ -2985,6 +2997,29 @@ impl Board {
             )));
         };
         core::list_tasks_blocking_me(
+            &self.pool,
+            &viewer,
+            a.project_id,
+            a.include_archived.unwrap_or(false),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "The unified 'awaiting you' queue (task_860): every task awaiting a decision from `viewer` (defaults to you) -- tasks blocked_on that principal UNION tasks with an open blocking question routed to it, keyed INDEPENDENT of assignee (owner-held tasks are deliberately not assigned to the principal), team-expanded, deduped. Returns one task-centric row per task {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]} so you see everything awaiting a principal in one call and can answer the questions inline. Supersedes list_tasks_blocking_me (questions-only). Pass viewer=operator for the operator's queue."
+    )]
+    async fn list_awaiting(
+        &self,
+        Parameters(a): Parameters<ListAwaitingArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(viewer) = self.me_opt(a.viewer.as_deref()) else {
+            return Err(err(anyhow::anyhow!(
+                "no viewer: pass `viewer` or call with a session identity"
+            )));
+        };
+        core::list_awaiting(
             &self.pool,
             &viewer,
             a.project_id,
