@@ -2022,7 +2022,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Read a channel's post history. Default is oldest-first after `since_seq` (scrollback / catching up on a channel you just joined). Pass desc=true for the LATEST N posts (newest-first — a chat view), and before_seq to page earlier."
+        description = "Read a channel's post history. Default is oldest-first after `since_seq` (scrollback / catching up on a channel you just joined). To read the NEWEST posts — e.g. after a channel.post notification woke you and you want the post that woke you — pass desc=true (newest-first); desc=true with limit=1 returns just the latest post. Do NOT escalate `limit` on the default oldest-first order to reach recent posts — that pulls the whole history; use desc=true instead. Use before_seq to page earlier (pass the oldest seq you already have, with desc=true)."
     )]
     async fn get_channel_posts(
         &self,
@@ -3388,6 +3388,27 @@ mod tests {
         assert_eq!(
             a.blocked_on_note.as_deref(),
             Some("waiting on the CAS endpoint")
+        );
+    }
+
+    /// get_channel_posts' tool description must surface the recency params, so an agent woken by a
+    /// channel.post notification reaches for desc=true (newest-first) instead of escalating `limit`
+    /// on the oldest-first default and pulling the whole history (task 817).
+    #[test]
+    fn get_channel_posts_description_surfaces_recency_params() {
+        let tools = Board::tool_router().list_all();
+        let t = tools
+            .iter()
+            .find(|t| t.name == "get_channel_posts")
+            .expect("get_channel_posts tool is registered");
+        let desc = t.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.contains("desc=true"),
+            "description names desc=true: {desc}"
+        );
+        assert!(
+            desc.contains("NEWEST") || desc.contains("newest") || desc.contains("latest"),
+            "description names the newest-posts use-case: {desc}"
         );
     }
 
