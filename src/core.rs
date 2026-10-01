@@ -7256,6 +7256,35 @@ pub async fn create_document(
     Ok(out)
 }
 
+/// Is this document agent memory (task_826)? True when it carries the reserved agent-memory tag OR
+/// is filed under a reserved memory path prefix (`repos/`, `agents/`). The path check is the
+/// belt-and-suspenders half: memory docs created before the tag mechanism landed stay untagged
+/// until re-versioned, so the migration's re-version pass identifies them by path. A missing
+/// document is treated as not-memory (the caller surfaces the real "no document" error).
+async fn document_is_memory(pool: &Pool, document_id: i64) -> anyhow::Result<bool> {
+    let Some(row) = sqlx::query(
+        "SELECT path, EXISTS(SELECT 1 FROM json_each(documents.metadata, '$.tags') WHERE value=?) \
+         AS has_tag FROM documents WHERE id=?",
+    )
+    .bind(RESERVED_MEMORY_TAG)
+    .bind(document_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(false);
+    };
+    let has_tag: i64 = row.try_get("has_tag")?;
+    if has_tag != 0 {
+        return Ok(true);
+    }
+    let path: Option<String> = row.try_get("path")?;
+    Ok(path.as_deref().is_some_and(|p| {
+        RESERVED_MEMORY_PATH_PREFIXES
+            .iter()
+            .any(|pre| p.starts_with(pre))
+    }))
+}
+
 /// Append a new immutable version and advance the document's current pointer. A new version
 /// supersedes any prior approval: an `approved` / `changes_requested` document drops back to
 /// `in_review` (the review workflow itself lands in a follow-on task).
@@ -7269,12 +7298,18 @@ pub async fn publish_version(
     content_type: Option<&str>,
     content: Option<&str>,
 ) -> anyhow::Result<Value> {
-    // Reject an ambiguous bare "#N" in the submitted version summary/content (task #517 hard-fail).
-    if let Some(s) = summary {
-        check_bare_refs(s)?;
-    }
-    if let Some(c) = content {
-        check_bare_refs(c)?;
+    // Reject an ambiguous bare "#N" in the submitted version summary/content (task #517 hard-fail),
+    // EXCEPT for agent-memory docs (task_826): their bodies are raw historical content whose old
+    // PR/task numbers must stay verbatim (never-degrade). The create path and a CID publish never
+    // body-ref-lint, so this inline-version lint was the lone asymmetry that hard-rejected those
+    // historical refs; skipping it for memory docs makes version consistent with create for them.
+    if !document_is_memory(pool, document_id).await? {
+        if let Some(s) = summary {
+            check_bare_refs(s)?;
+        }
+        if let Some(c) = content {
+            check_bare_refs(c)?;
+        }
     }
     let ts = now_iso();
     let ct = content_type.unwrap_or("text/markdown");
@@ -18824,6 +18859,98 @@ mod tests {
             vec![ma],
             "list_wiki(prefix) still resolves memory"
         );
+        Ok(())
+    }
+
+    /// publish_version exempts agent-memory docs from the bare-"#N" reference lint (task_826): a
+    /// memory body is raw historical content whose old PR/task numbers must stay verbatim. A memory
+    /// doc is identified by its reserved path prefix OR the reserved tag; a non-memory doc still
+    /// hard-rejects a bare "#N" in its version body, so the lint is intact for board prose.
+    #[tokio::test]
+    async fn publish_version_skips_bare_ref_lint_for_memory_docs() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // A memory doc identified by its reserved PATH prefix (untagged, like the pre-existing docs
+        // the migration re-versions): a bare "#N" in the body is accepted verbatim.
+        let by_path = create_document(
+            &pool,
+            "repo mem",
+            None,
+            "cid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let by_path_id = by_path["id"].as_i64().unwrap();
+        set_document_path(&pool, by_path_id, "repos/cadenza/old-note", Some("u")).await?;
+        publish_version(
+            &pool,
+            by_path_id,
+            "bafyv2",
+            None,
+            Some("u"),
+            None,
+            Some("historical note: fixed in #504 and #517, see the thread"),
+        )
+        .await?;
+
+        // A memory doc identified by its reserved TAG (filed at a non-reserved path) is also exempt.
+        let by_tag = create_document(
+            &pool,
+            "tagged mem",
+            None,
+            "cid",
+            None,
+            Some("u"),
+            Some(json!({ "tags": [RESERVED_MEMORY_TAG] })),
+            None,
+            None,
+        )
+        .await?;
+        let by_tag_id = by_tag["id"].as_i64().unwrap();
+        set_document_path(&pool, by_tag_id, "notes/tagged", Some("u")).await?;
+        publish_version(
+            &pool,
+            by_tag_id,
+            "bafyv2",
+            None,
+            Some("u"),
+            None,
+            Some("recalled context mentioning #123"),
+        )
+        .await?;
+
+        // A non-memory doc still hard-rejects a bare "#N" in its version body.
+        let design = create_document(
+            &pool,
+            "a design",
+            None,
+            "cid",
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let design_id = design["id"].as_i64().unwrap();
+        set_document_path(&pool, design_id, "designs/d1", Some("u")).await?;
+        let err = publish_version(
+            &pool,
+            design_id,
+            "bafyv2",
+            None,
+            Some("u"),
+            None,
+            Some("blocked on #42"),
+        )
+        .await
+        .expect_err("a non-memory doc body still ref-lints")
+        .to_string();
+        assert!(err.starts_with("ambiguous bare reference"), "got: {err}");
         Ok(())
     }
 
