@@ -2809,16 +2809,19 @@ impl Board {
 
 /// The board's canonical writing-guidance document: the Fleet Doc-Writing Style Guide (`doc_7`,
 /// filed at the `guides/doc-writing-style-guide` wiki path). Exposed over MCP as a discoverable
-/// resource (task_369) so a skills-aware client can find and load the guidance natively, without a
-/// bespoke registration surface. A plain MCP resource is deliberately standard-agnostic: if the MCP
-/// skills extension (`io.modelcontextprotocol/skills`, SEP-2640) later stabilizes with host
+/// resource (task_369) so a resources-aware client can find and load the guidance natively, without
+/// a bespoke registration surface. A plain MCP resource is deliberately standard-agnostic: if the
+/// MCP skills extension (`io.modelcontextprotocol/skills`, SEP-2640) later stabilizes with host
 /// support, this is cheap to repoint to a `skill://` manifest. The board Document stays the
 /// authoring + storage layer; this is only the discovery surface over it.
 const WRITING_SKILL_DOC_ID: i64 = 7;
 
-/// Stable resource URI for [`WRITING_SKILL_DOC_ID`]. The `skill://` scheme mirrors the MCP skills
-/// extension in spirit so a future upgrade can keep the same identifier.
-const WRITING_SKILL_URI: &str = "skill://fleet/doc-writing-style-guide";
+/// Stable resource URI for [`WRITING_SKILL_DOC_ID`]. Uses the `file://` scheme because that is the
+/// scheme Claude Code's `@`-mention resource picker documents as referenceable (`@server:file://...`);
+/// a custom scheme like `skill://` is not confirmed to resolve in the picker today, so a documented
+/// scheme keeps the resource actually loadable. The path mirrors the doc's `guides/...` wiki path.
+/// If the MCP skills extension later lands with host support, the URI repoints to its manifest then.
+const WRITING_SKILL_URI: &str = "file://guides/doc-writing-style-guide";
 
 #[tool_handler]
 impl ServerHandler for Board {
