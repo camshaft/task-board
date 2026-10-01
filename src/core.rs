@@ -6978,6 +6978,113 @@ pub async fn get_document_versions(pool: &Pool, document_id: i64) -> anyhow::Res
 /// in the document's `metadata.tags` array), task_id (documents attached to that task), and
 /// author (created_by). All filters AND together.
 #[allow(clippy::too_many_arguments)]
+/// Map an operator-facing document status word to the STORED value (task 694c): the operator says
+/// draft / pending-review / published; the board stores draft / operator_review / approved. An
+/// already-stored form (or an unknown word) passes through unchanged, so BOTH vocabularies filter.
+pub fn resolve_status_alias(s: &str) -> String {
+    match s.trim() {
+        "pending-review" | "pending_review" => "operator_review",
+        "published" => "approved",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Parse a comma-separated status filter into resolved stored status values (alias-mapped), empties
+/// dropped. "draft, pending-review" -> ["draft", "operator_review"].
+pub fn parse_status_filter(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(resolve_status_alias)
+        .collect()
+}
+
+/// Filters for [`list_documents_filtered`] (task 694c). All optional; an empty `statuses` matches
+/// any status. `tag` includes docs carrying the tag; `exclude_tag` drops docs carrying it (the
+/// primitive the UI composes default-hide from, e.g. hide the "charter" tag).
+#[derive(Default)]
+pub struct DocListFilter<'a> {
+    pub project_id: Option<i64>,
+    pub statuses: Vec<String>,
+    pub tag: Option<&'a str>,
+    pub exclude_tag: Option<&'a str>,
+    pub task_id: Option<i64>,
+    pub author: Option<&'a str>,
+    pub include_archived: bool,
+}
+
+/// List documents with the full filter set (task 694c). Multi-value status (IN), tag include +
+/// exclude, project/author/task filters, archived hidden unless requested. The conds + binds below
+/// MUST stay in the same order (a no-bind cond like the archived filter can go anywhere).
+pub async fn list_documents_filtered(pool: &Pool, f: &DocListFilter<'_>) -> anyhow::Result<Value> {
+    let mut q = String::from(
+        "SELECT id, title, slug, path, project_id, status, current_version_id, approved_version_id, \
+         created_by, updated_at, archived_at, deprecated_at, superseded_by FROM documents",
+    );
+    let mut conds: Vec<String> = Vec::new();
+    if !f.include_archived {
+        conds.push("archived_at IS NULL".into());
+    }
+    if f.project_id.is_some() {
+        conds.push("project_id=?".into());
+    }
+    if !f.statuses.is_empty() {
+        let placeholders = vec!["?"; f.statuses.len()].join(",");
+        conds.push(format!("status IN ({placeholders})"));
+    }
+    if f.author.is_some() {
+        conds.push("created_by=?".into());
+    }
+    if f.task_id.is_some() {
+        conds.push("id IN (SELECT document_id FROM document_attachments WHERE task_id=?)".into());
+    }
+    if f.tag.is_some() {
+        // A value in the metadata.tags JSON array. json_each yields no rows when tags is absent.
+        conds.push(
+            "EXISTS (SELECT 1 FROM json_each(documents.metadata, '$.tags') WHERE value=?)".into(),
+        );
+    }
+    if f.exclude_tag.is_some() {
+        conds.push(
+            "NOT EXISTS (SELECT 1 FROM json_each(documents.metadata, '$.tags') WHERE value=?)"
+                .into(),
+        );
+    }
+    if !conds.is_empty() {
+        q.push_str(" WHERE ");
+        q.push_str(&conds.join(" AND "));
+    }
+    q.push_str(" ORDER BY id");
+    let mut query = sqlx::query(&q);
+    if let Some(p) = f.project_id {
+        query = query.bind(p);
+    }
+    for s in &f.statuses {
+        query = query.bind(s);
+    }
+    if let Some(a) = f.author {
+        query = query.bind(a);
+    }
+    if let Some(t) = f.task_id {
+        query = query.bind(t);
+    }
+    if let Some(tg) = f.tag {
+        query = query.bind(tg);
+    }
+    if let Some(xt) = f.exclude_tag {
+        query = query.bind(xt);
+    }
+    let rows = query.fetch_all(pool).await?;
+    Ok(Value::Array(
+        rows.iter().map(|r| row_to_json_ref(r, "doc")).collect(),
+    ))
+}
+
+/// Back-compat single-status/tag/author listing used only by the test suite now that MCP/REST call
+/// [`list_documents_filtered`] directly. The single `status` is comma-split + alias-resolved, so
+/// this path also accepts the operator vocabulary.
+#[cfg(test)]
 pub async fn list_documents(
     pool: &Pool,
     project_id: Option<i64>,
@@ -6987,57 +7094,20 @@ pub async fn list_documents(
     author: Option<&str>,
     include_archived: bool,
 ) -> anyhow::Result<Value> {
-    let mut q = String::from(
-        "SELECT id, title, slug, path, project_id, status, current_version_id, approved_version_id, \
-         created_by, updated_at, archived_at, deprecated_at, superseded_by FROM documents",
-    );
-    // conds and the binds below MUST stay in the same order. (A cond that binds no value — like
-    // the archived filter — can go anywhere without disturbing that order.)
-    let mut conds: Vec<&str> = Vec::new();
-    if !include_archived {
-        conds.push("archived_at IS NULL");
-    }
-    if project_id.is_some() {
-        conds.push("project_id=?");
-    }
-    if status.is_some() {
-        conds.push("status=?");
-    }
-    if author.is_some() {
-        conds.push("created_by=?");
-    }
-    if task_id.is_some() {
-        conds.push("id IN (SELECT document_id FROM document_attachments WHERE task_id=?)");
-    }
-    if tag.is_some() {
-        // A value in the metadata.tags JSON array. json_each yields no rows when tags is absent.
-        conds.push("EXISTS (SELECT 1 FROM json_each(documents.metadata, '$.tags') WHERE value=?)");
-    }
-    if !conds.is_empty() {
-        q.push_str(" WHERE ");
-        q.push_str(&conds.join(" AND "));
-    }
-    q.push_str(" ORDER BY id");
-    let mut query = sqlx::query(&q);
-    if let Some(p) = project_id {
-        query = query.bind(p);
-    }
-    if let Some(s) = status {
-        query = query.bind(s);
-    }
-    if let Some(a) = author {
-        query = query.bind(a);
-    }
-    if let Some(t) = task_id {
-        query = query.bind(t);
-    }
-    if let Some(tg) = tag {
-        query = query.bind(tg);
-    }
-    let rows = query.fetch_all(pool).await?;
-    Ok(Value::Array(
-        rows.iter().map(|r| row_to_json_ref(r, "doc")).collect(),
-    ))
+    let statuses = status.map(parse_status_filter).unwrap_or_default();
+    list_documents_filtered(
+        pool,
+        &DocListFilter {
+            project_id,
+            statuses,
+            tag,
+            exclude_tag: None,
+            task_id,
+            author,
+            include_archived,
+        },
+    )
+    .await
 }
 
 // --- Wiki: hierarchical paths over documents (#105) ---
@@ -16922,6 +16992,118 @@ mod tests {
         // check_non_ascii (the bailing path) agrees on the first offender: same source of truth.
         assert!(check_non_ascii("ok \u{2014} no", false).is_err());
         assert!(check_non_ascii("all ascii here", false).is_ok());
+        Ok(())
+    }
+
+    // task 694c: list_documents_filtered supports a multi-value status IN-set, an exclude_tag
+    // primitive, and the operator status vocabulary (pending-review/published aliases). These are
+    // what the UI composes default-hide (hide charters unless pending-review) from.
+    #[tokio::test]
+    async fn list_documents_filtered_multi_status_exclude_tag_and_aliases() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let charter_meta = || Some(json!({ "tags": ["charter"] }));
+        let a = create_document(
+            &pool,
+            "A charter draft",
+            Some(pid),
+            "cid",
+            None,
+            Some("u"),
+            charter_meta(),
+            None,
+            None,
+        )
+        .await?;
+        let b = create_document(
+            &pool,
+            "B charter pending",
+            Some(pid),
+            "cid",
+            None,
+            Some("u"),
+            charter_meta(),
+            None,
+            None,
+        )
+        .await?;
+        let c = create_document(
+            &pool,
+            "C design approved",
+            Some(pid),
+            "cid",
+            None,
+            Some("u"),
+            Some(json!({ "tags": ["design"] })),
+            None,
+            None,
+        )
+        .await?;
+        // Set statuses directly (create_document starts as 'draft').
+        for (doc, st) in [(&b, "operator_review"), (&c, "approved")] {
+            sqlx::query("UPDATE documents SET status=? WHERE id=?")
+                .bind(st)
+                .bind(doc["id"].as_i64().unwrap())
+                .execute(&pool)
+                .await?;
+        }
+        let ids = |v: &Value| -> Vec<i64> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_i64().unwrap())
+                .collect()
+        };
+        let (aid, bid, cid) = (
+            a["id"].as_i64().unwrap(),
+            b["id"].as_i64().unwrap(),
+            c["id"].as_i64().unwrap(),
+        );
+
+        // Multi-status IN: draft + operator_review -> A, B (not the approved C).
+        let multi = list_documents_filtered(
+            &pool,
+            &DocListFilter {
+                statuses: vec!["draft".into(), "operator_review".into()],
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(ids(&multi), vec![aid, bid]);
+
+        // Operator vocabulary via parse_status_filter: "pending-review" -> operator_review -> B;
+        // "published" -> approved -> C.
+        let pending = list_documents_filtered(
+            &pool,
+            &DocListFilter {
+                statuses: parse_status_filter("pending-review"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(ids(&pending), vec![bid]);
+        let published = list_documents_filtered(
+            &pool,
+            &DocListFilter {
+                statuses: parse_status_filter("published"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(ids(&published), vec![cid]);
+
+        // exclude_tag=charter -> only the non-charter C.
+        let non_charter = list_documents_filtered(
+            &pool,
+            &DocListFilter {
+                exclude_tag: Some("charter"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(ids(&non_charter), vec![cid]);
         Ok(())
     }
 
