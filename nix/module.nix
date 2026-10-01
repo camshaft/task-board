@@ -131,6 +131,18 @@ in
       requires = [ "task-board.socket" ];
       after = [ "network.target" "task-board.socket" ];
 
+      # Service-ONLY restart on a redeploy, leaving the socket unit (and its listening fd) up, so
+      # mid-deploy connections queue in the kernel backlog instead of hitting a connection-refused
+      # window (the recurring deploy-time 502). Without this, switch-to-configuration-ng drags the
+      # socket into the stop-set when it restarts a socket-activated service (it runs the socket
+      # stop/start branch) -- bouncing the fd on every deploy. `stopIfChanged = false` makes ng run
+      # `systemctl restart task-board.service` only, never entering that branch. restartIfChanged
+      # stays true (default) so the restart still reloads the new ExecStart -- a service-only
+      # restart that picks up the new build without closing the socket. Confirmed live on green
+      # (socket ActiveEnterTimestamp held across a deploy; service restarted onto the new build).
+      # Pairs with the board-side graceful SIGTERM drain for a zero-downtime deploy (task_753).
+      stopIfChanged = false;
+
       environment = {
         RUST_LOG = lib.mkDefault "info,task_board=debug";
       };
