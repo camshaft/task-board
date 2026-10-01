@@ -454,6 +454,16 @@ export function TaskDrawer() {
                 </dd>
                 <dt className="text-[var(--color-muted)]">Created by</dt>
                 <dd className="col-span-2 font-mono text-xs">{task.created_by ?? '—'}</dd>
+                {/* Created / last-updated timestamps (task 748): relative for scanning, with the
+                    exact local time on hover. */}
+                <dt className="text-[var(--color-muted)]">Created</dt>
+                <dd className="col-span-2 text-xs" title={new Date(task.created_at).toLocaleString()}>
+                  {relTime(task.created_at)}
+                </dd>
+                <dt className="text-[var(--color-muted)]">Updated</dt>
+                <dd className="col-span-2 text-xs" title={new Date(task.updated_at).toLocaleString()}>
+                  {relTime(task.updated_at)}
+                </dd>
                 <dt className="text-[var(--color-muted)]">Subscribers</dt>
                 <dd className="col-span-2 font-mono text-xs">
                   {task.subscribers.length ? task.subscribers.join(', ') : '—'}
