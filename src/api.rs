@@ -165,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/comments/{comment_id}/cancel", post(cancel_question))
         .route("/comments/{comment_id}/supersede", post(supersede_question))
         .route("/tasks/blocking-me", get(list_tasks_blocking_me))
+        .route("/tasks/awaiting", get(list_awaiting))
         .route("/tasks/{task_id}/props", patch(set_task_props))
         .route("/tasks/{task_id}/move", post(move_task))
         .route("/tasks/{task_id}/archive", post(archive_task))
@@ -403,6 +404,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/supersede", summary: "Supersede an open question with a replacement (doc_33 A6): the old is kept immutable + linked, the new copies its payload with a new prompt. Asker-only.", query: "", body: Some("SupersedeQuestionBody") },
     Endpoint { method: "GET", path: "/api/tasks/blocking-me", summary: "Tasks with an open blocking question routed to `viewer` (team-expanded) -- the question-based waiting-on-me view.", query: "viewer=str&project_id=int&include_archived=bool", body: None },
+    Endpoint { method: "GET", path: "/api/tasks/awaiting", summary: "The unified 'awaiting you' queue (task_860): tasks blocked_on the `viewer` principal UNION tasks with an open blocking question routed to it, keyed INDEPENDENT of assignee (owner-held tasks are not assigned to the principal), team-expanded, deduped. Returns one task-centric row per task: {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]}. Supersedes blocking-me (questions-only).", query: "viewer=str&project_id=int&include_archived=bool", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/archive", summary: "Soft-archive a task: hide it from the default list_tasks view (still fetchable by id and with include_archived). Orthogonal to status; reversible with restore.", query: "", body: Some("ArchiveTaskBody") },
@@ -1338,6 +1340,26 @@ async fn list_tasks_blocking_me(
 ) -> ApiResult {
     Ok(Json(
         core::list_tasks_blocking_me(&st.pool, &q.viewer, q.project_id, q.include_archived).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AwaitingQuery {
+    /// The principal whose awaiting-decision queue to return (e.g. "operator"). A team-targeted
+    /// block or a team-routed question surfaces for the team's members.
+    viewer: String,
+    project_id: Option<i64>,
+    #[serde(default)]
+    include_archived: bool,
+}
+
+/// `GET /api/tasks/awaiting?viewer=<principal>` — the unified "awaiting you" queue (task_860):
+/// tasks blocked_on the principal UNION tasks with an open blocking question routed to the
+/// principal, keyed independent of assignee, deduped to one task-centric row each with
+/// `blocked_on_principal` + full-payload `questions[]`.
+async fn list_awaiting(State(st): State<AppState>, Query(q): Query<AwaitingQuery>) -> ApiResult {
+    Ok(Json(
+        core::list_awaiting(&st.pool, &q.viewer, q.project_id, q.include_archived).await?,
     ))
 }
 
