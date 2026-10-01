@@ -88,6 +88,7 @@ pub async fn stream(
     pool: Pool,
     rx: broadcast::Receiver<StreamEvent>,
     last_event_id: Option<i64>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Response {
     // `cutoff` is the highest seq already accounted for by the replay portion; live events
     // are filtered to seq > cutoff so nothing is delivered twice.
@@ -126,7 +127,13 @@ pub async fn stream(
         }
     });
 
+    // End the stream when the process begins a graceful shutdown, so this long-lived response
+    // closes instead of holding axum's graceful_shutdown open until the systemd stop-timeout +
+    // SIGKILL (task_753). The client reconnects and replays the gap via Last-Event-ID.
     let body = tokio_stream::iter(replay).chain(live);
+    // `take_until` is from futures_util::StreamExt; call it fully-qualified so we don't import a
+    // second StreamExt (which would make `chain`/`filter_map` above ambiguous with tokio_stream's).
+    let body = futures_util::StreamExt::take_until(body, shutdown.cancelled_owned());
     Sse::new(body)
         .keep_alive(
             KeepAlive::new()
@@ -196,6 +203,30 @@ async fn max_seq(pool: &Pool) -> i64 {
 mod tests {
     use super::*;
     use crate::core;
+
+    /// A graceful shutdown ends an open SSE stream promptly instead of holding the connection
+    /// (and axum's graceful_shutdown) open until the systemd stop-timeout + SIGKILL (task_753).
+    #[tokio::test]
+    async fn stream_ends_on_shutdown() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let tx = channel();
+        let rx = tx.subscribe();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel(); // the process is already shutting down
+        let resp = stream(pool, rx, None, shutdown).await;
+        // The body must COMPLETE (not hang): the cancelled token ends the live stream via take_until.
+        let collected = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await;
+        assert!(
+            collected.is_ok(),
+            "a cancelled shutdown token must end the SSE stream promptly, not hang"
+        );
+        Ok(())
+    }
 
     /// The tailer publishes only events committed after it starts, and each carries the
     /// routing fields the UI invalidates on.

@@ -26,6 +26,10 @@ pub struct AppState {
     /// Optional IPFS HTTP API for server-side content-addressing of raw document `content`.
     /// `None` keeps the board CID-only. See `crate::ipfs` and `config::Settings::ipfs_api_url`.
     pub ipfs_api_url: Option<String>,
+    /// Cancelled when the process begins a graceful shutdown, so long-lived `GET /api/stream`
+    /// SSE responses end instead of holding `graceful_shutdown` open until the systemd
+    /// stop-timeout + SIGKILL (task_753). SSE clients reconnect and replay via Last-Event-ID.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Map an anyhow error to a JSON HTTP response. "no project/task ..." -> 404/400.
@@ -2920,7 +2924,7 @@ async fn stream(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<i64>().ok())
         .or(q.last_event_id);
-    sse::stream(st.pool.clone(), rx, last_event_id).await
+    sse::stream(st.pool.clone(), rx, last_event_id, st.shutdown.clone()).await
 }
 
 fn default_true() -> bool {
@@ -2950,6 +2954,7 @@ mod tests {
             pool,
             events_tx,
             ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         Ok(())
     }
@@ -3021,6 +3026,7 @@ mod tests {
             pool,
             events_tx,
             ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
         let get = |uri: String| {
@@ -3071,6 +3077,7 @@ mod tests {
             pool,
             events_tx,
             ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let resp = health(State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);

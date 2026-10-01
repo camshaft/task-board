@@ -154,6 +154,9 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         events_tx,
         ipfs_api_url: cfg.ipfs_api_url.clone(),
+        // Shares cancellation with `ct`: the shutdown closure's `ct.cancel()` ends in-flight SSE
+        // streams so graceful_shutdown drains promptly instead of waiting out the stop-timeout.
+        shutdown: ct.clone(),
     });
 
     // Reverse tunnel for fleet hosts with no inbound path: they dial /tunnel/ws and the board
