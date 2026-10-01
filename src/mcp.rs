@@ -126,7 +126,7 @@ pub struct ListAgentsArgs {
     pub meta_value: Option<String>,
     /// Return full agent objects (incl the heavy charter) instead of the compact {id, display_name,
     /// status, metadata} roster projection. Default false.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub verbose: Option<bool>,
     /// Max rows (default 200, capped at 1000).
     #[serde(default)]
@@ -163,7 +163,7 @@ pub struct UpdateAgentArgs {
     pub clear: Option<Vec<String>>,
     /// Return the full agent (including the `charter`) in the response. Default false — the response
     /// omits the charter to keep a looping caller's context light; fetch it with get_agent.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub verbose: Option<bool>,
 }
 
@@ -281,7 +281,7 @@ pub struct UpdateTaskArgs {
     pub assignee: Option<String>,
     /// Clear the task's owner (set it to no assignee). Takes precedence over `assignee`. This is
     /// the reliable, client-safe way to unassign (an empty-string `assignee` is not portable).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub unassign: Option<bool>,
     #[serde(default)]
     pub title: Option<String>,
@@ -534,7 +534,7 @@ pub struct CommentTaskArgs {
     pub external_link: Option<core::ExternalRef>,
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
     /// Use only for an intentional occurrence, e.g. quoting a banned phrase to discuss it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
 }
 
@@ -555,7 +555,7 @@ pub struct SubscribeArgs {
     #[serde(default)]
     pub document_id: Option<i64>,
     /// Whole-board firehose: subscribe to EVERY event on the board (for a coordinator/auto-assigner).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub board: Option<bool>,
     /// Optional event-class filter (#462): a subset of ["created", "done", "blocked", "status",
     /// "comment", "assigned", "review", "doc"]. When given, this subscription is delivery-gated to
@@ -642,7 +642,7 @@ pub struct GetChannelPostsArgs {
     pub before_seq: Option<i64>,
     /// false (default) = oldest-first (scrollback); true = newest-first, so since_seq=0 + limit=N
     /// returns the LATEST N posts (a chat view).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub desc: bool,
 }
 
@@ -816,6 +816,7 @@ pub struct SetChannelAutoJoinArgs {
     pub channel_id: i64,
     /// true = every agent is a member (existing agents joined now + new agents auto-join on
     /// register); false = stop auto-joining (existing members stay).
+    #[serde(deserialize_with = "de_bool_lenient")]
     pub auto_join: bool,
     /// The agent performing the change (event actor). Defaults to this session's identity.
     #[serde(default)]
@@ -878,7 +879,7 @@ pub struct CheckNotificationsArgs {
     /// Whose inbox to drain. Defaults to the agent this session registered as.
     #[serde(default)]
     pub agent_id: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "de_bool_lenient")]
     pub mark_read: bool,
     #[serde(default = "default_limit")]
     pub limit: i64,
@@ -907,7 +908,7 @@ pub struct GetMessagesArgs {
     /// Whose messages. Defaults to the agent this session registered as.
     #[serde(default)]
     pub agent_id: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "de_bool_lenient")]
     pub mark_read: bool,
     #[serde(default = "default_limit")]
     pub limit: i64,
@@ -924,7 +925,7 @@ pub struct GetEventsArgs {
     pub actor: Option<String>,
     /// `true` returns the LATEST `limit` events (newest-first) — a live activity feed. Default
     /// `false` is oldest-first after `since_seq` — for incrementally tailing the log.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub desc: bool,
 }
 
@@ -957,7 +958,7 @@ pub struct CreateDocumentArgs {
     pub content_type: Option<String>,
     /// Submit even if the content contains a banned phrase (the pre-submit lint otherwise rejects
     /// it). Text content is scanned; non-text content is not.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
 }
 
@@ -981,7 +982,7 @@ pub struct PublishVersionArgs {
     pub content_type: Option<String>,
     /// Submit even if the content contains a banned phrase (the pre-submit lint otherwise rejects
     /// it). Text content is scanned; non-text content is not.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
 }
 
@@ -1002,7 +1003,7 @@ pub struct ListWikiArgs {
     #[serde(default)]
     pub prefix: Option<String>,
     /// Include archived (retired) documents in the tree. Hidden by default.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub include_archived: bool,
 }
 
@@ -1051,7 +1052,7 @@ pub struct ListDocumentsArgs {
     #[serde(default)]
     pub author: Option<String>,
     /// Include archived (retired) documents. Hidden by default.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub include_archived: bool,
 }
 
@@ -1079,7 +1080,7 @@ pub struct CommentDocumentArgs {
     #[serde(default)]
     pub external_author: Option<String>,
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
 }
 
@@ -1201,6 +1202,7 @@ pub struct SetReviewStatusArgs {
 pub struct SetReviewVettedArgs {
     pub review_id: i64,
     /// true = mark the review vetted (adversarial review run + addressed); false = clear it.
+    #[serde(deserialize_with = "de_bool_lenient")]
     pub vetted: bool,
     /// The agent setting the flag (defaults to this session's identity). Recorded for audit.
     #[serde(default)]
@@ -2954,6 +2956,44 @@ mod tests {
             !from_value::<GetDocumentArgs>(json!({"document_id": 1}))
                 .unwrap()
                 .include_body
+        );
+
+        // acknowledge_banned (Option<bool>) on the content-gate tools -- the task 603 break: the
+        // harness sent "true" and the server rejected, forcing a raw-REST fallback.
+        assert_eq!(
+            from_value::<PublishVersionArgs>(
+                json!({"document_id": 1, "acknowledge_banned": "true"})
+            )
+            .unwrap()
+            .acknowledge_banned,
+            Some(true)
+        );
+        assert_eq!(
+            from_value::<CommentDocumentArgs>(
+                json!({"document_id": 1, "body": "x", "acknowledge_banned": "false"})
+            )
+            .unwrap()
+            .acknowledge_banned,
+            Some(false)
+        );
+        assert_eq!(
+            from_value::<CommentTaskArgs>(
+                json!({"task_id": 1, "body": "x", "acknowledge_banned": true})
+            )
+            .unwrap()
+            .acknowledge_banned,
+            Some(true)
+        );
+        // Required bool args (no default) coerce too.
+        assert!(
+            from_value::<SetReviewVettedArgs>(json!({"review_id": 1, "vetted": "true"}))
+                .unwrap()
+                .vetted
+        );
+        assert!(
+            !from_value::<SetChannelAutoJoinArgs>(json!({"channel_id": 1, "auto_join": "false"}))
+                .unwrap()
+                .auto_join
         );
 
         // i64: stringified and native, plus absent -> None.
