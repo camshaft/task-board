@@ -184,6 +184,23 @@ export default function DocumentView() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
+  // A document URL opened directly with a #section fragment (e.g. a doc deep-link posted to
+  // Slack, task 790) should land scrolled to that heading, not just at the top. Mirrors the
+  // in-app anchor click's target lookup (markdown.tsx's scrollToFragment), but runs once the
+  // content has actually rendered (contentNonce) instead of on a click, since nothing was
+  // clicked to trigger it.
+  useEffect(() => {
+    const frag = window.location.hash.slice(1)
+    if (!frag) return
+    let target: HTMLElement | null = null
+    try {
+      target = document.getElementById(decodeURIComponent(frag))
+    } catch {
+      target = document.getElementById(frag)
+    }
+    target?.scrollIntoView({ block: 'start' })
+  }, [documentId, contentNonce])
+
   function requestChanges() {
     const note = window.prompt('What needs to change? (optional note)') ?? undefined
     void act(() => requestDocumentChanges(id, { actor, note: note || undefined }))
