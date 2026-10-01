@@ -1182,6 +1182,12 @@ pub struct PoseQuestionArgs {
     /// Non-blocking only: wait this many seconds for an answer before proceeding on the default (requires `default`).
     #[serde(default)]
     pub wait_period_seconds: Option<i64>,
+    /// Optional inline JSON Schema the framed answer must satisfy (the schema-driven model). When present, a submitted answer is validated against this schema generically rather than by `kind`.
+    #[serde(default)]
+    pub response_schema: Option<serde_json::Value>,
+    /// Optional UI descriptor stored verbatim (element name, props, element-schema CID); resolved by the client, not the board.
+    #[serde(default)]
+    pub ui: Option<serde_json::Value>,
     #[serde(default)]
     pub actor: Option<String>,
 }
@@ -2812,13 +2818,13 @@ impl Board {
     }
 
     #[tool(
-        description = "Pose a structured question on a task (doc_33): a typed, answerable question comment of a given kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list), routed to a person/team/agent. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Returns the question comment; notifies the routed-to principal."
+        description = "Pose a structured question on a task (doc_33): a typed, answerable question comment of a given kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list), routed to a person/team/agent. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Optionally carry an inline response_schema (a JSON Schema the framed answer must satisfy) plus a ui descriptor; when a response_schema is present, submitted answers are validated against it generically. Returns the question comment; notifies the routed-to principal."
     )]
     async fn pose_question(
         &self,
         Parameters(a): Parameters<PoseQuestionArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::pose_question(
+        core::pose_question_full(
             &self.pool,
             a.task_id,
             &a.kind,
@@ -2828,6 +2834,8 @@ impl Board {
             a.blocking.unwrap_or(true),
             a.default,
             a.wait_period_seconds,
+            a.response_schema,
+            a.ui,
             self.me_opt(s(&a.actor)).as_deref(),
         )
         .await
@@ -2836,7 +2844,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Answer an open question (doc_33). A framed answer (shape matching the kind: bool / choice / text / ranked) marks it answered; a text answer to a non-text kind is the universal out-of-frame escape and marks it answered-outside-frame. Records a reply answer comment, clears the task's question-block if it was the last blocking one, and notifies the asker. Returns the answer comment."
+        description = "Answer an open question (doc_33). For a kind-based question a framed answer (shape matching the kind: bool / choice / text / ranked) marks it answered; a text answer to a non-text kind is the universal out-of-frame escape and marks it answered-outside-frame. For a schema-driven question (one carrying a response_schema) the value is validated against that schema generically -- a non-text shape must satisfy it, and a text answer that satisfies it is framed while one that does not is the out-of-frame escape. Records a reply answer comment, clears the task's question-block if it was the last blocking one, and notifies the asker. Returns the answer comment."
     )]
     async fn answer_question(
         &self,
