@@ -20,38 +20,82 @@ struct AddResponse {
     hash: String,
 }
 
-/// Pin `bytes` via the IPFS HTTP API at `api_url` (e.g. "http://127.0.0.1:5001") and return
-/// the resulting CID. Uses `/api/v0/add` with a multipart file part, as Kubo expects.
+/// Backoff before each retry of a transient `add` failure (task_851): a few retries over a few
+/// seconds so a brief Kubo restart/blip is ridden out instead of hard-failing a document write.
+/// One entry per retry (attempts = len + 1); the value is the pause BEFORE that retry.
+const ADD_RETRY_BACKOFF: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+];
+
+/// Pin `bytes` via the IPFS HTTP API at `api_url` (e.g. "http://127.0.0.1:5001") and return the
+/// resulting CID. Uses `/api/v0/add` with a multipart file part, as Kubo expects. A transient
+/// failure (a connection/send error or a 5xx from the node) is retried with backoff (task_851) so a
+/// brief Kubo restart does not hard-fail the write; a 4xx (or an unparseable 2xx) is permanent and
+/// returned at once.
 pub async fn add(api_url: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
+    add_with_backoff(api_url, bytes, ADD_RETRY_BACKOFF).await
+}
+
+/// `add`, parameterized on the retry backoff so tests can drive it with zero delays. After the last
+/// attempt a still-transient failure surfaces as an "ipfs backend unavailable" error, which the
+/// HTTP layer maps to a retryable 503 rather than a hard 500.
+async fn add_with_backoff(
+    api_url: &str,
+    bytes: Vec<u8>,
+    backoff: &[std::time::Duration],
+) -> anyhow::Result<String> {
     let url = format!("{}/api/v0/add?pin=true", api_url.trim_end_matches('/'));
-    let part = reqwest::multipart::Part::bytes(bytes).file_name("content");
-    let form = reqwest::multipart::Form::new().part("file", part);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("building ipfs http client")?;
-    let resp = client
-        .post(&url)
-        .multipart(form)
-        .send()
-        .await
-        .context("posting to ipfs /api/v0/add")?;
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("ipfs add returned {code}: {body}");
+    let attempts = backoff.len() + 1;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(backoff[attempt - 1]).await;
+        }
+        // Rebuild the multipart form each attempt: reqwest's Form is consumed by send().
+        let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name("content");
+        let form = reqwest::multipart::Form::new().part("file", part);
+        match client.post(&url).multipart(form).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                // Kubo streams one JSON object per added object, newline-delimited; for a single
+                // file that's one line. Take the last non-empty line (the top-level object). A parse
+                // failure here is a protocol mismatch (permanent), not transient -> return it.
+                let text = resp.text().await.context("reading ipfs add response")?;
+                let line = text
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .context("empty ipfs add response")?;
+                let parsed: AddResponse = serde_json::from_str(line)
+                    .with_context(|| format!("parsing ipfs add response: {line}"))?;
+                return Ok(parsed.hash);
+            }
+            Ok(resp) => {
+                let code = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                // A 4xx is a permanent client-side problem -> fail now, no retry. A 5xx is a
+                // transient node problem -> remember it and fall through to the next attempt.
+                if !code.is_server_error() {
+                    anyhow::bail!("ipfs add returned {code}: {body}");
+                }
+                last_err = Some(anyhow::anyhow!("ipfs add returned {code}: {body}"));
+            }
+            Err(e) => {
+                // Connection/send/timeout error: transient, retry.
+                last_err = Some(anyhow::Error::new(e).context("posting to ipfs /api/v0/add"));
+            }
+        }
     }
-    // Kubo streams one JSON object per added object, newline-delimited; for a single file
-    // that's one line. Take the last non-empty line (the top-level object).
-    let text = resp.text().await.context("reading ipfs add response")?;
-    let line = text
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .context("empty ipfs add response")?;
-    let parsed: AddResponse =
-        serde_json::from_str(line).with_context(|| format!("parsing ipfs add response: {line}"))?;
-    Ok(parsed.hash)
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("ipfs add failed"))
+        .context(format!(
+            "ipfs backend unavailable after {attempts} attempts (transient add failure); retry shortly"
+        )))
 }
 
 /// A permissive sanity check that `cid` looks like a bare content id, so the read gateway
@@ -206,6 +250,92 @@ mod tests {
         assert!(!is_probable_cid("../../etc/passwd")); // path traversal
         assert!(!is_probable_cid("bafy with space"));
         assert!(!is_probable_cid("bafy/sub")); // no slashes
+    }
+
+    /// Stand up a fake Kubo `/api/v0/add` on an ephemeral port that counts calls: returns a 503 for
+    /// the first `fail_first` requests then a Kubo-shaped OK, or always `permanent` when set.
+    async fn spawn_fake_add(
+        fail_first: usize,
+        permanent: Option<axum::http::StatusCode>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let app = axum::Router::new().route(
+            "/api/v0/add",
+            axum::routing::post(move || {
+                let c = c.clone();
+                async move {
+                    let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some(code) = permanent {
+                        return (code, String::from("bad request"));
+                    }
+                    if n <= fail_first {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            String::from("node restarting"),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            String::from("{\"Hash\":\"QmFakeCid\"}\n"),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    /// A transient 5xx is retried with backoff and the add eventually succeeds (task_851).
+    #[tokio::test]
+    async fn add_retries_transient_5xx_then_succeeds() {
+        let (url, count) = spawn_fake_add(2, None).await;
+        let zero = [std::time::Duration::ZERO; 3];
+        let cid = add_with_backoff(&url, b"hi".to_vec(), &zero).await.unwrap();
+        assert_eq!(cid, "QmFakeCid");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "2 failures + 1 success"
+        );
+    }
+
+    /// A persistent 5xx gives up after the bounded attempts with a retryable "ipfs backend
+    /// unavailable" error (mapped to 503), not an unbounded hang.
+    #[tokio::test]
+    async fn add_gives_up_after_bounded_attempts() {
+        let (url, count) = spawn_fake_add(usize::MAX, None).await;
+        let zero = [std::time::Duration::ZERO; 2]; // 3 attempts total
+        let err = add_with_backoff(&url, b"x".to_vec(), &zero)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("ipfs backend unavailable"), "got: {err}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A 4xx is permanent: fail immediately, no retry.
+    #[tokio::test]
+    async fn add_does_not_retry_a_4xx() {
+        let (url, count) = spawn_fake_add(0, Some(axum::http::StatusCode::BAD_REQUEST)).await;
+        let zero = [std::time::Duration::ZERO; 2];
+        let err = add_with_backoff(&url, b"x".to_vec(), &zero)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ipfs add returned 400"), "got: {err}");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no retry on a permanent 4xx"
+        );
     }
 
     #[tokio::test]

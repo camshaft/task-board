@@ -70,9 +70,11 @@ impl IntoResponse for ApiError {
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
-        } else if msg.starts_with("no IPFS backend") {
-            // The board has no IPFS backend configured, so server-side content-addressing
-            // is unavailable — the deployment hasn't enabled it (set ipfs_api_url).
+        } else if msg.starts_with("no IPFS backend") || msg.starts_with("ipfs backend unavailable")
+        {
+            // Either the deployment has no IPFS backend configured (set ipfs_api_url), or the
+            // backend was transiently unavailable through the bounded add retries (task_851).
+            // Both are retryable-from-the-client, so 503 rather than a hard 500.
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
