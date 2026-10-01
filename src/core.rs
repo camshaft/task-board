@@ -1126,6 +1126,246 @@ pub async fn set_identity_alias(
     Ok(json!({ "alias": alias, "canonical": canonical }))
 }
 
+// --- People / teams: the multi-operator identity model (doc_26 / task 542, Phase 1) ---
+// People are first-class human identities in their own registry (separate from `agents`); teams are
+// addressable groups whose members are people OR other teams (recursive). Ids are stable string
+// handles. Membership is kept acyclic at write time and the read-time expansion is cycle-guarded.
+// ENFORCEMENT is deferred: this records identities + membership and resolves them at read time;
+// nothing here gates access or requires login.
+
+/// Create (or idempotently upsert) a person. `id` is a stable string handle (e.g. "cameron").
+pub async fn create_person(
+    pool: &Pool,
+    id: &str,
+    display_name: Option<&str>,
+    created_by: Option<&str>,
+    metadata: Option<Value>,
+) -> anyhow::Result<Value> {
+    let id = id.trim();
+    if id.is_empty() {
+        anyhow::bail!("give a non-empty person id");
+    }
+    let meta = metadata.unwrap_or_else(|| json!({})).to_string();
+    sqlx::query(
+        "INSERT INTO people(id, display_name, created_by, created_at, metadata) VALUES(?,?,?,?,?) \
+         ON CONFLICT(id) DO UPDATE SET \
+           display_name=COALESCE(excluded.display_name, people.display_name), \
+           metadata=excluded.metadata",
+    )
+    .bind(id)
+    .bind(display_name)
+    .bind(created_by)
+    .bind(now_iso())
+    .bind(meta)
+    .execute(pool)
+    .await?;
+    get_person(pool, id).await
+}
+
+pub async fn get_person(pool: &Pool, id: &str) -> anyhow::Result<Value> {
+    let Some(row) = sqlx::query("SELECT * FROM people WHERE id=?").bind(id).fetch_optional(pool).await?
+    else {
+        anyhow::bail!("no person {id}");
+    };
+    Ok(row_to_json(&row))
+}
+
+pub async fn list_people(pool: &Pool) -> anyhow::Result<Value> {
+    let rows = sqlx::query("SELECT * FROM people ORDER BY id").fetch_all(pool).await?;
+    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
+/// Create (or idempotently upsert) a team. `id` is a stable string handle (e.g. "operator").
+pub async fn create_team(
+    pool: &Pool,
+    id: &str,
+    display_name: Option<&str>,
+    created_by: Option<&str>,
+    metadata: Option<Value>,
+) -> anyhow::Result<Value> {
+    let id = id.trim();
+    if id.is_empty() {
+        anyhow::bail!("give a non-empty team id");
+    }
+    let meta = metadata.unwrap_or_else(|| json!({})).to_string();
+    sqlx::query(
+        "INSERT INTO teams(id, display_name, created_by, created_at, metadata) VALUES(?,?,?,?,?) \
+         ON CONFLICT(id) DO UPDATE SET \
+           display_name=COALESCE(excluded.display_name, teams.display_name), \
+           metadata=excluded.metadata",
+    )
+    .bind(id)
+    .bind(display_name)
+    .bind(created_by)
+    .bind(now_iso())
+    .bind(meta)
+    .execute(pool)
+    .await?;
+    get_team(pool, id).await
+}
+
+pub async fn list_teams(pool: &Pool) -> anyhow::Result<Value> {
+    let rows = sqlx::query("SELECT * FROM teams ORDER BY id").fetch_all(pool).await?;
+    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
+/// A team plus its direct members and its fully-resolved person set (nested teams expanded).
+pub async fn get_team(pool: &Pool, team_id: &str) -> anyhow::Result<Value> {
+    let Some(row) = sqlx::query("SELECT * FROM teams WHERE id=?").bind(team_id).fetch_optional(pool).await?
+    else {
+        anyhow::bail!("no team {team_id}");
+    };
+    let mut out = row_to_json(&row);
+    let members: Vec<Value> = sqlx::query(
+        "SELECT member_id, member_kind FROM team_members WHERE team_id=? ORDER BY member_kind, member_id",
+    )
+    .bind(team_id)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(row_to_json)
+    .collect();
+    let people: Vec<Value> = resolve_team_people(pool, team_id)
+        .await?
+        .into_iter()
+        .map(Value::String)
+        .collect();
+    if let Value::Object(ref mut m) = out {
+        m.insert("members".into(), Value::Array(members));
+        m.insert("resolved_people".into(), Value::Array(people));
+    }
+    Ok(out)
+}
+
+/// Expand a team to the set of PERSON ids it contains, following nested teams. Cycle-guarded by a
+/// visited-set so a cyclic membership graph still terminates (doc_26 appendix A1).
+async fn resolve_team_people(pool: &Pool, team_id: &str) -> anyhow::Result<BTreeSet<String>> {
+    let mut people: BTreeSet<String> = BTreeSet::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut stack = vec![team_id.to_string()];
+    while let Some(tid) = stack.pop() {
+        if !visited.insert(tid.clone()) {
+            continue; // already expanded this team -> cycle guard
+        }
+        for r in sqlx::query("SELECT member_id, member_kind FROM team_members WHERE team_id=?")
+            .bind(&tid)
+            .fetch_all(pool)
+            .await?
+        {
+            let mid: String = r.try_get("member_id")?;
+            let kind: String = r.try_get("member_kind")?;
+            if kind == "team" {
+                stack.push(mid);
+            } else {
+                people.insert(mid);
+            }
+        }
+    }
+    Ok(people)
+}
+
+/// Whether team `from` can reach team `target` through nested-team membership (team-only BFS,
+/// cycle-guarded). Used to reject a sub-team add that would create a membership cycle.
+async fn team_reaches_team(pool: &Pool, from: &str, target: &str) -> anyhow::Result<bool> {
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut stack = vec![from.to_string()];
+    while let Some(tid) = stack.pop() {
+        if tid == target {
+            return Ok(true);
+        }
+        if !visited.insert(tid.clone()) {
+            continue;
+        }
+        for r in sqlx::query("SELECT member_id FROM team_members WHERE team_id=? AND member_kind='team'")
+            .bind(&tid)
+            .fetch_all(pool)
+            .await?
+        {
+            stack.push(r.try_get("member_id")?);
+        }
+    }
+    Ok(false)
+}
+
+/// Add a person or team as a member of a team (idempotent). Validates the member exists in its
+/// registry; for a sub-team, rejects self-membership and any add that would create a cycle (so
+/// read-time expansion always terminates). Returns the updated team.
+pub async fn add_team_member(
+    pool: &Pool,
+    team_id: &str,
+    member_id: &str,
+    member_kind: &str,
+    created_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let member_kind = member_kind.trim();
+    if member_kind != "person" && member_kind != "team" {
+        anyhow::bail!("member_kind must be \"person\" or \"team\"");
+    }
+    if sqlx::query("SELECT 1 FROM teams WHERE id=?").bind(team_id).fetch_optional(pool).await?.is_none() {
+        anyhow::bail!("no team {team_id}");
+    }
+    let member_table = if member_kind == "person" { "people" } else { "teams" };
+    if sqlx::query(&format!("SELECT 1 FROM {member_table} WHERE id=?"))
+        .bind(member_id)
+        .fetch_optional(pool)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no {member_kind} {member_id} to add as a member");
+    }
+    if member_kind == "team" {
+        if member_id == team_id {
+            anyhow::bail!("a team cannot be a member of itself");
+        }
+        if team_reaches_team(pool, member_id, team_id).await? {
+            anyhow::bail!(
+                "adding team \"{member_id}\" to team \"{team_id}\" would create a membership cycle"
+            );
+        }
+    }
+    sqlx::query(
+        "INSERT INTO team_members(team_id, member_id, member_kind, created_by, created_at) \
+         VALUES(?,?,?,?,?) ON CONFLICT(team_id, member_id, member_kind) DO NOTHING",
+    )
+    .bind(team_id)
+    .bind(member_id)
+    .bind(member_kind)
+    .bind(created_by)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    get_team(pool, team_id).await
+}
+
+/// Remove a member from a team (idempotent). Returns the updated team.
+pub async fn remove_team_member(
+    pool: &Pool,
+    team_id: &str,
+    member_id: &str,
+    member_kind: &str,
+) -> anyhow::Result<Value> {
+    sqlx::query("DELETE FROM team_members WHERE team_id=? AND member_id=? AND member_kind=?")
+        .bind(team_id)
+        .bind(member_id)
+        .bind(member_kind)
+        .execute(pool)
+        .await?;
+    get_team(pool, team_id).await
+}
+
+/// Resolve an addressable principal id to the set of PERSON ids who can act on it (task 542): a
+/// team expands to its people (cycle-guarded); anything else (a person id, or an agent id) resolves
+/// to itself. The read-time primitive for team-aware addressing + visibility in later phases.
+// Exercised by tests now; the bin consumer lands in Phase 2 (team addressing / blocked_on kind=team).
+#[allow(dead_code)]
+pub async fn resolve_principal_people(pool: &Pool, id: &str) -> anyhow::Result<BTreeSet<String>> {
+    if sqlx::query("SELECT 1 FROM teams WHERE id=?").bind(id).fetch_optional(pool).await?.is_some() {
+        resolve_team_people(pool, id).await
+    } else {
+        Ok(BTreeSet::from([id.to_string()]))
+    }
+}
+
 // --- Tasks ---
 
 /// An external-system reference for idempotent ingest (task 270). A bridge adapter passes this
@@ -10207,6 +10447,63 @@ mod tests {
         assert_eq!(tasks[1]["assignee_status"], Value::Null, "unregistered assignee -> null status");
         assert_eq!(tasks[1]["assignee_last_seen"], Value::Null);
         assert_eq!(tasks[2]["assignee_status"], Value::Null, "no assignee -> null status");
+        Ok(())
+    }
+
+    /// The multi-operator model (task 542 Phase 1): recursive team membership resolves to people
+    /// through nested teams, write-time cycle/self/missing-member guards reject bad adds, the
+    /// read-time expansion is cycle-safe even against a directly-inserted cycle, and
+    /// resolve_principal_people expands a team but passes a person/agent through unchanged.
+    #[tokio::test]
+    async fn teams_recursive_membership_and_cycle_guard() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // Seeded by db::init: person cameron, team operator (member cameron).
+        assert_eq!(get_team(&pool, "operator").await?["resolved_people"], json!(["cameron"]));
+
+        create_person(&pool, "zach", Some("Zach"), Some("system"), None).await?;
+        create_team(&pool, "eng", Some("Engineering"), Some("system"), None).await?;
+        add_team_member(&pool, "eng", "zach", "person", Some("system")).await?;
+        add_team_member(&pool, "eng", "operator", "team", Some("system")).await?; // nested team
+
+        // eng expands to zach + cameron (cameron via the nested operator team).
+        let eng_people: BTreeSet<String> = get_team(&pool, "eng").await?["resolved_people"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(eng_people, BTreeSet::from(["zach".to_string(), "cameron".to_string()]));
+
+        // Write-time guards: a cycle (operator already nested under eng), self-membership, and a
+        // missing member are all rejected.
+        assert!(
+            add_team_member(&pool, "operator", "eng", "team", Some("system")).await.is_err(),
+            "cycle add rejected"
+        );
+        assert!(add_team_member(&pool, "eng", "eng", "team", Some("system")).await.is_err(), "self rejected");
+        assert!(
+            add_team_member(&pool, "eng", "ghost", "person", Some("system")).await.is_err(),
+            "missing member rejected"
+        );
+
+        // resolve_principal_people: a team expands; a person and an unknown/agent id pass through.
+        assert_eq!(resolve_principal_people(&pool, "operator").await?, BTreeSet::from(["cameron".to_string()]));
+        assert_eq!(resolve_principal_people(&pool, "zach").await?, BTreeSet::from(["zach".to_string()]));
+        assert_eq!(
+            resolve_principal_people(&pool, "v-some-agent").await?,
+            BTreeSet::from(["v-some-agent".to_string()])
+        );
+
+        // Defensive: a cycle inserted DIRECTLY (bypassing the write-time guard) still terminates on
+        // read -- the visited-set guard in resolve_team_people stops the loop.
+        create_team(&pool, "leads", None, Some("system"), None).await?;
+        add_team_member(&pool, "leads", "eng", "team", Some("system")).await?;
+        sqlx::query("INSERT INTO team_members(team_id, member_id, member_kind, created_at) VALUES('eng','leads','team',?)")
+            .bind(now_iso())
+            .execute(&pool)
+            .await?;
+        let _ = resolve_team_people(&pool, "eng").await?; // must terminate despite the eng<->leads cycle
         Ok(())
     }
 }

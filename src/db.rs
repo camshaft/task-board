@@ -305,6 +305,38 @@ CREATE TABLE IF NOT EXISTS identity_aliases (
     created_by TEXT,
     created_at TEXT NOT NULL
 );
+-- PEOPLE / TEAMS (multi-operator model, doc_26 / task 542). People are first-class human
+-- identities in their OWN registry, separate from `agents`; assignee/mention resolution reads
+-- people + agents together at read time (no physical merge). Teams are addressable groups whose
+-- members are people OR other teams (recursive) -- a team of teams subsumes a separate org
+-- concept. Ids are stable string handles, matching the agent-id / identity-alias convention
+-- (person "cameron", team "operator"). AUTH/enforcement is deferred: these record who/what, and
+-- visibility is a recorded property, with nothing enforced until the later login step.
+CREATE TABLE IF NOT EXISTS people (
+    id           TEXT PRIMARY KEY,
+    display_name TEXT,
+    created_by   TEXT,
+    created_at   TEXT NOT NULL,
+    metadata     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS teams (
+    id           TEXT PRIMARY KEY,
+    display_name TEXT,
+    created_by   TEXT,
+    created_at   TEXT NOT NULL,
+    metadata     TEXT NOT NULL DEFAULT '{}'
+);
+-- A member is a person or a team (member_kind). The graph is kept ACYCLIC at write time (a
+-- sub-team add that would create a cycle is rejected) and the read-time expansion is cycle-guarded
+-- (visited-set), so resolving a team to its people always terminates (doc_26 appendix A1).
+CREATE TABLE IF NOT EXISTS team_members (
+    team_id     TEXT NOT NULL,
+    member_id   TEXT NOT NULL,
+    member_kind TEXT NOT NULL,
+    created_by  TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (team_id, member_id, member_kind)
+);
 -- SECRET REQUESTS: the board is an ephemeral secret-REQUEST broker, never a secret store. An agent
 -- files a named request carrying the (non-secret) age recipient pubkeys + human instructions; an
 -- operator opens a single-use capability link and submits the value ENCRYPTED IN THE BROWSER, so
@@ -746,6 +778,33 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
          VALUES('operator','cameron','system',?) ON CONFLICT(alias) DO NOTHING",
     )
     .bind(crate::events::now_iso())
+    .execute(&pool)
+    .await?;
+
+    // Seed the multi-operator model so current references keep resolving at cutover (task 542):
+    // cameron as the one existing person, and "operator" as a one-member team (cameron). The
+    // operator -> cameron alias above still resolves too, so nothing breaks on flag day. Idempotent.
+    let now = crate::events::now_iso();
+    sqlx::query(
+        "INSERT INTO people(id, display_name, created_by, created_at) \
+         VALUES('cameron','Cameron','system',?) ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(&now)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO teams(id, display_name, created_by, created_at) \
+         VALUES('operator','Operator','system',?) ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(&now)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO team_members(team_id, member_id, member_kind, created_by, created_at) \
+         VALUES('operator','cameron','person','system',?) \
+         ON CONFLICT(team_id, member_id, member_kind) DO NOTHING",
+    )
+    .bind(&now)
     .execute(&pool)
     .await?;
 
