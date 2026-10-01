@@ -8221,27 +8221,40 @@ pub async fn submit_to_operator_review(
             .await?
             .try_get("version_no")?;
 
-    // 2a. Conformance ran against the CURRENT version: a terminal `adversarial_review` summary entry
-    // on a review over this doc whose JSON body records `reviewed_version` == current_version_no.
+    // 2a. Conformance ran against the CURRENT version: a terminal `adversarial_review` entry on a
+    // review over this doc records `reviewed_version` == current_version_no (task_868). The version
+    // is read from the review's `metadata.reviewed_version` -- the structured source of truth set via
+    // create_review's metadata, which is MCP-settable -- OR, for back-compat, the entry body parsed
+    // as JSON. The review is matched tolerantly across BOTH source/target_ref conventions:
+    // 'board_doc'/'<id>' (canonical) and 'board-document'/'doc_<id>' (the design-zoom convention),
+    // so either review-creation path satisfies the gate.
     let target_ref = document_id.to_string();
+    let target_ref_doc = format!("doc_{document_id}");
     let summaries = sqlx::query(
-        "SELECT rl.body AS body FROM review_log rl JOIN reviews r ON r.id = rl.review_id \
-         WHERE r.source='board_doc' AND r.target_ref=? AND rl.entry_type='adversarial_review'",
+        "SELECT r.metadata AS metadata, rl.body AS body FROM review_log rl \
+         JOIN reviews r ON r.id = rl.review_id \
+         WHERE r.source IN ('board_doc','board-document') AND r.target_ref IN (?, ?) \
+           AND rl.entry_type='adversarial_review'",
     )
     .bind(&target_ref)
+    .bind(&target_ref_doc)
     .fetch_all(&mut *tx)
     .await?;
-    let ran_current = summaries.iter().any(|s| {
-        s.try_get::<Option<String>, _>("body")
-            .ok()
-            .flatten()
-            .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+    // reviewed_version lives in either a JSON string (the review metadata, or the entry body); pull
+    // the first that parses to an object carrying an integer reviewed_version.
+    let reviewed_version_of = |s: Option<String>| -> Option<i64> {
+        s.and_then(|b| serde_json::from_str::<Value>(&b).ok())
             .and_then(|v| v.get("reviewed_version").and_then(|r| r.as_i64()))
-            .is_some_and(|rev| rev == current_version_no)
+    };
+    let ran_current = summaries.iter().any(|s| {
+        let from_meta =
+            reviewed_version_of(s.try_get::<Option<String>, _>("metadata").ok().flatten());
+        let from_body = reviewed_version_of(s.try_get::<Option<String>, _>("body").ok().flatten());
+        from_meta == Some(current_version_no) || from_body == Some(current_version_no)
     });
     if !ran_current {
         anyhow::bail!(
-            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review summary entry records reviewed_version={current_version_no}. A conformance review must run (or re-run) on the current version before the doc can reach the operator"
+            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body). A conformance review must run (or re-run) on the current version before the doc can reach the operator"
         );
     }
 
@@ -8252,10 +8265,12 @@ pub async fn submit_to_operator_review(
         "SELECT COUNT(*) AS n FROM review_log rl \
          JOIN reviews r ON r.id = rl.review_id \
          JOIN tasks t ON t.id = rl.task_id \
-         WHERE r.source='board_doc' AND r.target_ref=? AND rl.entry_type='finding' \
+         WHERE r.source IN ('board_doc','board-document') AND r.target_ref IN (?, ?) \
+           AND rl.entry_type='finding' \
            AND rl.task_id IS NOT NULL AND t.status NOT IN ('done','cancelled','canceled')",
     )
     .bind(&target_ref)
+    .bind(&target_ref_doc)
     .fetch_one(&mut *tx)
     .await?
     .try_get("n")?;
@@ -17949,6 +17964,73 @@ mod tests {
         assert_eq!(
             out2["metadata"]["template_waiver_reason"],
             json!("no template fits an experiment note")
+        );
+        Ok(())
+    }
+
+    /// task_868: the submit gate reads reviewed_version from the review's `metadata.reviewed_version`
+    /// (the structured source of truth) even when the adversarial_review entry body is NOT JSON, and
+    /// it matches a review created under the design-zoom convention (source='board-document',
+    /// target_ref='doc_<id>'), not just the canonical 'board_doc'/'<id>'. This is the first-doc-stuck
+    /// defect: the review existed + metadata was correct, but the gate read neither.
+    #[tokio::test]
+    async fn submit_gate_reads_reviewed_version_from_metadata_and_tolerates_convention(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Docs", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let d = create_document(
+            &pool,
+            "Design: Zoom",
+            Some(pid),
+            "bafyv1",
+            Some("v1"),
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        // Advance to v2 so the current version is 2.
+        publish_version(&pool, did, "bafyv2", Some("v2"), Some("author"), None, None).await?;
+
+        // Review under the OTHER convention (source='board-document', target_ref='doc_<id>'), with
+        // reviewed_version carried ONLY in the review metadata (not the entry body).
+        let r = create_review(
+            &pool,
+            "document",
+            Some("board-document"),
+            Some(&format!("doc_{did}")),
+            Some("conformance"),
+            Some("approved"),
+            Some("design-zoom"),
+            Some("librarian"),
+            Some(json!({ "review_type": "adversarial", "reviewed_version": 2 })),
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        // A NON-JSON body: the old gate (body-JSON only) would never see reviewed_version here.
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some("reviewed_version=2 PASS -- doc_7 A8 conformance"),
+            Some("librarian"),
+            None,
+            None,
+        )
+        .await?;
+
+        let out =
+            submit_to_operator_review(&pool, did, Some("author"), Some("doc_7 incl A8"), None)
+                .await?;
+        assert_eq!(
+            out["status"],
+            json!("operator_review"),
+            "metadata.reviewed_version + the board-document convention satisfy the gate"
         );
         Ok(())
     }
