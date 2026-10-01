@@ -6,7 +6,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use schemars::{schema_for, JsonSchema};
 use serde::Deserialize;
@@ -174,8 +174,9 @@ pub fn router(state: AppState) -> Router {
         .route("/banned-phrases/{phrase}", axum::routing::delete(remove_banned_phrase))
         .route("/identity-aliases", get(list_identity_aliases).post(set_identity_alias))
         .route("/people", get(list_people).post(create_person))
+        .route("/people/{id}", delete(delete_person))
         .route("/teams", get(list_teams).post(create_team))
-        .route("/teams/{team_id}", get(get_team))
+        .route("/teams/{team_id}", get(get_team).delete(delete_team))
         .route("/teams/{team_id}/members", post(add_team_member).delete(remove_team_member))
         .route("/secret-requests", get(list_secret_requests).post(create_secret_request))
         .route("/secret-requests/{id}", get(get_secret_request))
@@ -333,9 +334,11 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/identity-aliases", summary: "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). A small config table consumers/UI use to resolve or display a floating name as the canonical identity across assignee, blocked_on, and @-mentions.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/people", summary: "List people (first-class human identities, multi-operator model doc_26). A separate registry from agents; resolved together with agents at read time.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/people", summary: "Create or upsert a person by stable string id (e.g. cameron).", query: "", body: Some("CreatePersonBody") },
+    Endpoint { method: "DELETE", path: "/api/people/{id}", summary: "Delete a person and drop their team memberships.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/teams", summary: "List teams (addressable groups whose members are people OR other teams).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/teams", summary: "Create or upsert a team by stable string id (e.g. operator).", query: "", body: Some("CreateTeamBody") },
     Endpoint { method: "GET", path: "/api/teams/{team_id}", summary: "Get a team with its direct members and its fully-resolved person set (nested teams expanded, cycle-guarded).", query: "", body: None },
+    Endpoint { method: "DELETE", path: "/api/teams/{team_id}", summary: "Delete a team and drop its memberships (its members and its membership in parent teams).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/teams/{team_id}/members", summary: "Add a person or team as a member (idempotent). Rejects a sub-team add that would create a membership cycle.", query: "", body: Some("TeamMemberBody") },
     Endpoint { method: "DELETE", path: "/api/teams/{team_id}/members", summary: "Remove a member (person or team) from a team (idempotent).", query: "", body: Some("TeamMemberBody") },
     Endpoint { method: "POST", path: "/api/identity-aliases", summary: "Upsert an identity alias (alias -> canonical). Idempotent on the alias (repoints an existing one); alias is stored lowercased.", query: "", body: Some("SetIdentityAliasBody") },
@@ -1549,6 +1552,10 @@ async fn create_person(State(st): State<AppState>, Json(b): Json<CreatePersonBod
     ))
 }
 
+async fn delete_person(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    Ok(Json(core::delete_person(&st.pool, &id).await?))
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct CreateTeamBody {
     /// Stable string handle for the team (e.g. "operator"). Upserts if it already exists.
@@ -1571,6 +1578,10 @@ async fn create_team(State(st): State<AppState>, Json(b): Json<CreateTeamBody>) 
 
 async fn get_team(State(st): State<AppState>, Path(team_id): Path<String>) -> ApiResult {
     Ok(Json(core::get_team(&st.pool, &team_id).await?))
+}
+
+async fn delete_team(State(st): State<AppState>, Path(team_id): Path<String>) -> ApiResult {
+    Ok(Json(core::delete_team(&st.pool, &team_id).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]
