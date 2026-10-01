@@ -1176,8 +1176,9 @@ pub struct GetCommentArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PoseQuestionArgs {
     pub task_id: i64,
-    /// One of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list.
-    pub kind: String,
+    /// Legacy kind -- one of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list. OMIT it for a CID-keyed question that instead carries its own `response_schema` plus a `ui.element_schema_cid` (the element's content id, its canonical type identifier).
+    #[serde(default)]
+    pub kind: Option<String>,
     /// The question prompt.
     pub prompt: String,
     /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list.
@@ -2831,7 +2832,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Pose a structured question on a task (doc_33): a typed, answerable question comment of a given kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list), routed to a person/team/agent. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Optionally carry an inline response_schema (a JSON Schema the framed answer must satisfy) plus a ui descriptor; when a response_schema is present, submitted answers are validated against it generically. Returns the question comment; notifies the routed-to principal."
+        description = "Pose a structured question on a task (doc_33), routed to a person/team/agent. Give EITHER a legacy kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list) OR -- for a CID-keyed question (doc_33 v16) -- omit kind and carry an inline response_schema (the validation contract) plus a ui.element_schema_cid (the element's content id, its canonical type identifier the client branches on). When a response_schema is present, submitted answers are validated against it generically. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Returns the question comment; notifies the routed-to principal."
     )]
     async fn pose_question(
         &self,
@@ -2840,7 +2841,7 @@ impl Board {
         core::pose_question_full(
             &self.pool,
             a.task_id,
-            &a.kind,
+            a.kind.as_deref(),
             &a.prompt,
             a.options,
             &a.routed_to,

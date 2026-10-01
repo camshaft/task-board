@@ -3403,7 +3403,7 @@ pub async fn recompute_question_block(
 pub async fn pose_question_full(
     pool: &Pool,
     task_id: i64,
-    kind: &str,
+    kind: Option<&str>,
     prompt: &str,
     options: Option<Value>,
     routed_to: &str,
@@ -3419,17 +3419,41 @@ pub async fn pose_question_full(
     if prompt.is_empty() {
         anyhow::bail!("give a non-empty question prompt");
     }
-    if !QUESTION_KINDS.contains(&kind) {
-        anyhow::bail!(
-            "unknown question kind '{kind}' (expected one of: {})",
-            QUESTION_KINDS.join(", ")
-        );
-    }
     let routed_to = routed_to.trim();
     if routed_to.is_empty() {
         anyhow::bail!("give a `routed_to` principal (a person, team, or agent id)");
     }
-    let options = normalize_question_options(kind, options)?;
+    // A question's type identity is EITHER a legacy kind string OR, in the CID-keyed model
+    // (doc_33 v16), its element CID -- the content id of the element's schema that the client
+    // branches on. A kind selects the legacy per-kind validation; omitting it means a CID-keyed
+    // question, which must carry its own inline `response_schema` (the validation contract, so the
+    // backend never changes to add a type) and a `ui.element_schema_cid` (the canonical type id).
+    let kind = kind.map(str::trim).filter(|k| !k.is_empty());
+    if let Some(k) = kind {
+        if !QUESTION_KINDS.contains(&k) {
+            anyhow::bail!(
+                "unknown question kind '{k}' (expected one of: {}); or omit `kind` for a CID-keyed question carrying its own `response_schema` + `ui.element_schema_cid`",
+                QUESTION_KINDS.join(", ")
+            );
+        }
+    } else if response_schema.is_none() {
+        anyhow::bail!(
+            "give a `kind`, or omit it for a CID-keyed question that carries its own `response_schema` + `ui.element_schema_cid`"
+        );
+    }
+    // Options belong to a legacy kind that needs them; a CID-keyed question puts its choices in the
+    // element schema, so it carries none.
+    let options = match kind {
+        Some(k) => normalize_question_options(k, options)?,
+        None => {
+            if options.is_some() {
+                anyhow::bail!(
+                    "a CID-keyed question (no `kind`) carries its choices in its schema, not `options`"
+                );
+            }
+            json!([])
+        }
+    };
     if blocking {
         if default.is_some() {
             anyhow::bail!("a blocking question cannot carry a `default` -- a default is for a non-blocking question the asker proceeds on");
@@ -3455,7 +3479,21 @@ pub async fn pose_question_full(
     if let Some(u) = ui.as_ref() {
         if !u.is_object() {
             anyhow::bail!(
-                "`ui` must be a JSON object (an element descriptor: element name, props, element-schema CID)"
+                "`ui` must be a JSON object (an element descriptor: element, props, element_schema_cid)"
+            );
+        }
+    }
+    if kind.is_none() {
+        // CID-keyed: the element CID is the canonical type identifier, so it must be present.
+        let has_cid = ui
+            .as_ref()
+            .and_then(|u| u.get("element_schema_cid"))
+            .and_then(|c| c.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_cid {
+            anyhow::bail!(
+                "a CID-keyed question (no `kind`) must carry `ui.element_schema_cid` (the element's content id, its canonical type identifier)"
             );
         }
     }
@@ -3472,16 +3510,19 @@ pub async fn pose_question_full(
     let project_id: i64 = task_row.try_get("project_id")?;
     let routed_kind = principal_kind(&mut tx, routed_to).await?;
     if let Some(ref d) = default {
-        match response_schema.as_ref() {
-            Some(schema) => validate_value_against_schema(schema, d)
-                .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?,
-            None => validate_answer_value(kind, d, &options)
-                .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?,
+        if let Some(schema) = response_schema.as_ref() {
+            validate_value_against_schema(schema, d)
+                .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?;
+        } else if let Some(k) = kind {
+            validate_answer_value(k, d, &options)
+                .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?;
         }
     }
     let mut payload = Map::new();
-    payload.insert("kind".into(), json!(kind));
-    if kind_needs_options(kind) {
+    if let Some(k) = kind {
+        payload.insert("kind".into(), json!(k));
+    }
+    if kind.map(kind_needs_options).unwrap_or(false) {
         payload.insert("options".into(), options);
     }
     payload.insert("routed_to".into(), json!(routed_to));
@@ -3549,7 +3590,7 @@ pub async fn pose_question(
     pose_question_full(
         pool,
         task_id,
-        kind,
+        Some(kind),
         prompt,
         options,
         routed_to,
@@ -9674,6 +9715,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cid_keyed_question_without_kind() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "rev", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("asker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        let schema = json!({
+            "type": "object",
+            "required": ["approved"],
+            "properties": {"approved": {"type": "boolean"}}
+        });
+        let ui = json!({"element": "approval", "element_schema_cid": "bafyApprovalCid"});
+
+        // No kind + response_schema + ui.element_schema_cid -> a valid CID-keyed question.
+        let q = pose_question_full(
+            &pool,
+            tid,
+            None,
+            "approve?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some(schema.clone()),
+            Some(ui.clone()),
+            Some("asker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+        assert!(
+            q["payload"].get("kind").is_none(),
+            "a CID-keyed question stores no kind"
+        );
+        assert_eq!(
+            q["payload"]["ui"]["element_schema_cid"],
+            json!("bafyApprovalCid")
+        );
+        // Answers validate against the inline schema (CID-independent); a non-text shape must satisfy it.
+        answer_question(&pool, qid, "framed", json!({"approved": true}), Some("rev")).await?;
+        assert_eq!(get_comment(&pool, qid).await?["state"], json!("answered"));
+
+        // No kind AND no response_schema -> error (a question needs a type identity).
+        assert!(pose_question_full(
+            &pool,
+            tid,
+            None,
+            "x?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("asker")
+        )
+        .await
+        .is_err());
+        // No kind + response_schema but NO ui.element_schema_cid -> error.
+        assert!(pose_question_full(
+            &pool,
+            tid,
+            None,
+            "x?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            Some(schema.clone()),
+            Some(json!({"element": "approval"})),
+            Some("asker"),
+        )
+        .await
+        .is_err());
+        // A legacy kind still works (back-compat).
+        let qk = pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "ship?",
+            None,
+            "rev",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("asker"),
+        )
+        .await?;
+        assert_eq!(qk["payload"]["kind"], json!("yes_no"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn schema_driven_questions_validate_generically() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
@@ -9700,7 +9853,7 @@ mod tests {
             pose_question_full(
                 &pool,
                 tid,
-                "fill_in_the_blank",
+                Some("fill_in_the_blank"),
                 "age?",
                 None,
                 "rev",
@@ -9720,7 +9873,7 @@ mod tests {
             pose_question_full(
                 &pool,
                 tid,
-                "fill_in_the_blank",
+                Some("fill_in_the_blank"),
                 "age?",
                 None,
                 "rev",
@@ -9746,7 +9899,7 @@ mod tests {
         let q = pose_question_full(
             &pool,
             tid,
-            "fill_in_the_blank",
+            Some("fill_in_the_blank"),
             "approve?",
             None,
             "rev",
@@ -9782,7 +9935,7 @@ mod tests {
         let q2 = pose_question_full(
             &pool,
             tid,
-            "fill_in_the_blank",
+            Some("fill_in_the_blank"),
             "approve 2?",
             None,
             "rev",
@@ -9813,7 +9966,7 @@ mod tests {
         let q3 = pose_question_full(
             &pool,
             tid,
-            "fill_in_the_blank",
+            Some("fill_in_the_blank"),
             "secret value?",
             None,
             "rev",
@@ -9835,7 +9988,7 @@ mod tests {
             pose_question_full(
                 &pool,
                 tid,
-                "fill_in_the_blank",
+                Some("fill_in_the_blank"),
                 "pick?",
                 None,
                 "rev",
@@ -9853,7 +10006,7 @@ mod tests {
         let q4 = pose_question_full(
             &pool,
             tid,
-            "fill_in_the_blank",
+            Some("fill_in_the_blank"),
             "pick ok?",
             None,
             "rev",
