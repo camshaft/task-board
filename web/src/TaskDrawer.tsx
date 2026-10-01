@@ -692,6 +692,36 @@ export function TaskDrawer() {
                 )}
               </div>
 
+              {task.blocking_questions && task.blocking_questions.length > 0 && (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3">
+                  <div className="mb-1.5 text-xs font-medium text-amber-300">
+                    Blocked by {task.blocking_questions.length} open question
+                    {task.blocking_questions.length > 1 ? 's' : ''}
+                    {task.question_blocked_on && task.question_blocked_on.length > 0 && (
+                      <span className="font-normal text-amber-300/70">
+                        {' '}
+                        (awaiting {task.question_blocked_on.join(', ')})
+                      </span>
+                    )}
+                  </div>
+                  <ul className="space-y-1">
+                    {task.blocking_questions.map((q) => (
+                      <li key={q.comment_id}>
+                        <button
+                          onClick={() => navigate({ hash: `comment-${q.comment_id}` })}
+                          className="text-left text-xs text-amber-200/90 hover:text-amber-100 hover:underline"
+                        >
+                          {q.prompt.length > 90 ? `${q.prompt.slice(0, 90)}...` : q.prompt}
+                          {q.routed_to && (
+                            <span className="text-amber-300/70"> - {q.routed_to}</span>
+                          )}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               <div>
                 <div className="mb-2 text-xs text-[var(--color-muted)]">
                   Comments ({task.comments.length})

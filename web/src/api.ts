@@ -80,6 +80,15 @@ export interface QuestionOption {
   id: string
   label: string
 }
+// One open blocking question, as summarized by a single-task fetch's derived block (doc_33 A7).
+// `kind` is null for a CID-keyed question (its element is named by ui.element_schema_cid instead).
+export interface BlockingQuestion {
+  comment_id: number
+  kind: QuestionKind | null
+  routed_to: string | null
+  blocking: boolean
+  prompt: string
+}
 export interface QuestionPayload {
   kind: QuestionKind
   // Present for multiple_choice / select_all / rank_list.
@@ -212,6 +221,13 @@ export interface Task {
   monitor_exempt?: boolean
   children?: { id: number; title: string; status: TaskStatus }[]
   child_rollup?: { done: number; total: number }
+  // Derived question-block (doc_33 A7 / task_628), present on a single-task fetch. effectively_blocked
+  // is the scalar blocked_on OR any open blocking question; blocking_questions lists the open ones
+  // (sorted by comment id) and question_blocked_on is the union of their routed_to principals.
+  effectively_blocked?: boolean
+  question_blocked?: boolean
+  question_blocked_on?: string[]
+  blocking_questions?: BlockingQuestion[]
   attached_documents?: {
     id: number
     title: string
