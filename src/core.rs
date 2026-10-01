@@ -3100,9 +3100,11 @@ async fn open_routed_questions(
 /// shortcut) misses them. A task qualifies if EITHER it is blocked_on the principal
 /// (blocked_on_kind='operator' when the principal resolves to the operator, or kind agent/team with
 /// blocked_on_ref in the doc_26 team-expanded principal set) OR it carries an open blocking question
-/// routed to the principal (as `list_tasks_blocking_me`). Returns one deduped task-centric row per
-/// task -- blocked_on_principal + blocked_on_note, plus questions[] carrying the FULL question
-/// comment objects so a client renders + answers them inline. Supersedes the questions-only
+/// routed to the principal (as `list_tasks_blocking_me`). Returns a flat array of discriminated
+/// items (task_873): a `kind:"task"` row per qualifying task (blocked_on_principal, blocked_on_note,
+/// and questions[] carrying the FULL question comment objects so a client renders and answers them
+/// inline), and, when the principal resolves to the operator, a `kind:"document"` row per document
+/// awaiting the operator's approval (status `operator_review`). Supersedes the questions-only
 /// `list_tasks_blocking_me`.
 pub async fn list_awaiting(
     pool: &Pool,
@@ -3173,6 +3175,7 @@ pub async fn list_awaiting(
         let note: Option<String> = r.try_get("blocked_on_note")?;
         let questions = open_routed_questions(pool, task_id, &routed).await?;
         out.push(json!({
+            "kind": "task",
             "task_id": task_id,
             "task_title": r.try_get::<Option<String>, _>("title")?,
             "project_id": r.try_get::<Option<i64>, _>("project_id")?,
@@ -3184,6 +3187,42 @@ pub async fn list_awaiting(
             "blocked_on_note": if blocked_on_principal { note } else { None },
             "questions": questions,
         }));
+    }
+
+    // Document approvals awaiting the operator (task_873): a doc in `operator_review` sits at the
+    // submit-to-operator chokepoint, awaiting the operator's approve/request-changes. This is the
+    // operator's decision alone -- no non-operator principal is a doc approver -- so the row type
+    // appears only when the principal resolves to the operator. Honors the same project/archived
+    // filters as the task rows.
+    if resolves_to_operator {
+        let mut dq = String::from(
+            "SELECT d.id AS id, d.title AS title, d.status AS status, d.path AS path, \
+             d.updated_at AS updated_at, dv.version_no AS version_no \
+             FROM documents d JOIN document_versions dv ON dv.id = d.current_version_id \
+             WHERE d.status='operator_review'",
+        );
+        if !include_archived {
+            dq.push_str(" AND d.archived_at IS NULL");
+        }
+        if project_id.is_some() {
+            dq.push_str(" AND d.project_id=?");
+        }
+        dq.push_str(" ORDER BY d.id");
+        let mut dquery = sqlx::query(&dq);
+        if let Some(pid) = project_id {
+            dquery = dquery.bind(pid);
+        }
+        for dr in dquery.fetch_all(pool).await? {
+            out.push(json!({
+                "kind": "document",
+                "document_id": dr.try_get::<i64, _>("id")?,
+                "title": dr.try_get::<Option<String>, _>("title")?,
+                "status": dr.try_get::<Option<String>, _>("status")?,
+                "version_no": dr.try_get::<Option<i64>, _>("version_no")?,
+                "updated_at": dr.try_get::<Option<String>, _>("updated_at")?,
+                "path": dr.try_get::<Option<String>, _>("path")?,
+            }));
+        }
     }
     Ok(Value::Array(out))
 }
@@ -18839,6 +18878,53 @@ mod tests {
         let rc = by_id(cid).unwrap();
         assert_eq!(rc["blocked_on_principal"], json!(true));
         assert_eq!(rc["questions"].as_array().unwrap().len(), 1);
+        // Task rows are discriminated kind:"task" (task_873).
+        assert!(
+            rows.iter().all(|r| r["kind"] == json!("task")),
+            "every row so far is a task row"
+        );
+
+        // task_873: a document in operator_review surfaces as a kind:"document" row for the
+        // operator, with its pending version_no; a non-operator viewer gets no document rows.
+        let doc = create_document(
+            &pool,
+            "Design: Pending",
+            Some(pid),
+            "bafyv1",
+            Some("v1"),
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let doc_id = doc["id"].as_i64().unwrap();
+        sqlx::query("UPDATE documents SET status='operator_review' WHERE id=?")
+            .bind(doc_id)
+            .execute(&pool)
+            .await?;
+
+        let awaiting2 = list_awaiting(&pool, "operator", None, false).await?;
+        let rows2 = awaiting2.as_array().unwrap();
+        let drow = rows2
+            .iter()
+            .find(|r| r["kind"] == json!("document") && r["document_id"].as_i64() == Some(doc_id))
+            .expect("doc in operator_review appears as a document row for the operator");
+        assert_eq!(drow["status"], json!("operator_review"));
+        assert_eq!(drow["version_no"], json!(1), "the pending version");
+        assert_eq!(drow["title"], json!("Design: Pending"));
+        // The task rows are still there (unioned in the same flat array).
+        assert!(rows2.iter().any(|r| r["task_id"].as_i64() == Some(aid)));
+        // A non-operator viewer gets no document rows (doc approval is operator-only).
+        let other = list_awaiting(&pool, "some-other-agent", None, false).await?;
+        assert!(
+            other
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["kind"] != json!("document")),
+            "document rows are operator-only"
+        );
         Ok(())
     }
 

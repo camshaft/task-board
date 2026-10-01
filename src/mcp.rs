@@ -3008,7 +3008,7 @@ impl Board {
     }
 
     #[tool(
-        description = "The unified 'awaiting you' queue (task_860): every task awaiting a decision from `viewer` (defaults to you) -- tasks blocked_on that principal UNION tasks with an open blocking question routed to it, keyed INDEPENDENT of assignee (owner-held tasks are deliberately not assigned to the principal), team-expanded, deduped. Returns one task-centric row per task {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]} so you see everything awaiting a principal in one call and can answer the questions inline. Supersedes list_tasks_blocking_me (questions-only). Pass viewer=operator for the operator's queue."
+        description = "The unified 'awaiting you' queue (task_860 + task_873): everything awaiting a decision from `viewer` (defaults to you), keyed INDEPENDENT of assignee (owner-held tasks are deliberately not assigned to the principal), team-expanded, deduped, as a FLAT array of discriminated items. kind='task' rows {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]} cover tasks blocked_on the principal OR carrying an open blocking question routed to it (answer the questions inline). kind='document' rows {document_id, title, status, version_no, updated_at, path} cover docs awaiting the operator's approval (status operator_review) and appear only when the viewer resolves to the operator. Supersedes list_tasks_blocking_me (questions-only). Pass viewer=operator for the operator's queue."
     )]
     async fn list_awaiting(
         &self,
