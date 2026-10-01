@@ -463,7 +463,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/reviews/{review_id}/log", summary: "Append a log entry (comment / finding / decision / ...). Pass external_id for idempotent ingest (a bridge replaying an upstream item returns appended:false).", query: "", body: Some("AppendReviewLogBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
-    Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/exclude_tag/task_id/author; archived hidden unless include_archived=true). status accepts a comma-separated set + the operator vocabulary (pending-review/published); exclude_tag hides a tag (default-hide primitive).", query: "project_id=int&status=str&tag=str&exclude_tag=str&task_id=int&author=str&include_archived=bool", body: None },
+    Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/exclude_tag/task_id/author; archived hidden unless include_archived=true). status accepts a comma-separated set + the operator vocabulary (pending-review/published); exclude_tag hides a tag (default-hide primitive). Agent-memory docs (the reserved agent-memory tag, or the repos/ and agents/ path prefixes) are hidden unless include_memory=true.", query: "project_id=int&status=str&tag=str&exclude_tag=str&task_id=int&author=str&include_archived=bool&include_memory=bool", body: None },
     Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
     Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None },
     Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list. Pass ?include_body=true to also inline the current version's markdown (resolved server-side from its CID; body:null + body_error on fetch failure).", query: "include_body=bool", body: None },
@@ -2429,6 +2429,11 @@ struct ListDocumentsQuery {
     /// Include archived (retired) documents; hidden by default.
     #[serde(default)]
     include_archived: bool,
+    /// Include agent-memory documents -- those carrying the reserved `agent-memory` tag, and those
+    /// filed under the reserved repos/ or agents/ path prefixes. Hidden from the default feed by
+    /// default (task_826). Browse memory via list_wiki with a prefix.
+    #[serde(default)]
+    include_memory: bool,
 }
 
 #[derive(Deserialize)]
@@ -2465,6 +2470,7 @@ async fn list_documents(
                 task_id: q.task_id,
                 author: q.author.as_deref(),
                 include_archived: q.include_archived,
+                include_memory: q.include_memory,
             },
         )
         .await?,

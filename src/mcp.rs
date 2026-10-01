@@ -1143,6 +1143,11 @@ pub struct ListDocumentsArgs {
     /// Include archived (retired) documents. Hidden by default.
     #[serde(default, deserialize_with = "de_bool_lenient")]
     pub include_archived: bool,
+    /// Include agent-memory documents -- those carrying the reserved `agent-memory` tag, and those
+    /// filed under the reserved repos/ or agents/ path prefixes. Hidden from the default feed by
+    /// default (task_826); browse memory via list_wiki with a prefix.
+    #[serde(default, deserialize_with = "de_bool_lenient")]
+    pub include_memory: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2776,7 +2781,7 @@ impl Board {
     }
 
     #[tool(
-        description = "List documents for discovery, filtered by any combination of project, status, tag (a value in metadata.tags), exclude_tag (hide docs with that tag), task_id (docs attached to that task), and author. Filters AND together. `status` accepts a single value OR a comma-separated set (match any) and the operator vocabulary draft / pending-review / published (mapped to the stored draft / operator_review / approved). Archived (retired) documents are hidden unless include_archived=true. For the default-hide pattern (e.g. hide charters unless pending-review), compose exclude_tag with a tag+status query."
+        description = "List documents for discovery, filtered by any combination of project, status, tag (a value in metadata.tags), exclude_tag (hide docs with that tag), task_id (docs attached to that task), and author. Filters AND together. `status` accepts a single value OR a comma-separated set (match any) and the operator vocabulary draft / pending-review / published (mapped to the stored draft / operator_review / approved). Archived (retired) documents are hidden unless include_archived=true. Agent-memory documents (those carrying the reserved agent-memory tag, or filed under the reserved repos/ and agents/ path prefixes) are hidden from this feed unless include_memory=true; browse memory via list_wiki with a prefix instead. For the default-hide pattern (e.g. hide charters unless pending-review), compose exclude_tag with a tag+status query."
     )]
     async fn list_documents(
         &self,
@@ -2797,6 +2802,7 @@ impl Board {
                 task_id: a.task_id,
                 author: s(&a.author),
                 include_archived: a.include_archived,
+                include_memory: a.include_memory,
             },
         )
         .await
