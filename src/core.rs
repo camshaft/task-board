@@ -1353,6 +1353,34 @@ pub async fn remove_team_member(
     get_team(pool, team_id).await
 }
 
+/// Delete a person and cascade: drop any team memberships where this person is a member.
+pub async fn delete_person(pool: &Pool, id: &str) -> anyhow::Result<Value> {
+    let res = sqlx::query("DELETE FROM people WHERE id=?").bind(id).execute(pool).await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("no person {id}");
+    }
+    sqlx::query("DELETE FROM team_members WHERE member_id=? AND member_kind='person'")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(json!({ "deleted": id }))
+}
+
+/// Delete a team and cascade: drop its own memberships (its members) and any memberships where it
+/// is a sub-team of another team.
+pub async fn delete_team(pool: &Pool, id: &str) -> anyhow::Result<Value> {
+    let res = sqlx::query("DELETE FROM teams WHERE id=?").bind(id).execute(pool).await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("no team {id}");
+    }
+    sqlx::query("DELETE FROM team_members WHERE team_id=? OR (member_id=? AND member_kind='team')")
+        .bind(id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(json!({ "deleted": id }))
+}
+
 /// Resolve an addressable principal id to the set of PERSON ids who can act on it (task 542): a
 /// team expands to its people (cycle-guarded); anything else (a person id, or an agent id) resolves
 /// to itself. The read-time primitive for team-aware addressing + visibility in later phases.
@@ -10504,6 +10532,28 @@ mod tests {
             .execute(&pool)
             .await?;
         let _ = resolve_team_people(&pool, "eng").await?; // must terminate despite the eng<->leads cycle
+
+        // Deleting a team cascades its membership edges: 'leads' is dropped both as a member of eng
+        // and as a team that had members. After it, eng no longer lists leads.
+        delete_team(&pool, "leads").await?;
+        assert!(get_team(&pool, "leads").await.is_err(), "deleted team is gone");
+        let eng_members: Vec<String> = get_team(&pool, "eng").await?["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["member_id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!eng_members.contains(&"leads".to_string()), "leads edge cascaded out of eng");
+        assert!(delete_team(&pool, "leads").await.is_err(), "deleting a missing team errors");
+
+        // Deleting a person cascades their memberships: zach drops out of eng's resolution.
+        delete_person(&pool, "zach").await?;
+        assert!(get_person(&pool, "zach").await.is_err(), "deleted person is gone");
+        assert_eq!(
+            resolve_team_people(&pool, "eng").await?,
+            BTreeSet::from(["cameron".to_string()]),
+            "eng now resolves to cameron only (via operator) after zach deleted"
+        );
         Ok(())
     }
 }
