@@ -222,6 +222,16 @@ async fn main() -> anyhow::Result<()> {
         // Shares cancellation with `ct`: the shutdown closure's `ct.cancel()` ends in-flight SSE
         // streams so graceful_shutdown drains promptly instead of waiting out the stop-timeout.
         shutdown: ct.clone(),
+        db_path: cfg.db_path.clone(),
+        db_snapshot: if cfg.db_snapshot_enabled {
+            api::DbSnapshotCfg {
+                enabled: true,
+                user: cfg.db_snapshot_user.clone(),
+                password: cfg.db_snapshot_password.clone(),
+            }
+        } else {
+            api::DbSnapshotCfg::disabled()
+        },
     });
 
     // Reverse tunnel for fleet hosts with no inbound path: they dial /tunnel/ws and the board

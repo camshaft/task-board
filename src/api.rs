@@ -30,6 +30,32 @@ pub struct AppState {
     /// SSE responses end instead of holding `graceful_shutdown` open until the systemd
     /// stop-timeout + SIGKILL (task_753). SSE clients reconnect and replay via Last-Event-ID.
     pub shutdown: tokio_util::sync::CancellationToken,
+    /// Path to the SQLite database file, so the DB-snapshot endpoint can write its `VACUUM INTO`
+    /// copy beside it (same filesystem, same owning user). See [`AppState::db_snapshot`].
+    pub db_path: String,
+    /// Config for the authenticated DB-snapshot download endpoint (`GET /api/admin/db-snapshot`).
+    /// `enabled` false (the default) 404s the endpoint; when enabled, `user`/`password` gate it with
+    /// HTTP Basic auth. See `config::Settings::db_snapshot_enabled`.
+    pub db_snapshot: DbSnapshotCfg,
+}
+
+/// Config for the authenticated DB-snapshot download endpoint, carried on [`AppState`].
+#[derive(Clone, Debug)]
+pub struct DbSnapshotCfg {
+    pub enabled: bool,
+    pub user: Option<String>,
+    pub password: Option<String>,
+}
+
+impl DbSnapshotCfg {
+    /// The dormant config: endpoint disabled, no credential (used in tests + the default wiring).
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            user: None,
+            password: None,
+        }
+    }
 }
 
 /// Map an anyhow error to a JSON HTTP response. "no project/task ..." -> 404/400.
@@ -143,6 +169,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/tunnels", get(tunnels))
         .route("/meta", get(meta))
+        .route("/admin/db-snapshot", get(db_snapshot))
         .route("/agents", get(list_agents).post(register_agent))
         .route("/agents/{agent_id}", get(get_agent).patch(update_agent))
         .route("/agents/{agent_id}/status", post(set_status))
@@ -362,6 +389,178 @@ async fn meta() -> Json<Value> {
     }))
 }
 
+/// `GET /api/admin/db-snapshot` -- download a consistent copy of the SQLite database behind HTTP
+/// Basic auth. The daemon owns `db_path`, so this authed GET is the extraction primitive for host
+/// migration + DR: no stop-the-daemon, no cross-user root file-copy. Fail-closed at every step:
+/// disabled by default (404, hiding its existence), 503 if enabled without a credential, 401 on a
+/// missing/bad credential. The served file is produced via `VACUUM INTO` (point-in-time consistent
+/// even under WAL -- never a torn mid-write stream) and is integrity-checked before it is served.
+async fn db_snapshot(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    // Dormant unless explicitly enabled; a 404 hides the endpoint's existence when off.
+    if !st.db_snapshot.enabled {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    // Enabled but un-credentialed is a misconfiguration -- refuse rather than serve unauthenticated.
+    let (Some(user), Some(pass)) = (
+        st.db_snapshot.user.as_deref().filter(|s| !s.is_empty()),
+        st.db_snapshot.password.as_deref().filter(|s| !s.is_empty()),
+    ) else {
+        tracing::error!(
+            "db-snapshot endpoint is enabled but has no credential configured; refusing to serve"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "db-snapshot endpoint is misconfigured",
+        )
+            .into_response();
+    };
+    if !basic_auth_ok(&headers, user, pass) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                "Basic realm=\"task-board db-snapshot\"",
+            )],
+            "unauthorized",
+        )
+            .into_response();
+    }
+
+    match produce_db_snapshot(&st.pool, &st.db_path).await {
+        Ok((body, filename)) => (
+            StatusCode::OK,
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/octet-stream".to_string(),
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("db-snapshot failed: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed").into_response()
+        }
+    }
+}
+
+/// Validate an HTTP Basic `Authorization` header against the configured credential. Both fields are
+/// compared in constant time so a mismatch does not leak position via timing. A missing or malformed
+/// header is a plain `false` (the caller returns 401).
+fn basic_auth_ok(headers: &HeaderMap, user: &str, pass: &str) -> bool {
+    use base64::Engine as _;
+    let Some(raw) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(b64) = raw
+        .strip_prefix("Basic ")
+        .or_else(|| raw.strip_prefix("basic "))
+    else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
+        return false;
+    };
+    let Ok(creds) = String::from_utf8(decoded) else {
+        return false;
+    };
+    let Some((u, p)) = creds.split_once(':') else {
+        return false;
+    };
+    // Non-short-circuiting `&` so both comparisons always run.
+    ct_eq(u.as_bytes(), user.as_bytes()) & ct_eq(p.as_bytes(), pass.as_bytes())
+}
+
+/// Constant-time byte-slice equality (for the two equal-length comparands differ-fast is avoided).
+/// A length difference returns early -- the length of a secret is a far weaker leak than its bytes.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Produce a point-in-time-consistent snapshot of the database and return it as a streaming body.
+/// `VACUUM INTO` writes a fresh, self-consistent copy (correct even under WAL), which is then
+/// integrity-checked; the temp file is opened and immediately UNLINKED so its inode is reclaimed the
+/// moment the stream ends (or the client disconnects), never leaving a full-fleet-data copy on disk.
+async fn produce_db_snapshot(
+    pool: &Pool,
+    db_path: &str,
+) -> anyhow::Result<(axum::body::Body, String)> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    // Beside the DB: same filesystem + owned by the service user, so VACUUM INTO can always write it.
+    let dir = std::path::Path::new(db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let tmp = dir.join(format!(".board-snapshot-{pid}-{nanos}.db"));
+    let tmp_str = tmp.to_string_lossy().to_string();
+
+    // The path is process-generated (pid + nanos) with no quote/backslash, so formatting it into the
+    // VACUUM INTO string literal is injection-safe. VACUUM INTO cannot target an existing file.
+    if tmp_str.contains('\'') || tmp_str.contains('\\') {
+        anyhow::bail!("refusing to snapshot: unexpected characters in temp path");
+    }
+    let _ = tokio::fs::remove_file(&tmp).await;
+    sqlx::query(&format!("VACUUM INTO '{tmp_str}'"))
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("VACUUM INTO snapshot failed: {e}"))?;
+
+    // Fail-closed on a corrupt copy: verify it opens clean before serving.
+    if let Err(e) = verify_snapshot_integrity(&tmp_str).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+
+    let file = tokio::fs::File::open(&tmp)
+        .await
+        .map_err(|e| anyhow::anyhow!("opening snapshot: {e}"))?;
+    // Unlink now; the open fd keeps the inode alive for the stream, then it is auto-reclaimed.
+    let _ = tokio::fs::remove_file(&tmp).await;
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    Ok((body, format!("task-board-{nanos}.db")))
+}
+
+/// Open the snapshot read-only and run `PRAGMA integrity_check`, erroring unless it reports "ok".
+async fn verify_snapshot_integrity(path: &str) -> anyhow::Result<()> {
+    use sqlx::{ConnectOptions, Connection};
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .connect()
+        .await
+        .map_err(|e| anyhow::anyhow!("opening snapshot for integrity check: {e}"))?;
+    let result: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("integrity_check failed: {e}"))?;
+    let _ = conn.close().await;
+    if result != "ok" {
+        anyhow::bail!("snapshot failed integrity_check: {result}");
+    }
+    Ok(())
+}
+
 // --- Discovery ---
 
 /// One row in the endpoint catalog: HTTP method, path template, a one-line summary, and
@@ -383,6 +582,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/tunnels", summary: "Diagnostic: which agents currently have a live reverse tunnel (so the board can push a wake rather than the agent polling). An agent absent here has no live tunnel — its wakes fall back to the inbox + poll.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/health", summary: "Health beacon: cheap liveness+readiness probe. 200 {ok:true,db:true} when the process is up and the database is reachable; 503 {ok:false} when the database is not ready. Check before a full tick and treat any non-200 (incl a 502 from the origin when it is down) as back-off-and-retry.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/admin/db-snapshot", summary: "Download a point-in-time-consistent copy of the SQLite database (VACUUM INTO, integrity-checked), behind HTTP Basic auth. Disabled by default (404 when off); the deployment keeps it loopback/LAN-bound and off the public tunnel. The extraction primitive for host migration + DR.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&limit=int&offset=int", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
@@ -3144,6 +3344,8 @@ mod tests {
             events_tx,
             ipfs_api_url: None,
             shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
         });
         Ok(())
     }
@@ -3216,6 +3418,8 @@ mod tests {
             events_tx,
             ipfs_api_url: None,
             shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
         };
 
         let get = |uri: String| {
@@ -3284,6 +3488,8 @@ mod tests {
             events_tx,
             ipfs_api_url: None,
             shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
         };
         let get = |uri: String| {
             let app = router(state.clone());
@@ -3343,9 +3549,132 @@ mod tests {
             events_tx,
             ipfs_api_url: None,
             shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
         };
         let resp = health(State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    /// basic_auth_ok accepts exactly the configured credential and rejects a missing, malformed,
+    /// wrong-scheme, or wrong-value header.
+    #[test]
+    fn basic_auth_ok_accepts_only_the_configured_credential() {
+        use base64::Engine as _;
+        let hdr = |val: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                val.parse().expect("valid header value"),
+            );
+            h
+        };
+        let basic = |u: &str, p: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"))
+            )
+        };
+        // Correct credential.
+        assert!(basic_auth_ok(
+            &hdr(&basic("ops", "s3cret")),
+            "ops",
+            "s3cret"
+        ));
+        // Wrong password / wrong user.
+        assert!(!basic_auth_ok(&hdr(&basic("ops", "nope")), "ops", "s3cret"));
+        assert!(!basic_auth_ok(
+            &hdr(&basic("eve", "s3cret")),
+            "ops",
+            "s3cret"
+        ));
+        // Missing header, wrong scheme, non-base64, no colon.
+        assert!(!basic_auth_ok(&HeaderMap::new(), "ops", "s3cret"));
+        assert!(!basic_auth_ok(&hdr("Bearer abc"), "ops", "s3cret"));
+        assert!(!basic_auth_ok(&hdr("Basic !!!notb64"), "ops", "s3cret"));
+        assert!(!basic_auth_ok(
+            &hdr(&format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("nocolon")
+            )),
+            "ops",
+            "s3cret"
+        ));
+    }
+
+    /// The DB-snapshot endpoint is fail-closed and auth-gated: 404 when disabled, 401 without/with a
+    /// bad credential, and 200 + a valid SQLite file (correct magic header) with the right credential.
+    #[tokio::test]
+    async fn db_snapshot_endpoint_is_gated_and_serves_a_valid_db() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("b.db").to_str().unwrap().to_string();
+        let pool = crate::db::init(&db_path).await?;
+        // Some real content so the snapshot is a non-trivial, consistent DB.
+        core::create_project(&pool, "P", None, Some("a"), None).await?;
+        let (events_tx, _rx) = broadcast::channel(16);
+
+        let get = |state: AppState, auth: Option<String>| {
+            let mut b = axum::http::Request::builder().uri("/admin/db-snapshot");
+            if let Some(a) = auth {
+                b = b.header(axum::http::header::AUTHORIZATION, a);
+            }
+            let req = b.body(axum::body::Body::empty()).unwrap();
+            async move { router(state).oneshot(req).await.unwrap() }
+        };
+        let enabled = AppState {
+            pool: pool.clone(),
+            events_tx: events_tx.clone(),
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: db_path.clone(),
+            db_snapshot: DbSnapshotCfg {
+                enabled: true,
+                user: Some("ops".into()),
+                password: Some("s3cret".into()),
+            },
+        };
+        let disabled = AppState {
+            pool: pool.clone(),
+            events_tx,
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: db_path.clone(),
+            db_snapshot: DbSnapshotCfg::disabled(),
+        };
+        let good = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("ops:s3cret")
+        );
+        let bad = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("ops:wrong")
+        );
+
+        // Disabled -> 404 (existence hidden).
+        assert_eq!(
+            get(disabled, Some(good.clone())).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        // Enabled but no/bad credential -> 401.
+        assert_eq!(
+            get(enabled.clone(), None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get(enabled.clone(), Some(bad)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Correct credential -> 200 + a real SQLite file.
+        let resp = get(enabled, Some(good)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        assert!(
+            bytes.starts_with(b"SQLite format 3\0"),
+            "served body must be a valid SQLite database (magic header)"
+        );
         Ok(())
     }
 

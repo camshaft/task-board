@@ -43,6 +43,21 @@ pub struct Settings {
     /// store the returned CID) — so a client with no local IPFS can still author a document.
     /// When unset (the default), the board stays CID-only: callers supply a precomputed CID.
     pub ipfs_api_url: Option<String>,
+    /// Enable the authenticated DB-snapshot download endpoint (`GET /api/admin/db-snapshot`).
+    ///
+    /// Default `false`: the endpoint 404s (hides its existence) unless explicitly turned on. When
+    /// on, it serves a point-in-time-CONSISTENT copy of the SQLite database (produced via
+    /// `VACUUM INTO`, so never a torn mid-write byte stream) behind HTTP Basic auth -- the daemon
+    /// owns `db_path`, so an authed GET sidesteps the stop-daemon / cross-user file-copy problem for
+    /// host migration + DR. The whole fleet's data lives in that file (including secret-broker
+    /// records), so this is a full-exfil surface: the DEPLOYMENT must keep it loopback/LAN-bound and
+    /// OFF the public tunnel. Requires `db_snapshot_user` + `db_snapshot_password` when enabled.
+    pub db_snapshot_enabled: bool,
+    /// HTTP Basic-auth username for the DB-snapshot endpoint. Required when it is enabled.
+    pub db_snapshot_user: Option<String>,
+    /// HTTP Basic-auth password for the DB-snapshot endpoint. Required when it is enabled; deliver it
+    /// via the deployment's secret manager (agenix), never role-plaintext.
+    pub db_snapshot_password: Option<String>,
 }
 
 impl Default for Settings {
@@ -54,6 +69,9 @@ impl Default for Settings {
             webhook_timeout_secs: 5.0,
             mcp_allowed_hosts: Vec::new(),
             ipfs_api_url: None,
+            db_snapshot_enabled: false,
+            db_snapshot_user: None,
+            db_snapshot_password: None,
         }
     }
 }
@@ -75,6 +93,12 @@ pub struct Config {
     /// Optional IPFS HTTP API base URL for server-side content-addressing. See
     /// `Settings::ipfs_api_url`. `None` keeps the board CID-only.
     pub ipfs_api_url: Option<String>,
+    /// Enable the authenticated DB-snapshot download endpoint. See `Settings::db_snapshot_enabled`.
+    pub db_snapshot_enabled: bool,
+    /// Basic-auth username for the DB-snapshot endpoint. See `Settings::db_snapshot_user`.
+    pub db_snapshot_user: Option<String>,
+    /// Basic-auth password for the DB-snapshot endpoint. See `Settings::db_snapshot_password`.
+    pub db_snapshot_password: Option<String>,
 }
 
 impl Config {
@@ -101,6 +125,9 @@ impl Config {
             web_dir: web_dir.filter(|s| !s.is_empty()),
             mcp_allowed_hosts: s.mcp_allowed_hosts,
             ipfs_api_url: s.ipfs_api_url.filter(|s| !s.is_empty()),
+            db_snapshot_enabled: s.db_snapshot_enabled,
+            db_snapshot_user: s.db_snapshot_user.filter(|s| !s.is_empty()),
+            db_snapshot_password: s.db_snapshot_password.filter(|s| !s.is_empty()),
         }
     }
 }
