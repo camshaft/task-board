@@ -417,6 +417,27 @@ export function TaskDrawer() {
                     {STATUS_LABEL[s]}
                   </button>
                 ))}
+                {/* Icebox / restore (task_1221): a real-want-but-not-now toggle, kept distinct from
+                    the active-status row above. Iceboxing drops it off the active board + silences
+                    nudges; restore returns it to To do for a fresh re-triage. */}
+                {task.status === 'icebox' ? (
+                  <button
+                    disabled={busy}
+                    onClick={() => setStatus('todo')}
+                    className="ml-1 rounded-md px-2.5 py-1 text-xs text-sky-300 ring-1 ring-inset ring-sky-500/40 transition hover:bg-[var(--color-panel-2)]"
+                  >
+                    Restore to To do
+                  </button>
+                ) : (
+                  <button
+                    disabled={busy}
+                    onClick={() => setStatus('icebox')}
+                    title="Icebox: kept, but not now — off the active board, no nudges"
+                    className="ml-1 rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] ring-1 ring-inset ring-[var(--color-border)] transition hover:bg-[var(--color-panel-2)] hover:text-cyan-300"
+                  >
+                    Icebox
+                  </button>
+                )}
               </div>
 
               <dl className="mb-5 grid grid-cols-3 gap-y-2 text-sm">

@@ -208,6 +208,15 @@ export function useTasks(projectId: number) {
   )
 }
 
+// Iceboxed tasks for a project (task_1221). The default list_tasks view hides status=icebox, so this
+// is a separate on-demand fetch for the board's icebox panel. Keyed under the `tasks:` prefix so a
+// touched()/invalidateMatching('tasks:') refresh (e.g. after an icebox/restore) re-fetches it too.
+export function useIceboxTasks(projectId: number) {
+  return useResource<TaskSummary[]>(`tasks:icebox:${projectId}`, () =>
+    api.listTasks({ project_id: projectId, status: 'icebox' }),
+  )
+}
+
 export function useTask(taskId: number) {
   return useResource<Task>(keys.task(taskId), () => api.getTask(taskId))
 }

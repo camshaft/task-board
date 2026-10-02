@@ -18,6 +18,7 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   blocked: 'Blocked',
   done: 'Done',
   cancelled: 'Cancelled',
+  icebox: 'Icebox',
 }
 
 // Tailwind classes for each task status chip.
@@ -27,6 +28,8 @@ export const STATUS_CHIP: Record<TaskStatus, string> = {
   blocked: 'bg-rose-500/15 text-rose-300 ring-rose-500/30',
   done: 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30',
   cancelled: 'bg-zinc-500/15 text-zinc-400 ring-zinc-500/30',
+  // Frost tint, distinct from cancelled's zinc -- "kept, not now" rather than "won't do".
+  icebox: 'bg-cyan-500/15 text-cyan-300 ring-cyan-500/30',
 }
 
 export const AGENT_DOT: Record<AgentStatus, string> = {
