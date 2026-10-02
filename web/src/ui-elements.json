@@ -234,6 +234,31 @@
         "required": ["minimum", "maximum"],
         "additionalProperties": false
       }
+    },
+    "datetime": {
+      "title": "Date / time",
+      "description": "A scheduling or deadline decision picked with a native date / datetime / time control, avoiding free-text date parsing. The response schema is a string constrained by a pattern regex (the generic validator treats a string format as advisory, so the pattern -- not format -- gives the server-side guarantee): YYYY-MM-DD for mode=date, YYYY-MM-DDTHH:MM for datetime, HH:MM for time. props.mode selects the control; optional min / max bound the pickable range (same string shape as the value).",
+      "component": "DateTimeInput",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["date", "datetime", "time"],
+            "description": "Which native picker to render (default date). date -> YYYY-MM-DD, datetime -> YYYY-MM-DDTHH:MM, time -> HH:MM."
+          },
+          "min": {
+            "type": "string",
+            "description": "Earliest selectable value, same string shape as mode (e.g. \"2026-01-01\" for date)."
+          },
+          "max": {
+            "type": "string",
+            "description": "Latest selectable value, same string shape as mode."
+          }
+        },
+        "additionalProperties": false
+      }
     }
   }
 }

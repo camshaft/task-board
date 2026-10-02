@@ -144,6 +144,9 @@ type FormSpec =
       // a live value readout rather than a typed field; 'input' (default) is the numeric text field.
       display?: 'input' | 'slider'
     }
+  // `datetime` (schema-driven, doc_3371 A1 entry 7): a native date/datetime/time picker whose string
+  // value the inline response_schema validates with a pattern regex. mode picks the control.
+  | { shape: 'datetime'; mode: 'date' | 'datetime' | 'time'; min?: string; max?: string }
   | { shape: 'age'; recipient: string }
 
 // Does a response schema expect an array value (vs a scalar)? Used to decide a single-select's
@@ -246,6 +249,10 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
           unit: asText(p.unit),
           display: asNumber(p.minimum) != null && asNumber(p.maximum) != null ? 'slider' : 'input',
         }
+      case 'datetime': {
+        const mode = p.mode === 'datetime' || p.mode === 'time' ? p.mode : 'date'
+        return { shape: 'datetime', mode, min: asText(p.min), max: asText(p.max) }
+      }
       case 'age-request': {
         const recipient = asText(p.recipient)
         // With a recipient we can encrypt in-browser; without one, fall back to the free-text escape.
@@ -421,6 +428,7 @@ function AnswerForm({
   const [multi, setMulti] = useState<string[]>([])
   const [text, setText] = useState('')
   const [num, setNum] = useState('')
+  const [dt, setDt] = useState('')
   const [order, setOrder] = useState<string[]>(options.map((o) => o.id))
   // string-list rows (start with one empty row the operator types into).
   const [items, setItems] = useState<string[]>([''])
@@ -810,6 +818,30 @@ function AnswerForm({
               Submit
             </button>
           </div>
+        </div>
+      )}
+
+      {spec?.shape === 'datetime' && (
+        // Native date/datetime/time picker (doc_3371 A1 entry 7): submits the control's string value
+        // (YYYY-MM-DD / YYYY-MM-DDTHH:MM / HH:MM), which the inline response_schema validates by
+        // pattern. The native control guarantees the shape, so just require a non-empty pick.
+        <div className="flex items-center gap-2">
+          <input
+            type={spec.mode === 'datetime' ? 'datetime-local' : spec.mode}
+            value={dt}
+            min={spec.min}
+            max={spec.max}
+            disabled={busy}
+            onChange={(e) => setDt(e.target.value)}
+            className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
+          />
+          <button
+            disabled={busy || !dt}
+            className={BTN}
+            onClick={() => onSubmit('datetime', dt)}
+          >
+            Submit
+          </button>
         </div>
       )}
 
