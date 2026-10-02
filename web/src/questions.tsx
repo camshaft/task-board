@@ -113,7 +113,7 @@ type FormSpec =
       min?: number
       max?: number
       scalar?: boolean
-      display?: 'buttons' | 'scale'
+      display?: 'buttons' | 'scale' | 'stars'
       minLabel?: string
       maxLabel?: string
     }
@@ -131,15 +131,19 @@ function isArraySchema(s: unknown): boolean {
 // The one-tap presentation a single-choice question asks for, or undefined for the default radio
 // list. Same data model either way: the hint rides the opaque ui descriptor (no schema/kind
 // change). 'buttons' = inline button row (task_1179); 'scale' = ordered rating/Likert row (doc_3371
-// A1 entry 1 -- element names scale/rating/likert all map here). Honored via ui.element or a
-// variant/display prop.
-function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | undefined {
+// A1 entry 1); 'stars' = star-glyph rating row (A1 entry 2). Each element's aliases map here;
+// honored via ui.element or a variant/display prop.
+function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | 'stars' | undefined {
   const el = q.ui?.element
   const p = q.ui?.props
-  const hint = el === 'buttons' || p?.variant === 'buttons' || p?.display === 'buttons' ? 'buttons' : null
-  if (hint) return hint
-  const isScale = (v: unknown) => v === 'scale' || v === 'rating' || v === 'likert'
-  if (isScale(el) || (p && (isScale(p.variant) || isScale(p.display)))) return 'scale'
+  const anyIs = (names: string[]) => (v: unknown) => typeof v === 'string' && names.includes(v)
+  const matches = (names: string[]) => {
+    const is = anyIs(names)
+    return is(el) || (!!p && (is(p.variant) || is(p.display)))
+  }
+  if (matches(['buttons'])) return 'buttons'
+  if (matches(['scale', 'rating', 'likert'])) return 'scale'
+  if (matches(['stars', 'star', 'rating-stars'])) return 'stars'
   return undefined
 }
 
@@ -297,6 +301,46 @@ const BTN = 'rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white di
 const BTN_GHOST =
   'rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] ring-1 ring-inset ring-[var(--color-border)] hover:bg-[var(--color-panel-2)] disabled:opacity-40'
 
+// Star-rating render for a single-choice question (doc_3371 A1 entry 2, task_1206). The ordered
+// options are drawn as star glyphs that fill (solid) up to the pointed/focused star; one tap submits
+// that option's id -- same value as every other single-choice variant. Its own component because the
+// hover/focus fill needs local state. Each star carries an aria-label so it is answerable without
+// the visual fill. Large glyphs, so AA treats them as large text.
+function StarRating({
+  options,
+  busy,
+  scalar,
+  onSubmit,
+}: {
+  options: QuestionOption[]
+  busy: boolean
+  scalar?: boolean
+  onSubmit: (shape: string, value: unknown) => void
+}) {
+  const [hover, setHover] = useState(-1)
+  // Theme-aware gold (set on each star below): amber-700 on a light panel (>=4.5:1) and the brighter
+  // amber-400 on dark (>=13:1). amber-400 alone fails WCAG AA on white, so it is never unconditional.
+  return (
+    <div className="flex items-center gap-1" onMouseLeave={() => setHover(-1)}>
+      {options.map((o, i) => (
+        <button
+          key={o.id}
+          type="button"
+          disabled={busy}
+          title={o.label || `${i + 1}`}
+          aria-label={o.label || `${i + 1} of ${options.length}`}
+          onMouseEnter={() => setHover(i)}
+          onFocus={() => setHover(i)}
+          onClick={() => onSubmit('choice', scalar ? o.id : [o.id])}
+          className="text-2xl leading-none text-amber-700 disabled:opacity-40 dark:text-amber-400"
+        >
+          {i <= hover ? '★' : '☆'}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // The interactive answer form for an OPEN question, driven by its normalized FormSpec. Submits
 // { shape, value } matching the backend contract: bool; choice (array of option ids, for single and
 // multi select); text; ranked (ordered option ids). The element's props refine it -- custom yes/no
@@ -385,6 +429,10 @@ function AnswerForm({
             </button>
           ))}
         </div>
+      )}
+
+      {spec?.shape === 'choice' && !spec.multi && spec.display === 'stars' && (
+        <StarRating options={options} busy={busy} scalar={spec.scalar} onSubmit={onSubmit} />
       )}
 
       {spec?.shape === 'choice' && !spec.multi && spec.display === 'scale' && (
