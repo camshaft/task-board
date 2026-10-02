@@ -132,7 +132,7 @@ export default function Documents() {
         </div>
       </div>
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
-        {error && <p className="text-sm text-rose-300">{error.message}</p>}
+        {error && <p className="text-sm text-rose-700 dark:text-rose-300">{error.message}</p>}
         {loading && !docs && <p className="text-sm text-[var(--color-muted)]">Loading…</p>}
         {docs && docs.length === 0 && (
           <p className="text-sm text-[var(--color-muted)]">No documents yet.</p>

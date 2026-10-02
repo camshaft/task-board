@@ -1414,7 +1414,7 @@ export function QuestionComment({
             <button
               disabled={busy}
               onClick={onDecline}
-              className="text-amber-700 hover:text-amber-600 disabled:opacity-40 dark:text-amber-400 dark:hover:text-amber-300"
+              className="text-amber-800 hover:text-amber-700 disabled:opacity-40 dark:text-amber-400 dark:hover:text-amber-300"
             >
               Decline
             </button>

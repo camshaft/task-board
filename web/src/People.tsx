@@ -268,7 +268,7 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
   }
 
   if (loading && !team) return <p className="text-sm text-[var(--color-muted)]">Loading...</p>
-  if (error) return <p className="text-sm text-rose-300">{error.message}</p>
+  if (error) return <p className="text-sm text-rose-700 dark:text-rose-300">{error.message}</p>
   if (!team) return null
 
   // Suggest ids for the add control, scoped to the chosen member kind: people, other teams (to
@@ -439,7 +439,7 @@ function PersonDetailPanel({
 
   if (loading && teams.length === 0)
     return <p className="text-sm text-[var(--color-muted)]">Loading...</p>
-  if (error) return <p className="text-sm text-rose-300">{error.message}</p>
+  if (error) return <p className="text-sm text-rose-700 dark:text-rose-300">{error.message}</p>
 
   const teamName = (id: string) => teams.find((t) => t.id === id)?.display_name || id
 

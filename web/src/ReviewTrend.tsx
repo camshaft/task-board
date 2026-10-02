@@ -30,7 +30,7 @@ function TrendBody() {
     return <p className="px-3 pb-3 text-xs text-[var(--color-muted)]">Loading trend…</p>
   }
   if (error) {
-    return <p className="px-3 pb-3 text-xs text-rose-300">{error.message}</p>
+    return <p className="px-3 pb-3 text-xs text-rose-700 dark:text-rose-300">{error.message}</p>
   }
   if (!data) return null
   return (
