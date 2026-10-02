@@ -7,10 +7,10 @@
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, InitializeRequestParams, InitializeResult,
-    ListResourcesResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
-    ServerConfig,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    InitializeRequestParams, InitializeResult, ListResourcesResult, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{
@@ -49,6 +49,10 @@ pub struct Board {
     /// agent skip register_agent / login / remembering its own name. `None` when no (valid) header
     /// arrived, so a non-fleet session behaves exactly as before.
     forced_identity: Arc<Mutex<Option<String>>>,
+    /// The raw `X-Fleet-Agent` header value last applied to `forced_identity` (task_1039 per-request
+    /// forcing). Lets `call_tool` skip the identity-alias lookup when the header is unchanged (it is
+    /// constant per connection), so forcing does not add a DB query to every tool call.
+    forced_raw: Arc<Mutex<Option<String>>>,
     // Populated and consumed by the #[tool_router]/#[tool_handler] macros.
     #[allow(dead_code)]
     tool_router: ToolRouter<Board>,
@@ -1758,6 +1762,7 @@ impl Board {
             ipfs_api_url,
             identity: Arc::new(Mutex::new(None)),
             forced_identity: Arc::new(Mutex::new(None)),
+            forced_raw: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
@@ -3679,9 +3684,40 @@ impl ServerHandler for Board {
             let canonical = core::resolve_identity_alias(&self.pool, &name).await;
             *self.forced_identity.lock().unwrap() = Some(canonical.clone());
             *self.identity.lock().unwrap() = Some(canonical);
+            *self.forced_raw.lock().unwrap() = Some(name);
         }
         context.peer.set_peer_info(request.clone());
         self.negotiate_initialize(&request)
+    }
+
+    /// task_1039: force the acting identity from the per-request `X-Fleet-Agent` header on EVERY
+    /// tool call, not just at `initialize`. Under MCP 2026-07-28 the client replays its configured
+    /// headers on every request and the `Mcp-Session-Id` binding is removed, so a tool-call POST may
+    /// land on a fresh/unbound Board that never saw `initialize` -- reading the header here forces the
+    /// identity regardless of session reuse. Hand-writing `call_tool` suppresses the `#[tool_handler]`
+    /// default (which only dispatches); we add the header read, then delegate to the same tool router.
+    /// Dormant/back-compat: no valid header leaves `forced_identity` untouched (a non-fleet or
+    /// unexpanded-`${...}` session falls through to the explicit/register_agent path exactly as before).
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        if let Some(name) =
+            trusted_agent_header(context.extensions.get::<axum::http::request::Parts>())
+        {
+            // Resolve only when the raw header changes (it is constant per connection), so a healthy
+            // fleet call does not add an identity-alias lookup to every single tool call.
+            let unchanged = self.forced_raw.lock().unwrap().as_deref() == Some(name.as_str());
+            if !unchanged {
+                let canonical = core::resolve_identity_alias(&self.pool, &name).await;
+                *self.forced_identity.lock().unwrap() = Some(canonical.clone());
+                *self.identity.lock().unwrap() = Some(canonical);
+                *self.forced_raw.lock().unwrap() = Some(name);
+            }
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 
     fn get_info(&self) -> ServerConfig {
