@@ -20,7 +20,7 @@ import { findAndReplace } from 'mdast-util-find-and-replace'
 import { toString as mdastToString } from 'mdast-util-to-string'
 import type { Root as MdastRoot, Paragraph as MdastParagraph } from 'mdast'
 import type { Element as HastElement } from 'hast'
-import { api, ipfsUrl, type DocumentVersion } from './api'
+import { api, ipfsUrl, type DocumentVersion, type LinkRule } from './api'
 
 // Markdown renderer: a real CommonMark parser (remark/unified via react-markdown + remark-gfm),
 // extended with a small remark plugin for the board's own non-standard inline/block syntax
@@ -50,6 +50,10 @@ export interface MentionTarget {
 }
 export type AgentResolver = (id: string) => MentionTarget | null
 export const AgentMentionContext = createContext<AgentResolver>(() => null)
+
+// Deployment-configured custom link-tag rules (task_1243), provided app-wide so every rendered
+// markdown surface linkifies the same patterns. Empty by default (no custom rules → nothing extra).
+export const LinkRulesContext = createContext<LinkRule[]>([])
 
 // Transclusion recursion state: how deep we are and which paths are already on the embed chain,
 // so ![[a]] → ![[b]] → ![[a]] (or an over-deep nest) stops with a placeholder instead of looping.
@@ -145,7 +149,38 @@ function remarkEmbedBlocks() {
 // lookbehind rejects a word-char-preceded token) — native CommonMark constructs (links, emphasis,
 // code spans, autolinks) are handled by remark-parse / remark-gfm and never reach this plugin. A
 // bare "#N" is intentionally NOT lowered (task_869): it is no longer an auto-link.
-function remarkBoardRefs() {
+function remarkBoardRefs(rules: LinkRule[] = []) {
+  // Deployment-configured custom link rules (task_1243), compiled once per plugin instance. A bad
+  // regex is skipped defensively so a malformed deployment config can never throw during render (the
+  // backend already rejects bad patterns at startup). `matchRe` is global for findAndReplace; a
+  // separate non-global `extractRe` pulls the capture groups out of each matched substring to fill
+  // the url_template's $1.. placeholders ($0 = the whole match).
+  const customPairs = rules.flatMap((rule) => {
+    let matchRe: RegExp
+    let extractRe: RegExp
+    try {
+      matchRe = new RegExp(rule.pattern, 'g')
+      extractRe = new RegExp(rule.pattern)
+    } catch {
+      return []
+    }
+    return [
+      [
+        matchRe,
+        (full: string) => {
+          const m = extractRe.exec(full)
+          const href = rule.url_template.replace(/\$(\d+)/g, (_sub, d: string) => {
+            const g = m?.[Number(d)]
+            return g == null ? '' : g
+          })
+          return {
+            type: 'boardRef',
+            data: { hName: 'a', hProperties: { boardKind: 'custom-ref', href, raw: full } },
+          }
+        },
+      ],
+    ]
+  })
   return (tree: MdastRoot) => {
     findAndReplace(tree, [
       [
@@ -189,6 +224,9 @@ function remarkBoardRefs() {
           data: { hName: 'a', hProperties: { boardKind: 'mention', agentId: id, raw: full } },
         }),
       ],
+      // Deployment-configured custom rules run LAST, so a built-in ref (task_N, owner/repo#N, …) on
+      // overlapping text always wins and a custom rule only linkifies the remaining text.
+      ...customPairs,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ] as any)
   }
@@ -313,6 +351,28 @@ function AnchorRenderer(props: BoardAnchorProps) {
     ) : (
       <>{raw}</>
     )
+  }
+
+  // Deployment-configured custom ref (task_1243): the matched text (`raw`) links to the rule's
+  // substituted url_template. Same safety dispatch as a native link below -- an http(s)/mailto URL
+  // is an external anchor, an in-app absolute path uses the router <Link>, and anything else (a
+  // relative or unsafe scheme) degrades to inert text rather than a dangerous/broken link.
+  if (boardKind === 'custom-ref') {
+    if (href && /^(https?:\/\/|mailto:)/i.test(href)) {
+      return (
+        <a href={href} className={LINK_CLS}>
+          {raw}
+        </a>
+      )
+    }
+    if (href && href.startsWith('/') && !href.startsWith('//')) {
+      return (
+        <Link to={href} className={LINK_CLS}>
+          {raw}
+        </Link>
+      )
+    }
+    return <>{raw}</>
   }
 
   // Native markdown link / remark-gfm bare-URL autolink.
@@ -534,13 +594,16 @@ export function Markdown({
   anchors?: boolean
 }) {
   const components = useMemo(() => makeComponents(anchors), [anchors])
+  // Deployment-configured custom link rules (task_1243), app-wide via context; empty outside a
+  // provider (and by default), so markdown renders exactly as before when none are configured.
+  const linkRules = useContext(LinkRulesContext)
   // Rebuilt every render (not memoized): a fresh heading-slug Map per render matches the old
   // per-call `opts.slugs = new Map()` dedup scope — reusing one across a changed `source` would
   // leak dedupe suffixes from a previous document into a new one.
   const remarkPlugins: NonNullable<ComponentProps<typeof ReactMarkdown>['remarkPlugins']> = [
     remarkGfm,
     remarkEmbedBlocks,
-    remarkBoardRefs,
+    [remarkBoardRefs, linkRules],
   ]
   if (anchors) remarkPlugins.push([remarkHeadingSlugs, new Map<string, number>()])
 
