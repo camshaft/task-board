@@ -327,8 +327,11 @@ pub struct UpdateTaskArgs {
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub parent_id: Option<i64>,
     /// What this task is blocked on. REQUIRED when setting status=blocked — a blocked task must
-    /// record what it is waiting on. Omit to leave unchanged; pass kind="none" to clear.
+    /// record what it is waiting on. Omit to leave unchanged; pass kind="none" to clear. Accepts a
+    /// bare kind string, "kind:target" shorthand, or the {kind,target,note} object (task_971: the
+    /// advertised schema permits all these forms, matching the lenient runtime deserializer).
     #[serde(default, deserialize_with = "de_opt_blocked_on_lenient")]
+    #[schemars(schema_with = "blocked_on_schema")]
     pub blocked_on: Option<BlockedOnArgs>,
     /// Flat alternative to `blocked_on` for a client that cannot nest an object: pass
     /// `blocked_on_kind` (task | agent | team | operator | external, or "none" to clear) together
@@ -555,6 +558,32 @@ fn de_opt_blocked_on_lenient<'de, D: serde::Deserializer<'de>>(
             "expected blocked_on as an object or a kind string (e.g. \"operator\"), got {other}"
         ))),
     }
+}
+
+/// Advertised JSON schema for the `blocked_on` field (task 971). The runtime deserializer
+/// ([`de_opt_blocked_on_lenient`]) accepts a bare kind string, a "kind:target" shorthand, a
+/// stringified-JSON object, or the native object -- but the DERIVED schema from
+/// `Option<BlockedOnArgs>` is object-only, so schema-aware MCP clients reject the string/bare/
+/// stringified forms ("invalid type: string, expected struct BlockedOnArgs") BEFORE the lenient
+/// deserializer ever runs, and the task stays unchanged while the agent narrates "blocked" in
+/// prose (the task_966 symptom). This widens the advertised schema to `oneOf: [null, string,
+/// BlockedOnArgs]` so schema-aware clients allow every form the runtime already accepts.
+fn blocked_on_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let object = serde_json::to_value(generator.subschema_for::<BlockedOnArgs>())
+        .expect("BlockedOnArgs subschema serializes");
+    let value = serde_json::json!({
+        "description": "What this task is blocked on. Accepts EITHER a kind string (\"operator\", \
+            or the \"task:611\" shorthand) OR the {kind, target, note} object. kind is \
+            task|agent|team|operator|external (or \"none\" to clear). Null/absent leaves it \
+            unchanged. REQUIRED when setting status=blocked.",
+        "oneOf": [
+            { "type": "null" },
+            { "type": "string" },
+            object,
+        ],
+    });
+    schemars::Schema::try_from(value)
+        .unwrap_or_else(|v| panic!("blocked_on schema is not a valid object schema: {v}"))
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3926,6 +3955,74 @@ mod tests {
         .unwrap();
         assert_eq!(flat.blocked_on_kind.as_deref(), Some("task"));
         assert_eq!(flat.blocked_on_ref.as_deref(), Some("611"));
+
+        // task 971 / task 981: EVERY schema-enumerated kind parses via the native object form, and
+        // kind=external (the one task_981 flagged -- a client that misread "expected struct
+        // BlockedOnArgs" as "external rejected" fell back to operator and polluted the operator
+        // queue) parses via the bare string, stringified-JSON object, and flat forms too.
+        for kind in ["task", "agent", "team", "operator", "external"] {
+            let parsed = from_value::<UpdateTaskArgs>(
+                json!({"task_id": 1, "blocked_on": {"kind": kind, "note": "x"}}),
+            )
+            .unwrap_or_else(|e| panic!("object blocked_on kind={kind} should parse: {e}"))
+            .blocked_on
+            .unwrap();
+            assert_eq!(parsed.kind, kind);
+        }
+        let ext_bare =
+            from_value::<UpdateTaskArgs>(json!({"task_id": 1, "blocked_on": "external"}))
+                .unwrap()
+                .blocked_on
+                .unwrap();
+        assert_eq!(ext_bare.kind, "external");
+        let ext_jstr = from_value::<UpdateTaskArgs>(
+            json!({"task_id": 1, "blocked_on": "{\"kind\":\"external\",\"note\":\"waiting on CAS\"}"}),
+        )
+        .unwrap()
+        .blocked_on
+        .unwrap();
+        assert_eq!(ext_jstr.kind, "external");
+        assert_eq!(ext_jstr.note.as_deref(), Some("waiting on CAS"));
+        let ext_flat = from_value::<UpdateTaskArgs>(
+            json!({"task_id": 1, "blocked_on_kind": "external", "blocked_on_note": "infra"}),
+        )
+        .unwrap();
+        assert_eq!(ext_flat.blocked_on_kind.as_deref(), Some("external"));
+    }
+
+    /// task 971: the advertised schema for `blocked_on` permits a STRING (not just the object), so a
+    /// schema-aware MCP client no longer rejects blocked_on="operator" / a stringified object with
+    /// "invalid type: string, expected struct BlockedOnArgs" before the lenient deserializer runs.
+    #[test]
+    fn blocked_on_schema_permits_string_and_object() {
+        let schema = serde_json::to_value(schema_for!(UpdateTaskArgs)).unwrap();
+        let bo = schema
+            .pointer("/properties/blocked_on")
+            .unwrap_or_else(|| panic!("no blocked_on property in schema: {schema}"));
+        let variants = bo
+            .get("oneOf")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("blocked_on should advertise a oneOf, got {bo}"));
+        let permits_string = variants.iter().any(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("string")
+                || v.get("type")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|a| a.iter().any(|t| t == "string"))
+        });
+        assert!(
+            permits_string,
+            "blocked_on oneOf must permit a string: {bo}"
+        );
+        // The object branch survives (carried as a $ref to BlockedOnArgs or inlined).
+        let permits_object = variants.iter().any(|v| {
+            v.get("$ref").is_some()
+                || v.get("type").and_then(|t| t.as_str()) == Some("object")
+                || v.get("properties").is_some()
+        });
+        assert!(
+            permits_object,
+            "blocked_on oneOf must still permit the object: {bo}"
+        );
     }
 
     /// comment_task / comment_document accept the fleet-habit identity field (agent_id / actor) as an
