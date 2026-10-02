@@ -1994,6 +1994,28 @@ pub async fn project_access(pool: &Pool, project_id: i64) -> anyhow::Result<Valu
     Ok(out)
 }
 
+/// Whether `principal` has access (the READ predicate) to `project_id` under the doc_26 A5 model: it
+/// is a grantee in the project's RESOLVED access map, or the project creator. Reuses `project_access`
+/// so cascade semantics match EXACTLY -- the creator always passes, a fleet-coordination member
+/// passes via the standing grant on every project, and a NON-cascade grant does NOT admit a sub-team
+/// member. The authoritative single-project read-scoping predicate (task_542 Phase 3 Part B5b); the
+/// read paths call it, gated behind `enforcement_enabled`, in the wiring slice, and list scoping
+/// (readable project ids) builds on the same map there.
+// Consumed by the B5b read-scoping wiring that lands next; allow it ahead of its first caller so the
+// cascade-correct access predicate lands + is tested as its own reviewable slice.
+#[allow(dead_code)]
+pub async fn principal_can_read_project(
+    pool: &Pool,
+    principal: &str,
+    project_id: i64,
+) -> anyhow::Result<bool> {
+    let pa = project_access(pool, project_id).await?;
+    Ok(pa
+        .get("access")
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.contains_key(principal)))
+}
+
 /// Resolve an addressable principal id to the set of principal ids who can act on it (task 542): a
 /// team expands to its people AND its agents (cycle-guarded); anything else (a person id, or an
 /// agent id) resolves to itself. The read-time primitive for team-aware addressing + visibility in
@@ -23011,6 +23033,61 @@ mod tests {
         assert!(
             !enforcement_enabled(&pool).await?,
             "a rejected enable leaves enforcement off"
+        );
+        Ok(())
+    }
+
+    /// task_542 B5b: principal_can_read_project is the cascade-correct read predicate -- the creator,
+    /// granted-team members, and fleet-coordination members pass; a stranger fails; and a sub-team
+    /// member under a NON-cascade grant is correctly EXCLUDED.
+    #[tokio::test]
+    async fn principal_can_read_project_respects_grants_and_cascade() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["boss", "alice", "bob", "coord", "carol"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let pid = create_project(&pool, "P", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // Creator always reads; a stranger with no grant does not.
+        assert!(principal_can_read_project(&pool, "boss", pid).await?);
+        assert!(!principal_can_read_project(&pool, "bob", pid).await?);
+
+        // A direct member of a cascade-granted team reads.
+        create_team(&pool, "readers", None, Some("boss"), None).await?;
+        add_team_member(&pool, "readers", "alice", "agent", Some("boss")).await?;
+        attach_project_team(&pool, pid, "readers", "read", true, Some("boss")).await?;
+        assert!(principal_can_read_project(&pool, "alice", pid).await?);
+        assert!(
+            !principal_can_read_project(&pool, "bob", pid).await?,
+            "bob still has no grant"
+        );
+
+        // A fleet-coordination member reads via the standing grant every project carries.
+        add_team_member(
+            &pool,
+            FLEET_COORDINATION_TEAM,
+            "coord",
+            "agent",
+            Some("boss"),
+        )
+        .await?;
+        assert!(
+            principal_can_read_project(&pool, "coord", pid).await?,
+            "fleet-coordination standing grant confers read"
+        );
+
+        // Cascade correctness: a sub-team member under a NON-cascade grant is EXCLUDED.
+        create_team(&pool, "parent", None, Some("boss"), None).await?;
+        create_team(&pool, "child", None, Some("boss"), None).await?;
+        add_team_member(&pool, "parent", "child", "team", Some("boss")).await?;
+        add_team_member(&pool, "child", "carol", "agent", Some("boss")).await?;
+        attach_project_team(&pool, pid, "parent", "read", false, Some("boss")).await?; // NON-cascade
+        assert!(
+            !principal_can_read_project(&pool, "carol", pid).await?,
+            "a non-cascade grant must not admit a sub-team member"
         );
         Ok(())
     }
