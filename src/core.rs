@@ -2016,6 +2016,29 @@ pub async fn principal_can_read_project(
         .is_some_and(|m| m.contains_key(principal)))
 }
 
+/// `get_project` scoped to `viewer` when enforcement is enabled (task_542 Phase 3 Part B5b). With
+/// enforcement OFF (today) it returns the project unchanged -- recorded-not-enforced. With enforcement
+/// ON it is FAIL-CLOSED: an identified viewer that cannot read the project -- OR no identified viewer
+/// at all -- gets `Value::Null`, indistinguishable from "no such project", so enforcement does not
+/// leak a project's existence. The MCP/REST read handlers call this with the authenticated caller;
+/// internal callers that must bypass scoping (e.g. `project_access`) keep calling `get_project`.
+pub async fn get_project_scoped(
+    pool: &Pool,
+    project_id: i64,
+    viewer: Option<&str>,
+) -> anyhow::Result<Value> {
+    if enforcement_enabled(pool).await? {
+        let allowed = match viewer {
+            Some(v) => principal_can_read_project(pool, v, project_id).await?,
+            None => false, // fail-closed: an unidentified caller sees nothing under enforcement
+        };
+        if !allowed {
+            return Ok(Value::Null);
+        }
+    }
+    get_project(pool, project_id).await
+}
+
 /// Resolve an addressable principal id to the set of principal ids who can act on it (task 542): a
 /// team expands to its people AND its agents (cycle-guarded); anything else (a person id, or an
 /// agent id) resolves to itself. The read-time primitive for team-aware addressing + visibility in
@@ -23088,6 +23111,61 @@ mod tests {
         assert!(
             !principal_can_read_project(&pool, "carol", pid).await?,
             "a non-cascade grant must not admit a sub-team member"
+        );
+        Ok(())
+    }
+
+    /// task_542 B5b: get_project_scoped is a passthrough while enforcement is OFF, and FAIL-CLOSED
+    /// once enabled -- the creator and fleet-coordination members read, a stranger and an
+    /// unidentified caller get Null (indistinguishable from "no such project").
+    #[tokio::test]
+    async fn get_project_scoped_enforces_only_when_enabled() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["boss", "bob", "coord"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let pid = create_project(&pool, "P", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // Enforcement OFF: everyone -- even an unidentified caller -- gets the project.
+        assert!(!get_project_scoped(&pool, pid, Some("bob")).await?.is_null());
+        assert!(!get_project_scoped(&pool, pid, None).await?.is_null());
+
+        // Enable enforcement (the freshly seeded state is enablable).
+        set_enforcement_enabled(&pool, true, Some("boss")).await?;
+
+        // Creator (implicit admin) still reads; a stranger and an unidentified caller fail closed.
+        assert!(
+            !get_project_scoped(&pool, pid, Some("boss"))
+                .await?
+                .is_null(),
+            "creator reads"
+        );
+        assert!(
+            get_project_scoped(&pool, pid, Some("bob")).await?.is_null(),
+            "a stranger is denied under enforcement"
+        );
+        assert!(
+            get_project_scoped(&pool, pid, None).await?.is_null(),
+            "an unidentified caller is denied under enforcement"
+        );
+
+        // A fleet-coordination member reads via the standing grant -- no coordination lockout.
+        add_team_member(
+            &pool,
+            FLEET_COORDINATION_TEAM,
+            "coord",
+            "agent",
+            Some("boss"),
+        )
+        .await?;
+        assert!(
+            !get_project_scoped(&pool, pid, Some("coord"))
+                .await?
+                .is_null(),
+            "fleet-coordination member reads via the standing grant"
         );
         Ok(())
     }
