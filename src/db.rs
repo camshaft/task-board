@@ -359,6 +359,22 @@ CREATE TABLE IF NOT EXISTS team_members (
     created_at  TEXT NOT NULL,
     PRIMARY KEY (team_id, member_id, member_kind)
 );
+-- PROJECT VISIBILITY / ROLES (doc_26 appendix A2/A5, task 542 Phase 3). A project grants access to a
+-- TEAM with a role (admin > read-write > read); `cascade_nested` (default on) extends the grant to the
+-- team's nested sub-teams, off limits it to the team's direct members. Read-time resolution expands
+-- each granted team to its principals (people + agents) and the strongest role wins across paths. This
+-- is the RECORDING layer: who may do what is recorded + read now. ENFORCEMENT (fail-closed read
+-- scoping + role-gated writes keyed off the authenticated principal, A5) lands as Phase 3 Part B behind
+-- the two operator policy decisions. (`cascade_nested` not `cascade`: CASCADE is a SQLite keyword.)
+CREATE TABLE IF NOT EXISTS project_teams (
+    project_id     INTEGER NOT NULL,
+    team_id        TEXT NOT NULL,
+    role           TEXT NOT NULL,
+    cascade_nested INTEGER NOT NULL DEFAULT 1,
+    created_by     TEXT,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (project_id, team_id)
+);
 -- SECRET REQUESTS: the board is an ephemeral secret-REQUEST broker, never a secret store. An agent
 -- files a named request carrying the (non-secret) age recipient pubkeys + human instructions; an
 -- operator opens a single-use capability link and submits the value ENCRYPTED IN THE BROWSER, so
