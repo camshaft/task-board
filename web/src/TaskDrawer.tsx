@@ -123,7 +123,7 @@ export function TaskDrawer() {
     if (!task || status === task.status) return
     setBusy(true)
     try {
-      await updateTask(task.id, { status, actor })
+      await updateTask(task.id, { status, principal: actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -137,7 +137,7 @@ export function TaskDrawer() {
     if (assignee == null) return
     setBusy(true)
     try {
-      await updateTask(task.id, { assignee, actor })
+      await updateTask(task.id, { assignee, principal: actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -149,7 +149,7 @@ export function TaskDrawer() {
     if (!task || to === task.project_id) return
     setBusy(true)
     try {
-      await moveTask(task.id, { to_project_id: to, actor })
+      await moveTask(task.id, { to_project_id: to, principal: actor })
       // The task left this board; follow it to its new project so the drawer stays valid.
       navigate(`/projects/${to}/tasks/${task.id}`)
     } catch (e) {
@@ -164,7 +164,7 @@ export function TaskDrawer() {
     if (!body || !task) return
     setBusy(true)
     try {
-      await commentTask(task.id, { body, author: actor })
+      await commentTask(task.id, { body, principal: actor })
       setComment('')
     } catch (e) {
       setError((e as Error).message)
@@ -178,7 +178,7 @@ export function TaskDrawer() {
     if (!task) return
     setBusy(true)
     try {
-      await answerQuestion(task.id, commentId, { shape, value, actor })
+      await answerQuestion(task.id, commentId, { shape, value, principal: actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -191,7 +191,7 @@ export function TaskDrawer() {
     if (feedback == null) return
     setBusy(true)
     try {
-      await declineQuestion(task.id, commentId, { feedback, actor })
+      await declineQuestion(task.id, commentId, { feedback, principal: actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -202,7 +202,7 @@ export function TaskDrawer() {
     if (!task || !window.confirm('Cancel this question? It will be marked cancelled.')) return
     setBusy(true)
     try {
-      await cancelQuestion(task.id, commentId, { actor })
+      await cancelQuestion(task.id, commentId, { principal: actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -217,7 +217,7 @@ export function TaskDrawer() {
     if (new_prompt == null || !new_prompt.trim()) return
     setBusy(true)
     try {
-      await supersedeQuestion(task.id, commentId, { new_prompt, actor })
+      await supersedeQuestion(task.id, commentId, { new_prompt, principal: actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -235,7 +235,7 @@ export function TaskDrawer() {
         project_id: task.project_id,
         title: title.trim(),
         parent_id: task.id,
-        created_by: actor,
+        principal: actor,
       })
     } catch (e) {
       setError((e as Error).message)
@@ -289,7 +289,7 @@ export function TaskDrawer() {
     if (!task) return
     setBusy(true)
     try {
-      await updateTask(task.id, { ...patch, actor })
+      await updateTask(task.id, { ...patch, principal: actor })
     } catch (e) {
       setError((e as Error).message)
     } finally {

@@ -105,7 +105,7 @@ export default function DocumentView() {
   async function addComment() {
     const body = draft.trim()
     if (!body) return
-    await act(() => commentDocument(id, { body, author: actor, reply_to: replyTo ?? undefined }))
+    await act(() => commentDocument(id, { body, principal: actor, reply_to: replyTo ?? undefined }))
     setDraft('')
     setReplyTo(null)
   }
@@ -116,7 +116,7 @@ export default function DocumentView() {
     await act(() =>
       commentDocument(id, {
         body,
-        author: actor,
+        principal: actor,
         region: region ?? undefined,
         version_id: doc?.current_version?.id ?? undefined,
       }),
@@ -127,7 +127,7 @@ export default function DocumentView() {
 
   // Post a reply from inside a thread popover (attaches to the region's top-level comment).
   async function addReply(parentId: number, body: string) {
-    await act(() => commentDocument(id, { body, author: actor, reply_to: parentId }))
+    await act(() => commentDocument(id, { body, principal: actor, reply_to: parentId }))
   }
 
   // Highlight every region-anchored comment's quote in the shown content via the CSS Custom
@@ -205,14 +205,14 @@ export default function DocumentView() {
 
   function requestChanges() {
     const note = window.prompt('What needs to change? (optional note)') ?? undefined
-    void act(() => requestDocumentChanges(id, { actor, note: note || undefined }))
+    void act(() => requestDocumentChanges(id, { principal: actor, note: note || undefined }))
   }
 
   async function savePath() {
     if (editPath === null) return
     // Normalize: trim, drop leading/trailing slashes, collapse doubles. Empty clears the filing.
     const path = editPath.trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/')
-    await act(() => setDocumentPath(id, { path, actor }))
+    await act(() => setDocumentPath(id, { path, principal: actor }))
     setEditPath(null)
   }
 
@@ -268,7 +268,7 @@ export default function DocumentView() {
             {canSubmit && (
               <button
                 disabled={busy}
-                onClick={() => void act(() => submitDocumentForReview(id, { actor }))}
+                onClick={() => void act(() => submitDocumentForReview(id, { principal: actor }))}
                 className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
               >
                 Submit for review
@@ -278,7 +278,7 @@ export default function DocumentView() {
               <>
                 <button
                   disabled={busy}
-                  onClick={() => void act(() => approveDocument(id, { actor }))}
+                  onClick={() => void act(() => approveDocument(id, { principal: actor }))}
                   className="rounded-md bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
                 >
                   Approve
@@ -511,7 +511,7 @@ export default function DocumentView() {
                       repliesOf={repliesOf}
                       busy={busy}
                       resolveExternal={extName}
-                      onResolve={(cid) => void act(() => resolveDocumentComment(id, cid, { actor }))}
+                      onResolve={(cid) => void act(() => resolveDocumentComment(id, cid, { principal: actor }))}
                       onReply={addReply}
                       onClose={() => setOpenKey(null)}
                     />
@@ -763,7 +763,7 @@ export default function DocumentView() {
                       versionNo={versionNo(c.version_id)}
                       busy={busy}
                       resolveExternal={extName}
-                      onResolve={() => void act(() => resolveDocumentComment(id, c.id, { actor }))}
+                      onResolve={() => void act(() => resolveDocumentComment(id, c.id, { principal: actor }))}
                       onReply={() => setReplyTo(replyTo === c.id ? null : c.id)}
                       replying={replyTo === c.id}
                     />
@@ -776,7 +776,7 @@ export default function DocumentView() {
                               versionNo={versionNo(r.version_id)}
                               busy={busy}
                               resolveExternal={extName}
-                              onResolve={() => void act(() => resolveDocumentComment(id, r.id, { actor }))}
+                              onResolve={() => void act(() => resolveDocumentComment(id, r.id, { principal: actor }))}
                             />
                           </li>
                         ))}

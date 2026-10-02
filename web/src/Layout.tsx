@@ -136,7 +136,7 @@ export default function Layout() {
     const name = window.prompt('Project name:')
     if (!name?.trim()) return
     try {
-      await createProject({ name: name.trim(), created_by: actor })
+      await createProject({ name: name.trim(), principal: actor })
     } catch (e) {
       window.alert((e as Error).message)
     }

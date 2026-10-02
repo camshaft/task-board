@@ -76,7 +76,7 @@ export default function Search() {
 
   async function setTaskStatus(id: number, s: TaskStatus) {
     try {
-      await updateTask(id, { status: s, actor })
+      await updateTask(id, { status: s, principal: actor })
       await run()
     } catch (e) {
       window.alert((e as Error).message)
@@ -87,7 +87,7 @@ export default function Search() {
     const body = window.prompt('Comment:')
     if (!body?.trim()) return
     try {
-      await commentTask(id, { body: body.trim(), author: actor })
+      await commentTask(id, { body: body.trim(), principal: actor })
       await run()
     } catch (e) {
       window.alert((e as Error).message)

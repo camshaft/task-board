@@ -62,7 +62,7 @@ export default function ChannelView() {
     setBusy(true)
     setActionError(null)
     try {
-      await inviteToChannel(id, { agent_id: who.trim(), invited_by: actor })
+      await inviteToChannel(id, { agent_id: who.trim(), principal: actor })
     } catch (e) {
       setActionError((e as Error).message)
     } finally {

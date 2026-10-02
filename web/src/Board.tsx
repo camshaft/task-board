@@ -70,7 +70,7 @@ export default function Board() {
         project_id: project,
         title,
         assignee: newAssignee.trim() || undefined,
-        created_by: actor,
+        principal: actor,
       })
       cancelComposer()
     } catch (e) {
@@ -88,7 +88,7 @@ export default function Board() {
     const name = window.prompt('Project name:', current.name)
     if (name == null || !name.trim() || name.trim() === current.name) return
     try {
-      await updateProject(project, { name: name.trim(), actor })
+      await updateProject(project, { name: name.trim(), principal: actor })
     } catch (e) {
       setError((e as Error).message)
     }
@@ -99,7 +99,7 @@ export default function Board() {
     const url = window.prompt('Repository URL (blank to clear):', repo ?? '')
     if (url == null) return
     try {
-      await updateProject(project, { metadata: { repo: url.trim() }, actor })
+      await updateProject(project, { metadata: { repo: url.trim() }, principal: actor })
     } catch (e) {
       setError((e as Error).message)
     }
@@ -109,7 +109,7 @@ export default function Board() {
     if (!current) return
     if (!window.confirm(`Archive “${current.name}”? It's hidden from the board but not deleted — you can restore it anytime.`)) return
     try {
-      await updateProject(project, { status: 'archived', actor })
+      await updateProject(project, { status: 'archived', principal: actor })
     } catch (e) {
       setError((e as Error).message)
     }
@@ -118,7 +118,7 @@ export default function Board() {
   async function restoreProject() {
     if (!current) return
     try {
-      await updateProject(project, { status: 'active', actor })
+      await updateProject(project, { status: 'active', principal: actor })
     } catch (e) {
       setError((e as Error).message)
     }

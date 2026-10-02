@@ -55,7 +55,7 @@ export default function ReviewView() {
     setBusy(true)
     setActionError(null)
     try {
-      await setReviewStatus(id, { status: to, actor, note: note || undefined })
+      await setReviewStatus(id, { status: to, principal: actor, note: note || undefined })
     } catch (e) {
       setActionError((e as Error).message)
     } finally {
@@ -77,7 +77,7 @@ export default function ReviewView() {
     setBusy(true)
     setActionError(null)
     try {
-      await setReviewVetted(id, { vetted: next, actor, note: note || undefined })
+      await setReviewVetted(id, { vetted: next, principal: actor, note: note || undefined })
     } catch (e) {
       setActionError((e as Error).message)
     } finally {
@@ -96,7 +96,7 @@ export default function ReviewView() {
     setBusy(true)
     setActionError(null)
     try {
-      await appendReviewLog(id, { entry_type: entryType, body, author: actor, task_id: taskId })
+      await appendReviewLog(id, { entry_type: entryType, body, principal: actor, task_id: taskId })
       setEntryBody('')
       setFindingTask('')
     } catch (e) {

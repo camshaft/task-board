@@ -45,22 +45,22 @@ export default function Awaiting() {
     }
   }
   const answerQ = (taskId: number, commentId: number, shape: string, value: unknown) =>
-    void run(commentId, () => answerQuestion(taskId, commentId, { shape, value, actor }))
+    void run(commentId, () => answerQuestion(taskId, commentId, { shape, value, principal: actor }))
   const declineQ = (taskId: number, commentId: number) => {
     const feedback = window.prompt('Decline this question — a short note on why / what to do instead:')
     if (feedback == null) return
-    void run(commentId, () => declineQuestion(taskId, commentId, { feedback, actor }))
+    void run(commentId, () => declineQuestion(taskId, commentId, { feedback, principal: actor }))
   }
   const cancelQ = (taskId: number, commentId: number) => {
     if (!window.confirm('Cancel this question? It will be marked cancelled.')) return
-    void run(commentId, () => cancelQuestion(taskId, commentId, { actor }))
+    void run(commentId, () => cancelQuestion(taskId, commentId, { principal: actor }))
   }
   const supersedeQ = (taskId: number, commentId: number) => {
     const new_prompt = window.prompt(
       'Re-pose this question with a new prompt (the old one is kept and linked):',
     )
     if (new_prompt == null || !new_prompt.trim()) return
-    void run(commentId, () => supersedeQuestion(taskId, commentId, { new_prompt, actor }))
+    void run(commentId, () => supersedeQuestion(taskId, commentId, { new_prompt, principal: actor }))
   }
 
   const taskCount = items.filter((it) => it.kind === 'task').length

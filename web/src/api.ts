@@ -584,7 +584,7 @@ export const api = {
   ) => req<Agent>('PATCH', `/agents/${encodeURIComponent(id)}`, b),
   // Request a graceful stand-down: records the request on the agent + drops an observable
   // notification into its inbox. A signal only — never changes status / kills the agent.
-  requestStandDown: (id: string, b: { requested_by?: string; reason?: string } = {}) =>
+  requestStandDown: (id: string, b: { principal?: string; reason?: string } = {}) =>
     req<Agent>('POST', `/agents/${encodeURIComponent(id)}/request-stand-down`, b),
 
   listProjects: (status?: string) =>
@@ -593,7 +593,7 @@ export const api = {
   createProject: (b: {
     name: string
     description?: string
-    created_by?: string
+    principal?: string
     metadata?: Record<string, unknown>
   }) => req<Project>('POST', '/projects', b),
   updateProject: (
@@ -603,7 +603,7 @@ export const api = {
       description?: string
       status?: string
       metadata?: Record<string, unknown>
-      actor?: string
+      principal?: string
     },
   ) => req<Project>('PATCH', `/projects/${id}`, b),
 
@@ -646,7 +646,7 @@ export const api = {
     description?: string
     assignee?: string
     priority?: string
-    created_by?: string
+    principal?: string
     parent_id?: number
     metadata?: Record<string, unknown>
   }) => req<Task>('POST', '/tasks', b),
@@ -658,16 +658,16 @@ export const api = {
       title?: string
       description?: string
       priority?: string
-      actor?: string
+      principal?: string
       // Reparent: a task id nests under that epic, 0 clears the parent (back to top-level),
       // omitted leaves it unchanged. Same-project / self / cycle guards are enforced server-side.
       parent_id?: number
       metadata?: Record<string, unknown>
     },
   ) => req<Task>('PATCH', `/tasks/${id}`, b),
-  commentTask: (id: number, b: { body: string; author?: string }) =>
+  commentTask: (id: number, b: { body: string; principal?: string }) =>
     req<{ comment_id: number; task_id: number }>('POST', `/tasks/${id}/comments`, b),
-  moveTask: (id: number, b: { to_project_id: number; actor?: string }) =>
+  moveTask: (id: number, b: { to_project_id: number; principal?: string }) =>
     req<Task>('POST', `/tasks/${id}/move`, b),
 
   // Operator-questions actions (task_628 / task_629). Pose is agent-side (not surfaced in the UI
@@ -676,23 +676,23 @@ export const api = {
   // question's lifecycle state.
   answerQuestion: (
     commentId: number,
-    b: { shape: string; value: unknown; actor?: string },
+    b: { shape: string; value: unknown; principal?: string },
   ) => req<Comment>('POST', `/comments/${commentId}/answer`, b),
-  declineQuestion: (commentId: number, b: { feedback: string; actor?: string }) =>
+  declineQuestion: (commentId: number, b: { feedback: string; principal?: string }) =>
     req<Comment>('POST', `/comments/${commentId}/decline`, b),
-  cancelQuestion: (commentId: number, b: { actor?: string } = {}) =>
+  cancelQuestion: (commentId: number, b: { principal?: string } = {}) =>
     req<Comment>('POST', `/comments/${commentId}/cancel`, b),
   // Re-pose an OPEN question with a new prompt (asker-only; the old is kept immutable + linked).
-  supersedeQuestion: (commentId: number, b: { new_prompt: string; actor?: string }) =>
+  supersedeQuestion: (commentId: number, b: { new_prompt: string; principal?: string }) =>
     req<Comment>('POST', `/comments/${commentId}/supersede`, b),
 
   // order='desc' returns the LATEST `limit` events, newest-first (for an activity feed); the
   // default 'asc' returns oldest-first above `since_seq` (for incremental tailing). Both compose
   // with `since_seq` and `actor`.
-  getEvents: (since_seq = 0, limit = 100, actor?: string, order?: 'asc' | 'desc') =>
+  getEvents: (since_seq = 0, limit = 100, principal?: string, order?: 'asc' | 'desc') =>
     req<EventRow[]>(
       'GET',
-      `/events?since_seq=${since_seq}&limit=${limit}${actor ? `&actor=${encodeURIComponent(actor)}` : ''}${order ? `&order=${order}` : ''}`,
+      `/events?since_seq=${since_seq}&limit=${limit}${principal ? `&principal=${encodeURIComponent(principal)}` : ''}${order ? `&order=${order}` : ''}`,
     ),
 
   listDocuments: (
@@ -730,7 +730,7 @@ export const api = {
       `/wiki${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`,
     ),
   // Set (or clear, with an empty string) a document's wiki path. Unique among filed docs.
-  setDocumentPath: (id: number, b: { path: string; actor?: string }) =>
+  setDocumentPath: (id: number, b: { path: string; principal?: string }) =>
     req<Document>('POST', `/documents/${id}/path`, b),
   getDocumentVersions: (id: number) =>
     req<DocumentVersion[]>('GET', `/documents/${id}/versions`),
@@ -744,15 +744,15 @@ export const api = {
   },
   commentDocument: (
     id: number,
-    b: { body: string; version_id?: number; author?: string; region?: unknown; reply_to?: number },
+    b: { body: string; version_id?: number; principal?: string; region?: unknown; reply_to?: number },
   ) => req<DocumentComment>('POST', `/documents/${id}/comments`, b),
-  resolveComment: (id: number, commentId: number, b: { actor?: string } = {}) =>
+  resolveComment: (id: number, commentId: number, b: { principal?: string } = {}) =>
     req<DocumentComment>('POST', `/documents/${id}/comments/${commentId}/resolve`, b),
-  submitDocumentForReview: (id: number, b: { actor?: string } = {}) =>
+  submitDocumentForReview: (id: number, b: { principal?: string } = {}) =>
     req<Document>('POST', `/documents/${id}/submit-review`, b),
-  requestDocumentChanges: (id: number, b: { actor?: string; note?: string } = {}) =>
+  requestDocumentChanges: (id: number, b: { principal?: string; note?: string } = {}) =>
     req<Document>('POST', `/documents/${id}/request-changes`, b),
-  approveDocument: (id: number, b: { actor?: string } = {}) =>
+  approveDocument: (id: number, b: { principal?: string } = {}) =>
     req<Document>('POST', `/documents/${id}/approve`, b),
 
   // Channels + DMs. `member` returns that agent's channels (incl. private/DMs); omitted lists
@@ -766,7 +766,7 @@ export const api = {
   createChannel: (b: {
     name: string
     topic?: string
-    created_by?: string
+    principal?: string
     metadata?: Record<string, unknown>
   }) => req<Channel>('POST', '/channels', b),
   // order='desc' returns the LATEST `limit` posts newest-first (for the initial chat view — render
@@ -786,7 +786,7 @@ export const api = {
   },
   postToChannel: (id: number, b: { sender: string; body: string; reply_to?: number }) =>
     req<{ seq: number }>('POST', `/channels/${id}/posts`, b),
-  inviteToChannel: (id: number, b: { agent_id: string; invited_by?: string }) =>
+  inviteToChannel: (id: number, b: { agent_id: string; principal?: string }) =>
     req<Channel>('POST', `/channels/${id}/invites`, b),
   sendMessage: (b: { from_agent: string; to_agent: string; body: string }) =>
     req<{ seq: number }>('POST', '/messages', b),
@@ -811,15 +811,15 @@ export const api = {
     const qs = p.toString()
     return req<ReviewTrend>('GET', `/reviews/trend${qs ? `?${qs}` : ''}`)
   },
-  setReviewStatus: (id: number, b: { status: ReviewStatus; actor?: string; note?: string }) =>
+  setReviewStatus: (id: number, b: { status: ReviewStatus; principal?: string; note?: string }) =>
     req<Review>('POST', `/reviews/${id}/status`, b),
   // The adversarial-review gate (task 428). Server records the actor + logs a `decision` entry and
   // emits review.vetted_changed; same-value is an idempotent no-op. Returns the updated review.
-  setReviewVetted: (id: number, b: { vetted: boolean; actor?: string; note?: string }) =>
+  setReviewVetted: (id: number, b: { vetted: boolean; principal?: string; note?: string }) =>
     req<Review>('POST', `/reviews/${id}/vetted`, b),
   appendReviewLog: (
     id: number,
-    b: { entry_type: string; body?: string; author?: string; task_id?: number; external_id?: string },
+    b: { entry_type: string; body?: string; principal?: string; task_id?: number; external_id?: string },
   ) =>
     req<{ review_id: number; entry_id: number; appended: boolean; entry_type: string }>(
       'POST',
@@ -851,17 +851,17 @@ export const api = {
   // are upserted by stable string id; a team member is a person or a nested team. The server
   // cycle-guards nested-team resolution and rejects a sub-team add that would create a cycle.
   listPeople: () => req<Person[]>('GET', '/people'),
-  createPerson: (b: { id: string; display_name?: string; created_by?: string }) =>
+  createPerson: (b: { id: string; display_name?: string; principal?: string }) =>
     req<Person>('POST', '/people', b),
   deletePerson: (id: string) =>
     req<{ deleted: string }>('DELETE', `/people/${encodeURIComponent(id)}`),
   listTeams: () => req<Team[]>('GET', '/teams'),
-  createTeam: (b: { id: string; display_name?: string; created_by?: string }) =>
+  createTeam: (b: { id: string; display_name?: string; principal?: string }) =>
     req<Team>('POST', '/teams', b),
   getTeam: (id: string) => req<TeamDetail>('GET', `/teams/${encodeURIComponent(id)}`),
   deleteTeam: (id: string) =>
     req<{ deleted: string }>('DELETE', `/teams/${encodeURIComponent(id)}`),
-  addTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team'; created_by?: string }) =>
+  addTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team'; principal?: string }) =>
     req<TeamDetail>('POST', `/teams/${encodeURIComponent(teamId)}/members`, b),
   removeTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team' }) =>
     req<TeamDetail>('DELETE', `/teams/${encodeURIComponent(teamId)}/members`, b),
