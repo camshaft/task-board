@@ -222,6 +222,7 @@ pub struct CreateProjectArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateProjectArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub project_id: i64,
     /// New name (must be unique case-insensitively).
     #[serde(default)]
@@ -242,6 +243,7 @@ pub struct UpdateProjectArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MoveTaskArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     /// The project to move the task into.
     pub to_project_id: i64,
@@ -260,6 +262,7 @@ pub struct ListProjectsArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetProjectArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub project_id: i64,
 }
 
@@ -295,6 +298,7 @@ pub struct CreateTaskArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateTaskArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     /// todo / in_progress / blocked / done / cancelled
     #[serde(default)]
@@ -401,8 +405,50 @@ fn de_opt_bool_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<
     }
 }
 
-/// An `Option<i64>` where the client may have stringified the number: accepts null, an integer, or a
-/// string that parses to an i64 (empty string -> None).
+/// Coerce a loosely-typed id value into an i64 (task 955). Accepts a bare integer id written as a
+/// string ("6") or a typed-ref token an agent carried over from the content-body convention --
+/// "channel_6", "task_6", "project_6", "#6", "channel:6" -- extracting the trailing integer. On
+/// failure the error NAMES the offending token and the expected type instead of the misleading
+/// generic "could not be parsed as JSON" / "missing field" messages that made agents re-send the
+/// identical malformed call. The unquoted-bareword form (`channel_id: channel_6`, no quotes) is
+/// invalid JSON the client never delivers to us, so the matching schema-description + this error on
+/// the quoted recovery form (`"channel_6"`) are the board-side levers.
+fn coerce_i64_token(s: &str) -> Result<i64, String> {
+    let t = s.trim();
+    let t = t.strip_prefix('#').unwrap_or(t);
+    if let Ok(n) = t.parse::<i64>() {
+        return Ok(n);
+    }
+    // typed-ref form: a name prefix then '_' or ':' then the integer (channel_6, task:6).
+    if let Some((_, tail)) = t.rsplit_once(['_', ':']) {
+        if let Ok(n) = tail.trim().parse::<i64>() {
+            return Ok(n);
+        }
+    }
+    Err(format!(
+        "expected a bare integer id (e.g. 6), got {s:?} -- an id parameter takes the raw integer, \
+         not a channel_N/task_N token and not a quoted string"
+    ))
+}
+
+/// A required `i64` id where the client may have stringified it or written a typed-ref token
+/// (task 955): accepts an integer, a stringified integer, or "channel_6"/"task_6"/"#6". A missing
+/// field still errors (the field stays required); only a present, loosely-typed value is coerced.
+fn de_i64_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .ok_or_else(|| serde::de::Error::custom("expected an integer id")),
+        serde_json::Value::String(s) => coerce_i64_token(&s).map_err(serde::de::Error::custom),
+        other => Err(serde::de::Error::custom(format!(
+            "expected an integer id, got {other}"
+        ))),
+    }
+}
+
+/// An `Option<i64>` where the client may have stringified the number: accepts null, an integer, a
+/// string that parses to an i64, or a typed-ref token (via [`coerce_i64_token`]); empty string ->
+/// None.
 fn de_opt_i64_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
     match Option::<serde_json::Value>::deserialize(d)? {
         None | Some(serde_json::Value::Null) => Ok(None),
@@ -415,9 +461,9 @@ fn de_opt_i64_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i
             if t.is_empty() {
                 return Ok(None);
             }
-            t.parse::<i64>().map(Some).map_err(|_| {
-                serde::de::Error::custom(format!("expected an integer, got string {s:?}"))
-            })
+            coerce_i64_token(t)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
         }
         Some(other) => Err(serde::de::Error::custom(format!(
             "expected an integer, got {other}"
@@ -514,6 +560,7 @@ fn de_opt_blocked_on_lenient<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetTaskPropsArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     /// Key/value properties to merge into the task's metadata.
     pub props: JsonObject,
@@ -537,6 +584,7 @@ pub struct SetDocumentPropsArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetTaskArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     /// How many of the most-recent comments to inline (chronological within the slice). Omit for
     /// the default recent slice; pass 0 for metadata-only (no comments); pass a larger number to
@@ -550,6 +598,7 @@ pub struct GetTaskArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveTaskArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     /// The agent performing the archive/restore (for the event actor). Defaults to the
     /// agent this session registered as.
@@ -600,6 +649,7 @@ pub struct ListTasksArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommentTaskArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     pub body: String,
     /// Who is commenting (your agent id). `agent_id`/`actor` are accepted as aliases, since those
@@ -666,6 +716,7 @@ pub struct SubscribeArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MuteTaskArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     /// The agent to mute/unmute the task for. Defaults to the agent this session registered as.
     #[serde(default)]
@@ -698,12 +749,17 @@ pub struct ListChannelsArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetChannelArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PostToChannelArgs {
+    /// The channel's id as a bare integer (e.g. 6) -- NOT a channel_N token and NOT a quoted
+    /// string. (Typed refs like `channel_6` are for CONTENT you write; an id parameter takes the
+    /// raw integer. A stringified "6" or a "channel_6" token is tolerated, but prefer the bare 6.)
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
     /// The poster. Defaults to the agent this session registered as.
     #[serde(default)]
@@ -727,6 +783,7 @@ pub struct PostToChannelArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetChannelPostsArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
     #[serde(default)]
     pub since_seq: i64,
@@ -930,6 +987,7 @@ pub struct FulfillSecretArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetChannelPropsArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
     /// Key/value properties to merge into the channel's metadata — e.g. the outbound
     /// reflect-back policy `{"direction":"both","outbound_authors":["concierge"]}`.
@@ -939,6 +997,7 @@ pub struct SetChannelPropsArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetChannelAutoJoinArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
     /// true = every agent is a member (existing agents joined now + new agents auto-join on
     /// register); false = stop auto-joining (existing members stay).
@@ -982,11 +1041,13 @@ pub struct ListExternalLinksArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PromoteThreadArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
     /// The seq of the thread's root post (its replies — posts with reply_to == this — are
     /// imported as task comments).
     pub root_post_seq: i64,
     /// Project the new task is created in.
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub project_id: i64,
     /// Who is promoting (task creator + subscriber). Defaults to your session identity.
     #[serde(default)]
@@ -996,6 +1057,7 @@ pub struct PromoteThreadArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InviteToChannelArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
     /// The agent to invite (auto-joined).
     pub agent_id: String,
@@ -1103,6 +1165,7 @@ pub struct CreateDocumentArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublishVersionArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     /// Bare IPFS content id for the new version. Stored verbatim; the board never resolves it.
     /// Optional if `content` is given (and the board has an IPFS backend configured).
@@ -1131,6 +1194,7 @@ pub struct PublishVersionArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetDocumentPathArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     /// The wiki path to file this document under (e.g. architecture/board/events). An empty
     /// string clears the path (unfiles the doc). Must be unique among filed documents.
@@ -1188,6 +1252,7 @@ pub struct ReadDocumentArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateDocumentArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     /// New title — a short, specific noun phrase; the viewer renders the title as the page header.
     pub title: String,
@@ -1230,6 +1295,7 @@ pub struct ListDocumentsArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommentDocumentArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     pub body: String,
     /// The version this comment is written against (anchors the region to immutable content).
@@ -1259,6 +1325,7 @@ pub struct CommentDocumentArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveCommentArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
     #[serde(default)]
     pub actor: Option<String>,
@@ -1267,6 +1334,7 @@ pub struct ResolveCommentArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetDocumentCommentsArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     #[serde(default)]
     pub version_id: Option<i64>,
@@ -1277,12 +1345,14 @@ pub struct GetDocumentCommentsArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetCommentArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PoseQuestionArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     /// Legacy kind -- one of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list. OMIT it for a CID-keyed question that instead carries its own `response_schema` plus a `ui.element_schema_cid` (the element's content id, its canonical type identifier).
     #[serde(default)]
@@ -1317,6 +1387,7 @@ pub struct PoseQuestionArgs {
 #[serde(deny_unknown_fields)]
 pub struct AnswerQuestionArgs {
     /// The question comment id to answer.
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
     /// The answer shape: bool / choice / text / ranked. Use text for an out-of-frame answer to a non-text kind.
     pub shape: String,
@@ -1329,6 +1400,7 @@ pub struct AnswerQuestionArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeclineQuestionArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
     /// Why the question is declined; delivered to the asker and recorded on the task.
     pub feedback: String,
@@ -1339,6 +1411,7 @@ pub struct DeclineQuestionArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CancelQuestionArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
     #[serde(default)]
     pub actor: Option<String>,
@@ -1347,6 +1420,7 @@ pub struct CancelQuestionArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SupersedeQuestionArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
     /// The prompt for the replacement question (the old one is kept immutable + linked).
     pub new_prompt: String,
@@ -1370,6 +1444,7 @@ pub struct ListAwaitingArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentActorArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     #[serde(default)]
     pub actor: Option<String>,
@@ -1378,6 +1453,7 @@ pub struct DocumentActorArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeprecateDocumentArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     /// Mark deprecated (default) or, when false, clear the deprecation + supersede link.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
@@ -1392,6 +1468,7 @@ pub struct DeprecateDocumentArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestChangesArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     #[serde(default)]
     pub actor: Option<String>,
@@ -1403,6 +1480,7 @@ pub struct RequestChangesArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitToOperatorReviewArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
     #[serde(default)]
     pub actor: Option<String>,
@@ -1419,7 +1497,9 @@ pub struct SubmitToOperatorReviewArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttachDocumentArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
     #[serde(default)]
     pub actor: Option<String>,
@@ -3727,6 +3807,42 @@ mod tests {
             .unwrap()
             .parent_id
             .is_none());
+
+        // task 955: a required id param tolerates the recovery forms an agent reaches for after a
+        // bareword slip -- a stringified int and a typed-ref token -- instead of a misleading
+        // "missing field" / parse error. The unquoted bareword (channel_6, no quotes) is invalid
+        // JSON the client never delivers; these are the quoted forms that reach the server.
+        for raw in [
+            json!({"channel_id": 6, "body": "x"}),
+            json!({"channel_id": "6", "body": "x"}),
+            json!({"channel_id": "channel_6", "body": "x"}),
+            json!({"channel_id": "#6", "body": "x"}),
+            json!({"channel_id": "channel:6", "body": "x"}),
+        ] {
+            assert_eq!(
+                from_value::<PostToChannelArgs>(raw.clone())
+                    .unwrap_or_else(|e| panic!("{raw} should coerce: {e}"))
+                    .channel_id,
+                6
+            );
+        }
+        // A genuinely non-numeric id errors, and the message names the token + expected type.
+        let err = from_value::<GetChannelArgs>(json!({"channel_id": "lobby"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"lobby\""),
+            "error should name the token: {err}"
+        );
+        assert!(
+            err.contains("bare integer id"),
+            "error should name the expected type: {err}"
+        );
+        // The helper itself: coercion + error shape.
+        assert_eq!(coerce_i64_token("  task_42 "), Ok(42));
+        assert_eq!(coerce_i64_token("#7"), Ok(7));
+        assert_eq!(coerce_i64_token("13"), Ok(13));
+        assert!(coerce_i64_token("not-an-id").is_err());
 
         // list_tasks scalar filters: stringified bool + i64.
         let lt = from_value::<ListTasksArgs>(
