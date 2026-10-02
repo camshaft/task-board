@@ -16,6 +16,7 @@ import {
   useChannels,
   useEvents,
   useIdentityAliases,
+  usePeople,
   useProjects,
   useWiki,
 } from './resources'
@@ -114,18 +115,35 @@ export default function Layout() {
     return m
   }, [wikiDocs])
   const resolveWikiLink = useCallback<WikiResolver>((path) => wikiByPath.get(path) ?? null, [wikiByPath])
-  // Known agent ids, so @mentions in any rendered markdown link only to real agents (an unknown
-  // @word stays plain text). Live-updates as agents register.
+  // Known agent + person ids, so an @mention in any rendered markdown auto-links to a real agent or
+  // person (an unknown @word stays plain text). Live-updates as agents register / people are added.
   const { data: agents = [] } = useAgents()
+  const { data: people = [] } = usePeople()
   const { data: awaiting = [] } = useAwaiting(actor)
   const agentIds = useMemo(() => new Set(agents.map((a) => a.id)), [agents])
-  // Identity aliases (task 532): a mention of an alias (@operator) links to its canonical identity
-  // (/agents/cameron). Curated data, so we link even if the canonical has no agent row yet.
+  const peopleIds = useMemo(() => new Set(people.map((p) => p.id)), [people])
+  // Identity aliases (task 532): a mention of an alias (@operator) links to its canonical identity.
+  // Curated data, so we link even if the canonical has no agent/person row yet.
   const { data: aliases = [] } = useIdentityAliases()
   const aliasMap = useMemo(() => new Map(aliases.map((a) => [a.alias, a.canonical])), [aliases])
+  // An @handle links to the agent page for an agent, or the people page for a person; an alias
+  // resolves to its canonical's target (task_1139 added people + alias-to-person; agents behave as
+  // before). A canonical with no known row still links to its agent page (curated-alias behavior).
+  const hrefForPrincipal = useCallback(
+    (id: string): string | null =>
+      agentIds.has(id) ? `/agents/${encodeURIComponent(id)}` : peopleIds.has(id) ? '/people' : null,
+    [agentIds, peopleIds],
+  )
   const resolveMention = useCallback<AgentResolver>(
-    (id) => (agentIds.has(id) ? id : (aliasMap.get(id) ?? null)),
-    [agentIds, aliasMap],
+    (id) => {
+      const direct = hrefForPrincipal(id)
+      if (direct) return { href: direct, canonical: id }
+      const canon = aliasMap.get(id)
+      if (canon)
+        return { href: hrefForPrincipal(canon) ?? `/agents/${encodeURIComponent(canon)}`, canonical: canon }
+      return null
+    },
+    [hrefForPrincipal, aliasMap],
   )
   const [showArchived, setShowArchived] = useState(false)
   // The left sidebar is an off-canvas drawer on small screens (toggled from the header) and a
