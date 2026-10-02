@@ -39,12 +39,12 @@ function buildTree(docs: DocumentSummary[]): Node {
 function TreeRows({
   node,
   depth,
-  collapsed,
+  expanded,
   toggle,
 }: {
   node: Node
   depth: number
-  collapsed: Set<string>
+  expanded: Set<string>
   toggle: (full: string) => void
 }) {
   const entries = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name))
@@ -52,7 +52,9 @@ function TreeRows({
     <>
       {entries.map((n) => {
         const hasChildren = n.children.size > 0
-        const isOpen = !collapsed.has(n.full)
+        // Folders open on demand: a node is open only once the reader expands it, so the tree
+        // starts collapsed at the top level rather than fully unfolded.
+        const isOpen = expanded.has(n.full)
         return (
           <div key={n.full}>
             <div
@@ -90,7 +92,7 @@ function TreeRows({
               )}
             </div>
             {hasChildren && isOpen && (
-              <TreeRows node={n} depth={depth + 1} collapsed={collapsed} toggle={toggle} />
+              <TreeRows node={n} depth={depth + 1} expanded={expanded} toggle={toggle} />
             )}
           </div>
         )
@@ -106,9 +108,11 @@ function TreeRows({
 export default function Wiki() {
   const scrollRef = useScrollRestoration()
   const { data: docs = [], loading, error } = useWiki()
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  // Which folders are expanded. Empty by default, so the tree opens collapsed at the top level and
+  // the reader discloses children on demand (task_1058 goal: the wiki was unusable fully expanded).
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const toggle = (full: string) =>
-    setCollapsed((s) => {
+    setExpanded((s) => {
       const n = new Set(s)
       if (n.has(full)) n.delete(full)
       else n.add(full)
@@ -136,7 +140,7 @@ export default function Wiki() {
           </p>
         )}
         {docs.length > 0 && (
-          <TreeRows node={tree} depth={0} collapsed={collapsed} toggle={toggle} />
+          <TreeRows node={tree} depth={0} expanded={expanded} toggle={toggle} />
         )}
       </div>
     </main>
