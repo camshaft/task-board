@@ -2117,6 +2117,16 @@ impl Board {
         let project_id = core::resolve_create_project(&self.pool, a.project_id, a.parent_id)
             .await
             .map_err(err)?;
+        // task_542 B5c: gate the write on the authenticated caller's project access when enforcement
+        // is enabled (fail-closed; inert while off). Keyed on the authenticated identity, not the
+        // client-supplied created_by.
+        core::ensure_can_write_project(
+            &self.pool,
+            self.authenticated_identity().as_deref(),
+            project_id,
+        )
+        .await
+        .map_err(err)?;
         core::create_task(
             &self.pool,
             project_id,

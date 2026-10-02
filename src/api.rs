@@ -1595,9 +1595,17 @@ struct CreateTaskBody {
     external_link: Option<core::ExternalRef>,
 }
 
-async fn create_task(State(st): State<AppState>, Json(b): Json<CreateTaskBody>) -> ApiResult {
+async fn create_task(
+    State(st): State<AppState>,
+    viewer: Option<Extension<ForcedViewer>>,
+    Json(b): Json<CreateTaskBody>,
+) -> ApiResult {
     // project_id is optional when parent_id is given (task 708): inherit the parent's project.
     let project_id = core::resolve_create_project(&st.pool, b.project_id, b.parent_id).await?;
+    // task_542 B5c: gate the write on the authenticated caller's project access when enforcement is
+    // enabled (fail-closed; a no-op while off). The actor is the forced-trusted-user viewer.
+    let actor = viewer.map(|Extension(ForcedViewer(v))| v);
+    core::ensure_can_write_project(&st.pool, actor.as_deref(), project_id).await?;
     Ok(Json(
         core::create_task(
             &st.pool,
