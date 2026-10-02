@@ -124,19 +124,25 @@
     },
     "age-request": {
       "title": "Encrypted secret request",
-      "description": "Request a secret encrypted to an age recipient (replaces the dedicated secret-request path, task_713). The response schema is a string holding the age ciphertext, produced client-side, so no plaintext is ever stored on the board. props.recipient is the age public key to encrypt to.",
+      "description": "Request a secret encrypted to one or more age recipients (replaces the dedicated secret-request path, task_713). The response schema is a string holding the age ciphertext, produced client-side (encrypted to every recipient), so no plaintext is ever stored on the board. props.recipient_pubkeys are the age public keys to encrypt to; optional props.target is an advisory destination the fulfiller interprets (not validated by the board).",
       "component": "AgeRequest",
       "props_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "recipient": {
-            "type": "string",
-            "description": "age public key (recipient) the secret is encrypted to, client-side"
+          "recipient_pubkeys": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "description": "age public keys (recipients) the secret is encrypted to, client-side; the ciphertext is encrypted to all of them."
           },
-          "label": { "type": "string" }
+          "label": { "type": "string" },
+          "target": {
+            "type": "string",
+            "description": "Optional advisory destination for the secret (e.g. a path or name the fulfiller writes it to); free-form, not validated by the board."
+          }
         },
-        "required": ["recipient"],
+        "required": ["recipient_pubkeys"],
         "additionalProperties": false
       }
     },
