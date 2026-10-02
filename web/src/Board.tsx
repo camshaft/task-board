@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link, Outlet, useParams } from 'react-router-dom'
 import { type TaskSummary } from './api'
 import { useBoardContext } from './Layout'
-import { createTask, updateProject, useProjects, useTasks } from './resources'
+import { createTask, updateProject, updateTask, useIceboxTasks, useProjects, useTasks } from './resources'
 import { Identity, PriorityDot, StatusChip, STATUS_LABEL, TASK_COLUMNS } from './ui'
 
 // The kanban board for one project (from the :projectId route param). Renders its own
@@ -12,6 +12,10 @@ export default function Board() {
   const project = Number(projectId)
   const { actor } = useBoardContext()
   const { data: tasks = [], error: tasksError } = useTasks(project)
+  // Icebox (task_1221): fetched separately since the default task view hides status=icebox. Always
+  // fetched (cheap) so the toggle can show a count; the list only renders when expanded.
+  const { data: iceboxed = [] } = useIceboxTasks(project)
+  const [showIcebox, setShowIcebox] = useState(false)
   const { data: projects = [] } = useProjects()
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
@@ -124,6 +128,17 @@ export default function Board() {
     }
   }
 
+  // One-click restore of an iceboxed task back to the active backlog (task_1221). Restore-to-todo
+  // only, per board-pm: an iceboxed item's prior dependency may have shifted, so todo forces a fresh
+  // re-triage. Both the icebox list and the active board refresh via the touched() in updateTask.
+  async function restoreFromIcebox(id: number) {
+    try {
+      await updateTask(id, { status: 'todo', principal: actor })
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
   const shownError = error ?? tasksError?.message ?? null
 
   return (
@@ -152,6 +167,15 @@ export default function Board() {
         </button>
         {/* Project actions. Kept as small text buttons so the board stays the focus. */}
         <div className="ml-auto flex items-center gap-1 text-xs text-[var(--color-muted)]">
+          {iceboxed.length > 0 && (
+            <button
+              onClick={() => setShowIcebox((v) => !v)}
+              title="Iceboxed tasks — kept, but not now"
+              className={`rounded px-2 py-1 hover:bg-[var(--color-panel-2)] ${showIcebox ? 'text-cyan-700 dark:text-cyan-300' : ''}`}
+            >
+              {showIcebox ? '▾' : '▸'} Icebox ({iceboxed.length})
+            </button>
+          )}
           <Link to={`/projects/${project}/access`} className="rounded px-2 py-1 hover:bg-[var(--color-panel-2)]">
             Access
           </Link>
@@ -223,6 +247,37 @@ export default function Board() {
       {shownError && (
         <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
           {shownError}
+        </div>
+      )}
+
+      {showIcebox && iceboxed.length > 0 && (
+        // On-demand icebox view (task_1221): kept out of the active kanban (not a TASK_COLUMNS
+        // column), revealed only via the header toggle. Each item one-click restores to To do.
+        <div className="border-b border-[var(--color-border)] bg-[var(--color-panel)]/40 px-4 py-3">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-cyan-700 dark:text-cyan-300">
+            Icebox — kept, not now ({iceboxed.length})
+          </p>
+          <ul className="flex flex-wrap gap-2">
+            {iceboxed.sort(byRecent).map((t) => (
+              <li
+                key={t.id}
+                className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2.5 py-1.5"
+              >
+                <PriorityDot priority={t.priority} />
+                <Link to={`tasks/${t.id}`} className="max-w-xs truncate text-sm hover:text-sky-300">
+                  {t.title}
+                </Link>
+                <span className="font-mono text-[11px] text-[var(--color-muted)]">#{t.id}</span>
+                <button
+                  onClick={() => restoreFromIcebox(t.id)}
+                  className="rounded px-1.5 py-0.5 text-xs text-sky-400 hover:bg-[var(--color-panel)] hover:text-sky-300"
+                  title="Restore to To do"
+                >
+                  Restore
+                </button>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 

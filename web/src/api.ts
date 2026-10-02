@@ -8,7 +8,10 @@
 // slash on baseURI matters, so the backend always emits <base href="{prefix}/">.
 const API_ROOT = new URL('api', document.baseURI).href
 
-export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled'
+// `icebox` (task_1221) is a real-want-but-not-now state: hidden from the default list_tasks view +
+// monitor-exempt server-side, surfaced on demand and one-click restorable. It is deliberately NOT in
+// TASK_COLUMNS so it stays off the active kanban.
+export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled' | 'icebox'
 export type AgentStatus = 'online' | 'busy' | 'away' | 'offline'
 
 export interface Agent {
