@@ -113,7 +113,7 @@ type FormSpec =
       min?: number
       max?: number
       scalar?: boolean
-      display?: 'buttons' | 'scale' | 'stars'
+      display?: 'buttons' | 'scale' | 'stars' | 'nps'
       minLabel?: string
       maxLabel?: string
     }
@@ -133,7 +133,7 @@ function isArraySchema(s: unknown): boolean {
 // change). 'buttons' = inline button row (task_1179); 'scale' = ordered rating/Likert row (doc_3371
 // A1 entry 1); 'stars' = star-glyph rating row (A1 entry 2). Each element's aliases map here;
 // honored via ui.element or a variant/display prop.
-function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | 'stars' | undefined {
+function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | 'stars' | 'nps' | undefined {
   const el = q.ui?.element
   const p = q.ui?.props
   const anyIs = (names: string[]) => (v: unknown) => typeof v === 'string' && names.includes(v)
@@ -144,7 +144,20 @@ function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | 'stars' | unde
   if (matches(['buttons'])) return 'buttons'
   if (matches(['scale', 'rating', 'likert'])) return 'scale'
   if (matches(['stars', 'star', 'rating-stars'])) return 'stars'
+  if (matches(['nps', 'net-promoter', 'net_promoter'])) return 'nps'
   return undefined
+}
+
+// NPS is a 0-10 scale, so it shares the scale render but carries conventional default end labels
+// when the question did not supply its own (doc_3371 A1 entry 5).
+function endLabels(
+  display: 'buttons' | 'scale' | 'stars' | 'nps' | undefined,
+  min: string | undefined,
+  max: string | undefined,
+): { minLabel?: string; maxLabel?: string } {
+  if (display === 'nps')
+    return { minLabel: min ?? 'Not at all likely', maxLabel: max ?? 'Extremely likely' }
+  return { minLabel: min, maxLabel: max }
 }
 
 function formSpecFor(q: QuestionPayload): FormSpec | null {
@@ -163,8 +176,7 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
           options: asOptions(p.options),
           scalar: !isArraySchema(q.response_schema),
           display: choiceDisplay(q),
-          minLabel: asText(p.min_label),
-          maxLabel: asText(p.max_label),
+          ...endLabels(choiceDisplay(q), asText(p.min_label), asText(p.max_label)),
         }
       case 'multi-select':
         return {
@@ -205,8 +217,7 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
         multi: false,
         options: q.options ?? [],
         display: choiceDisplay(q),
-        minLabel: asText(q.ui?.props?.min_label),
-        maxLabel: asText(q.ui?.props?.max_label),
+        ...endLabels(choiceDisplay(q), asText(q.ui?.props?.min_label), asText(q.ui?.props?.max_label)),
       }
     case 'select_all':
       return { shape: 'choice', multi: true, options: q.options ?? [] }
@@ -435,7 +446,7 @@ function AnswerForm({
         <StarRating options={options} busy={busy} scalar={spec.scalar} onSubmit={onSubmit} />
       )}
 
-      {spec?.shape === 'choice' && !spec.multi && spec.display === 'scale' && (
+      {spec?.shape === 'choice' && !spec.multi && (spec.display === 'scale' || spec.display === 'nps') && (
         // Rating / Likert scale (doc_3371 A1 entry 1, task_1203): the ordered options as one row of
         // equal-width one-tap buttons, with optional end labels beneath. One tap submits the chosen
         // option id -- same value as the radio variant.
