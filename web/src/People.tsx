@@ -11,6 +11,7 @@ import {
   removeTeamMember,
   useAgents,
   useAllTeamDetails,
+  useIdentityAliases,
   usePeople,
   useTeam,
   useTeams,
@@ -409,9 +410,10 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
   )
 }
 
-// The detail panel for one selected person: which teams they belong to. The backend has no reverse
-// lookup, so this inverts every team's detail client-side -- direct memberships (the person is a
-// listed member) and transitive ones (the person resolves into the team through a nested team).
+// The detail panel for one selected person: the names they are addressed by (identity aliases that
+// resolve to them) and which teams they belong to. The backend has no reverse lookup for either, so
+// this inverts the alias map and every team's detail client-side -- team memberships split into
+// direct (the person is a listed member) and transitive (resolves in through a nested team).
 function PersonDetailPanel({
   personId,
   onSelectTeam,
@@ -421,7 +423,10 @@ function PersonDetailPanel({
 }) {
   const { data: teams = [], loading, error } = useAllTeamDetails()
   const { data: people = [] } = usePeople()
+  const { data: aliases = [] } = useIdentityAliases()
   const person = people.find((p) => p.id === personId)
+  // Reverse of the alias map: the names that resolve to this person (e.g. operator -> cameron).
+  const personAliases = aliases.filter((a) => a.canonical === personId).map((a) => a.alias)
 
   const directTeams = teams
     .filter((t) => t.members.some((m) => m.member_kind === 'person' && m.member_id === personId))
@@ -459,6 +464,26 @@ function PersonDetailPanel({
           <span className="ml-1.5 font-mono text-[11px] text-[var(--color-muted)]">{personId}</span>
         )}
       </div>
+
+      {personAliases.length > 0 && (
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+            Also known as
+            <span className="ml-1 font-normal normal-case">(aliases)</span>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {personAliases.map((alias) => (
+              <span
+                key={alias}
+                title={`${alias} resolves to ${personId}`}
+                className="rounded-full bg-[var(--color-panel-2)] px-2 py-0.5 font-mono text-xs text-[var(--color-muted)]"
+              >
+                {alias}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div>
         <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
