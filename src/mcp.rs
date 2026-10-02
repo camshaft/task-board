@@ -199,7 +199,7 @@ pub struct RequestStandDownArgs {
     /// The agent asked to wind down.
     pub agent_id: String,
     /// Who is asking (defaults to this session's identity).
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "requested_by", default)]
     pub requested_by: Option<String>,
     /// Optional reason shown to the agent + on its page.
     #[serde(default)]
@@ -212,7 +212,7 @@ pub struct CreateProjectArgs {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
     /// Arbitrary project properties (e.g. {"repo": "https://github.com/org/repo"}).
     #[serde(default)]
@@ -236,7 +236,7 @@ pub struct UpdateProjectArgs {
     #[serde(default)]
     pub metadata: Option<JsonObject>,
     /// Set to your agent id so you aren't notified of your own change.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -248,7 +248,7 @@ pub struct MoveTaskArgs {
     /// The project to move the task into.
     pub to_project_id: i64,
     /// Set to your agent id so you aren't notified of your own change.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -280,7 +280,7 @@ pub struct CreateTaskArgs {
     pub assignee: Option<String>,
     #[serde(default)]
     pub priority: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
     /// Arbitrary properties (pipeline state, source, ipfs_cid, target collection, ...).
     #[serde(default)]
@@ -318,7 +318,7 @@ pub struct UpdateTaskArgs {
     #[serde(default)]
     pub priority: Option<String>,
     /// Set to your agent id so you aren't notified of your own change.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
     /// MERGED into the task's props.
     #[serde(default)]
@@ -606,7 +606,7 @@ pub struct SetDocumentPropsArgs {
     pub path: Option<String>,
     /// Key/value properties to merge into the document's metadata (e.g. description, type, tags).
     pub props: JsonObject,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -631,7 +631,7 @@ pub struct ArchiveTaskArgs {
     pub task_id: i64,
     /// The agent performing the archive/restore (for the event actor). Defaults to the
     /// agent this session registered as.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -685,7 +685,13 @@ pub struct CommentTaskArgs {
     /// are the identity field names other board tools use — so a call that passes agent_id (a common
     /// habit) still records the author, and the self-notify "minus the actor" exclusion fires,
     /// instead of silently storing a null author and echoing your own comment back to you (task 531).
-    #[serde(default, alias = "agent_id", alias = "actor")]
+    #[serde(
+        rename = "principal",
+        alias = "author",
+        default,
+        alias = "agent_id",
+        alias = "actor"
+    )]
     pub author: Option<String>,
     /// Optional external identity id (e.g. "slack:U123") to attribute this comment to — for an
     /// ingested human. `author` stays the fleet agent (you) that performed the write.
@@ -760,7 +766,7 @@ pub struct CreateChannelArgs {
     #[serde(default)]
     pub topic: Option<String>,
     /// Your agent id — auto-joined as the first member.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
     /// Arbitrary channel properties.
     #[serde(default)]
@@ -791,7 +797,7 @@ pub struct PostToChannelArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
     /// The poster. Defaults to the agent this session registered as.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "sender", default)]
     pub sender: Option<String>,
     pub body: String,
     /// Optional parent post seq to reply under (one-level threading).
@@ -885,7 +891,7 @@ pub struct AddBannedPhraseArgs {
     /// Optional note: why it's banned, or what to write instead.
     #[serde(default)]
     pub note: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
 }
 
@@ -896,7 +902,7 @@ pub struct SetIdentityAliasArgs {
     pub alias: String,
     /// The canonical identity it resolves to, e.g. "cameron".
     pub canonical: String,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
 }
 
@@ -916,7 +922,7 @@ pub struct CreatePersonArgs {
     pub id: String,
     #[serde(default)]
     pub display_name: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
     #[serde(default)]
     pub metadata: Option<JsonObject>,
@@ -929,7 +935,7 @@ pub struct CreateTeamArgs {
     pub id: String,
     #[serde(default)]
     pub display_name: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
     #[serde(default)]
     pub metadata: Option<JsonObject>,
@@ -958,7 +964,7 @@ pub struct TeamMemberArgs {
     pub member_id: String,
     /// "person", "team", or "agent" (team-scoped agents, task 542).
     pub member_kind: String,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
 }
 
@@ -1001,7 +1007,7 @@ pub struct RequestSecretArgs {
     #[serde(default)]
     pub fulfiller: Option<String>,
     /// The requesting agent (defaults to this session's identity).
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "requested_by", default)]
     pub requested_by: Option<String>,
 }
 
@@ -1033,7 +1039,7 @@ pub struct SetChannelAutoJoinArgs {
     #[serde(deserialize_with = "de_bool_lenient")]
     pub auto_join: bool,
     /// The agent performing the change (event actor). Defaults to this session's identity.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1079,7 +1085,7 @@ pub struct PromoteThreadArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub project_id: i64,
     /// Who is promoting (task creator + subscriber). Defaults to your session identity.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1091,7 +1097,7 @@ pub struct InviteToChannelArgs {
     /// The agent to invite (auto-joined).
     pub agent_id: String,
     /// Your agent id (the inviter).
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "invited_by", default)]
     pub invited_by: Option<String>,
 }
 
@@ -1111,7 +1117,7 @@ pub struct CheckNotificationsArgs {
 #[serde(deny_unknown_fields)]
 pub struct SendMessageArgs {
     /// Sender. Defaults to the agent this session registered as.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "from_agent", default)]
     pub from_agent: Option<String>,
     pub to_agent: String,
     pub body: String,
@@ -1147,7 +1153,7 @@ pub struct GetEventsArgs {
     #[serde(default = "default_events_limit")]
     pub limit: i64,
     /// Only events whose `actor` matches — a complete per-agent activity feed.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
     /// `true` returns the LATEST `limit` events (newest-first) — a live activity feed. Default
     /// `false` is oldest-first after `since_seq` — for incrementally tailing the log.
@@ -1176,7 +1182,7 @@ pub struct CreateDocumentArgs {
     /// approval review fast and accurate. For v1, a short note on what the document is.
     #[serde(default)]
     pub summary: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
     /// Arbitrary props (tags, etc). MERGED is not applicable on create — set the initial bag.
     #[serde(default)]
@@ -1209,7 +1215,7 @@ pub struct PublishVersionArgs {
     /// fill it on a publish -- a blank change-note makes the operator's review slower.
     #[serde(default)]
     pub summary: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
     /// MIME type of this version's bytes (default text/markdown). The board records only the label.
     #[serde(default)]
@@ -1228,7 +1234,7 @@ pub struct SetDocumentPathArgs {
     /// The wiki path to file this document under (e.g. architecture/board/events). An empty
     /// string clears the path (unfiles the doc). Must be unique among filed documents.
     pub path: String,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1285,7 +1291,7 @@ pub struct UpdateDocumentArgs {
     pub document_id: i64,
     /// New title — a short, specific noun phrase; the viewer renders the title as the page header.
     pub title: String,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1309,7 +1315,7 @@ pub struct ListDocumentsArgs {
     #[serde(default)]
     pub task_id: Option<i64>,
     /// Only documents created by this author (created_by).
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "author", default)]
     pub author: Option<String>,
     /// Include archived (retired) documents. Hidden by default.
     #[serde(default, deserialize_with = "de_bool_lenient")]
@@ -1333,7 +1339,13 @@ pub struct CommentDocumentArgs {
     /// Who is commenting (your agent id). `agent_id`/`actor` are accepted as aliases (the identity
     /// field names other board tools use), so a call that passes agent_id still records the author
     /// instead of storing null and defeating the self-notify exclusion (task 531).
-    #[serde(default, alias = "agent_id", alias = "actor")]
+    #[serde(
+        rename = "principal",
+        alias = "author",
+        default,
+        alias = "agent_id",
+        alias = "actor"
+    )]
     pub author: Option<String>,
     /// Free-form JSON anchor (e.g. W3C/Hypothesis selectors). Stored verbatim; omit for a
     /// doc-level comment.
@@ -1356,7 +1368,7 @@ pub struct CommentDocumentArgs {
 pub struct ResolveCommentArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1408,7 +1420,7 @@ pub struct PoseQuestionArgs {
     /// Optional UI descriptor stored verbatim (element name, props, element-schema CID); resolved by the client, not the board.
     #[serde(default)]
     pub ui: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1422,7 +1434,7 @@ pub struct AnswerQuestionArgs {
     pub shape: String,
     /// The answer value: a boolean (bool); an array of option ids (choice: 1 for multiple_choice, N for select_all); a string (text); or the option ids in order (ranked).
     pub value: serde_json::Value,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1433,7 +1445,7 @@ pub struct DeclineQuestionArgs {
     pub comment_id: i64,
     /// Why the question is declined; delivered to the asker and recorded on the task.
     pub feedback: String,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1442,7 +1454,7 @@ pub struct DeclineQuestionArgs {
 pub struct CancelQuestionArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1453,7 +1465,7 @@ pub struct SupersedeQuestionArgs {
     pub comment_id: i64,
     /// The prompt for the replacement question (the old one is kept immutable + linked).
     pub new_prompt: String,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1475,7 +1487,7 @@ pub struct ListAwaitingArgs {
 pub struct DocumentActorArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1490,7 +1502,7 @@ pub struct DeprecateDocumentArgs {
     /// The document that supersedes this one (recorded only when deprecating). Must exist.
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub superseded_by: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1499,7 +1511,7 @@ pub struct DeprecateDocumentArgs {
 pub struct RequestChangesArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
     /// Optional note explaining what needs to change.
     #[serde(default)]
@@ -1511,7 +1523,7 @@ pub struct RequestChangesArgs {
 pub struct SubmitToOperatorReviewArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
     /// The doc template you read and followed (e.g. the design-doc template id/name). Required
     /// unless you give a `template_waiver_reason`.
@@ -1530,7 +1542,7 @@ pub struct AttachDocumentArgs {
     pub document_id: i64,
     #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
 
@@ -1554,7 +1566,7 @@ pub struct CreateReviewArgs {
     #[serde(default)]
     pub status: Option<String>,
     /// The agent that created/produced the review (defaults to this session's identity).
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
     /// The reviewer(s) assigned. A single agent id in increment 1.
     #[serde(default)]
@@ -1605,7 +1617,7 @@ pub struct SetReviewStatusArgs {
     /// the current status is an idempotent no-op.
     pub status: String,
     /// The agent making the transition (defaults to this session's identity).
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
     /// An optional note recorded on the state-change log entry (e.g. why changes were requested).
     #[serde(default)]
@@ -1620,7 +1632,7 @@ pub struct SetReviewVettedArgs {
     #[serde(deserialize_with = "de_bool_lenient")]
     pub vetted: bool,
     /// The agent setting the flag (defaults to this session's identity). Recorded for audit.
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
     /// An optional note recorded on the audit log entry.
     #[serde(default)]
@@ -1639,7 +1651,7 @@ pub struct AppendReviewLogArgs {
     #[serde(default)]
     pub body: Option<String>,
     /// The author of this entry (defaults to this session's identity).
-    #[serde(default)]
+    #[serde(rename = "principal", alias = "author", default)]
     pub author: Option<String>,
     /// For an actionable `finding`: the id of the child task tracking the fix.
     #[serde(default)]
@@ -4022,6 +4034,67 @@ mod tests {
         assert!(
             permits_object,
             "blocked_on oneOf must still permit the object: {bo}"
+        );
+    }
+
+    /// task_1035: the acting principal is advertised as `principal` in the generated schema (not the
+    /// legacy per-domain name), while the legacy name is still ACCEPTED on input as a serde alias so
+    /// existing clients do not break. Checks a representative sample across the renamed name set.
+    #[test]
+    fn acting_field_is_advertised_as_principal() {
+        // UpdateTaskArgs (was `actor`), CommentTaskArgs (was `author`), PostToChannelArgs (was
+        // `sender`), CreateTaskArgs (was `created_by`): all now advertise `principal`.
+        for (name, schema) in [
+            (
+                "UpdateTaskArgs",
+                serde_json::to_value(schema_for!(UpdateTaskArgs)).unwrap(),
+            ),
+            (
+                "CommentTaskArgs",
+                serde_json::to_value(schema_for!(CommentTaskArgs)).unwrap(),
+            ),
+            (
+                "PostToChannelArgs",
+                serde_json::to_value(schema_for!(PostToChannelArgs)).unwrap(),
+            ),
+            (
+                "CreateTaskArgs",
+                serde_json::to_value(schema_for!(CreateTaskArgs)).unwrap(),
+            ),
+        ] {
+            let props = schema
+                .pointer("/properties")
+                .and_then(|p| p.as_object())
+                .unwrap_or_else(|| panic!("{name}: no properties"));
+            assert!(
+                props.contains_key("principal"),
+                "{name} must advertise `principal`, got {:?}",
+                props.keys().collect::<Vec<_>>()
+            );
+            for legacy in ["actor", "author", "sender", "created_by"] {
+                assert!(
+                    !props.contains_key(legacy),
+                    "{name} must not advertise the legacy `{legacy}` as a property"
+                );
+            }
+        }
+        // Back-compat: both the legacy name and `principal` still deserialize into the (Rust-named)
+        // field, so no client breaks during the transition.
+        assert_eq!(
+            from_value::<UpdateTaskArgs>(json!({"task_id": 1, "actor": "a"}))
+                .unwrap()
+                .actor
+                .as_deref(),
+            Some("a"),
+            "legacy `actor` still accepted"
+        );
+        assert_eq!(
+            from_value::<UpdateTaskArgs>(json!({"task_id": 1, "principal": "p"}))
+                .unwrap()
+                .actor
+                .as_deref(),
+            Some("p"),
+            "`principal` accepted"
         );
     }
 

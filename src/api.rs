@@ -357,6 +357,7 @@ async fn api_not_found() -> Response {
 /// intentionally omitted too: it names who gets subscribed, so forcing it would break subscribing
 /// another agent on their behalf — treated as a target, not the actor.
 const ACTING_FIELDS: &[&str] = &[
+    "principal",
     "actor",
     "author",
     "sender",
@@ -1212,6 +1213,7 @@ async fn set_status(
 #[derive(Deserialize, JsonSchema)]
 struct RequestStandDownBody {
     /// Who is asking (for the audit event + the agent's page).
+    #[serde(rename = "principal", alias = "requested_by")]
     requested_by: Option<String>,
     /// Optional reason shown to the agent.
     reason: Option<String>,
@@ -1281,6 +1283,7 @@ async fn list_projects(
 struct CreateProjectBody {
     name: String,
     description: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
     metadata: Option<Value>,
 }
@@ -1313,6 +1316,7 @@ struct UpdateProjectBody {
     status: Option<String>,
     /// MERGED into the project's props (e.g. a repo link), not replaced.
     metadata: Option<Value>,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1394,6 +1398,7 @@ struct CreateTaskBody {
     description: Option<String>,
     assignee: Option<String>,
     priority: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
     metadata: Option<Value>,
     /// Optional parent task (makes this a child/subtask). Must be in the same project.
@@ -1475,6 +1480,7 @@ struct UpdateTaskBody {
     title: Option<String>,
     description: Option<String>,
     priority: Option<String>,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
     metadata: Option<Value>,
     /// Reparent: a parent task id (same project), or 0 to clear the parent (make top-level).
@@ -1523,6 +1529,7 @@ async fn update_task(
 #[derive(Deserialize, JsonSchema)]
 struct CommentBody {
     body: String,
+    #[serde(rename = "principal", alias = "author")]
     author: Option<String>,
     /// Optional external identity id (e.g. "slack:U123") this comment is attributed to — for an
     /// ingested human author. `author` stays the fleet agent that performed the write.
@@ -1578,6 +1585,7 @@ struct PoseQuestionBody {
     response_schema: Option<Value>,
     /// Optional UI descriptor stored verbatim (element name, props, element-schema CID); resolved by the client, not the board.
     ui: Option<Value>,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1611,6 +1619,7 @@ struct AnswerQuestionBody {
     shape: String,
     /// The answer value per shape (boolean; array of option ids; string; or ids in order).
     value: Value,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1627,6 +1636,7 @@ async fn answer_question(
 #[derive(Deserialize, JsonSchema)]
 struct DeclineQuestionBody {
     feedback: String,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1642,6 +1652,7 @@ async fn decline_question(
 
 #[derive(Deserialize, JsonSchema)]
 struct CancelQuestionBody {
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1659,6 +1670,7 @@ async fn cancel_question(
 struct SupersedeQuestionBody {
     /// The prompt for the replacement question (the old one is kept immutable + linked).
     new_prompt: String,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1703,6 +1715,7 @@ async fn set_task_props(
 #[derive(Deserialize, JsonSchema)]
 struct MoveTaskBody {
     to_project_id: i64,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1719,6 +1732,7 @@ async fn move_task(
 #[derive(Deserialize, JsonSchema)]
 struct ArchiveTaskBody {
     /// The agent performing the archive/restore (for the event actor).
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1863,6 +1877,7 @@ async fn list_channels(
 struct CreateChannelBody {
     name: String,
     topic: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
     metadata: Option<Value>,
 }
@@ -1968,6 +1983,7 @@ struct SetChannelAutoJoinBody {
     /// true = every agent is a member (existing joined now + new agents auto-join on register);
     /// false = stop auto-joining (existing members stay).
     auto_join: bool,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -1987,6 +2003,7 @@ struct PromoteThreadBody {
     root_post_seq: i64,
     /// Project the new task is created in.
     project_id: i64,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -2010,6 +2027,7 @@ async fn promote_thread(
 #[derive(Deserialize, JsonSchema)]
 struct InviteChannelBody {
     agent_id: String,
+    #[serde(rename = "principal", alias = "invited_by")]
     invited_by: Option<String>,
 }
 
@@ -2060,6 +2078,7 @@ struct EventsQuery {
     #[serde(default = "default_events_limit")]
     limit: i64,
     /// Only events whose `actor` matches — a complete per-agent activity feed.
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
     /// `asc` (default, oldest-first — incremental pollers) or `desc` (newest-first, so
     /// `since_seq=0&limit=N` returns the LATEST N events — a live activity feed).
@@ -2131,6 +2150,7 @@ struct SetWorkspaceKindBody {
     /// MERGED into any existing bag.
     config: Option<Value>,
     description: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
 }
 
@@ -2165,6 +2185,7 @@ struct AddBannedPhraseBody {
     phrase: String,
     /// Optional note: why it's banned, or what to write instead.
     note: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
 }
 
@@ -2281,6 +2302,7 @@ struct SetIdentityAliasBody {
     alias: String,
     /// The canonical identity it resolves to, e.g. "cameron".
     canonical: String,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
 }
 
@@ -2304,6 +2326,7 @@ struct CreatePersonBody {
     /// Stable string handle for the person (e.g. "cameron"). Upserts if it already exists.
     id: String,
     display_name: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
     metadata: Option<Value>,
 }
@@ -2334,6 +2357,7 @@ struct CreateTeamBody {
     /// Stable string handle for the team (e.g. "operator"). Upserts if it already exists.
     id: String,
     display_name: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
     metadata: Option<Value>,
 }
@@ -2369,6 +2393,7 @@ struct TeamMemberBody {
     member_id: String,
     /// "person", "team", or "agent" (team-scoped agents, task 542).
     member_kind: String,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
 }
 
@@ -2420,6 +2445,7 @@ struct CreateSecretRequestBody {
     /// The agent to directly notify on submit + whose token gates the ciphertext pull.
     fulfiller: Option<String>,
     /// The requesting agent (for the audit event).
+    #[serde(rename = "principal", alias = "requested_by")]
     requested_by: Option<String>,
 }
 
@@ -2499,6 +2525,7 @@ async fn fulfill_secret(
 #[derive(Deserialize, JsonSchema)]
 struct CancelSecretBody {
     /// The agent cancelling the request (for the audit event).
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -2528,6 +2555,7 @@ struct CreateReviewBody {
     /// Initial A2 status; defaults to `open`. open / in_review / changes_requested / approved / closed.
     status: Option<String>,
     /// The agent that created/produced the review.
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
     /// The reviewer(s) assigned (a single agent id in increment 1).
     assignee: Option<String>,
@@ -2597,6 +2625,7 @@ struct SetReviewStatusBody {
     /// the current status is an idempotent no-op.
     status: String,
     /// The agent making the transition.
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
     /// An optional note recorded on the state-change log entry.
     note: Option<String>,
@@ -2624,6 +2653,7 @@ struct SetReviewVettedBody {
     /// true = mark the review vetted (adversarial review run + addressed); false = clear it.
     vetted: bool,
     /// The agent setting the flag (recorded for audit).
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
     /// An optional note recorded on the audit log entry.
     note: Option<String>,
@@ -2654,6 +2684,7 @@ struct AppendReviewLogBody {
     /// The entry text.
     body: Option<String>,
     /// The author of this entry.
+    #[serde(rename = "principal", alias = "author")]
     author: Option<String>,
     /// For an actionable `finding`: the id of the child task tracking the fix.
     task_id: Option<i64>,
@@ -2822,6 +2853,7 @@ struct ListDocumentsQuery {
     /// Exclude documents carrying this tag (the default-hide primitive, e.g. exclude_tag=charter).
     exclude_tag: Option<String>,
     task_id: Option<i64>,
+    #[serde(rename = "principal", alias = "author")]
     author: Option<String>,
     /// Include archived (retired) documents; hidden by default.
     #[serde(default)]
@@ -2888,6 +2920,7 @@ struct CreateDocumentBody {
     /// A one-line change-note for this version (what changed + what to look for); the operator reads
     /// it as the review caption on the version list + diff. For v1, a short note on what the doc is.
     summary: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
     metadata: Option<Value>,
     /// MIME type of v1's bytes (default text/markdown). The board records only the label.
@@ -2967,6 +3000,7 @@ async fn get_document(
 struct UpdateDocumentBody {
     /// New title — a short, specific noun phrase; the viewer renders the title as the page header.
     title: String,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -2976,6 +3010,7 @@ struct SetDocumentPropsBody {
     /// tags, provenance). Keys overwrite; unmentioned keys are left as-is.
     #[serde(default)]
     props: serde_json::Map<String, Value>,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -3124,6 +3159,7 @@ struct PublishVersionBody {
     /// look for. The operator reads it as the review caption (version list + diff), so always fill
     /// it on a publish -- a blank change-note makes the operator's review slower.
     summary: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
     /// MIME type of this version's bytes (default text/markdown). The board records only the label.
     content_type: Option<String>,
@@ -3178,6 +3214,7 @@ struct SetDocumentPathBody {
     /// The wiki path to file this document under (e.g. architecture/board/events). An empty
     /// string clears the path (unfiles the doc). Must be unique among filed documents.
     path: String,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -3213,6 +3250,7 @@ struct CommentDocumentBody {
     body: String,
     /// The version this comment is written against (anchors the region to immutable content).
     version_id: Option<i64>,
+    #[serde(rename = "principal", alias = "author")]
     author: Option<String>,
     /// Free-form JSON anchor (e.g. W3C/Hypothesis selectors). Omit for a doc-level comment.
     region: Option<Value>,
@@ -3248,6 +3286,7 @@ async fn comment_document(
 
 #[derive(Deserialize, JsonSchema)]
 struct ResolveCommentBody {
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -3263,6 +3302,7 @@ async fn resolve_comment(
 
 #[derive(Deserialize, JsonSchema)]
 struct DocumentActorBody {
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -3278,6 +3318,7 @@ async fn submit_for_review(
 
 #[derive(Deserialize, JsonSchema)]
 struct SubmitToOperatorReviewBody {
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
     /// The doc template you read and followed. Required unless `template_waiver_reason` is given.
     template_followed: Option<String>,
@@ -3305,6 +3346,7 @@ async fn submit_to_operator_review(
 
 #[derive(Deserialize, JsonSchema)]
 struct RequestChangesBody {
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
     /// Optional note explaining what needs to change.
     note: Option<String>,
@@ -3358,6 +3400,7 @@ struct DeprecateDocumentBody {
     /// The document that supersedes this one (recorded only when deprecating; must exist).
     #[serde(default)]
     superseded_by: Option<i64>,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
@@ -3391,6 +3434,7 @@ async fn deprecate_document(
 #[derive(Deserialize, JsonSchema)]
 struct AttachDocumentBody {
     task_id: i64,
+    #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
 
