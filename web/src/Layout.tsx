@@ -52,6 +52,10 @@ function ConnectionBanner() {
 export interface BoardContext {
   actor: string
   setActor: (id: string) => void
+  // The server-enforced identity, present only when a trusted front-door host injected it into the
+  // page (null on localhost / a permissive host). When set, the identity is immutable in the client
+  // and the Settings page shows the username read-only. See readForcedUser.
+  forcedUser: string | null
   theme: { pref: ThemePref; setPref: (p: ThemePref) => void }
 }
 
@@ -59,16 +63,32 @@ export function useBoardContext() {
   return useOutletContext<BoardContext>()
 }
 
-// Your identity on the board. Persisted so actions (comments, status changes) are
-// attributed and you aren't notified of your own changes. Trust-on-first-use, no auth.
-function useActor(): [string, (v: string) => void] {
-  const [actor, setActor] = useState(() => localStorage.getItem('tb-actor') || 'human')
+// A trusted front-door host injects the authenticated, server-resolved identity into the served
+// index.html as <meta name="board-user" content="..."> (server half, camshaft/task-board#303). When
+// present it is server-enforced -- the server overwrites the actor on every non-loopback write -- so
+// the client cannot change or spoof it; on localhost / a permissive host the element is absent and
+// the identity stays a client-local, editable localStorage value.
+function readForcedUser(): string | null {
+  const content = document
+    .querySelector('meta[name="board-user"]')
+    ?.getAttribute('content')
+    ?.trim()
+  return content ? content : null
+}
+
+// Your identity on the board. When a trusted host injected a forced identity it wins and is
+// immutable here (the server enforces it anyway); otherwise it is persisted to localStorage so
+// actions are attributed and you aren't notified of your own changes. Trust-on-first-use, no auth.
+function useActor(): { actor: string; setActor: (v: string) => void; forcedUser: string | null } {
+  const forcedUser = useMemo(() => readForcedUser(), [])
+  const [actor, setActor] = useState(() => forcedUser ?? localStorage.getItem('tb-actor') ?? 'human')
   const set = (v: string) => {
+    if (forcedUser) return // server-enforced identity: immutable in the client
     const id = v.trim() || 'human'
     localStorage.setItem('tb-actor', id)
     setActor(id)
   }
-  return [actor, set]
+  return { actor, setActor: set, forcedUser }
 }
 
 // The persistent chrome — header, project/agent sidebar, activity feed — around an
@@ -77,7 +97,7 @@ function useActor(): [string, (v: string) => void] {
 export default function Layout() {
   const { projectId } = useParams()
   const selectedProject = projectId != null ? Number(projectId) : null
-  const [actor, setActor] = useActor()
+  const { actor, setActor, forcedUser } = useActor()
   const theme = useTheme() // single theme source of truth; applied app-wide, shared via context
   useLiveUpdates() // one SSE connection makes every subscribed panel live
   const { data: projects = [], error: projectsError } = useProjects()
@@ -311,7 +331,7 @@ export default function Layout() {
             [[wiki-links]] in any markdown below resolve against the live wiki. */}
         <WikiLinkContext.Provider value={resolveWikiLink}>
           <AgentMentionContext.Provider value={resolveMention}>
-            <Outlet context={{ actor, setActor, theme } satisfies BoardContext} />
+            <Outlet context={{ actor, setActor, forcedUser, theme } satisfies BoardContext} />
           </AgentMentionContext.Provider>
         </WikiLinkContext.Provider>
 
