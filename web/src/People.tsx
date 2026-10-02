@@ -10,6 +10,7 @@ import {
   deleteTeam,
   removeTeamMember,
   useAgents,
+  useAllTeamDetails,
   usePeople,
   useTeam,
   useTeams,
@@ -25,9 +26,15 @@ export default function People() {
   const scrollRef = useScrollRestoration()
   const { data: people = [], loading: peopleLoading } = usePeople()
   const { data: teams = [], loading: teamsLoading } = useTeams()
-  const [selectedTeam, setSelectedTeam] = useState<string | null>(null)
+  // A single selection across both columns: a person (show the teams they are in) or a team (manage
+  // its members). The right column is the detail panel for whichever is selected.
+  const [selected, setSelected] = useState<{ kind: 'person' | 'team'; id: string } | null>(null)
 
-  const selectionExists = selectedTeam != null && teams.some((t) => t.id === selectedTeam)
+  const selectionExists =
+    selected != null &&
+    (selected.kind === 'team'
+      ? teams.some((t) => t.id === selected.id)
+      : people.some((p) => p.id === selected.id))
 
   return (
     <main className="flex min-w-0 flex-1 flex-col">
@@ -58,25 +65,40 @@ export default function People() {
             <p className="text-sm text-[var(--color-muted)]">No people yet.</p>
           )}
           <ul className="flex flex-col gap-1">
-            {people.map((p) => (
-              <li
-                key={p.id}
-                className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-2.5 py-1.5"
-              >
-                <span className="min-w-0 flex-1 truncate text-sm">
-                  {p.display_name || p.id}
-                  {p.display_name && p.display_name !== p.id && (
-                    <span className="ml-1.5 font-mono text-[11px] text-[var(--color-muted)]">
-                      {p.id}
-                    </span>
-                  )}
-                </span>
-                <DeleteButton
-                  label={`person ${p.id}`}
-                  onDelete={() => deletePerson(p.id)}
-                />
-              </li>
-            ))}
+            {people.map((p) => {
+              const isSelected = selected?.kind === 'person' && selected.id === p.id
+              return (
+                <li
+                  key={p.id}
+                  className={`flex items-center gap-2 rounded-md border px-2.5 py-1.5 ${
+                    isSelected
+                      ? 'border-sky-500/50 bg-sky-500/10'
+                      : 'border-[var(--color-border)] bg-[var(--color-panel)] hover:border-sky-500/40'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setSelected({ kind: 'person', id: p.id })}
+                    aria-pressed={isSelected}
+                    className="min-w-0 flex-1 truncate text-left text-sm"
+                  >
+                    {p.display_name || p.id}
+                    {p.display_name && p.display_name !== p.id && (
+                      <span className="ml-1.5 font-mono text-[11px] text-[var(--color-muted)]">
+                        {p.id}
+                      </span>
+                    )}
+                  </button>
+                  <DeleteButton
+                    label={`person ${p.id}`}
+                    onDelete={async () => {
+                      await deletePerson(p.id)
+                      if (selected?.kind === 'person' && selected.id === p.id) setSelected(null)
+                    }}
+                  />
+                </li>
+              )
+            })}
           </ul>
         </section>
 
@@ -96,49 +118,56 @@ export default function People() {
             <p className="text-sm text-[var(--color-muted)]">No teams yet.</p>
           )}
           <ul className="flex flex-col gap-1">
-            {teams.map((t) => (
-              <li
-                key={t.id}
-                className={`flex items-center gap-2 rounded-md border px-2.5 py-1.5 ${
-                  selectedTeam === t.id
-                    ? 'border-sky-500/50 bg-sky-500/10'
-                    : 'border-[var(--color-border)] bg-[var(--color-panel)] hover:border-sky-500/40'
-                }`}
-              >
-                <button
-                  type="button"
-                  onClick={() => setSelectedTeam(t.id)}
-                  aria-pressed={selectedTeam === t.id}
-                  className="min-w-0 flex-1 truncate text-left text-sm"
+            {teams.map((t) => {
+              const isSelected = selected?.kind === 'team' && selected.id === t.id
+              return (
+                <li
+                  key={t.id}
+                  className={`flex items-center gap-2 rounded-md border px-2.5 py-1.5 ${
+                    isSelected
+                      ? 'border-sky-500/50 bg-sky-500/10'
+                      : 'border-[var(--color-border)] bg-[var(--color-panel)] hover:border-sky-500/40'
+                  }`}
                 >
-                  {t.display_name || t.id}
-                  {t.display_name && t.display_name !== t.id && (
-                    <span className="ml-1.5 font-mono text-[11px] text-[var(--color-muted)]">
-                      {t.id}
-                    </span>
-                  )}
-                </button>
-                <DeleteButton
-                  label={`team ${t.id}`}
-                  onDelete={async () => {
-                    await deleteTeam(t.id)
-                    if (selectedTeam === t.id) setSelectedTeam(null)
-                  }}
-                />
-              </li>
-            ))}
+                  <button
+                    type="button"
+                    onClick={() => setSelected({ kind: 'team', id: t.id })}
+                    aria-pressed={isSelected}
+                    className="min-w-0 flex-1 truncate text-left text-sm"
+                  >
+                    {t.display_name || t.id}
+                    {t.display_name && t.display_name !== t.id && (
+                      <span className="ml-1.5 font-mono text-[11px] text-[var(--color-muted)]">
+                        {t.id}
+                      </span>
+                    )}
+                  </button>
+                  <DeleteButton
+                    label={`team ${t.id}`}
+                    onDelete={async () => {
+                      await deleteTeam(t.id)
+                      if (selected?.kind === 'team' && selected.id === t.id) setSelected(null)
+                    }}
+                  />
+                </li>
+              )
+            })}
           </ul>
         </section>
 
-        {/* Selected team detail */}
+        {/* Detail for the current selection: a team's membership, or the teams a person is in. */}
         <section className="flex min-w-0 flex-col gap-2">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-            Membership
+            {selectionExists && selected?.kind === 'person' ? 'Person' : 'Membership'}
           </h2>
-          {selectionExists ? (
-            <TeamDetailPanel teamId={selectedTeam} actor={actor} />
+          {selectionExists && selected?.kind === 'team' ? (
+            <TeamDetailPanel teamId={selected.id} actor={actor} />
+          ) : selectionExists && selected?.kind === 'person' ? (
+            <PersonDetailPanel personId={selected.id} onSelectTeam={(id) => setSelected({ kind: 'team', id })} />
           ) : (
-            <p className="text-sm text-[var(--color-muted)]">Select a team to manage its members.</p>
+            <p className="text-sm text-[var(--color-muted)]">
+              Select a person to see their teams, or a team to manage its members.
+            </p>
           )}
         </section>
       </div>
@@ -376,6 +405,90 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
           Add member
         </button>
       </form>
+    </div>
+  )
+}
+
+// The detail panel for one selected person: which teams they belong to. The backend has no reverse
+// lookup, so this inverts every team's detail client-side -- direct memberships (the person is a
+// listed member) and transitive ones (the person resolves into the team through a nested team).
+function PersonDetailPanel({
+  personId,
+  onSelectTeam,
+}: {
+  personId: string
+  onSelectTeam: (teamId: string) => void
+}) {
+  const { data: teams = [], loading, error } = useAllTeamDetails()
+  const { data: people = [] } = usePeople()
+  const person = people.find((p) => p.id === personId)
+
+  const directTeams = teams
+    .filter((t) => t.members.some((m) => m.member_kind === 'person' && m.member_id === personId))
+    .map((t) => t.id)
+  const directSet = new Set(directTeams)
+  // Resolved-but-not-direct: the person is in the team's resolved_people only via a nested team.
+  const viaTeams = teams
+    .filter((t) => !directSet.has(t.id) && t.resolved_people.includes(personId))
+    .map((t) => t.id)
+
+  if (loading && teams.length === 0)
+    return <p className="text-sm text-[var(--color-muted)]">Loading...</p>
+  if (error) return <p className="text-sm text-rose-300">{error.message}</p>
+
+  const teamName = (id: string) => teams.find((t) => t.id === id)?.display_name || id
+
+  function TeamChip({ id }: { id: string }) {
+    return (
+      <button
+        type="button"
+        onClick={() => onSelectTeam(id)}
+        title={`Open team ${id}`}
+        className="rounded-full bg-violet-500/15 px-2 py-0.5 font-mono text-xs text-violet-300 hover:bg-violet-500/25"
+      >
+        {teamName(id)}
+      </button>
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-3">
+      <div className="text-sm font-medium">
+        {person?.display_name || personId}
+        {person?.display_name && person.display_name !== personId && (
+          <span className="ml-1.5 font-mono text-[11px] text-[var(--color-muted)]">{personId}</span>
+        )}
+      </div>
+
+      <div>
+        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+          Member of
+          <span className="ml-1 font-normal normal-case">(direct)</span>
+        </div>
+        {directTeams.length === 0 ? (
+          <p className="text-xs text-[var(--color-muted)]">No direct team memberships.</p>
+        ) : (
+          <div className="flex flex-wrap gap-1.5">
+            {directTeams.map((id) => (
+              <TeamChip key={id} id={id} />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {viaTeams.length > 0 && (
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+            Also in
+            <span className="ml-1 font-normal normal-case">(via a nested team)</span>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {viaTeams.map((id) => (
+              <TeamChip key={id} id={id} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -65,6 +65,7 @@ const keys = {
   people: 'people',
   teams: 'teams',
   team: (id: string) => `team:${id}`,
+  teamDetails: 'teamDetails:all',
   reviews: 'reviews',
   review: (id: number) => `review:${id}`,
   reviewTrend: 'reviewTrend',
@@ -139,6 +140,18 @@ export function useTeams() {
 
 export function useTeam(id: string) {
   return useResource<TeamDetail>(keys.team(id), () => api.getTeam(id))
+}
+
+// Every team's full detail (members + resolved sets), fetched by listing teams then resolving each.
+// The backend has no reverse "which teams is this person/agent in" lookup, so the people view
+// inverts these details client-side to show a principal's team memberships. Invalidated by the same
+// team/membership mutations as the per-team detail (flagged to board-pm: a server-side reverse
+// endpoint would avoid the fan-out as teams grow).
+export function useAllTeamDetails() {
+  return useResource<TeamDetail[]>(keys.teamDetails, async () => {
+    const teams = await api.listTeams()
+    return Promise.all(teams.map((t) => api.getTeam(t.id)))
+  })
 }
 
 // A document's external links (task 707): bridged URLs attached to the doc (e.g. a chorus page),
@@ -593,12 +606,14 @@ export async function deletePerson(id: string) {
   invalidate(keys.people)
   invalidateMatching('team:') // a deleted person drops out of every team's membership/resolution
   invalidate(keys.teams)
+  invalidate(keys.teamDetails)
   return r
 }
 
 export async function createTeam(b: Parameters<typeof api.createTeam>[0]) {
   const t = await api.createTeam(b)
   invalidate(keys.teams)
+  invalidate(keys.teamDetails)
   return t
 }
 
@@ -606,6 +621,7 @@ export async function deleteTeam(id: string) {
   const r = await api.deleteTeam(id)
   invalidate(keys.teams)
   invalidateMatching('team:') // the team itself + any parent team that nested it
+  invalidate(keys.teamDetails)
   return r
 }
 
@@ -617,6 +633,7 @@ export async function addTeamMember(
   invalidate(keys.team(teamId))
   invalidateMatching('team:') // a nested-team add changes parent teams' resolved_people too
   invalidate(keys.teams)
+  invalidate(keys.teamDetails)
   return t
 }
 
@@ -628,6 +645,7 @@ export async function removeTeamMember(
   invalidate(keys.team(teamId))
   invalidateMatching('team:')
   invalidate(keys.teams)
+  invalidate(keys.teamDetails)
   return t
 }
 
