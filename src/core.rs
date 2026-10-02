@@ -4620,6 +4620,51 @@ pub async fn answer_question(
         .await?;
     if blocking {
         recompute_question_block(&mut tx, &mut hooks, task_id, actor).await?;
+        // task_1148: when the operator answers the operator-routed blocking question that an
+        // operator-block was waiting on, auto-clear the block and hand the task back to its owner --
+        // no manual reclassification (the task_1069 repro: a task stayed blocked_on=operator after
+        // its gating decision landed). Gated tightly so a block the operator did not actually
+        // resolve is never cleared: the answered question was blocking AND routed_to="operator", NO
+        // open blocking question remains, and the task still carries a scalar blocked_on=operator.
+        // (Scalar blocks tied to a team that routes to the operator, and the doc-approval linkage,
+        // are follow-on slices; this clears only the canonical routed_to="operator" ask.)
+        let answered_operator_question =
+            payload.get("routed_to").and_then(|v| v.as_str()) == Some("operator");
+        if answered_operator_question && open_blocking_questions(&mut tx, task_id).await?.is_empty()
+        {
+            let still_operator_blocked =
+                sqlx::query("SELECT 1 FROM tasks WHERE id=? AND blocked_on_kind='operator'")
+                    .bind(task_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .is_some();
+            if still_operator_blocked {
+                // Clear the scalar operator-block and return the task to its owner. The blocked
+                // status requires a blocked_on, so clearing the block flips status back to
+                // in_progress (resume active work); the owner-held assignee is untouched.
+                sqlx::query(
+                    "UPDATE tasks SET blocked_on_kind=NULL, blocked_on_ref=NULL, \
+                     blocked_on_note=NULL, status='in_progress', updated_at=? WHERE id=?",
+                )
+                .bind(&ts)
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+                emit(
+                    &mut tx,
+                    &mut hooks,
+                    "task.updated",
+                    actor,
+                    Some(task_id),
+                    None,
+                    None,
+                    None,
+                    json!({ "reason": "operator_answered", "returned_to_owner": true, "status": "in_progress" }),
+                    Recipients::FromTask,
+                )
+                .await?;
+            }
+        }
     }
     let mut recips = BTreeSet::new();
     if let Some(a) = &author {
@@ -11753,6 +11798,158 @@ mod tests {
         assert!(
             agent_blocked.get("blocked_on_warning").is_none(),
             "an agent-block must not carry the operator-block warning: {agent_blocked:#?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operator_answer_clears_block_and_hands_back() -> anyhow::Result<()> {
+        // task_1148: answering the operator-routed blocking question an operator-block waited on
+        // clears the scalar block and returns the task to its owner (status in_progress), with the
+        // owner-held assignee untouched -- no manual reclassification.
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Operator-routed blocking question, then an operator-block on the task.
+        let q = pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "approve?",
+            None,
+            "operator",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            Some(json!({"kind": "operator"})),
+        )
+        .await?;
+        let before = get_task(&pool, tid).await?;
+        assert_eq!(before["status"], json!("blocked"));
+        assert_eq!(before["blocked_on"]["kind"], json!("operator"));
+
+        // The operator answers -> block cleared, task handed back to its owner.
+        answer_question(&pool, qid, "bool", json!(true), Some("operator")).await?;
+        let after = get_task(&pool, tid).await?;
+        assert_eq!(
+            after["status"],
+            json!("in_progress"),
+            "operator answer resumes the owner: {after:#?}"
+        );
+        assert!(
+            after["blocked_on"].is_null(),
+            "operator-block cleared: {after:#?}"
+        );
+        assert_eq!(
+            after["assignee"],
+            json!("worker"),
+            "owner-held assignee untouched"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_operator_answer_leaves_operator_block() -> anyhow::Result<()> {
+        // task_1148 gate: answering a blocking question routed to a NON-operator principal must NOT
+        // clear an operator-block (the operator never resolved it).
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        register_agent(&pool, "helper", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Blocking question routed to another agent, with an operator-block on the task.
+        let q = pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "check?",
+            None,
+            "helper",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            Some(json!({"kind": "operator"})),
+        )
+        .await?;
+
+        answer_question(&pool, qid, "bool", json!(true), Some("helper")).await?;
+        let after = get_task(&pool, tid).await?;
+        assert_eq!(
+            after["status"],
+            json!("blocked"),
+            "a non-operator answer must not resume the task: {after:#?}"
+        );
+        assert_eq!(
+            after["blocked_on"]["kind"],
+            json!("operator"),
+            "the operator-block must remain: {after:#?}"
         );
         Ok(())
     }
