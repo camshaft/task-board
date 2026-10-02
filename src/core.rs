@@ -3244,6 +3244,54 @@ pub async fn archive_done_proposals(
     older_than_days: i64,
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
+    archive_stale_by_status(
+        pool,
+        project_id,
+        "done",
+        older_than_days,
+        actor,
+        "retention",
+    )
+    .await
+}
+
+/// Age-out sweep (task_1215 sibling of task_1228): soft-archive stale UNTRIAGED todos -- tasks still
+/// in `todo` (never picked up) and untouched for at least `older_than_days` days (board-pm's M=14d
+/// default is applied at the call layer). Reuses the done-retention sweep shape and is scoped to
+/// status='todo', so it naturally never fires on blocked, in_progress, done, or iceboxed tasks.
+/// Restorable (restore_task) and auditable (emits task.archived with reason=stale_todo).
+pub async fn archive_stale_todos(
+    pool: &Pool,
+    project_id: i64,
+    older_than_days: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    archive_stale_by_status(
+        pool,
+        project_id,
+        "todo",
+        older_than_days,
+        actor,
+        "stale_todo",
+    )
+    .await
+}
+
+/// Shared body of the task_1215 retention-sweep family: soft-archive every task in `project_id`
+/// whose status is `status` and that has been untouched for at least `older_than_days` days
+/// (updated_at as the age proxy, compared via datetime() for format-robustness). One tx; archiving is
+/// reversible (set_task_archived) and emits task.archived tagged with `reason` so a reader can tell a
+/// done-retention archive from a stale-todo age-out. Returns {project_id, older_than_days, archived,
+/// task_ids}. `status` is an internal constant (never caller input), but it is still bound, not
+/// interpolated.
+async fn archive_stale_by_status(
+    pool: &Pool,
+    project_id: i64,
+    status: &str,
+    older_than_days: i64,
+    actor: Option<&str>,
+    reason: &str,
+) -> anyhow::Result<Value> {
     if older_than_days < 0 {
         anyhow::bail!("older_than_days must be >= 0");
     }
@@ -3253,10 +3301,11 @@ pub async fn archive_done_proposals(
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let rows = sqlx::query(
         "SELECT id, project_id FROM tasks \
-         WHERE project_id=? AND status='done' AND archived_at IS NULL \
+         WHERE project_id=? AND status=? AND archived_at IS NULL \
            AND datetime(updated_at) <= datetime('now', ?) ORDER BY id",
     )
     .bind(project_id)
+    .bind(status)
     .bind(&cutoff_modifier)
     .fetch_all(&mut *tx)
     .await?;
@@ -3279,7 +3328,7 @@ pub async fn archive_done_proposals(
             Some(proj),
             None,
             None,
-            json!({ "archived": true, "reason": "retention", "older_than_days": older_than_days }),
+            json!({ "archived": true, "reason": reason, "older_than_days": older_than_days }),
             Recipients::FromTask,
         )
         .await?;
@@ -24956,6 +25005,100 @@ mod tests {
         // Restorable: un-archive the old done task.
         set_task_archived(&pool, old_done, false, Some("worker")).await?;
         assert!(get_task(&pool, old_done).await?["archived_at"].is_null());
+        Ok(())
+    }
+
+    /// task_1215 sibling: the age-out sweep archives only STALE TODOS (status=todo, untouched >= M
+    /// days); a recent todo, a done task, and an iceboxed task are all left alone (status scoping).
+    #[tokio::test]
+    async fn archive_stale_todos_sweeps_old_todos_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let mk = |title: &'static str| {
+            let pool = pool.clone();
+            async move {
+                create_task(
+                    &pool,
+                    pid,
+                    title,
+                    None,
+                    Some("worker"),
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|t| t["id"].as_i64().unwrap())
+            }
+        };
+        let backdate = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE tasks SET updated_at=datetime('now','-30 days') WHERE id=?")
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+            }
+        };
+
+        // An old TODO (untouched 30 days) -> eligible at M=14.
+        let old_todo = mk("Old todo").await?;
+        backdate(old_todo).await?;
+        // A recent TODO (updated now) -> not yet eligible.
+        let recent_todo = mk("Recent todo").await?;
+        // An old DONE task -> not a todo, left to the done-retention sweep.
+        let old_done = mk("Old done").await?;
+        update_task(
+            &pool,
+            old_done,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        backdate(old_done).await?;
+        // An old ICEBOX task -> not a todo, exempt.
+        let old_icebox = mk("Old icebox").await?;
+        update_task(
+            &pool,
+            old_icebox,
+            Some("icebox"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        backdate(old_icebox).await?;
+
+        let res = archive_stale_todos(&pool, pid, 14, Some("worker")).await?;
+        assert_eq!(res["archived"], json!(1), "only the old todo: {res:#?}");
+        assert_eq!(res["task_ids"], json!([old_todo]));
+        assert!(get_task(&pool, old_todo).await?["archived_at"].is_string());
+        assert!(get_task(&pool, recent_todo).await?["archived_at"].is_null());
+        assert!(
+            get_task(&pool, old_done).await?["archived_at"].is_null(),
+            "a done task is not touched by the stale-todo age-out"
+        );
+        assert!(
+            get_task(&pool, old_icebox).await?["archived_at"].is_null(),
+            "an iceboxed task is not touched by the stale-todo age-out"
+        );
         Ok(())
     }
 }

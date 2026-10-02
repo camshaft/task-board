@@ -791,6 +791,21 @@ pub struct ArchiveDoneProposalsArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ArchiveStaleTodosArgs {
+    /// The project whose stale (untriaged) todos to sweep.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub project_id: i64,
+    /// Archive a todo only after it has been untouched for at least this many days.
+    /// Defaults to 14; 0 archives every todo immediately (no age-out window).
+    #[serde(default)]
+    pub older_than_days: Option<i64>,
+    /// The agent performing the sweep (event actor). Defaults to the session identity.
+    #[serde(rename = "principal", alias = "actor", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListTasksArgs {
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub project_id: Option<i64>,
@@ -2380,6 +2395,25 @@ impl Board {
             &self.pool,
             a.project_id,
             a.older_than_days.unwrap_or(7),
+            actor.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Age-out sweep (task_1215 sibling of task_1228): soft-archive stale UNTRIAGED todos in `project_id` -- tasks still in status=todo (never picked up) and untouched for at least `older_than_days` days (default 14; 0 = no age-out window). Scoped to status=todo, so it never fires on blocked, in_progress, done, or iceboxed tasks. Reversible (restore_task), idempotent, auditable (task.archived reason=stale_todo). Returns {project_id, older_than_days, archived, task_ids}."
+    )]
+    async fn archive_stale_todos(
+        &self,
+        Parameters(a): Parameters<ArchiveStaleTodosArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::archive_stale_todos(
+            &self.pool,
+            a.project_id,
+            a.older_than_days.unwrap_or(14),
             actor.as_deref(),
         )
         .await
