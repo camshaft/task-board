@@ -104,37 +104,36 @@ impl Board {
     /// task_1099 vector that `me_opt`'s forced > CLIENT > session precedence left open).
     fn gate_author(&self, explicit: Option<&str>) -> Result<String, McpError> {
         let explicit = explicit.map(str::trim).filter(|s| !s.is_empty());
-        if let Some(auth) = self.authenticated_identity() {
-            // Authenticated (forced X-Fleet-Agent header or a persisted session): bind to it; a
-            // divergent client-supplied author is a forged reviewer identity -> reject.
-            if let Some(x) = explicit {
-                if x != auth {
-                    return Err(McpError::invalid_params(
-                        format!(
-                            "a gate-relevant review entry must be authored by your own identity \
-                             ({auth}); it cannot be recorded under another agent's name ({x})"
-                        ),
-                        None,
-                    ));
-                }
-            }
-            return Ok(auth);
-        }
-        // No authenticated identity: a fleet-native session opens a fresh Mcp-Session-Id per call, so
-        // register_agent cannot persist and (until the task_1092 bounce wires X-Fleet-Agent) no forced
-        // header arrives either. Fall back to the explicit author as a last resort rather than lock a
-        // legitimate reviewer out (the PR 326 regression). This leaves only the pre-326 self-asserted
-        // exposure for UNauthenticated sessions, with the doc_82 behavior rule as the honor backstop;
-        // it closes automatically as agents are bounced onto the header, at which point this tightens
-        // back to reject-if-none, gated on a task_1092 pool-carries-header preflight (task_1100).
-        explicit.map(|s| s.to_string()).ok_or_else(|| {
+        // Strict reject-if-none (task_1100 final tighten, shipped on board-pm's go-flag after
+        // v-fleet-tooling reported fleet-wide task_1092 completion: 63 PASS / 0 FAIL, every live native
+        // session carries X-Fleet-Agent). A gate entry REQUIRES an authenticated identity -- a forced
+        // X-Fleet-Agent header or a persisted session. An unauthenticated session can no longer
+        // self-assert an author, closing the pre-326 self-asserted exposure; the PR 328
+        // graceful-degradation fallback (explicit author as a last resort) is removed. A down agent
+        // writes nothing while down and respawns header-carrying, so there is no live gate-writer left
+        // without an authenticated identity.
+        let auth = self.authenticated_identity().ok_or_else(|| {
             McpError::invalid_params(
-                "a gate-relevant review entry needs an author: pass your agent id, or connect with \
-                 your X-Fleet-Agent header"
+                "a gate-relevant review entry requires an authenticated identity: connect with your \
+                 X-Fleet-Agent header (a client-supplied author is not accepted for a gate entry)"
                     .to_string(),
                 None,
             )
-        })
+        })?;
+        // Bind to the authenticated identity; a divergent client-supplied author is a forged reviewer
+        // identity -> reject.
+        if let Some(x) = explicit {
+            if x != auth {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "a gate-relevant review entry must be authored by your own identity \
+                         ({auth}); it cannot be recorded under another agent's name ({x})"
+                    ),
+                    None,
+                ));
+            }
+        }
+        Ok(auth)
     }
 }
 
@@ -4549,19 +4548,18 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let board = Board::new(pool, None);
 
-        // No authenticated identity (a fleet-native session: fresh Mcp-Session-Id per call, not yet
-        // bounced onto the X-Fleet-Agent header): fall back to the explicit author so a legitimate
-        // reviewer is not locked out (the PR 326 regression) -- but an authorless gate entry is still
-        // rejected.
+        // No authenticated identity (a fleet-native session with no forced header and no persisted
+        // session): a gate entry is REJECTED regardless of any client-supplied author -- the task_1100
+        // final strict tighten, now that the reviewer pool carries X-Fleet-Agent fleet-wide and the
+        // PR 328 graceful-degradation fallback is removed.
         assert!(board.authenticated_identity().is_none());
-        assert_eq!(
-            board.gate_author(Some("librarian"))?,
-            "librarian",
-            "an unauthenticated session falls back to the explicit author"
+        assert!(
+            board.gate_author(Some("librarian")).is_err(),
+            "an unauthenticated session cannot self-assert an author on a gate entry"
         );
         assert!(
             board.gate_author(None).is_err(),
-            "a gate entry with neither an authenticated identity nor an explicit author is rejected"
+            "a gate entry with no authenticated identity is rejected"
         );
 
         // A registered session: the gate author is the SESSION identity; a divergent client author is
