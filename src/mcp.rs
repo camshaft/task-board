@@ -108,6 +108,11 @@ pub struct RegisterAgentArgs {
     /// If set, every event delivered to your inbox is also POSTed here (best-effort).
     #[serde(default)]
     pub webhook_url: Option<String>,
+    /// Return the full agent (including the `charter`) in the response. Default false — the response
+    /// omits the charter so a looping caller that re-registers to re-bind identity each tick does not
+    /// re-ingest its own (potentially ~2KB) charter; fetch it with get_agent.
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub verbose: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1564,13 +1569,14 @@ impl Board {
 
     // --- Agents / presence ---
     #[tool(
-        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'agent:fixer-3'). `charter` is your role/mission (free-form). `metadata` is an optional dict of registry props (role, model, effort, interval, worktree, area, `repos: [{repo, branch}, ...]` for the repos you work in — one workspace checkout each, and `capabilities: [\"content-sharing\", ...]` — the capability mandate sets the fleet materializer composes for you, keyed on (role, repos, capabilities); a CSV/list is normalized to a deduped string list), MERGED into any existing bag. If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort)."
+        description = "Register (or update) yourself and mark yourself online. `agent_id` is the stable handle others address you by (e.g. 'agent:fixer-3'). `charter` is your role/mission (free-form). `metadata` is an optional dict of registry props (role, model, effort, interval, worktree, area, `repos: [{repo, branch}, ...]` for the repos you work in — one workspace checkout each, and `capabilities: [\"content-sharing\", ...]` — the capability mandate sets the fleet materializer composes for you, keyed on (role, repos, capabilities); a CSV/list is normalized to a deduped string list), MERGED into any existing bag. If you set `webhook_url`, every event delivered to your inbox is also POSTed there (best-effort). The response omits the (potentially large) `charter` unless you pass verbose:true — a looping caller that re-registers each tick to re-bind identity gets a compact object, not its own charter echoed back; fetch the full agent with get_agent."
     )]
     async fn register_agent(
         &self,
         Parameters(a): Parameters<RegisterAgentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let out = core::register_agent(
+        let verbose = a.verbose.unwrap_or(false);
+        let v = core::register_agent(
             &self.pool,
             &a.agent_id,
             s(&a.display_name),
@@ -1580,12 +1586,19 @@ impl Board {
             s(&a.webhook_url),
         )
         .await
-        .map_err(err)
-        .and_then(ok)?;
+        .map_err(err)?;
+        // Omit the (potentially large) charter unless verbose:true — a looping caller re-registers
+        // to re-bind identity every tick and never needs its own ~2KB charter echoed back
+        // (task #416 trimmed the sibling write tools; task #1006 is this register_agent gap).
+        let v = if verbose {
+            v
+        } else {
+            core::strip_field(v, "charter")
+        };
         // Bind this session to the registered agent (idempotent: re-registering just refreshes
         // it). Other tools then default their identity params from this when omitted.
         *self.identity.lock().unwrap() = Some(a.agent_id);
-        Ok(out)
+        ok(v)
     }
 
     #[tool(
