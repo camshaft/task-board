@@ -9100,7 +9100,7 @@ pub async fn submit_to_operator_review(
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
 
     let Some(row) = sqlx::query(
-        "SELECT project_id, title, archived_at, current_version_id, metadata FROM documents WHERE id=?",
+        "SELECT project_id, title, archived_at, current_version_id, metadata, created_by FROM documents WHERE id=?",
     )
     .bind(document_id)
     .fetch_optional(&mut *tx)
@@ -9113,6 +9113,9 @@ pub async fn submit_to_operator_review(
     let archived_at: Option<String> = row.try_get("archived_at")?;
     let current_version_id: Option<i64> = row.try_get("current_version_id")?;
     let meta_str: String = row.try_get("metadata")?;
+    // The doc's own author -- used by check 2a to reject a self-authored conformance review
+    // (task_1065 Part A): review independence must be structural, not honor-system.
+    let doc_author: Option<String> = row.try_get("created_by")?;
     if archived_at.is_some() {
         anyhow::bail!(
             "document {document_id} is archived; restore it before submitting for operator review"
@@ -9146,7 +9149,7 @@ pub async fn submit_to_operator_review(
     let target_ref = document_id.to_string();
     let target_ref_doc = format!("doc_{document_id}");
     let summaries = sqlx::query(
-        "SELECT r.metadata AS metadata, rl.body AS body FROM review_log rl \
+        "SELECT r.metadata AS metadata, rl.body AS body, rl.author AS entry_author FROM review_log rl \
          JOIN reviews r ON r.id = rl.review_id \
          WHERE r.source IN ('board_doc','board-document') AND r.target_ref IN (?, ?) \
            AND rl.entry_type='adversarial_review'",
@@ -9161,15 +9164,34 @@ pub async fn submit_to_operator_review(
         s.and_then(|b| serde_json::from_str::<Value>(&b).ok())
             .and_then(|v| v.get("reviewed_version").and_then(|r| r.as_i64()))
     };
+    // task_1065 Part A: a SELF-review never establishes independence. An adversarial_review entry
+    // whose author == the doc's own author (created_by) does NOT count toward the gate -- an author
+    // cannot clear their own doc under their own name. Case-insensitive; a null entry author still
+    // counts (back-compat with legacy null-author reviews). This closes the honest same-name
+    // self-review vector cheaply with no deploy dependency; the stronger fix for author-field
+    // IMPERSONATION (an entry stamped under the reviewer's name) is structural authenticated-author
+    // stamping, which rides the forced-identity rollout (task_1030 REST / task_1039 MCP, Part B).
+    let is_self_review = |entry_author: Option<&str>| -> bool {
+        match (entry_author, doc_author.as_deref()) {
+            (Some(a), Some(d)) => a.trim().eq_ignore_ascii_case(d.trim()),
+            _ => false,
+        }
+    };
     let ran_current = summaries.iter().any(|s| {
         let from_meta =
             reviewed_version_of(s.try_get::<Option<String>, _>("metadata").ok().flatten());
         let from_body = reviewed_version_of(s.try_get::<Option<String>, _>("body").ok().flatten());
-        from_meta == Some(current_version_no) || from_body == Some(current_version_no)
+        let version_matches =
+            from_meta == Some(current_version_no) || from_body == Some(current_version_no);
+        let entry_author: Option<String> = s
+            .try_get::<Option<String>, _>("entry_author")
+            .ok()
+            .flatten();
+        version_matches && !is_self_review(entry_author.as_deref())
     });
     if !ran_current && !conformance_exempt {
         anyhow::bail!(
-            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body). A conformance review must run (or re-run) on the current version before the doc can reach the operator"
+            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry by a NON-AUTHOR reviewer records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body; a review authored by the doc's own author does not count). An independent conformance review must run (or re-run) on the current version before the doc can reach the operator"
         );
     }
 
@@ -19555,6 +19577,122 @@ mod tests {
             err.contains("conformance review"),
             "a non-exempt doc with no review stays blocked on conformance; got: {err}"
         );
+        Ok(())
+    }
+
+    /// task_1065 Part A: the submit gate rejects a SELF-authored conformance review -- an
+    /// adversarial_review entry whose author == the doc's own author does not establish
+    /// independence, so the doc stays blocked until a NON-author reviewer records the current
+    /// version. A null-author entry still counts (back-compat), covered implicitly elsewhere.
+    #[tokio::test]
+    async fn submit_gate_rejects_self_authored_conformance_review() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Docs", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let d = create_document(
+            &pool,
+            "Design: Thing",
+            Some(pid),
+            "bafyself",
+            Some("v1"),
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        let dref = did.to_string();
+        let r = create_review(
+            &pool,
+            "design_conformance",
+            Some("board_doc"),
+            Some(dref.as_str()),
+            Some("conformance"),
+            None,
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        // A conformance summary at the current version, but authored by the DOC AUTHOR (self-review).
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 1, "conformance": "pass" }).to_string()),
+            Some("author"),
+            None,
+            None,
+        )
+        .await?;
+        // Waiver path (skips the design-doc structural gate); only 2a independence is under test.
+        let err = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            None,
+            Some("not a design doc, waiver"),
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("NON-AUTHOR") || err.contains("non-author") || err.contains("independent"),
+            "a self-authored conformance review must not satisfy the gate; got: {err}"
+        );
+        // Case-insensitive: an entry authored as "Author" is still the same self-reviewer.
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 1, "conformance": "pass" }).to_string()),
+            Some("Author"),
+            None,
+            None,
+        )
+        .await?;
+        assert!(submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            None,
+            Some("not a design doc, waiver"),
+            None,
+            false,
+            None,
+        )
+        .await
+        .is_err());
+        // A NON-author reviewer's summary at the current version clears the independence check.
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 1, "conformance": "pass" }).to_string()),
+            Some("reviewer"),
+            None,
+            None,
+        )
+        .await?;
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            None,
+            Some("not a design doc, waiver"),
+            None,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(out["status"], json!("operator_review"));
         Ok(())
     }
 
