@@ -3227,6 +3227,74 @@ pub async fn set_task_archived(
     get_task(pool, task_id).await
 }
 
+/// Retention sweep (task_1228 / epic task_1215): soft-archive every task in `project_id` that has
+/// been done and untouched for at least `older_than_days` days -- the dominant bulk-remover for a
+/// pipeline project like project_28 (self-improve), whose done proposals otherwise pile up unbounded.
+/// A board has no scheduler of its own, so this is an IDEMPOTENT on-demand sweep a hygiene daemon
+/// (or an operator) invokes periodically; each run archives only the newly-eligible tasks. `updated_at`
+/// is the done-age proxy -- a done task is rarely edited and a comment does not bump it, so a done
+/// task still being actively edited is left until it settles. Iceboxed tasks are naturally exempt
+/// (status=icebox is not 'done'). Archiving is reversible (`set_task_archived(.., false)` restores it)
+/// and emits `task.archived` per task with reason=retention, so the sweep is auditable and restorable,
+/// never a destructive delete. The `datetime()` wrapping makes the age comparison robust to the stored
+/// timestamp format. Returns `{project_id, older_than_days, archived: <count>, task_ids: [..]}`.
+pub async fn archive_done_proposals(
+    pool: &Pool,
+    project_id: i64,
+    older_than_days: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    if older_than_days < 0 {
+        anyhow::bail!("older_than_days must be >= 0");
+    }
+    let ts = now_iso();
+    let cutoff_modifier = format!("-{older_than_days} days");
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let rows = sqlx::query(
+        "SELECT id, project_id FROM tasks \
+         WHERE project_id=? AND status='done' AND archived_at IS NULL \
+           AND datetime(updated_at) <= datetime('now', ?) ORDER BY id",
+    )
+    .bind(project_id)
+    .bind(&cutoff_modifier)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let id: i64 = r.try_get("id")?;
+        let proj: i64 = r.try_get("project_id")?;
+        sqlx::query("UPDATE tasks SET archived_at=?, updated_at=? WHERE id=?")
+            .bind(&ts)
+            .bind(&ts)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.archived",
+            actor,
+            Some(id),
+            Some(proj),
+            None,
+            None,
+            json!({ "archived": true, "reason": "retention", "older_than_days": older_than_days }),
+            Recipients::FromTask,
+        )
+        .await?;
+        ids.push(id);
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({
+        "project_id": project_id,
+        "older_than_days": older_than_days,
+        "archived": ids.len(),
+        "task_ids": ids,
+    }))
+}
+
 /// Default number of most-recent comments the agent-facing MCP `get_task` inlines when the caller
 /// gives no explicit `comments_limit` (task #511). The REST/UI path stays unbounded (`None`).
 pub const DEFAULT_TASK_COMMENTS: i64 = 20;
@@ -24771,6 +24839,123 @@ mod tests {
             json!("icebox"),
             "an iceboxed dependent stays iceboxed when its former blocker completes"
         );
+        Ok(())
+    }
+
+    /// task_1228: the retention sweep archives only tasks that are done AND untouched for >= N days;
+    /// recent-done, non-done, and iceboxed tasks are left alone, the sweep is idempotent, and an
+    /// archived task is restorable.
+    #[tokio::test]
+    async fn archive_done_proposals_sweeps_old_done_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let mk = |title: &'static str| {
+            let pool = pool.clone();
+            async move {
+                create_task(
+                    &pool,
+                    pid,
+                    title,
+                    None,
+                    Some("worker"),
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|t| t["id"].as_i64().unwrap())
+            }
+        };
+        let done_now = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                update_task(
+                    &pool,
+                    id,
+                    Some("done"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+        };
+        let backdate = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE tasks SET updated_at=datetime('now','-30 days') WHERE id=?")
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+            }
+        };
+
+        // An old DONE task (done + untouched 30 days) -> eligible.
+        let old_done = mk("Old done").await?;
+        done_now(old_done).await?;
+        backdate(old_done).await?;
+        // A recent DONE task (updated_at = now) -> not yet eligible at N=7.
+        let recent_done = mk("Recent done").await?;
+        done_now(recent_done).await?;
+        // An old TODO task -> not done, never eligible.
+        let old_todo = mk("Old todo").await?;
+        backdate(old_todo).await?;
+        // An old ICEBOX task -> not done, naturally exempt.
+        let old_icebox = mk("Old icebox").await?;
+        update_task(
+            &pool,
+            old_icebox,
+            Some("icebox"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        backdate(old_icebox).await?;
+
+        // Sweep at N=7: only the old done task is archived.
+        let res = archive_done_proposals(&pool, pid, 7, Some("worker")).await?;
+        assert_eq!(
+            res["archived"],
+            json!(1),
+            "only the old done task: {res:#?}"
+        );
+        assert_eq!(res["task_ids"], json!([old_done]));
+        assert!(get_task(&pool, old_done).await?["archived_at"].is_string());
+        assert!(get_task(&pool, recent_done).await?["archived_at"].is_null());
+        assert!(get_task(&pool, old_todo).await?["archived_at"].is_null());
+        assert!(
+            get_task(&pool, old_icebox).await?["archived_at"].is_null(),
+            "an iceboxed task is not touched by the done-retention sweep"
+        );
+
+        // Idempotent: a second sweep archives nothing new (the one is already archived).
+        let again = archive_done_proposals(&pool, pid, 7, Some("worker")).await?;
+        assert_eq!(again["archived"], json!(0));
+
+        // N=0 catches the recent done task too (no retention), but still not the non-done ones.
+        let zero = archive_done_proposals(&pool, pid, 0, Some("worker")).await?;
+        assert_eq!(zero["archived"], json!(1));
+        assert_eq!(zero["task_ids"], json!([recent_done]));
+
+        // Restorable: un-archive the old done task.
+        set_task_archived(&pool, old_done, false, Some("worker")).await?;
+        assert!(get_task(&pool, old_done).await?["archived_at"].is_null());
         Ok(())
     }
 }

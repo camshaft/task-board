@@ -761,6 +761,21 @@ pub struct ArchiveTaskArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ArchiveDoneProposalsArgs {
+    /// The project whose done tasks to sweep (e.g. project_28, the self-improve pipeline).
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub project_id: i64,
+    /// Archive a task only after it has been done AND untouched for at least this many days.
+    /// Defaults to 7; 0 archives every eligible done task immediately (no retention window).
+    #[serde(default)]
+    pub older_than_days: Option<i64>,
+    /// The agent performing the sweep (event actor). Defaults to the session identity.
+    #[serde(rename = "principal", alias = "actor", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListTasksArgs {
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub project_id: Option<i64>,
@@ -2336,6 +2351,25 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(
+        description = "Retention sweep (task_1228): soft-archive every task in `project_id` that has been done AND untouched for at least `older_than_days` days (default 7; 0 = no retention window). The dominant bulk-remover for a self-improve/proposals project (e.g. project_28) whose done items pile up unbounded. Archiving is reversible (restore_task) and orthogonal to status; iceboxed tasks are naturally exempt (not done). Idempotent -- re-running archives only the newly-eligible. Returns {project_id, older_than_days, archived, task_ids}. Notifies each archived task's subscribers (task.archived, reason=retention)."
+    )]
+    async fn archive_done_proposals(
+        &self,
+        Parameters(a): Parameters<ArchiveDoneProposalsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::archive_done_proposals(
+            &self.pool,
+            a.project_id,
+            a.older_than_days.unwrap_or(7),
+            actor.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(
