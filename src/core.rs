@@ -5132,6 +5132,22 @@ fn response_schema_template_for(name: &str) -> Option<Value> {
         "text" => json!({ "type": "string" }),
         "age-request" => json!({ "type": "string" }),
         "string-list" => json!({ "type": "array", "items": { "type": "string" } }),
+        // Schema-driven elements (doc_3371 A1 entries 3/4/6/7/11, v-board-ui): the inline
+        // response_schema SHAPE each element's answer form submits. A `<...>` part is filled from the
+        // question's own props (bounds, a date/time regex, or the option / confidence-level ids).
+        "numeric" => json!({ "type": "number" }),
+        "slider" => json!({ "type": "number", "minimum": "<min>", "maximum": "<max>" }),
+        "datetime" => json!({ "type": "string", "pattern": "<date/time regex>" }),
+        "editable-value" => json!({ "type": "string" }),
+        "confidence-tag" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "choice": { "type": "string", "enum": ["<option id>"] },
+                "confidence": { "type": "string", "enum": ["<confidence level id>"] }
+            },
+            "required": ["choice", "confidence"]
+        }),
         _ => return None,
     })
 }
