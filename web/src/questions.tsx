@@ -103,8 +103,9 @@ type FormSpec =
   // array -- a CID-keyed single-select's response_schema is {type:string, enum:[ids]}, so a string
   // is required; the legacy multiple_choice kind validates by kind and expects an array.
   | { shape: 'bool'; yesLabel: string; noLabel: string }
-  // `buttons` (single-choice only): render the options as inline one-tap buttons that submit on
-  // click, rather than a radio list + submit button (task_1179 quick button-response variant).
+  // `display` (single-choice only): a one-tap presentation over the radio-list + submit default.
+  // 'buttons' is the inline button row (task_1179); 'scale' is an ordered rating/Likert row with
+  // optional end labels (doc_3371 A1 entry 1, task_1203). Both submit the chosen id on click.
   | {
       shape: 'choice'
       multi: boolean
@@ -112,7 +113,9 @@ type FormSpec =
       min?: number
       max?: number
       scalar?: boolean
-      buttons?: boolean
+      display?: 'buttons' | 'scale'
+      minLabel?: string
+      maxLabel?: string
     }
   | { shape: 'text'; placeholder?: string }
   | { shape: 'ranked'; options: QuestionOption[]; maxRanked?: number }
@@ -125,14 +128,19 @@ function isArraySchema(s: unknown): boolean {
   return !!s && typeof s === 'object' && (s as Record<string, unknown>).type === 'array'
 }
 
-// A single-choice question can ask to render as quick BUTTONS -- inline option buttons that submit
-// on one tap -- instead of the radio-list + submit (task_1179). Same data model: the hint rides the
-// opaque ui descriptor, so no schema/kind change. Honored when ui.element is "buttons" or ui.props
-// carries variant/display === "buttons".
-function wantsButtons(q: QuestionPayload): boolean {
-  if (q.ui?.element === 'buttons') return true
+// The one-tap presentation a single-choice question asks for, or undefined for the default radio
+// list. Same data model either way: the hint rides the opaque ui descriptor (no schema/kind
+// change). 'buttons' = inline button row (task_1179); 'scale' = ordered rating/Likert row (doc_3371
+// A1 entry 1 -- element names scale/rating/likert all map here). Honored via ui.element or a
+// variant/display prop.
+function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | undefined {
+  const el = q.ui?.element
   const p = q.ui?.props
-  return !!p && (p.variant === 'buttons' || p.display === 'buttons')
+  const hint = el === 'buttons' || p?.variant === 'buttons' || p?.display === 'buttons' ? 'buttons' : null
+  if (hint) return hint
+  const isScale = (v: unknown) => v === 'scale' || v === 'rating' || v === 'likert'
+  if (isScale(el) || (p && (isScale(p.variant) || isScale(p.display)))) return 'scale'
+  return undefined
 }
 
 function formSpecFor(q: QuestionPayload): FormSpec | null {
@@ -150,7 +158,9 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
           multi: false,
           options: asOptions(p.options),
           scalar: !isArraySchema(q.response_schema),
-          buttons: wantsButtons(q),
+          display: choiceDisplay(q),
+          minLabel: asText(p.min_label),
+          maxLabel: asText(p.max_label),
         }
       case 'multi-select':
         return {
@@ -186,7 +196,14 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
     case 'yes_no':
       return { shape: 'bool', yesLabel: 'Yes', noLabel: 'No' }
     case 'multiple_choice':
-      return { shape: 'choice', multi: false, options: q.options ?? [], buttons: wantsButtons(q) }
+      return {
+        shape: 'choice',
+        multi: false,
+        options: q.options ?? [],
+        display: choiceDisplay(q),
+        minLabel: asText(q.ui?.props?.min_label),
+        maxLabel: asText(q.ui?.props?.max_label),
+      }
     case 'select_all':
       return { shape: 'choice', multi: true, options: q.options ?? [] }
     case 'fill_in_the_blank':
@@ -353,7 +370,7 @@ function AnswerForm({
         </div>
       )}
 
-      {spec?.shape === 'choice' && !spec.multi && spec.buttons && (
+      {spec?.shape === 'choice' && !spec.multi && spec.display === 'buttons' && (
         // Quick button-response variant (task_1179): one tap on an option submits it immediately,
         // no separate submit step. Same submitted value as the radio variant below.
         <div className="flex flex-wrap gap-2">
@@ -370,7 +387,33 @@ function AnswerForm({
         </div>
       )}
 
-      {spec?.shape === 'choice' && !spec.multi && !spec.buttons && (
+      {spec?.shape === 'choice' && !spec.multi && spec.display === 'scale' && (
+        // Rating / Likert scale (doc_3371 A1 entry 1, task_1203): the ordered options as one row of
+        // equal-width one-tap buttons, with optional end labels beneath. One tap submits the chosen
+        // option id -- same value as the radio variant.
+        <div className="space-y-1">
+          <div className="flex gap-1">
+            {options.map((o) => (
+              <button
+                key={o.id}
+                disabled={busy}
+                className={`${BTN_GHOST} flex-1 justify-center text-center`}
+                onClick={() => onSubmit('choice', spec.scalar ? o.id : [o.id])}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+          {(spec.minLabel || spec.maxLabel) && (
+            <div className="flex justify-between text-[11px] text-[var(--color-muted)]">
+              <span>{spec.minLabel ?? ''}</span>
+              <span>{spec.maxLabel ?? ''}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {spec?.shape === 'choice' && !spec.multi && !spec.display && (
         <div className="space-y-1.5">
           {options.map((o) => (
             <label key={o.id} className="flex items-center gap-2 text-sm">
