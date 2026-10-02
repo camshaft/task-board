@@ -386,15 +386,13 @@ CREATE TABLE IF NOT EXISTS project_teams (
     created_at     TEXT NOT NULL,
     PRIMARY KEY (project_id, team_id)
 );
--- SECRET REQUESTS: the board is an ephemeral secret-REQUEST broker, never a secret store. An agent
--- files a named request carrying the (non-secret) age recipient pubkeys + human instructions; an
--- operator opens a single-use capability link and submits the value ENCRYPTED IN THE BROWSER, so
--- the board only ever holds ciphertext, and only transiently. A fulfiller pulls the ciphertext once
--- (fulfiller-token-gated), relocates it to durable storage, then the row is deleted. `ciphertext`
--- is NULL except in the submit->fulfill window; the row is hard-deleted on fulfill/cancel and a
--- stuck submitted row is purged after `expires_at`. Nothing here is content-addressed or put on the
--- firehose. `recipients` is a JSON array of age recipient pubkey strings; `target` is an advisory
--- placement hint the fulfiller owns; `submit_used` enforces the single-use submit link.
+-- SECRET REQUESTS (RETIRED SERVING SURFACE, task_713): the dedicated ephemeral secret-REQUEST
+-- broker was removed -- its serving code (create/submit/fulfill/list/cancel over core, MCP, and
+-- REST) is gone, superseded by the schema-driven age-request QUESTION whose string response_schema
+-- carries the browser-produced age ciphertext (so no plaintext ever reaches the board, same as
+-- before, now via the general question path). This TABLE is RETAINED per the additive-only policy
+-- (never DROP a table): no live code reads or writes it; any pre-existing rows are inert historical
+-- records. Do not re-add a serving surface here -- use the age-request question element instead.
 CREATE TABLE IF NOT EXISTS secret_requests (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL,

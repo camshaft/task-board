@@ -564,23 +564,6 @@ export interface ReviewTrend {
   by_area: ReviewTrendSlice[]
 }
 
-// A secret request as safe metadata (never the ciphertext or the capability tokens). The board
-// is an ephemeral request broker: this drives the submit page, which encrypts the value to
-// `recipients` in the browser and posts only ciphertext.
-export interface SecretRequest {
-  id: number
-  name: string
-  requested_by: string | null
-  fulfiller: string | null
-  status: string
-  recipients: string[]
-  instructions: string | null
-  target: string | null
-  created_at: string | null
-  submitted_at: string | null
-  expires_at: string | null
-}
-
 // Transient-blip handling (task_1286): a fetch that THROWS (TypeError "Failed to fetch" -- a lab/
 // tunnel or client network blip, offline, DNS; the request never completed) is TRANSIENT, not a
 // server defect. Idempotent GETs are safe to replay, so retry a couple of times with short backoff to
@@ -1038,10 +1021,6 @@ export const api = {
   ) => req<ProjectAccess>('POST', `/projects/${projectId}/teams`, b),
   detachProjectTeam: (projectId: number, b: { team_id: string; principal?: string }) =>
     req<ProjectAccess>('DELETE', `/projects/${projectId}/teams`, b),
-
-  getSecretRequest: (id: number) => req<SecretRequest>('GET', `/secret-requests/${id}`),
-  submitSecret: (id: number, b: { token: string; ciphertext: string }) =>
-    req<SecretRequest>('POST', `/secret-requests/${id}/submit`, b),
 }
 
 // Resolve a bare content id to a same-origin URL served by the board's scoped read-through
