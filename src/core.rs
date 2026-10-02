@@ -2039,6 +2039,35 @@ pub async fn get_project_scoped(
     get_project(pool, project_id).await
 }
 
+/// `get_task_limited` scoped to `viewer` when enforcement is enabled (task_542 Phase 3 Part B5b): a
+/// task is readable iff its PROJECT is readable by the viewer. FAIL-CLOSED under enforcement -- an
+/// unreadable project, an unidentified viewer, or a missing task all yield `Value::Null` (not-found),
+/// so enforcement leaks neither a task's existence nor its project membership. Passthrough while
+/// enforcement is OFF. The MCP/REST get_task handlers call this with the authenticated caller.
+pub async fn get_task_scoped(
+    pool: &Pool,
+    task_id: i64,
+    comments_limit: Option<i64>,
+    viewer: Option<&str>,
+) -> anyhow::Result<Value> {
+    if enforcement_enabled(pool).await? {
+        let project_id: Option<i64> = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?
+            .map(|r| r.try_get::<i64, _>("project_id"))
+            .transpose()?;
+        let allowed = match (viewer, project_id) {
+            (Some(v), Some(pid)) => principal_can_read_project(pool, v, pid).await?,
+            _ => false, // unidentified viewer, or no such task -> fail-closed / not found
+        };
+        if !allowed {
+            return Ok(Value::Null);
+        }
+    }
+    get_task_limited(pool, task_id, comments_limit).await
+}
+
 /// Resolve an addressable principal id to the set of principal ids who can act on it (task 542): a
 /// team expands to its people AND its agents (cycle-guarded); anything else (a person id, or an
 /// agent id) resolves to itself. The read-time primitive for team-aware addressing + visibility in
@@ -23166,6 +23195,63 @@ mod tests {
                 .await?
                 .is_null(),
             "fleet-coordination member reads via the standing grant"
+        );
+        Ok(())
+    }
+
+    /// task_542 B5b: get_task_scoped is a passthrough while enforcement is OFF, and FAIL-CLOSED once
+    /// enabled -- a task is readable iff its project is, so the project creator reads it and a
+    /// stranger / unidentified caller get Null (not-found, no existence leak).
+    #[tokio::test]
+    async fn get_task_scoped_enforces_via_project_access() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["boss", "bob"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let pid = create_project(&pool, "P", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let tid = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("boss"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // Enforcement OFF: anyone, and an unidentified caller, read the task.
+        assert!(!get_task_scoped(&pool, tid, None, Some("bob"))
+            .await?
+            .is_null());
+        assert!(!get_task_scoped(&pool, tid, None, None).await?.is_null());
+
+        set_enforcement_enabled(&pool, true, Some("boss")).await?;
+
+        // The project creator reads the task; a stranger and an unidentified caller fail closed.
+        assert!(
+            !get_task_scoped(&pool, tid, None, Some("boss"))
+                .await?
+                .is_null(),
+            "the project creator reads the task"
+        );
+        assert!(
+            get_task_scoped(&pool, tid, None, Some("bob"))
+                .await?
+                .is_null(),
+            "a stranger is scoped out of the task"
+        );
+        assert!(
+            get_task_scoped(&pool, tid, None, None).await?.is_null(),
+            "an unidentified caller is scoped out"
         );
         Ok(())
     }
