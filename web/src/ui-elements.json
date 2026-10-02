@@ -259,6 +259,50 @@
         },
         "additionalProperties": false
       }
+    },
+    "confidence-tag": {
+      "title": "Choice with confidence",
+      "description": "A single decision tagged with how sure the operator is -- it stays one decision because confidence is an attribute of the same answer (improves calibration; signals when to seek a second opinion). The answer is a composite object {choice, confidence} the generic object validation enforces (no new kind): choice is one option id, confidence is one level id. options holds the choices; confidence_levels holds the confidence scale (defaults to low / medium / high); confidence_label overrides the scale's prompt.",
+      "component": "ConfidenceTag",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          },
+          "confidence_levels": {
+            "type": "array",
+            "minItems": 2,
+            "description": "Ordered confidence scale (low to high). Omit for the default low / medium / high.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" }
+              },
+              "required": ["id", "label"],
+              "additionalProperties": false
+            }
+          },
+          "confidence_label": {
+            "type": "string",
+            "description": "Prompt shown above the confidence scale (default \"How confident are you?\")."
+          }
+        },
+        "required": ["options"],
+        "additionalProperties": false
+      }
     }
   }
 }

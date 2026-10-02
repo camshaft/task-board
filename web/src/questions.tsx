@@ -99,6 +99,13 @@ function asNumber(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
 }
 
+// Default confidence scale for the confidence-tag element when the question supplies none.
+const DEFAULT_CONFIDENCE_LEVELS: QuestionOption[] = [
+  { id: 'low', label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high', label: 'High' },
+]
+
 function asText(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined
 }
@@ -147,6 +154,9 @@ type FormSpec =
   // `datetime` (schema-driven, doc_3371 A1 entry 7): a native date/datetime/time picker whose string
   // value the inline response_schema validates with a pattern regex. mode picks the control.
   | { shape: 'datetime'; mode: 'date' | 'datetime' | 'time'; min?: string; max?: string }
+  // `confidence` (schema-driven, doc_3371 A1 entry 6): a composite {choice, confidence} object -- one
+  // decision plus how sure the operator is -- validated by the inline object response_schema.
+  | { shape: 'confidence'; options: QuestionOption[]; levels: QuestionOption[]; confidenceLabel?: string }
   | { shape: 'age'; recipient: string }
 
 // Does a response schema expect an array value (vs a scalar)? Used to decide a single-select's
@@ -253,6 +263,15 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
         const mode = p.mode === 'datetime' || p.mode === 'time' ? p.mode : 'date'
         return { shape: 'datetime', mode, min: asText(p.min), max: asText(p.max) }
       }
+      case 'confidence-tag': {
+        const levels = asOptions(p.confidence_levels)
+        return {
+          shape: 'confidence',
+          options: asOptions(p.options),
+          levels: levels.length >= 2 ? levels : DEFAULT_CONFIDENCE_LEVELS,
+          confidenceLabel: asText(p.confidence_label),
+        }
+      }
       case 'age-request': {
         const recipient = asText(p.recipient)
         // With a recipient we can encrypt in-browser; without one, fall back to the free-text escape.
@@ -325,6 +344,26 @@ function AnswerValue({
           <li key={i}>{labelFor(item)}</li>
         ))}
       </List>
+    )
+  }
+  // Composite choice-with-confidence answer {choice, confidence} (doc_3371 A1 entry 6): resolve the
+  // choice id to its option label and show the confidence alongside, rather than raw JSON.
+  if (
+    v &&
+    typeof v === 'object' &&
+    !Array.isArray(v) &&
+    'choice' in v &&
+    'confidence' in v
+  ) {
+    const rec = v as { choice: unknown; confidence: unknown }
+    return (
+      <span className="text-sm">
+        <span className="font-medium">{labelFor(rec.choice)}</span>
+        <span className="text-[var(--color-muted)]">
+          {' '}
+          · confidence: {typeof rec.confidence === 'string' ? rec.confidence : JSON.stringify(rec.confidence)}
+        </span>
+      </span>
     )
   }
   return (
@@ -429,6 +468,8 @@ function AnswerForm({
   const [text, setText] = useState('')
   const [num, setNum] = useState('')
   const [dt, setDt] = useState('')
+  const [confChoice, setConfChoice] = useState('')
+  const [confLevel, setConfLevel] = useState('')
   const [order, setOrder] = useState<string[]>(options.map((o) => o.id))
   // string-list rows (start with one empty row the operator types into).
   const [items, setItems] = useState<string[]>([''])
@@ -841,6 +882,55 @@ function AnswerForm({
             onClick={() => onSubmit('datetime', dt)}
           >
             Submit
+          </button>
+        </div>
+      )}
+
+      {spec?.shape === 'confidence' && (
+        // Choice-with-confidence (doc_3371 A1 entry 6): pick one option AND one confidence level, then
+        // submit the composite {choice, confidence} object the inline response_schema validates. One
+        // decision -- confidence is an attribute of the same answer, not a second question.
+        <div className="space-y-2.5">
+          <div className="space-y-1.5">
+            {spec.options.map((o) => (
+              <label key={o.id} className="flex items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="conf-choice"
+                  checked={confChoice === o.id}
+                  onChange={() => setConfChoice(o.id)}
+                />
+                {o.label}
+              </label>
+            ))}
+          </div>
+          <div>
+            <p className="mb-1 text-xs text-[var(--color-muted)]">
+              {spec.confidenceLabel ?? 'How confident are you?'}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {spec.levels.map((l) => (
+                <button
+                  key={l.id}
+                  disabled={busy}
+                  onClick={() => setConfLevel(l.id)}
+                  className={
+                    confLevel === l.id
+                      ? 'rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40'
+                      : BTN_GHOST
+                  }
+                >
+                  {l.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <button
+            disabled={busy || !confChoice || !confLevel}
+            className={BTN}
+            onClick={() => onSubmit('confidence', { choice: confChoice, confidence: confLevel })}
+          >
+            Submit answer
           </button>
         </div>
       )}
