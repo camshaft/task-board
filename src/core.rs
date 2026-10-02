@@ -10027,8 +10027,9 @@ pub async fn submit_to_operator_review(
     // 2a. Conformance ran against the CURRENT version: a terminal `adversarial_review` entry on a
     // review over this doc records `reviewed_version` == current_version_no (task_868). The version
     // is read from the review's `metadata.reviewed_version` -- the structured source of truth set via
-    // create_review's metadata, which is MCP-settable -- OR, for back-compat, the entry body parsed
-    // as JSON. The review is matched tolerantly across BOTH source/target_ref conventions:
+    // create_review's metadata (or the set_review_metadata recovery setter, task_1195) -- OR from the
+    // adversarial_review entry body, either a JSON object or a free-text `reviewed_version=N` token
+    // (task_1195 route A). The review is matched tolerantly across BOTH source/target_ref conventions:
     // 'board_doc'/'<id>' (canonical) and 'board-document'/'doc_<id>' (the design-zoom convention),
     // so either review-creation path satisfies the gate.
     let target_ref = document_id.to_string();
@@ -10043,11 +10044,46 @@ pub async fn submit_to_operator_review(
     .bind(&target_ref_doc)
     .fetch_all(&mut *tx)
     .await?;
-    // reviewed_version lives in either a JSON string (the review metadata, or the entry body); pull
-    // the first that parses to an object carrying an integer reviewed_version.
-    let reviewed_version_of = |s: Option<String>| -> Option<i64> {
-        s.and_then(|b| serde_json::from_str::<Value>(&b).ok())
+    // reviewed_version lives in a JSON string. The review METADATA is always a JSON object, so parse
+    // it as one.
+    fn version_from_json(s: &str) -> Option<i64> {
+        serde_json::from_str::<Value>(s)
+            .ok()
             .and_then(|v| v.get("reviewed_version").and_then(|r| r.as_i64()))
+    }
+    // task_1195 route A: the entry BODY may instead carry a free-text `reviewed_version=N` /
+    // `reviewed_version: N` token -- the form a non-author reviewer naturally writes when they vet,
+    // so stating the version in the vet entry is sufficient (no JSON-object body required). Parse the
+    // first `reviewed_version` key (case-insensitive) followed by an optional `:`/`=` then an integer.
+    // The NON-AUTHOR constraint below still gates it, so an author cannot self-assert a pass.
+    fn version_token(body: &str) -> Option<i64> {
+        let lower = body.to_ascii_lowercase();
+        let key = "reviewed_version";
+        let mut from = 0;
+        while let Some(idx) = lower[from..].find(key) {
+            let after = from + idx + key.len();
+            let rest = body[after..].trim_start();
+            let rest = rest
+                .strip_prefix(|c: char| c == ':' || c == '=')
+                .unwrap_or(rest)
+                .trim_start();
+            let digits: String = rest
+                .chars()
+                .take_while(|c: &char| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<i64>() {
+                return Some(n);
+            }
+            from = after;
+        }
+        None
+    }
+    let reviewed_version_of =
+        |s: Option<String>| -> Option<i64> { s.as_deref().and_then(version_from_json) };
+    // The body accepts the JSON object OR the free-text token (route A).
+    let reviewed_version_from_body = |s: Option<String>| -> Option<i64> {
+        s.as_deref()
+            .and_then(|b| version_from_json(b).or_else(|| version_token(b)))
     };
     // task_1065 Part A: a SELF-review never establishes independence. An adversarial_review entry
     // whose author == the doc's own author (created_by) does NOT count toward the gate -- an author
@@ -10065,7 +10101,8 @@ pub async fn submit_to_operator_review(
     let ran_current = summaries.iter().any(|s| {
         let from_meta =
             reviewed_version_of(s.try_get::<Option<String>, _>("metadata").ok().flatten());
-        let from_body = reviewed_version_of(s.try_get::<Option<String>, _>("body").ok().flatten());
+        let from_body =
+            reviewed_version_from_body(s.try_get::<Option<String>, _>("body").ok().flatten());
         let version_matches =
             from_meta == Some(current_version_no) || from_body == Some(current_version_no);
         let entry_author: Option<String> = s
@@ -10076,7 +10113,7 @@ pub async fn submit_to_operator_review(
     });
     if !ran_current && !conformance_exempt {
         anyhow::bail!(
-            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry by a NON-AUTHOR reviewer records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body; a review authored by the doc's own author does not count). An independent conformance review must run (or re-run) on the current version before the doc can reach the operator"
+            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry by a NON-AUTHOR reviewer records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body -- JSON {{\"reviewed_version\":{current_version_no}}} or a reviewed_version={current_version_no} token; a review authored by the doc's own author does not count). An independent conformance review must run (or re-run) on the current version before the doc can reach the operator"
         );
     }
 
@@ -20876,6 +20913,109 @@ mod tests {
             out["status"],
             json!("operator_review"),
             "metadata.reviewed_version + the board-document convention satisfy the gate"
+        );
+        Ok(())
+    }
+
+    /// task_1195 route A: a free-text `reviewed_version=N` / `reviewed_version: N` token in a
+    /// NON-AUTHOR adversarial_review entry body satisfies the submit gate even when the review has
+    /// EMPTY metadata and the body is not JSON (the recurrence-prevention half). The non-author
+    /// constraint still holds: the same token in the doc AUTHOR's own entry does not count.
+    #[tokio::test]
+    async fn submit_gate_accepts_reviewed_version_token_in_nonauthor_entry_body(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let pid = create_project(&pool, "Docs", None, Some("u"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let did = create_document(
+            &pool,
+            "Design: Thing",
+            Some(pid),
+            "bafyv1",
+            Some("v1"),
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        publish_version(&pool, did, "bafyv2", Some("v2"), Some("author"), None, None).await?;
+
+        // Review with EMPTY metadata (the review_65 situation): the only reviewed_version signal is
+        // a free-text token in the entry body, not JSON.
+        let rid = create_review(
+            &pool,
+            "document",
+            Some("board-document"),
+            Some(&format!("doc_{did}")),
+            Some("conformance"),
+            Some("approved"),
+            Some("design-x"),
+            Some("librarian"),
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // A token in the DOC AUTHOR's own entry must NOT clear the gate (non-author constraint).
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some("reviewed_version=2 -- self attest"),
+            Some("author"),
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            submit_to_operator_review(
+                &pool,
+                did,
+                Some("author"),
+                Some("doc_7 incl A8"),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .is_err(),
+            "a reviewed_version token in the doc author's own entry does not clear the gate"
+        );
+
+        // A NON-AUTHOR reviewer states it as a free-text token (not JSON) -> gate passes.
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some("reviewed_version: 2 PASS -- doc_7 A8 conformance"),
+            Some("librarian"),
+            None,
+            None,
+        )
+        .await?;
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("doc_7 incl A8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            out["status"],
+            json!("operator_review"),
+            "a reviewed_version token in a non-author entry body satisfies the gate"
         );
         Ok(())
     }
