@@ -10030,14 +10030,18 @@ pub async fn submit_to_operator_review(
     // create_review's metadata (or the set_review_metadata recovery setter, task_1195) -- OR from the
     // adversarial_review entry body, either a JSON object or a free-text `reviewed_version=N` token
     // (task_1195 route A). The review is matched tolerantly across BOTH source/target_ref conventions:
-    // 'board_doc'/'<id>' (canonical) and 'board-document'/'doc_<id>' (the design-zoom convention),
-    // so either review-creation path satisfies the gate.
+    // 'board_doc'/'<id>' (canonical) and 'board-document'/'doc_<id>' (the design-zoom convention) --
+    // AND a NULL source (task_1195: reviewers routinely create a conformance review without a source,
+    // e.g. review_68/review_69; target_ref already pins the document, so a null source must not make
+    // the review invisible to the gate -- that silent exclusion, not the version format, was why
+    // doc_3330 v9 bounced across every reviewed_version form). An explicit NON-doc source stays
+    // excluded. So any of these review-creation paths satisfies the gate.
     let target_ref = document_id.to_string();
     let target_ref_doc = format!("doc_{document_id}");
     let summaries = sqlx::query(
         "SELECT r.metadata AS metadata, rl.body AS body, rl.author AS entry_author FROM review_log rl \
          JOIN reviews r ON r.id = rl.review_id \
-         WHERE r.source IN ('board_doc','board-document') AND r.target_ref IN (?, ?) \
+         WHERE (r.source IS NULL OR r.source IN ('board_doc','board-document')) AND r.target_ref IN (?, ?) \
            AND rl.entry_type='adversarial_review'",
     )
     .bind(&target_ref)
@@ -10113,7 +10117,7 @@ pub async fn submit_to_operator_review(
     });
     if !ran_current && !conformance_exempt {
         anyhow::bail!(
-            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry by a NON-AUTHOR reviewer records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body -- JSON {{\"reviewed_version\":{current_version_no}}} or a reviewed_version={current_version_no} token; a review authored by the doc's own author does not count). An independent conformance review must run (or re-run) on the current version before the doc can reach the operator"
+            "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry by a NON-AUTHOR reviewer on a review targeting this document (target_ref '{document_id}' or 'doc_{document_id}') records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body -- JSON {{\"reviewed_version\":{current_version_no}}} or a reviewed_version={current_version_no} token; a review authored by the doc's own author does not count). An independent conformance review must run (or re-run) on the current version before the doc can reach the operator"
         );
     }
 
@@ -10124,7 +10128,7 @@ pub async fn submit_to_operator_review(
         "SELECT COUNT(*) AS n FROM review_log rl \
          JOIN reviews r ON r.id = rl.review_id \
          JOIN tasks t ON t.id = rl.task_id \
-         WHERE r.source IN ('board_doc','board-document') AND r.target_ref IN (?, ?) \
+         WHERE (r.source IS NULL OR r.source IN ('board_doc','board-document')) AND r.target_ref IN (?, ?) \
            AND rl.entry_type='finding' \
            AND rl.task_id IS NOT NULL AND t.status NOT IN ('done','cancelled','canceled')",
     )
@@ -21016,6 +21020,81 @@ mod tests {
             out["status"],
             json!("operator_review"),
             "a reviewed_version token in a non-author entry body satisfies the gate"
+        );
+        Ok(())
+    }
+
+    /// task_1195 (the real doc_3330 v9 bug): a conformance review created WITHOUT a source
+    /// (source=NULL) still satisfies the submit gate -- target_ref pins the document, so a null
+    /// source must not make the review invisible. review_68/review_69 were created with no source and
+    /// bounced on EVERY reviewed_version form because the gate's WHERE clause excluded them, while
+    /// review_66 (source set) cleared -- the inconsistency board-pm flagged.
+    #[tokio::test]
+    async fn submit_gate_matches_a_review_with_null_source() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let pid = create_project(&pool, "Docs", None, Some("u"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let did = create_document(
+            &pool,
+            "Core tenet",
+            Some(pid),
+            "bafyv1",
+            Some("v1"),
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        publish_version(&pool, did, "bafyv2", Some("v2"), Some("author"), None, None).await?;
+
+        // Review created with NO source (the review_68/69 situation) -- source stays NULL -- but
+        // target_ref pins the document and a non-author records reviewed_version == current.
+        let rid = create_review(
+            &pool,
+            "conformance",
+            None,
+            Some(&format!("doc_{did}")),
+            Some("conformance"),
+            Some("approved"),
+            Some("cr-reviewer"),
+            None,
+            Some(json!({ "reviewed_version": 2, "non_author": true })),
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some("reviewed_version=2 PASS -- non-author conformance"),
+            Some("cr-reviewer"),
+            None,
+            None,
+        )
+        .await?;
+
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("doc_7 incl A8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            out["status"],
+            json!("operator_review"),
+            "a null-source conformance review targeting the doc satisfies the gate"
         );
         Ok(())
     }
