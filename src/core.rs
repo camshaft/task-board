@@ -4697,11 +4697,16 @@ pub const QUESTION_KINDS: &[&str] = &[
     "select_all",
     "fill_in_the_blank",
     "rank_list",
+    // doc_3371 entry 8 (task_1257): a weighted point allocation across the options whose values must
+    // sum to a fixed budget -- a constant-sum constraint JSON Schema cannot express, so it is a
+    // genuine new kind with a custom server-side validator (not the schema-driven path).
+    "point_allocation",
 ];
-/// The answer-shape discriminators (doc_33 A2): choice covers single + multi select, so four shapes
-/// cover the five kinds. The out-of-frame escape is NOT a shape -- it is a `text` answer whose
-/// question state becomes `answered_outside_frame`.
-pub const ANSWER_SHAPES: &[&str] = &["choice", "bool", "text", "ranked"];
+/// The answer-shape discriminators (doc_33 A2): choice covers single + multi select. `allocation` is
+/// the point_allocation answer (doc_3371 entry 8): an object mapping option id -> integer points. The
+/// out-of-frame escape is NOT a shape -- it is a `text` answer whose state becomes
+/// `answered_outside_frame`.
+pub const ANSWER_SHAPES: &[&str] = &["choice", "bool", "text", "ranked", "allocation"];
 /// Question lifecycle states (doc_33 A2); `open` is the only non-terminal one.
 pub const QUESTION_STATES: &[&str] = &[
     "open",
@@ -4719,12 +4724,54 @@ fn kind_expected_shape(kind: &str) -> &'static str {
         "multiple_choice" | "select_all" => "choice",
         "fill_in_the_blank" => "text",
         "rank_list" => "ranked",
+        "point_allocation" => "allocation",
         _ => "text",
     }
 }
 /// Whether a kind carries an id/label options list.
 fn kind_needs_options(kind: &str) -> bool {
-    matches!(kind, "multiple_choice" | "select_all" | "rank_list")
+    matches!(
+        kind,
+        "multiple_choice" | "select_all" | "rank_list" | "point_allocation"
+    )
+}
+/// Whether a kind carries a `config` object (per-kind validation parameters beyond the options list).
+/// point_allocation (doc_3371 entry 8) carries `{budget}`, the constant sum the allocation must hit.
+fn kind_uses_config(kind: &str) -> bool {
+    matches!(kind, "point_allocation")
+}
+
+/// Validate + normalize a question's `config` for its kind (doc_3371 entry 8 / task_1257). A kind
+/// that uses config requires it with the expected fields; a kind that does not must not carry one.
+/// For point_allocation: `{budget}` where budget is an integer >= 1 (the constant sum answers hit).
+fn normalize_question_config(kind: &str, config: Option<Value>) -> anyhow::Result<Option<Value>> {
+    if !kind_uses_config(kind) {
+        if config.is_some() {
+            anyhow::bail!("kind '{kind}' takes no `config`");
+        }
+        return Ok(None);
+    }
+    let cfg = config.ok_or_else(|| {
+        anyhow::anyhow!("kind '{kind}' requires a `config` object (e.g. {{\"budget\": 100}})")
+    })?;
+    match kind {
+        "point_allocation" => {
+            let budget = cfg.get("budget").and_then(|b| b.as_i64()).ok_or_else(|| {
+                anyhow::anyhow!("point_allocation `config.budget` must be an integer")
+            })?;
+            if budget < 1 {
+                anyhow::bail!("point_allocation `config.budget` must be >= 1");
+            }
+            Ok(Some(json!({ "budget": budget })))
+        }
+        _ => unreachable!("kind_uses_config and this match must agree"),
+    }
+}
+
+/// The constant-sum `budget` a point_allocation question requires answers to hit, read from its
+/// stored `config`. Any other kind returns None.
+fn allocation_budget(config: &Value) -> Option<i64> {
+    config.get("budget").and_then(|b| b.as_i64())
 }
 
 /// Extract the option id strings from an options array ([{id,label}, ...]).
@@ -4775,7 +4822,12 @@ fn normalize_question_options(kind: &str, options: Option<Value>) -> anyhow::Res
 
 /// Validate a FRAMED answer `value` against the question `kind` + its `options`. The out-of-frame
 /// text escape is validated separately by the caller.
-fn validate_answer_value(kind: &str, value: &Value, options: &Value) -> anyhow::Result<()> {
+fn validate_answer_value(
+    kind: &str,
+    value: &Value,
+    options: &Value,
+    config: &Value,
+) -> anyhow::Result<()> {
     let ids: BTreeSet<String> = option_ids(options).into_iter().collect();
     match kind {
         "yes_no" => {
@@ -4826,6 +4878,37 @@ fn validate_answer_value(kind: &str, value: &Value, options: &Value) -> anyhow::
             }
             if got != ids {
                 anyhow::bail!("a rank_list answer must rank every option exactly once");
+            }
+        }
+        "point_allocation" => {
+            // doc_3371 entry 8 (task_1257): an object mapping option id -> non-negative integer
+            // points whose values sum to exactly the configured budget (constant-sum). An omitted
+            // option counts as zero; an unknown key is rejected.
+            let obj = value.as_object().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "a point_allocation answer must be an object of {{option_id: points}}"
+                )
+            })?;
+            let budget = allocation_budget(config).ok_or_else(|| {
+                anyhow::anyhow!("point_allocation question is missing its `config.budget`")
+            })?;
+            let mut sum: i64 = 0;
+            for (id, pts) in obj {
+                if !ids.contains(id) {
+                    anyhow::bail!("'{id}' is not one of the question's option ids");
+                }
+                let n = pts
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("the points for '{id}' must be an integer"))?;
+                if n < 0 {
+                    anyhow::bail!("the points for '{id}' must be >= 0");
+                }
+                sum += n;
+            }
+            if sum != budget {
+                anyhow::bail!(
+                    "a point_allocation answer must sum to the budget {budget} (got {sum})"
+                );
             }
         }
         other => anyhow::bail!("unknown question kind '{other}'"),
@@ -5112,13 +5195,10 @@ pub async fn recompute_question_block(
     Ok(())
 }
 
-/// Pose a question as a type=question comment on a task (doc_33 A4). Carries the kind, options,
-/// routed-to principal, blocking flag, and (non-blocking only) an optional default + wait period.
-/// Optionally carries an inline `response_schema` (a JSON Schema the framed answer must satisfy --
-/// the schema-driven model of doc_33 v15) and a pass-through `ui` descriptor (element + props +
-/// element-schema CID, stored verbatim and resolved by the client, not here). A blocking question
-/// contributes to the task's derived question-block until it resolves. Emits question.posed to the
-/// routed-to principal's agents. Returns the question comment.
+/// Back-compat `pose_question_full` without a per-kind `config` (the kinds predating doc_3371 entry 8
+/// take none). The many kind/schema tests pose through this; delegates to [`pose_question_configured`]
+/// with `config = None`. Test-only: the mcp/api boundaries call `pose_question_configured` directly.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn pose_question_full(
     pool: &Pool,
@@ -5132,6 +5212,48 @@ pub async fn pose_question_full(
     wait_period_seconds: Option<i64>,
     response_schema: Option<Value>,
     ui: Option<Value>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    pose_question_configured(
+        pool,
+        task_id,
+        kind,
+        prompt,
+        options,
+        routed_to,
+        blocking,
+        default,
+        wait_period_seconds,
+        response_schema,
+        ui,
+        None,
+        actor,
+    )
+    .await
+}
+
+/// Pose a question as a type=question comment on a task (doc_33 A4). Carries the kind, options,
+/// routed-to principal, blocking flag, and (non-blocking only) an optional default + wait period.
+/// Optionally carries an inline `response_schema` (a JSON Schema the framed answer must satisfy --
+/// the schema-driven model of doc_33 v15), a pass-through `ui` descriptor (element + props +
+/// element-schema CID, stored verbatim and resolved by the client, not here), and a per-kind `config`
+/// (doc_3371 entry 8 / task_1257: point_allocation's constant-sum `{budget}`). A blocking question
+/// contributes to the task's derived question-block until it resolves. Emits question.posed to the
+/// routed-to principal's agents. Returns the question comment.
+#[allow(clippy::too_many_arguments)]
+pub async fn pose_question_configured(
+    pool: &Pool,
+    task_id: i64,
+    kind: Option<&str>,
+    prompt: &str,
+    options: Option<Value>,
+    routed_to: &str,
+    blocking: bool,
+    default: Option<Value>,
+    wait_period_seconds: Option<i64>,
+    response_schema: Option<Value>,
+    ui: Option<Value>,
+    config: Option<Value>,
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
     check_bare_refs(prompt)?;
@@ -5176,6 +5298,17 @@ pub async fn pose_question_full(
                 );
             }
             json!([])
+        }
+    };
+    // Per-kind config (doc_3371 entry 8 / task_1257): e.g. point_allocation's constant-sum budget.
+    // A CID-keyed question (no legacy kind) carries no config.
+    let config = match kind {
+        Some(k) => normalize_question_config(k, config)?,
+        None => {
+            if config.is_some() {
+                anyhow::bail!("a CID-keyed question (no `kind`) takes no `config`");
+            }
+            None
         }
     };
     if blocking {
@@ -5238,7 +5371,7 @@ pub async fn pose_question_full(
             validate_value_against_schema(schema, d)
                 .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?;
         } else if let Some(k) = kind {
-            validate_answer_value(k, d, &options)
+            validate_answer_value(k, d, &options, config.as_ref().unwrap_or(&Value::Null))
                 .map_err(|e| anyhow::anyhow!("invalid `default`: {e}"))?;
         }
     }
@@ -5248,6 +5381,9 @@ pub async fn pose_question_full(
     }
     if kind.map(kind_needs_options).unwrap_or(false) {
         payload.insert("options".into(), options);
+    }
+    if let Some(c) = config.as_ref() {
+        payload.insert("config".into(), c.clone());
     }
     payload.insert("routed_to".into(), json!(routed_to));
     payload.insert("blocking".into(), json!(blocking));
@@ -5390,6 +5526,22 @@ fn answer_body_summary(shape: &str, value: &Value) -> String {
                     .join(" > ")
             })
             .unwrap_or_default(),
+        // doc_3371 entry 8: "optA: 60, optB: 40" (points per option, highest first).
+        "allocation" => value
+            .as_object()
+            .map(|m| {
+                let mut pairs: Vec<(&String, i64)> = m
+                    .iter()
+                    .map(|(k, v)| (k, v.as_i64().unwrap_or(0)))
+                    .collect();
+                pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                pairs
+                    .iter()
+                    .map(|(k, n)| format!("{k}: {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -5412,6 +5564,7 @@ pub async fn answer_question(
     let (task_id, author, payload) = load_open_question(&mut tx, comment_id).await?;
     let kind = payload.get("kind").and_then(|k| k.as_str()).unwrap_or("");
     let options = payload.get("options").cloned().unwrap_or_else(|| json!([]));
+    let config = payload.get("config").cloned().unwrap_or(Value::Null);
     let blocking = payload
         .get("blocking")
         .and_then(|b| b.as_bool())
@@ -5463,7 +5616,7 @@ pub async fn answer_question(
         }
         let expected = kind_expected_shape(kind);
         if shape == expected {
-            validate_answer_value(kind, &value, &options)?;
+            validate_answer_value(kind, &value, &options, &config)?;
             ("answered", false)
         } else if shape == "text" {
             if value.as_str().map(|s| s.trim().is_empty()).unwrap_or(true) {
@@ -25689,6 +25842,175 @@ mod tests {
             m["time_in_todo_secs"]["count"],
             json!(3),
             "every task contributes a todo sample: {m:#?}"
+        );
+        Ok(())
+    }
+
+    /// doc_3371 entry 8 (task_1257): the point_allocation kind enforces its constant-sum budget at
+    /// answer time -- an answer whose points miss the budget, name an unknown option, or are not
+    /// non-negative integers is rejected; a correct constant-sum answer is accepted and summarized.
+    /// Pose-time config validation (budget required, >= 1; no config on kinds that take none) holds.
+    #[tokio::test]
+    async fn point_allocation_enforces_constant_sum() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "allocate",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let opts = json!([
+            {"id": "a", "label": "A"},
+            {"id": "b", "label": "B"},
+            {"id": "c", "label": "C"}
+        ]);
+
+        // Pose a point_allocation question with a budget of 100.
+        let q = pose_question_configured(
+            &pool,
+            tid,
+            Some("point_allocation"),
+            "allocate 100 points",
+            Some(opts.clone()),
+            "worker",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({ "budget": 100 })),
+            Some("worker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+
+        // Wrong sum, unknown option, and non-integer points are each rejected (question stays open).
+        assert!(
+            answer_question(
+                &pool,
+                qid,
+                "allocation",
+                json!({"a": 50, "b": 40}),
+                Some("worker")
+            )
+            .await
+            .is_err(),
+            "a sub-budget sum is rejected"
+        );
+        assert!(
+            answer_question(
+                &pool,
+                qid,
+                "allocation",
+                json!({"a": 60, "z": 40}),
+                Some("worker")
+            )
+            .await
+            .is_err(),
+            "an unknown option id is rejected"
+        );
+        assert!(
+            answer_question(
+                &pool,
+                qid,
+                "allocation",
+                json!({"a": 60.5, "b": 39.5}),
+                Some("worker")
+            )
+            .await
+            .is_err(),
+            "non-integer points are rejected"
+        );
+
+        // A correct constant-sum answer is accepted and summarized highest-first.
+        let ans = answer_question(
+            &pool,
+            qid,
+            "allocation",
+            json!({"a": 60, "b": 40}),
+            Some("worker"),
+        )
+        .await?;
+        assert_eq!(ans["payload"]["shape"], json!("allocation"));
+        assert_eq!(
+            ans["body"].as_str().unwrap_or(""),
+            "a: 60, b: 40",
+            "summary lists points highest-first: {ans:#?}"
+        );
+
+        // Pose-time config validation: budget is required, must be >= 1, and no config is allowed on
+        // a kind that takes none.
+        assert!(
+            pose_question_configured(
+                &pool,
+                tid,
+                Some("point_allocation"),
+                "no config",
+                Some(opts.clone()),
+                "worker",
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("worker"),
+            )
+            .await
+            .is_err(),
+            "point_allocation requires a config.budget"
+        );
+        assert!(
+            pose_question_configured(
+                &pool,
+                tid,
+                Some("point_allocation"),
+                "zero budget",
+                Some(opts),
+                "worker",
+                true,
+                None,
+                None,
+                None,
+                None,
+                Some(json!({ "budget": 0 })),
+                Some("worker"),
+            )
+            .await
+            .is_err(),
+            "a budget of 0 is rejected"
+        );
+        assert!(
+            pose_question_configured(
+                &pool,
+                tid,
+                Some("yes_no"),
+                "yn with config",
+                None,
+                "worker",
+                true,
+                None,
+                None,
+                None,
+                None,
+                Some(json!({ "budget": 10 })),
+                Some("worker"),
+            )
+            .await
+            .is_err(),
+            "a kind that takes no config rejects one"
         );
         Ok(())
     }

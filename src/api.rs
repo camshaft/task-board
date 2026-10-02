@@ -880,7 +880,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
     Endpoint { method: "GET", path: "/api/comments/{comment_id}", summary: "Read one comment by id, with its type (plain/question/answer), parsed payload, lifecycle state, and reply_to/supersedes links.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task, routed to a principal; blocking by default. Give EITHER a legacy kind (yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list) OR omit kind for a CID-keyed question carrying an inline response_schema + ui.element_schema_cid (its canonical type id). Answers validated against the response_schema generically. Returns the question comment.", query: "", body: Some("PoseQuestionBody") },
+    Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task, routed to a principal; blocking by default. Give EITHER a legacy kind (yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list/point_allocation) OR omit kind for a CID-keyed question carrying an inline response_schema + ui.element_schema_cid (its canonical type id). Answers validated against the response_schema generically. point_allocation (doc_3371 entry 8) needs options + config={budget:N}; its answer is an object {option_id: integer_points} summing to the budget. Returns the question comment.", query: "", body: Some("PoseQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/answer", summary: "Answer an open question. For a kind-based question a framed answer (shape matching the kind) marks it answered and a text answer to a non-text kind is the out-of-frame escape; for a schema-driven question the value is validated against its response_schema generically. Returns the answer comment.", query: "", body: Some("AnswerQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/decline", summary: "Decline an open question with feedback (an explicit refusal, distinct from an out-of-frame answer).", query: "", body: Some("DeclineQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") },
@@ -1837,11 +1837,11 @@ async fn get_comment(State(st): State<AppState>, Path(comment_id): Path<i64>) ->
 
 #[derive(Deserialize, JsonSchema)]
 struct PoseQuestionBody {
-    /// Legacy kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list). Omit for a CID-keyed question carrying its own response_schema + ui.element_schema_cid (the canonical type id).
+    /// Legacy kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list / point_allocation). Omit for a CID-keyed question carrying its own response_schema + ui.element_schema_cid (the canonical type id).
     #[serde(default)]
     kind: Option<String>,
     prompt: String,
-    /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list.
+    /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list / point_allocation.
     options: Option<Value>,
     /// The principal (person/team/agent id) the question routes to; "operator" is the seeded team.
     routed_to: String,
@@ -1855,6 +1855,9 @@ struct PoseQuestionBody {
     response_schema: Option<Value>,
     /// Optional UI descriptor stored verbatim (element name, props, element-schema CID); resolved by the client, not the board.
     ui: Option<Value>,
+    /// Per-kind config. Required for point_allocation: {"budget": N} -- the constant sum (integer >= 1) an answer's points must total. Not accepted by kinds that take no config.
+    #[serde(default)]
+    config: Option<Value>,
     #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
@@ -1865,7 +1868,7 @@ async fn pose_question(
     Json(b): Json<PoseQuestionBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::pose_question_full(
+        core::pose_question_configured(
             &st.pool,
             task_id,
             b.kind.as_deref(),
@@ -1877,6 +1880,7 @@ async fn pose_question(
             b.wait_period_seconds,
             b.response_schema,
             b.ui,
+            b.config,
             b.actor.as_deref(),
         )
         .await?,
@@ -1885,9 +1889,9 @@ async fn pose_question(
 
 #[derive(Deserialize, JsonSchema)]
 struct AnswerQuestionBody {
-    /// bool / choice / text / ranked. Use text for an out-of-frame answer to a non-text kind.
+    /// bool / choice / text / ranked / allocation. Use text for an out-of-frame answer to a non-text kind.
     shape: String,
-    /// The answer value per shape (boolean; array of option ids; string; or ids in order).
+    /// The answer value per shape (boolean; array of option ids; string; ids in order; or an object {option_id: integer_points} summing to the budget for allocation).
     value: Value,
     #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
