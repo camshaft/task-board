@@ -103,7 +103,17 @@ type FormSpec =
   // array -- a CID-keyed single-select's response_schema is {type:string, enum:[ids]}, so a string
   // is required; the legacy multiple_choice kind validates by kind and expects an array.
   | { shape: 'bool'; yesLabel: string; noLabel: string }
-  | { shape: 'choice'; multi: boolean; options: QuestionOption[]; min?: number; max?: number; scalar?: boolean }
+  // `buttons` (single-choice only): render the options as inline one-tap buttons that submit on
+  // click, rather than a radio list + submit button (task_1179 quick button-response variant).
+  | {
+      shape: 'choice'
+      multi: boolean
+      options: QuestionOption[]
+      min?: number
+      max?: number
+      scalar?: boolean
+      buttons?: boolean
+    }
   | { shape: 'text'; placeholder?: string }
   | { shape: 'ranked'; options: QuestionOption[]; maxRanked?: number }
   | { shape: 'list'; min?: number; max?: number; placeholder?: string; itemLabel?: string }
@@ -113,6 +123,16 @@ type FormSpec =
 // submitted value shape so it satisfies the question's inline response_schema.
 function isArraySchema(s: unknown): boolean {
   return !!s && typeof s === 'object' && (s as Record<string, unknown>).type === 'array'
+}
+
+// A single-choice question can ask to render as quick BUTTONS -- inline option buttons that submit
+// on one tap -- instead of the radio-list + submit (task_1179). Same data model: the hint rides the
+// opaque ui descriptor, so no schema/kind change. Honored when ui.element is "buttons" or ui.props
+// carries variant/display === "buttons".
+function wantsButtons(q: QuestionPayload): boolean {
+  if (q.ui?.element === 'buttons') return true
+  const p = q.ui?.props
+  return !!p && (p.variant === 'buttons' || p.display === 'buttons')
 }
 
 function formSpecFor(q: QuestionPayload): FormSpec | null {
@@ -130,6 +150,7 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
           multi: false,
           options: asOptions(p.options),
           scalar: !isArraySchema(q.response_schema),
+          buttons: wantsButtons(q),
         }
       case 'multi-select':
         return {
@@ -165,7 +186,7 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
     case 'yes_no':
       return { shape: 'bool', yesLabel: 'Yes', noLabel: 'No' }
     case 'multiple_choice':
-      return { shape: 'choice', multi: false, options: q.options ?? [] }
+      return { shape: 'choice', multi: false, options: q.options ?? [], buttons: wantsButtons(q) }
     case 'select_all':
       return { shape: 'choice', multi: true, options: q.options ?? [] }
     case 'fill_in_the_blank':
@@ -332,7 +353,24 @@ function AnswerForm({
         </div>
       )}
 
-      {spec?.shape === 'choice' && !spec.multi && (
+      {spec?.shape === 'choice' && !spec.multi && spec.buttons && (
+        // Quick button-response variant (task_1179): one tap on an option submits it immediately,
+        // no separate submit step. Same submitted value as the radio variant below.
+        <div className="flex flex-wrap gap-2">
+          {options.map((o) => (
+            <button
+              key={o.id}
+              disabled={busy}
+              className={BTN_GHOST}
+              onClick={() => onSubmit('choice', spec.scalar ? o.id : [o.id])}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {spec?.shape === 'choice' && !spec.multi && !spec.buttons && (
         <div className="space-y-1.5">
           {options.map((o) => (
             <label key={o.id} className="flex items-center gap-2 text-sm">
