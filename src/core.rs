@@ -4155,7 +4155,7 @@ pub async fn answer_question(
     pool: &Pool,
     comment_id: i64,
     shape: &str,
-    value: Value,
+    mut value: Value,
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
@@ -4183,6 +4183,23 @@ pub async fn answer_question(
                 ("answered_outside_frame", true)
             }
         } else {
+            // The canonical yes-no element submits a raw boolean (shape=bool). If the question's
+            // response_schema is a string enum (e.g. a yes-no posed as {enum:["yes","no"]}) rather
+            // than a boolean, the raw boolean fails validation and the operator cannot answer at all
+            // (task_1093). Map the boolean to the matching yes/no enum string so the yes-no widget
+            // stays answerable regardless of how the schema was written -- but ONLY when the boolean
+            // does not already satisfy the schema AND the mapped string does, so a genuine boolean
+            // schema or a non-yes/no enum is untouched.
+            if shape == "bool" {
+                if let Some(b) = value.as_bool() {
+                    if validate_value_against_schema(schema, &value).is_err() {
+                        let mapped = json!(if b { "yes" } else { "no" });
+                        if validate_value_against_schema(schema, &mapped).is_ok() {
+                            value = mapped;
+                        }
+                    }
+                }
+            }
             validate_value_against_schema(schema, &value).map_err(|e| {
                 anyhow::anyhow!("answer does not satisfy the question's response schema: {e}")
             })?;
@@ -11397,6 +11414,139 @@ mod tests {
         )
         .await?;
         assert_eq!(q4["payload"]["default"]["approved"], json!(false));
+
+        Ok(())
+    }
+
+    /// task_1093: the canonical yes-no element submits a raw boolean, but a yes-no question posed
+    /// with a string-enum response_schema ({enum:["yes","no"]}) rejected that boolean and 500ed the
+    /// operator. answer_question now coerces the boolean to the matching yes/no enum string so the
+    /// widget stays answerable -- without misfiring on a real boolean schema or a non-yes/no enum.
+    #[tokio::test]
+    async fn yes_no_bool_answer_coerces_to_string_enum() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "rev", None, None, None, None, None).await?;
+        let pid = create_project(&pool, "P", None, Some("a"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let tid = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("asker"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let yn = json!({ "type": "string", "enum": ["yes", "no"] });
+
+        // yes-no posed with a string enum: a boolean answer is coerced to the matching enum string
+        // and recorded (true -> "yes" / false -> "no"), resolving the question answered.
+        let q_yes = pose_question_full(
+            &pool,
+            tid,
+            None,
+            "pick?",
+            None,
+            "rev",
+            false,
+            None,
+            None,
+            Some(yn.clone()),
+            Some(json!({ "element_schema_cid": "QmYesNo" })),
+            Some("asker"),
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let a_yes = answer_question(&pool, q_yes, "bool", json!(true), Some("rev")).await?;
+        assert_eq!(
+            a_yes["payload"]["value"],
+            json!("yes"),
+            "true coerced to the enum string yes"
+        );
+        assert_eq!(get_comment(&pool, q_yes).await?["state"], json!("answered"));
+
+        let q_no = pose_question_full(
+            &pool,
+            tid,
+            None,
+            "pick?",
+            None,
+            "rev",
+            false,
+            None,
+            None,
+            Some(yn.clone()),
+            Some(json!({ "element_schema_cid": "QmYesNo" })),
+            Some("asker"),
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let a_no = answer_question(&pool, q_no, "bool", json!(false), Some("rev")).await?;
+        assert_eq!(
+            a_no["payload"]["value"],
+            json!("no"),
+            "false coerced to the enum string no"
+        );
+
+        // A genuine boolean schema is untouched: the boolean validates directly, no coercion.
+        let q_bool = pose_question_full(
+            &pool,
+            tid,
+            None,
+            "pick?",
+            None,
+            "rev",
+            false,
+            None,
+            None,
+            Some(json!({ "type": "boolean" })),
+            Some(json!({ "element_schema_cid": "QmBool" })),
+            Some("asker"),
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let a_bool = answer_question(&pool, q_bool, "bool", json!(true), Some("rev")).await?;
+        assert_eq!(
+            a_bool["payload"]["value"],
+            json!(true),
+            "a boolean schema keeps the raw boolean"
+        );
+
+        // Coercion does NOT misfire on a non-yes/no enum: a boolean answer there still fails cleanly.
+        let q_other = pose_question_full(
+            &pool,
+            tid,
+            None,
+            "pick?",
+            None,
+            "rev",
+            false,
+            None,
+            None,
+            Some(json!({ "type": "string", "enum": ["approve", "deny"] })),
+            Some(json!({ "element_schema_cid": "QmOther" })),
+            Some("asker"),
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        assert!(
+            answer_question(&pool, q_other, "bool", json!(true), Some("rev"))
+                .await
+                .is_err(),
+            "a boolean against a non-yes/no string enum is not silently coerced"
+        );
 
         Ok(())
     }

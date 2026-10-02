@@ -100,6 +100,14 @@ impl IntoResponse for ApiError {
             || msg.contains("has no ciphertext to pull")
             || msg.starts_with("unknown review status")
             || msg.starts_with("unknown review log type")
+            // Structured-question answer / schema validation (task_1093): a bad answer is a client
+            // error, not a server fault -- so the client sees a clean 400, not an opaque 500.
+            || msg.starts_with("answer does not satisfy")
+            || msg.starts_with("an out-of-frame text answer")
+            || msg.starts_with("unknown answer shape")
+            || msg.starts_with("answer shape")
+            || msg.starts_with("invalid `response_schema`")
+            || msg.starts_with("invalid `default`")
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
@@ -112,6 +120,12 @@ impl IntoResponse for ApiError {
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
+        // Log the detail on a server fault so a 5xx is diagnosable from the journal rather than an
+        // opaque status (the gap behind the task_1093 answer-500 incident: tower_http logged only
+        // the status code, never the error message).
+        if code.is_server_error() {
+            tracing::error!(error = %msg, "api request failed with a server error");
+        }
         (code, Json(json!({ "error": msg }))).into_response()
     }
 }
