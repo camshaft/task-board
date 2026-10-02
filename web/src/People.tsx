@@ -226,7 +226,7 @@ function CreateForm({
       <button
         type="submit"
         disabled={!id.trim() || busy}
-        className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-40"
+        className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-40"
       >
         Add
       </button>
@@ -401,7 +401,7 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
         <button
           type="submit"
           disabled={!memberId.trim() || busy}
-          className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-40"
+          className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-40"
         >
           Add member
         </button>

@@ -164,7 +164,7 @@ export default function AgentView() {
             </button>
             <button
               onClick={() => setNudgeOpen((o) => !o)}
-              className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
+              className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-600"
             >
               Nudge
             </button>
@@ -216,7 +216,7 @@ export default function AgentView() {
             <button
               onClick={sendNudge}
               disabled={sending || !nudge.trim()}
-              className="rounded-md bg-sky-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+              className="rounded-md bg-sky-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
             >
               Send
             </button>
@@ -360,7 +360,7 @@ export default function AgentView() {
                   <button
                     disabled={busy}
                     onClick={saveMeta}
-                    className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+                    className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
                   >
                     Save
                   </button>

@@ -85,7 +85,7 @@ export default function Channels() {
             <button
               onClick={() => startDm('concierge')}
               disabled={dmBusy}
-              className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-40"
+              className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-40"
             >
               Message concierge
             </button>

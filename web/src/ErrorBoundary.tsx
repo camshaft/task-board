@@ -56,11 +56,9 @@ export default class ErrorBoundary extends Component<Props, State> {
             <button
               type="button"
               onClick={() => window.location.reload()}
-              // Explicit sky-700 hex (not the bg-sky-600 utility used elsewhere): white-on-sky-600
-              // is only ~4.08:1, just under the 4.5:1 AA floor for normal text, and a hex value is
-              // emitted as rgb() rather than Tailwind v4's oklch(), so the WCAG contrast audit can
-              // actually read it (it treats an unparsed oklch background as transparent). ~5.97:1.
-              className="rounded-md bg-[#0369a1] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#0284c7]"
+              // Primary buttons use sky-700 (not sky-600): white-on-sky-600 is only ~4.02:1, under
+              // the 4.5:1 AA floor for normal text, while white-on-sky-700 is ~5.85:1 (task_1209).
+              className="rounded-md bg-sky-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-600"
             >
               Reload
             </button>

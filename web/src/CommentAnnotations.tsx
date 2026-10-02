@@ -169,7 +169,7 @@ function AnnotationComposer({
         <button
           onClick={send}
           disabled={busy || !draft.trim()}
-          className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+          className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
         >
           Annotate
         </button>
@@ -267,7 +267,7 @@ function AnnotationThread({
           <button
             onClick={send}
             disabled={busy || !draft.trim()}
-            className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+            className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
           >
             Reply
           </button>
