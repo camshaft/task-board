@@ -173,6 +173,57 @@ function activeMention(value: string, caret: number): { start: number; query: st
   return { start: caret - query.length - 1, query }
 }
 
+// Word-boundary chars in a handle/label, so a match that starts a word (concierge in "v-concierge",
+// "Review" in "Review Bot") ranks above a mid-word one.
+const MENTION_BOUNDARY = /[-_ /.]/
+
+// Fuzzy-match a typed mention query against one candidate string, returning a rank score (higher is
+// better) or null for no match. cameron asked for fuzzy (substring/typo-tolerant) auto-complete
+// rather than exact/prefix (task_1151). Two tiers, both case-insensitive:
+//   1. Contiguous substring -> high score, boosted for a prefix or word-boundary start and for an
+//      earlier position. "cnc" matches "concierge"? no (not contiguous); "con" does, strongly.
+//   2. Subsequence (query chars appear in order, gaps allowed) -> lower score, so a dropped letter
+//      or an abbreviation still matches ("cncrge"/"camr" -> "concierge"/"cameron") but always ranks
+//      below a real substring hit. Consecutive-run and word-boundary matches earn more.
+// An empty query scores 0 for every candidate (the just-typed '@' lists everyone, as before).
+function fuzzyScore(query: string, text: string): number | null {
+  if (!query) return 0
+  const q = query.toLowerCase()
+  const t = text.toLowerCase()
+  const idx = t.indexOf(q)
+  if (idx !== -1) {
+    let score = 1000 - Math.min(idx, 100)
+    if (idx === 0) score += 500
+    else if (MENTION_BOUNDARY.test(t[idx - 1])) score += 250
+    return score
+  }
+  let ti = 0
+  let score = 0
+  let streak = 0
+  let prev = -2
+  for (const c of q) {
+    let found = -1
+    for (let j = ti; j < t.length; j++) {
+      if (t[j] === c) {
+        found = j
+        break
+      }
+    }
+    if (found === -1) return null
+    if (found === prev + 1) {
+      streak++
+      score += 10 + streak * 5
+    } else {
+      streak = 0
+      score += 1
+    }
+    if (found === 0 || MENTION_BOUNDARY.test(t[found - 1])) score += 15
+    prev = found
+    ti = found + 1
+  }
+  return score
+}
+
 export function AutoGrowTextarea({
   value,
   onChange,
@@ -198,13 +249,25 @@ export function AutoGrowTextarea({
   const [mention, setMention] = useState<{ start: number; query: string } | null>(null)
   const [sel, setSel] = useState(0)
 
+  // Fuzzy-rank the candidates against the active query (task_1151): score each on the better of its
+  // id or label, drop non-matches, and sort best-first (ties -> shorter label, then id) so the
+  // strongest match is pre-selected at the top. Top 8 only, to keep the dropdown compact.
   const candidates = mention
     ? agents
-        .filter((a) => {
-          const q = mention.query.toLowerCase()
-          return a.id.toLowerCase().includes(q) || a.label.toLowerCase().includes(q)
-        })
+        .map((a) => ({
+          a,
+          score: Math.max(
+            fuzzyScore(mention.query, a.id) ?? -Infinity,
+            fuzzyScore(mention.query, a.label) ?? -Infinity,
+          ),
+        }))
+        .filter((x) => x.score > -Infinity)
+        .sort(
+          (x, y) =>
+            y.score - x.score || x.a.label.length - y.a.label.length || x.a.id.localeCompare(y.a.id),
+        )
         .slice(0, 8)
+        .map((x) => x.a)
     : []
   const open = candidates.length > 0
 
