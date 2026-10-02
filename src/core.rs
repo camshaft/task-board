@@ -1848,6 +1848,64 @@ pub async fn enforcement_preflight(pool: &Pool) -> anyhow::Result<Value> {
     }))
 }
 
+/// The board-wide master switch for per-operator access enforcement (task 542 Phase 3 Part B5a).
+/// Read FAIL-CLOSED: a missing row -- or any value that is not exactly "true" -- means enforcement is
+/// OFF. Nothing CONSUMES this yet (read scoping / write gating key off it in later B5 slices), so it
+/// is a recorded-not-enforced toggle today; its only invariant is "defaults off, and cannot be turned
+/// on unless the enablement preflight passes" (see `set_enforcement_enabled`).
+// Consumed by the B5b/c read-scoping + write-gating slices (and an admin MCP/REST surface) that land
+// next; allow it ahead of its first caller so the foundation lands as its own reviewable slice.
+#[allow(dead_code)]
+pub async fn enforcement_enabled(pool: &Pool) -> anyhow::Result<bool> {
+    let value: Option<String> =
+        sqlx::query("SELECT value FROM board_settings WHERE key='enforcement_enabled'")
+            .fetch_optional(pool)
+            .await?
+            .map(|r| r.try_get::<String, _>("value"))
+            .transpose()?;
+    Ok(value.as_deref() == Some("true"))
+}
+
+/// Set the enforcement master switch (task 542 Phase 3 Part B5a). FAIL-CLOSED on ENABLE: turning
+/// enforcement ON is REJECTED unless `enforcement_preflight` reports `enablable=true` (the
+/// fleet-coordination team exists and holds its standing grant on every project), so a premature flip
+/// can never lock the coordination fleet out of the operator-private projects it coordinates (doc_26
+/// v12 A5 safe-enablement invariant; the task_1100 seed-before-flip lesson). Turning enforcement OFF
+/// is ALWAYS allowed (fail-safe: you can always disable). Idempotent upsert; returns
+/// `{enforcement_enabled}`.
+// Consumed by the B5 enforcement-enable path (and an admin MCP/REST surface) that lands next; allow
+// it ahead of its first caller so the foundation lands as its own reviewable slice.
+#[allow(dead_code)]
+pub async fn set_enforcement_enabled(
+    pool: &Pool,
+    enabled: bool,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    if enabled {
+        let pf = enforcement_preflight(pool).await?;
+        if pf.get("enablable").and_then(Value::as_bool) != Some(true) {
+            anyhow::bail!(
+                "cannot enable enforcement: the enablement preflight is not satisfied ({}). Seed the \
+                 fleet-coordination team and its standing grant on every project first.",
+                pf.get("blockers").cloned().unwrap_or_else(|| json!([]))
+            );
+        }
+    }
+    let ts = now_iso();
+    sqlx::query(
+        "INSERT INTO board_settings(key, value, updated_at, updated_by) \
+         VALUES('enforcement_enabled', ?, ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET \
+             value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+    )
+    .bind(if enabled { "true" } else { "false" })
+    .bind(&ts)
+    .bind(actor)
+    .execute(pool)
+    .await?;
+    Ok(json!({ "enforcement_enabled": enabled }))
+}
+
 /// A project's team grants PLUS the fully-resolved principal access map. `teams` is the raw grant
 /// list; `access` maps each reachable principal id -> {role, kind, via} where `role` is the strongest
 /// across every granting team, `kind` is "person"/"agent", and `via` is the team that conferred the
@@ -22910,6 +22968,50 @@ mod tests {
         let pf = enforcement_preflight(&pool).await?;
         assert_eq!(pf["enablable"], json!(false));
         assert_eq!(pf["fleet_coordination_team_exists"], json!(false));
+        Ok(())
+    }
+
+    /// task_542 B5a: the enforcement master switch defaults OFF, enabling is fail-closed on the
+    /// enablement preflight, and disabling is always allowed.
+    #[tokio::test]
+    async fn enforcement_switch_defaults_off_and_enable_is_fail_closed() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Defaults OFF with no row.
+        assert!(
+            !enforcement_enabled(&pool).await?,
+            "enforcement must default off"
+        );
+
+        // Seeded state (team + a granted project) is enablable, so enabling succeeds and persists.
+        create_project(&pool, "P", None, Some("concierge"), None).await?;
+        let on = set_enforcement_enabled(&pool, true, Some("concierge")).await?;
+        assert_eq!(on["enforcement_enabled"], json!(true));
+        assert!(enforcement_enabled(&pool).await?, "enable persisted");
+
+        // Disabling is always allowed.
+        set_enforcement_enabled(&pool, false, Some("concierge")).await?;
+        assert!(!enforcement_enabled(&pool).await?, "disable persisted");
+
+        // Fail-closed: with the fleet-coordination team gone the preflight fails, so enabling is
+        // rejected and the switch stays off.
+        sqlx::query("DELETE FROM teams WHERE id=?")
+            .bind(FLEET_COORDINATION_TEAM)
+            .execute(&pool)
+            .await?;
+        let err = set_enforcement_enabled(&pool, true, Some("concierge"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("preflight is not satisfied"),
+            "enable must fail closed when preflight fails: {err}"
+        );
+        assert!(
+            !enforcement_enabled(&pool).await?,
+            "a rejected enable leaves enforcement off"
+        );
         Ok(())
     }
 
