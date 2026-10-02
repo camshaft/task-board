@@ -83,7 +83,7 @@ export default function Reviews() {
       </div>
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
         <ReviewTrend />
-        {error && <p className="text-sm text-rose-300">{error.message}</p>}
+        {error && <p className="text-sm text-rose-700 dark:text-rose-300">{error.message}</p>}
         {loading && !reviews && <p className="text-sm text-[var(--color-muted)]">Loading…</p>}
         {reviews && reviews.length === 0 && (
           <p className="text-sm text-[var(--color-muted)]">No reviews yet.</p>

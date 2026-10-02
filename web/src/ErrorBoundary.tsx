@@ -43,7 +43,7 @@ export default class ErrorBoundary extends Component<Props, State> {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center p-6 text-center">
         <div className="w-full max-w-md space-y-3">
-          <h1 className="text-base font-semibold text-rose-300">Something went wrong</h1>
+          <h1 className="text-base font-semibold text-rose-700 dark:text-rose-300">Something went wrong</h1>
           <p className="text-sm text-[var(--color-muted)]">
             This page hit an unexpected error. Reloading usually fixes it.
           </p>

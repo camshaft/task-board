@@ -707,7 +707,7 @@ export function VegaLite({ code }: { code: string }) {
   if (error) {
     return (
       <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-3">
-        <p className="mb-1 text-xs text-rose-300">Couldn't render chart: {error}</p>
+        <p className="mb-1 text-xs text-rose-700 dark:text-rose-300">Couldn't render chart: {error}</p>
         <pre className="overflow-x-auto font-mono text-xs">
           <code>{code}</code>
         </pre>

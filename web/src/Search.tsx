@@ -152,7 +152,7 @@ export default function Search() {
       </div>
 
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
-        {error && <p className="text-sm text-rose-300">{error}</p>}
+        {error && <p className="text-sm text-rose-700 dark:text-rose-300">{error}</p>}
         {loading && <p className="text-sm text-[var(--color-muted)]">Searching…</p>}
         {!loading && results && results.length === 0 && (
           <p className="text-sm text-[var(--color-muted)]">No matching tasks.</p>
