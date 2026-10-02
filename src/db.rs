@@ -475,6 +475,18 @@ CREATE INDEX IF NOT EXISTS idx_doclinks_source ON document_links(source_document
 CREATE INDEX IF NOT EXISTS idx_doclinks_target ON document_links(target_path);
 CREATE INDEX IF NOT EXISTS idx_docembeds_source ON document_embeds(source_document_id);
 CREATE INDEX IF NOT EXISTS idx_docembeds_target ON document_embeds(target_path);
+
+-- Board-level key/value settings (task 542 Phase 3 Part B5). A tiny board-wide config store; the
+-- first key is `enforcement_enabled`, the master switch for per-operator access enforcement, read
+-- FAIL-CLOSED (an absent or non-"true" value => OFF). Kept separate from project/agent metadata so a
+-- board-wide toggle is not buried in one entity's row. Nothing consumes the switch yet (read scoping
+-- / write gating key off it in later slices) -- it is recorded-not-enforced today.
+CREATE TABLE IF NOT EXISTS board_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT
+);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
