@@ -83,6 +83,48 @@ impl Board {
             )
         })
     }
+
+    /// This session's AUTHENTICATED principal, independent of any client-supplied value: a trusted
+    /// forced identity (X-Fleet-Agent) if present, else the identity this session registered as.
+    /// `None` for an unregistered, header-less session. (task_1100)
+    fn authenticated_identity(&self) -> Option<String> {
+        self.forced_identity
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.identity.lock().unwrap().clone())
+    }
+
+    /// Bind the author of a GATE-RELEVANT review write (task_1100) to the authenticated caller. Unlike
+    /// `me_opt`, an authenticated session's identity CANNOT be overridden by a client-supplied author:
+    /// a forged reviewer identity on a conformance-gate entry (adversarial_review / set_review_vetted /
+    /// an approving set_review_status) can no longer be recorded. Requires an authenticated identity
+    /// and REJECTS a client-supplied author that names someone else. This is the enforcement half of
+    /// the review-integrity model (doc_82 v3 states the rule; this makes it structural, closing the
+    /// task_1099 vector that `me_opt`'s forced > CLIENT > session precedence left open).
+    fn gate_author(&self, explicit: Option<&str>) -> Result<String, McpError> {
+        let who = self.authenticated_identity().ok_or_else(|| {
+            McpError::invalid_params(
+                "this review action records a conformance-gate entry and requires an authenticated \
+                 identity: connect with your X-Fleet-Agent header or call register_agent first (a \
+                 client-supplied author is not accepted for a gate entry)"
+                    .to_string(),
+                None,
+            )
+        })?;
+        if let Some(x) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            if x != who {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "a gate-relevant review entry must be authored by your own identity \
+                         ({who}); it cannot be recorded under another agent's name ({x})"
+                    ),
+                    None,
+                ));
+            }
+        }
+        Ok(who)
+    }
 }
 
 /// Pretty-print like the Python `_j` (indent=2, default=str).
@@ -3643,7 +3685,13 @@ impl Board {
         &self,
         Parameters(a): Parameters<SetReviewStatusArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let actor = self.me_opt(s(&a.actor));
+        // Approving a review is a gate-relevant decision -> bind it to the authenticated caller
+        // (task_1100); other lifecycle transitions stay lenient.
+        let actor = if a.status.trim() == "approved" {
+            Some(self.gate_author(s(&a.actor))?)
+        } else {
+            self.me_opt(s(&a.actor))
+        };
         core::set_review_status(
             &self.pool,
             a.review_id,
@@ -3663,7 +3711,9 @@ impl Board {
         &self,
         Parameters(a): Parameters<SetReviewVettedArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let actor = self.me_opt(s(&a.actor));
+        // Setting the adversarial-review vetted flag is a gate-relevant decision: bind it to the
+        // authenticated caller, no forged actor (task_1100).
+        let actor = Some(self.gate_author(s(&a.actor))?);
         core::set_review_vetted(
             &self.pool,
             a.review_id,
@@ -3683,7 +3733,14 @@ impl Board {
         &self,
         Parameters(a): Parameters<AppendReviewLogArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let author = self.me_opt(s(&a.author));
+        // Gate-relevant entries (adversarial_review) bind the author to the authenticated caller and
+        // reject a forged reviewer identity (task_1100); other entry types stay lenient so a bridge's
+        // external_author ingestion keeps working.
+        let author = if a.entry_type.trim() == "adversarial_review" {
+            Some(self.gate_author(s(&a.author))?)
+        } else {
+            self.me_opt(s(&a.author))
+        };
         core::append_review_log(
             &self.pool,
             a.review_id,
@@ -4469,6 +4526,44 @@ mod tests {
             "forced beats an explicit value"
         );
         assert_eq!(board.me_opt(None).as_deref(), Some("forced"));
+        Ok(())
+    }
+
+    /// task_1100: a gate-relevant review write binds its author to the authenticated caller and
+    /// rejects a forged reviewer identity, closing the vector that me_opt's forced > CLIENT > session
+    /// precedence left open.
+    #[tokio::test]
+    async fn gate_author_binds_to_authenticated_caller() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool, None);
+
+        // No authenticated identity (unregistered, no header): a gate entry is rejected outright,
+        // even with a client-supplied author.
+        assert!(board.authenticated_identity().is_none());
+        assert!(
+            board.gate_author(Some("librarian")).is_err(),
+            "a gate entry with no authenticated identity is rejected"
+        );
+
+        // A registered session: the gate author is the SESSION identity; a divergent client author is
+        // rejected (the forgery vector), a matching or omitted one is accepted.
+        *board.identity.lock().unwrap() = Some("cr-reviewer".to_string());
+        assert_eq!(board.gate_author(None)?, "cr-reviewer");
+        assert_eq!(board.gate_author(Some("cr-reviewer"))?, "cr-reviewer");
+        assert!(
+            board.gate_author(Some("librarian")).is_err(),
+            "a registered agent cannot author a gate entry under another agent's name"
+        );
+
+        // A forced (X-Fleet-Agent) identity wins and likewise cannot be overridden by a client author.
+        *board.forced_identity.lock().unwrap() = Some("librarian".to_string());
+        assert_eq!(board.gate_author(None)?, "librarian");
+        assert_eq!(board.gate_author(Some("librarian"))?, "librarian");
+        assert!(
+            board.gate_author(Some("cr-reviewer")).is_err(),
+            "even a forced identity rejects a divergent client-supplied author"
+        );
         Ok(())
     }
 
