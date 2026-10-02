@@ -44,6 +44,10 @@ pub struct AppState {
     /// (the client sets its own actor). Empty (default) trusts the client everywhere. Arc so the
     /// per-request `State` clone is cheap. See [`force_trusted_user`] and `config::Settings::hosts`.
     pub host_auth: std::sync::Arc<std::collections::HashMap<String, Option<String>>>,
+    /// Deployment-defined link-tag rules (task_1243), served read-only at `GET /api/system/link-rules`
+    /// for the UI to linkify custom refs (e.g. CR-NNNN) in rendered content. Empty (default) means
+    /// no custom rules. Arc so the per-request `State` clone stays cheap. See `config::Settings::link_rules`.
+    pub link_rules: std::sync::Arc<Vec<crate::config::LinkRule>>,
 }
 
 /// Config for the authenticated DB-snapshot download endpoint, carried on [`AppState`].
@@ -235,6 +239,7 @@ pub fn router(state: AppState) -> Router {
             get(find_duplicate_tasks),
         )
         .route("/projects/{project_id}/metrics", get(project_queue_metrics))
+        .route("/system/link-rules", get(system_link_rules))
         .route("/enforcement/preflight", get(enforcement_preflight))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
@@ -873,6 +878,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects/{project_id}/age-out-todos", summary: "Age-out sweep (task_1215 sibling): soft-archive stale untriaged todos (status=todo, untouched for at least older_than_days days; default 14; 0 = no window). Scoped to status=todo, so blocked/in_progress/done/iceboxed are exempt. Reversible, idempotent. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveStaleTodosBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}/duplicates", summary: "Report-only duplicate detector (task_1215 dedup sibling): active tasks (todo/in_progress/blocked, non-archived) clustered by normalized title (case/whitespace-insensitive), returning clusters of 2+. Mutates nothing. Done/cancelled/iceboxed excluded. Returns {project_id, groups:[{title_key, count, tasks:[...]}]}.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/projects/{project_id}/metrics", summary: "Read-only queue-time metrics (task_1265): derived entirely from the events stream, no new tables. pickup_latency_secs (task creation -> first assignment), time_in_todo_secs (summed dwell in status todo), time_blocked_secs (summed dwell in status blocked, sampled over actually-blocked tasks only). Each is {count, p50, p90, max, mean} in whole seconds (nearest-rank percentiles). Mutates nothing. Returns {project_id, task_count, pickup_latency_secs, time_in_todo_secs, time_blocked_secs}.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/system/link-rules", summary: "The deployment-configured link-tag rules (task_1243): a read-only list of {pattern, url_template} the UI uses to linkify custom references (e.g. CR-NNNN) in rendered content, generalizing the built-in typed-ref linkification. Patterns live in the deployment TOML (never in source), so each deployment customizes its own tags; empty when none are configured. Returns {link_rules:[{pattern, url_template}]}. Mutates nothing.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/enforcement/preflight", summary: "Fail-closed preflight for enabling per-operator ACCESS enforcement -- checks WORKSPACE/PROJECT GRANTS, NOT document conformance (use grade_document, the doc_7 A8 rubric, for a doc's conformance). doc_26 A5: enablable=true only when the fleet-coordination team exists and holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant, blockers. Read-only.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
@@ -2115,6 +2121,12 @@ async fn project_queue_metrics(
     Ok(Json(
         core::project_queue_metrics(&st.pool, project_id).await?,
     ))
+}
+
+/// `GET /api/system/link-rules` — the deployment-configured link-tag rules (task_1243): a read-only
+/// list of {pattern, url_template} the UI linkifies in rendered content. Mutates nothing.
+async fn system_link_rules(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(json!({ "link_rules": &*st.link_rules })))
 }
 
 // --- Subscriptions ---
@@ -4001,6 +4013,7 @@ mod tests {
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
             host_auth: Default::default(),
+            link_rules: Default::default(),
         });
         Ok(())
     }
@@ -4076,6 +4089,7 @@ mod tests {
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
             host_auth: Default::default(),
+            link_rules: Default::default(),
         };
 
         let get = |uri: String| {
@@ -4133,6 +4147,7 @@ mod tests {
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
             host_auth: Default::default(),
+            link_rules: Default::default(),
         };
         // "foo" substring-matches BOTH v-foo and v-foo-helper and is not an exact id -> ambiguous.
         let resp = router(state)
@@ -4148,6 +4163,48 @@ mod tests {
             resp.status(),
             StatusCode::BAD_REQUEST,
             "ambiguous resolve_agent must be a 400 via BoardError"
+        );
+        Ok(())
+    }
+
+    /// task_1243: GET /system/link-rules serves the deployment-configured link-tag rules read-only.
+    #[tokio::test]
+    async fn system_link_rules_serves_configured_rules() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let (events_tx, _rx) = broadcast::channel(16);
+        let state = AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
+            link_rules: std::sync::Arc::new(vec![crate::config::LinkRule {
+                pattern: "CR-(\\d+)".to_string(),
+                url_template: "https://code.example.com/reviews/CR-$1".to_string(),
+            }]),
+        };
+        let resp = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/system/link-rules")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: Value = serde_json::from_slice(&bytes)?;
+        let rules = v["link_rules"].as_array().expect("link_rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["pattern"], json!("CR-(\\d+)"));
+        assert_eq!(
+            rules[0]["url_template"],
+            json!("https://code.example.com/reviews/CR-$1")
         );
         Ok(())
     }
@@ -4281,6 +4338,7 @@ mod tests {
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
             host_auth: std::sync::Arc::new(map),
+            link_rules: Default::default(),
         };
         let post = |host: &'static str, user: Option<&'static str>, author: &'static str| {
             let app = router(state.clone());
@@ -4377,6 +4435,7 @@ mod tests {
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
             host_auth: std::sync::Arc::new(map),
+            link_rules: Default::default(),
         };
         let get = |user: &'static str| {
             let app = router(state.clone());
@@ -4448,6 +4507,7 @@ mod tests {
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
             host_auth: Default::default(),
+            link_rules: Default::default(),
         };
         let get = |uri: String| {
             let app = router(state.clone());
@@ -4510,6 +4570,7 @@ mod tests {
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
             host_auth: Default::default(),
+            link_rules: Default::default(),
         };
         let resp = health(State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -4595,6 +4656,7 @@ mod tests {
                 password: Some("s3cret".into()),
             },
             host_auth: Default::default(),
+            link_rules: Default::default(),
         };
         let disabled = AppState {
             pool: pool.clone(),
@@ -4604,6 +4666,7 @@ mod tests {
             db_path: db_path.clone(),
             db_snapshot: DbSnapshotCfg::disabled(),
             host_auth: Default::default(),
+            link_rules: Default::default(),
         };
         let good = format!(
             "Basic {}",
