@@ -22,7 +22,7 @@ import {
 } from './resources'
 import { useConnectionHealth } from './store'
 import { type ThemePref, useTheme } from './theme'
-import { AGENT_DOT, relTime } from './ui'
+import { AGENT_DOT, relTime, UnreadBadge } from './ui'
 import { WikiTree } from './WikiTree'
 
 // A thin top banner shown while the backend is unreachable (e.g. the 502 window during a backend
@@ -178,6 +178,9 @@ export default function Layout() {
   for (const c of [...pubChannels, ...myChannels]) channelById.set(c.id, c)
   const channels = [...channelById.values()].sort((a, b) => a.id - b.id)
   const channelLabel = (c: Channel) => c.name || (c.private ? 'Direct message' : `#${c.id}`)
+  // Aggregate unread across the actor's channels, for a "something here for you" dot on the top-nav
+  // Channels link (task_1058 goal 3). Only the per-member list carries unread, so sum myChannels.
+  const channelsUnread = myChannels.reduce((n, c) => n + (c.unread_count ?? 0), 0)
   // Order the sidebar by project name (case-insensitive), not the server's creation-id order, so
   // the list is stable and scannable (task_1058 goal: projects appeared in an arbitrary order).
   // .filter() returns a copy, so sorting here does not mutate the shared store data.
@@ -254,9 +257,10 @@ export default function Layout() {
         </Link>
         <Link
           to="/channels"
-          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="flex items-center gap-1 text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
         >
           Channels
+          <UnreadBadge count={channelsUnread} dotOnly />
         </Link>
         <Link
           to="/people"
@@ -339,7 +343,12 @@ export default function Layout() {
                     }`}
                   >
                     <span className="text-[var(--color-muted)]">{c.private ? '🔒' : '#'}</span>
-                    <span className="truncate">{channelLabel(c)}</span>
+                    <span className={`truncate ${c.has_unread ? 'font-semibold' : ''}`}>
+                      {channelLabel(c)}
+                    </span>
+                    <span className="ml-auto">
+                      <UnreadBadge count={c.unread_count} />
+                    </span>
                   </Link>
                 ))}
                 {channels.length === 0 && (

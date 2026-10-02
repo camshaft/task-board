@@ -36,6 +36,29 @@ export const AGENT_DOT: Record<AgentStatus, string> = {
   offline: 'bg-zinc-600',
 }
 
+// Slack-style unread indicator for a channel (task_1058 goal 3). `count` > 0 renders a compact
+// sky count pill (capped "9+"); `dotOnly` renders just a dot (for an aggregate "something here"
+// marker on a nav link, where a precise count is noise). Nothing renders when count is 0/undefined,
+// so a caller can drop it in unconditionally. aria-label keeps it legible to a screen reader.
+export function UnreadBadge({ count, dotOnly }: { count?: number; dotOnly?: boolean }) {
+  if (!count || count <= 0) return null
+  if (dotOnly)
+    return (
+      <span
+        className="inline-block h-2 w-2 shrink-0 rounded-full bg-sky-400"
+        aria-label={`${count} unread`}
+      />
+    )
+  return (
+    <span
+      className="inline-flex min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-5 text-white"
+      aria-label={`${count} unread`}
+    >
+      {count > 9 ? '9+' : count}
+    </span>
+  )
+}
+
 export function StatusChip({ status }: { status: TaskStatus }) {
   return (
     <span
