@@ -1676,12 +1676,12 @@ pub struct GetCommentAnnotationsArgs {
 pub struct PoseQuestionArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
-    /// Legacy kind -- one of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list, point_allocation. OMIT it for a CID-keyed question that instead carries its own `response_schema` plus a `ui.element_schema_cid` (the element's content id, its canonical type identifier).
+    /// Legacy kind -- one of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list, point_allocation, quiz. OMIT it for a CID-keyed question that instead carries its own `response_schema` plus a `ui.element_schema_cid` (the element's content id, its canonical type identifier).
     #[serde(default)]
     pub kind: Option<String>,
     /// The question prompt.
     pub prompt: String,
-    /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list / point_allocation.
+    /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list / point_allocation / quiz.
     #[serde(default)]
     pub options: Option<serde_json::Value>,
     /// The principal (person, team, or agent id) the question routes to; "operator" is the seeded team.
@@ -1701,7 +1701,7 @@ pub struct PoseQuestionArgs {
     /// Optional UI descriptor stored verbatim (element name, props, element-schema CID); resolved by the client, not the board.
     #[serde(default)]
     pub ui: Option<serde_json::Value>,
-    /// Per-kind config object. Required for point_allocation: {"budget": N} -- the constant sum (integer >= 1) a point_allocation answer must total. Not accepted by kinds that take no config.
+    /// Per-kind config object. point_allocation: {"budget": N} -- the constant sum (integer >= 1) an answer must total. quiz: {"answer": [option_id, ...], "explanation"?: string} -- the correct option id(s) the answer is scored against (kept server-side, redacted from the question on read, revealed with the score on the answer) plus an optional explanation. Not accepted by kinds that take no config.
     #[serde(default)]
     pub config: Option<serde_json::Value>,
     #[serde(rename = "principal", alias = "actor", default)]
@@ -3681,7 +3681,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Pose a structured question on a task (doc_33), routed to a person/team/agent. Give EITHER a legacy kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list / point_allocation) OR -- for a CID-keyed question (doc_33 v16) -- omit kind and carry an inline response_schema (the validation contract) plus a ui.element_schema_cid (the element's content id, its canonical type identifier the client branches on). When a response_schema is present, submitted answers are validated against it generically. point_allocation (doc_3371 entry 8) needs options plus config={\"budget\": N}: its answer is an object {option_id: integer_points} that must sum to the budget. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Returns the question comment; notifies the routed-to principal."
+        description = "Pose a structured question on a task (doc_33), routed to a person/team/agent. Give EITHER a legacy kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list / point_allocation) OR -- for a CID-keyed question (doc_33 v16) -- omit kind and carry an inline response_schema (the validation contract) plus a ui.element_schema_cid (the element's content id, its canonical type identifier the client branches on). When a response_schema is present, submitted answers are validated against it generically. point_allocation (doc_3371 entry 8) needs options plus config={\"budget\": N}: its answer is an object {option_id: integer_points} that must sum to the budget. quiz (doc_3371 entry 10) needs options plus config={\"answer\": [option_id, ...], \"explanation\"?: string}: its answer is a choice (array of option ids) SCORED server-side against the stored key, which is redacted from the question on read and revealed with the score (correct + correct_answer + explanation) on the answer comment. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Returns the question comment; notifies the routed-to principal."
     )]
     async fn pose_question(
         &self,
