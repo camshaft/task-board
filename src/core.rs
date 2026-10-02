@@ -1217,6 +1217,13 @@ pub async fn list_projects(pool: &Pool, status: Option<&str>) -> anyhow::Result<
             m.insert("metadata".into(), meta);
             m.insert("task_counts".into(), Value::Object(cmap));
         }
+        // Phase 3: the project's team grants (visibility + roles), raw list.
+        if let Value::Object(ref mut m) = d {
+            m.insert(
+                "teams".into(),
+                Value::Array(project_grants(pool, pid).await?),
+            );
+        }
         out.push(d);
     }
     Ok(Value::Array(out))
@@ -1247,6 +1254,14 @@ pub async fn get_project(pool: &Pool, project_id: i64) -> anyhow::Result<Value> 
         m.insert(
             "tasks".into(),
             Value::Array(tasks.iter().map(|r| row_to_json_ref(r, "task")).collect()),
+        );
+    }
+    // Phase 3: the project's team grants (visibility + roles). Raw grants only here; the resolved
+    // principal access map is on project_access (GET /projects/{id}/teams).
+    if let Value::Object(ref mut m) = d {
+        m.insert(
+            "teams".into(),
+            Value::Array(project_grants(pool, project_id).await?),
         );
     }
     Ok(d)
@@ -1620,6 +1635,211 @@ pub async fn delete_team(pool: &Pool, id: &str) -> anyhow::Result<Value> {
         .execute(pool)
         .await?;
     Ok(json!({ "deleted": id }))
+}
+
+// --- Project visibility + roles (doc_26 appendix A2/A5, task 542 Phase 3 Part A: the RECORDING
+// layer; enforcement is Part B behind the two operator policy decisions) ---
+
+/// Valid project-grant roles. A principal's effective role on a project is the STRONGEST role across
+/// every granting path that reaches them (doc_26 A5 "strongest role wins").
+const PROJECT_ROLES: [&str; 3] = ["admin", "read-write", "read"];
+
+fn role_rank(role: &str) -> u8 {
+    match role {
+        "admin" => 3,
+        "read-write" => 2,
+        "read" => 1,
+        _ => 0,
+    }
+}
+
+/// Fold a principal's role from one granting path into the strongest-wins accumulator
+/// ({principal_id -> (rank, role, kind, via_team)}).
+fn fold_role(
+    acc: &mut std::collections::BTreeMap<String, (u8, String, String, String)>,
+    id: String,
+    kind: &str,
+    role: &str,
+    via: &str,
+) {
+    let rank = role_rank(role);
+    let better = acc.get(&id).map(|(r, ..)| rank > *r).unwrap_or(true);
+    if better {
+        acc.insert(
+            id,
+            (rank, role.to_string(), kind.to_string(), via.to_string()),
+        );
+    }
+}
+
+/// A project's raw team grants ([{team_id, role, cascade}]), surfaced on get_project/list_projects.
+async fn project_grants(pool: &Pool, project_id: i64) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT team_id, role, cascade_nested FROM project_teams WHERE project_id=? ORDER BY team_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for g in &rows {
+        let team_id: String = g.try_get("team_id")?;
+        let role: String = g.try_get("role")?;
+        let cascade: i64 = g.try_get("cascade_nested")?;
+        out.push(json!({ "team_id": team_id, "role": role, "cascade": cascade != 0 }));
+    }
+    Ok(out)
+}
+
+/// Attach a team to a project with a role (admin / read-write / read), idempotent -- re-attaching the
+/// same team updates its role + cascade. `cascade` (default true) extends the grant to the team's
+/// nested sub-teams; false limits it to the team's DIRECT members. Validates the role, project, and
+/// team. Returns the project with its grants + resolved access. RECORDING only -- enforcement is
+/// Phase 3 Part B.
+pub async fn attach_project_team(
+    pool: &Pool,
+    project_id: i64,
+    team_id: &str,
+    role: &str,
+    cascade: bool,
+    created_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let role = role.trim();
+    if !PROJECT_ROLES.contains(&role) {
+        anyhow::bail!("role must be \"admin\", \"read-write\", or \"read\"");
+    }
+    if sqlx::query("SELECT 1 FROM projects WHERE id=?")
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no project {project_id}");
+    }
+    if sqlx::query("SELECT 1 FROM teams WHERE id=?")
+        .bind(team_id)
+        .fetch_optional(pool)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no team {team_id}");
+    }
+    sqlx::query(
+        "INSERT INTO project_teams(project_id, team_id, role, cascade_nested, created_by, created_at) \
+         VALUES(?,?,?,?,?,?) \
+         ON CONFLICT(project_id, team_id) \
+         DO UPDATE SET role=excluded.role, cascade_nested=excluded.cascade_nested",
+    )
+    .bind(project_id)
+    .bind(team_id)
+    .bind(role)
+    .bind(cascade as i64)
+    .bind(created_by)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    project_access(pool, project_id).await
+}
+
+/// Detach a team's grant from a project (idempotent). Returns the project with its remaining grants.
+pub async fn detach_project_team(
+    pool: &Pool,
+    project_id: i64,
+    team_id: &str,
+) -> anyhow::Result<Value> {
+    sqlx::query("DELETE FROM project_teams WHERE project_id=? AND team_id=?")
+        .bind(project_id)
+        .bind(team_id)
+        .execute(pool)
+        .await?;
+    project_access(pool, project_id).await
+}
+
+/// A project's team grants PLUS the fully-resolved principal access map. `teams` is the raw grant
+/// list; `access` maps each reachable principal id -> {role, kind, via} where `role` is the strongest
+/// across every granting team, `kind` is "person"/"agent", and `via` is the team that conferred the
+/// winning role (or "(creator)" for the implicit creator admin grant, A5). A cascade grant expands
+/// nested sub-teams (cycle-guarded); a non-cascade grant counts only the team's direct person/agent
+/// members. Enforcement (Phase 3 Part B) reads this map; Part A only records + surfaces it.
+pub async fn project_access(pool: &Pool, project_id: i64) -> anyhow::Result<Value> {
+    let Some(prow) = sqlx::query("SELECT created_by FROM projects WHERE id=?")
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        anyhow::bail!("no project {project_id}");
+    };
+    let creator: Option<String> = prow.try_get("created_by")?;
+
+    let grants = sqlx::query(
+        "SELECT team_id, role, cascade_nested FROM project_teams WHERE project_id=? ORDER BY team_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut access: std::collections::BTreeMap<String, (u8, String, String, String)> =
+        std::collections::BTreeMap::new();
+
+    // Resolve each granted team to its principals in a single read tx (the deadlock-safe pattern:
+    // reuse the open connection rather than grabbing a second one per team).
+    let mut tx = pool.begin().await?;
+    for g in &grants {
+        let team_id: String = g.try_get("team_id")?;
+        let role: String = g.try_get("role")?;
+        let cascade: i64 = g.try_get("cascade_nested")?;
+        if cascade != 0 {
+            let (people, agents) = resolve_team_principals_tx(&mut tx, &team_id).await?;
+            for p in people {
+                fold_role(&mut access, p, "person", &role, &team_id);
+            }
+            for a in agents {
+                fold_role(&mut access, a, "agent", &role, &team_id);
+            }
+        } else {
+            // Direct members only -- a nested sub-team (member_kind=team) contributes nothing without
+            // cascade.
+            for r in sqlx::query("SELECT member_id, member_kind FROM team_members WHERE team_id=?")
+                .bind(&team_id)
+                .fetch_all(&mut *tx)
+                .await?
+            {
+                let mid: String = r.try_get("member_id")?;
+                let kind: String = r.try_get("member_kind")?;
+                if kind == "team" {
+                    continue;
+                }
+                fold_role(&mut access, mid, &kind, &role, &team_id);
+            }
+        }
+    }
+    tx.commit().await?;
+
+    // Implicit creator admin grant (A5): the project creator always has admin. Classify its kind from
+    // the registries (agent vs person) so the map is honest about principal kind.
+    if let Some(c) = creator {
+        let kind = if sqlx::query("SELECT 1 FROM agents WHERE id=?")
+            .bind(&c)
+            .fetch_optional(pool)
+            .await?
+            .is_some()
+        {
+            "agent"
+        } else {
+            "person"
+        };
+        fold_role(&mut access, c, kind, "admin", "(creator)");
+    }
+
+    let access_obj: Map<String, Value> = access
+        .into_iter()
+        .map(|(id, (_, role, kind, via))| (id, json!({ "role": role, "kind": kind, "via": via })))
+        .collect();
+
+    let mut out = get_project(pool, project_id).await?;
+    if let Value::Object(ref mut m) = out {
+        m.insert("access".into(), Value::Object(access_obj));
+    }
+    Ok(out)
 }
 
 /// Resolve an addressable principal id to the set of principal ids who can act on it (task 542): a
@@ -21762,6 +21982,97 @@ mod tests {
             BTreeSet::from(["v-rev".to_string()]),
             "the team-scoped agent member remains after the person deletions"
         );
+        Ok(())
+    }
+
+    /// Project visibility + roles (task 542 Phase 3 Part A): a team grant resolves to its principals
+    /// with the STRONGEST role winning across paths; a cascade grant expands nested sub-teams while a
+    /// non-cascade grant counts only direct members; the creator carries an implicit admin grant;
+    /// role/project/team are validated; detach removes the grant and get_project surfaces grants.
+    #[tokio::test]
+    async fn project_team_grants_resolve_roles_and_cascade() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        register_agent(&pool, "concierge", None, None, None, None, None).await?;
+        create_person(&pool, "alice", Some("Alice"), Some("system"), None).await?;
+        create_person(&pool, "bob", Some("Bob"), Some("system"), None).await?;
+        create_team(&pool, "eng", Some("Engineering"), Some("system"), None).await?;
+        create_team(&pool, "leads", Some("Leads"), Some("system"), None).await?;
+        add_team_member(&pool, "eng", "alice", "person", Some("system")).await?;
+        add_team_member(&pool, "leads", "alice", "person", Some("system")).await?;
+
+        let pid = create_project(&pool, "Proj A", None, Some("concierge"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // Two paths reach alice: eng=read, leads=admin -> strongest (admin) wins, recorded via leads.
+        attach_project_team(&pool, pid, "eng", "read", true, Some("system")).await?;
+        let out = attach_project_team(&pool, pid, "leads", "admin", true, Some("system")).await?;
+        assert_eq!(out["access"]["alice"]["role"], json!("admin"));
+        assert_eq!(out["access"]["alice"]["via"], json!("leads"));
+        assert_eq!(out["access"]["alice"]["kind"], json!("person"));
+        // Implicit creator admin grant (A5): concierge is admin, via (creator), classified as agent.
+        assert_eq!(out["access"]["concierge"]["role"], json!("admin"));
+        assert_eq!(out["access"]["concierge"]["via"], json!("(creator)"));
+        assert_eq!(out["access"]["concierge"]["kind"], json!("agent"));
+        // Raw grants surface on the returned project AND on a plain get_project read.
+        assert_eq!(out["teams"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            get_project(&pool, pid).await?["teams"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Cascade: team 'div' nests 'eng' and has a direct member 'bob'. A non-cascade grant counts
+        // only bob (direct); a cascade grant also reaches alice (via the nested eng team).
+        create_team(&pool, "div", Some("Division"), Some("system"), None).await?;
+        add_team_member(&pool, "div", "eng", "team", Some("system")).await?;
+        add_team_member(&pool, "div", "bob", "person", Some("system")).await?;
+        let pid2 = create_project(&pool, "Proj B", None, Some("system"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let no_cascade =
+            attach_project_team(&pool, pid2, "div", "read", false, Some("system")).await?;
+        assert_eq!(no_cascade["access"]["bob"]["role"], json!("read"));
+        assert!(
+            no_cascade["access"]["alice"].is_null(),
+            "a non-cascade grant excludes nested-team members"
+        );
+        let cascade = attach_project_team(&pool, pid2, "div", "read", true, Some("system")).await?;
+        assert_eq!(
+            cascade["access"]["alice"]["role"],
+            json!("read"),
+            "a cascade grant reaches nested-team members"
+        );
+
+        // Validation: a bad role, a missing project, and a missing team are all rejected.
+        assert!(
+            attach_project_team(&pool, pid, "eng", "owner", true, None)
+                .await
+                .is_err(),
+            "bad role rejected"
+        );
+        assert!(
+            attach_project_team(&pool, 999_999, "eng", "read", true, None)
+                .await
+                .is_err(),
+            "missing project rejected"
+        );
+        assert!(
+            attach_project_team(&pool, pid, "ghost-team", "read", true, None)
+                .await
+                .is_err(),
+            "missing team rejected"
+        );
+
+        // Detach removes the grant (idempotent): alice falls back to eng=read once leads is gone.
+        let after = detach_project_team(&pool, pid, "leads").await?;
+        assert_eq!(after["access"]["alice"]["role"], json!("read"));
+        assert_eq!(after["teams"].as_array().unwrap().len(), 1);
+        detach_project_team(&pool, pid, "leads").await?; // idempotent -- no error on a second detach
         Ok(())
     }
 }

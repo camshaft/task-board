@@ -284,6 +284,33 @@ pub struct GetProjectArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct AttachProjectTeamArgs {
+    /// The project to grant access on.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub project_id: i64,
+    /// The team handle to grant (e.g. "operator").
+    pub team_id: String,
+    /// Role: "admin", "read-write", or "read".
+    pub role: String,
+    /// Cascade the grant to the team's nested sub-teams (default true).
+    #[serde(default)]
+    pub cascade: Option<bool>,
+    #[serde(rename = "principal", alias = "created_by", default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DetachProjectTeamArgs {
+    /// The project.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub project_id: i64,
+    /// The team handle whose grant to revoke.
+    pub team_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTaskArgs {
     /// The project to create the task in. Optional when `parent_id` is given -- a child lives in its
     /// parent's project, so it is inherited. Required for a top-level task (no parent).
@@ -2673,6 +2700,54 @@ impl Board {
         Parameters(a): Parameters<TeamMemberArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::remove_team_member(&self.pool, &a.team_id, &a.member_id, &a.member_kind)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    // --- Project visibility + roles (task 542 Phase 3 Part A: recording layer) ---
+    #[tool(
+        description = "Grant a team access to a project with a role: \"admin\", \"read-write\", or \"read\" (strongest role wins across paths). Idempotent on (project, team) -- re-granting updates the role. cascade (default true) extends the grant to the team's nested sub-teams; false limits it to the team's direct members. Returns the project with its grants + resolved access. Recording layer -- enforcement follows in a later phase."
+    )]
+    async fn attach_project_team(
+        &self,
+        Parameters(a): Parameters<AttachProjectTeamArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let created_by = self.me_opt(s(&a.created_by));
+        core::attach_project_team(
+            &self.pool,
+            a.project_id,
+            &a.team_id,
+            &a.role,
+            a.cascade.unwrap_or(true),
+            created_by.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Revoke a team's grant on a project (idempotent). Returns the project with its remaining grants + resolved access."
+    )]
+    async fn detach_project_team(
+        &self,
+        Parameters(a): Parameters<DetachProjectTeamArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::detach_project_team(&self.pool, a.project_id, &a.team_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Get a project's team grants (visibility + roles) and the resolved principal access map: each principal id -> {role, kind, via} with the strongest role across paths, nested teams expanded for a cascade grant, plus the implicit creator admin grant. Read-only."
+    )]
+    async fn list_project_teams(
+        &self,
+        Parameters(a): Parameters<GetProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::project_access(&self.pool, a.project_id)
             .await
             .map_err(err)
             .and_then(ok)

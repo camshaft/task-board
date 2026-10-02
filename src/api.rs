@@ -205,6 +205,12 @@ pub fn router(state: AppState) -> Router {
             "/projects/{project_id}",
             get(get_project).patch(update_project),
         )
+        .route(
+            "/projects/{project_id}/teams",
+            get(list_project_teams)
+                .post(attach_project_team)
+                .delete(detach_project_team),
+        )
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
         .route("/tasks/{task_id}/comments", post(comment_task))
@@ -813,6 +819,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") },
+    Endpoint { method: "GET", path: "/api/projects/{project_id}/teams", summary: "Get a project's team grants (visibility + roles) + the resolved principal access map (strongest role wins; nested teams expanded for a cascade grant; implicit creator admin). Recording layer, task 542 Phase 3.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/projects/{project_id}/teams", summary: "Grant a team access to a project with a role (admin/read-write/read), idempotent. cascade (default true) extends to nested sub-teams.", query: "", body: Some("ProjectTeamBody") },
+    Endpoint { method: "DELETE", path: "/api/projects/{project_id}/teams", summary: "Revoke a team's grant on a project (idempotent).", query: "", body: Some("ProjectTeamBody") },
     Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
@@ -983,6 +992,7 @@ fn body_schemas() -> Value {
         CreatePersonBody,
         CreateTeamBody,
         TeamMemberBody,
+        ProjectTeamBody,
     )
 }
 
@@ -1414,6 +1424,59 @@ async fn update_project(
             b.actor.as_deref(),
         )
         .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ProjectTeamBody {
+    /// The team handle to grant/revoke (e.g. "operator").
+    team_id: String,
+    /// Role for the grant: "admin", "read-write", or "read". Required on attach; ignored on detach.
+    role: Option<String>,
+    /// Cascade the grant to the team's nested sub-teams (default true). Ignored on detach.
+    cascade: Option<bool>,
+    #[serde(rename = "principal", alias = "created_by")]
+    created_by: Option<String>,
+}
+
+/// GET the project's team grants + resolved principal access map (task 542 Phase 3).
+async fn list_project_teams(
+    State(st): State<AppState>,
+    Path(ProjectRef(project_id)): Path<ProjectRef>,
+) -> ApiResult {
+    Ok(Json(core::project_access(&st.pool, project_id).await?))
+}
+
+/// Attach a team to a project with a role (admin / read-write / read), idempotent.
+async fn attach_project_team(
+    State(st): State<AppState>,
+    Path(ProjectRef(project_id)): Path<ProjectRef>,
+    Json(b): Json<ProjectTeamBody>,
+) -> ApiResult {
+    let role = b.role.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("role is required: \"admin\", \"read-write\", or \"read\"")
+    })?;
+    Ok(Json(
+        core::attach_project_team(
+            &st.pool,
+            project_id,
+            &b.team_id,
+            role,
+            b.cascade.unwrap_or(true),
+            b.created_by.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+/// Detach a team's grant from a project (idempotent).
+async fn detach_project_team(
+    State(st): State<AppState>,
+    Path(ProjectRef(project_id)): Path<ProjectRef>,
+    Json(b): Json<ProjectTeamBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::detach_project_team(&st.pool, project_id, &b.team_id).await?,
     ))
 }
 
