@@ -2064,10 +2064,16 @@ impl Board {
         &self,
         Parameters(a): Parameters<GetProjectArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_project(&self.pool, a.project_id)
-            .await
-            .map_err(err)
-            .and_then(ok)
+        // task_542 B5b: scope the read to the authenticated caller when enforcement is enabled
+        // (fail-closed; inert while enforcement is off).
+        core::get_project_scoped(
+            &self.pool,
+            a.project_id,
+            self.authenticated_identity().as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(
