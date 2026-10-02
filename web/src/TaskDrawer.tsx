@@ -25,6 +25,7 @@ import {
   useTasks,
 } from './resources'
 import { Markdown } from './markdown'
+import { CommentAnnotations } from './CommentAnnotations'
 import { QuestionComment } from './questions'
 import {
   AuthorLabel,
@@ -796,7 +797,12 @@ export function TaskDrawer() {
                                   />
                                   <span>{relTime(c.created_at)}</span>
                                 </div>
-                                <Markdown source={c.body} className="text-sm" />
+                                <CommentAnnotations
+                                  commentId={c.id}
+                                  actor={actor}
+                                  body={c.body}
+                                  resolveExternal={extName}
+                                />
                               </>
                             )}
                           </li>

@@ -55,6 +55,39 @@ export function asQuote(region: unknown): RegionQuote | null {
   return null
 }
 
+// Shared CSS Custom Highlight registry for anchored regions. Several owners (each annotated comment
+// in a list) contribute ranges to the single '::highlight(tb-region)' pass, so a per-owner call
+// must not clobber the others. paintRegionRanges records this owner's ranges and rebuilds the
+// highlight from every owner; the returned cleanup drops this owner (call it on unmount or before
+// recomputing). Degrades to a no-op where the CSS Custom Highlight API is absent.
+const highlightOwners = new Map<string, Range[]>()
+
+function rebuildRegionHighlight(): void {
+  const highlights = (globalThis.CSS as unknown as { highlights?: Map<string, unknown> })?.highlights
+  const HighlightCtor = (globalThis as unknown as { Highlight?: new () => { add: (r: Range) => void } })
+    .Highlight
+  if (!highlights || !HighlightCtor) return
+  const all: Range[] = []
+  for (const rs of highlightOwners.values()) for (const r of rs) all.push(r)
+  if (all.length === 0) {
+    highlights.delete('tb-region')
+    return
+  }
+  const hl = new HighlightCtor()
+  for (const r of all) hl.add(r)
+  highlights.set('tb-region', hl as unknown)
+}
+
+export function paintRegionRanges(ownerKey: string, ranges: Range[]): () => void {
+  if (ranges.length > 0) highlightOwners.set(ownerKey, ranges)
+  else highlightOwners.delete(ownerKey)
+  rebuildRegionHighlight()
+  return () => {
+    highlightOwners.delete(ownerKey)
+    rebuildRegionHighlight()
+  }
+}
+
 // Locate a quote (optionally disambiguated by its preceding prefix) in a container's rendered text
 // and return a DOM Range spanning it - walking text nodes so a match that spans elements still
 // resolves. Returns null when the quote isn't present in the shown content.
