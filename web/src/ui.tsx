@@ -139,28 +139,47 @@ export function useCoarsePointer() {
 // used for every comment/message composer so multi-line input isn't cramped in a fixed box.
 // On desktop (fine pointer) Enter submits (matching the old <input> composers); on touch devices
 // Enter inserts a newline and you submit via the send button (task 435). Shift+Enter always newlines.
-// @-mention candidates (agents), fetched ONCE and shared across every composer — lazily, on the
-// first '@' typed anywhere, so an idle board pays nothing. A failed fetch clears the promise so a
-// later '@' retries. (task 474)
+// @-mention candidates, fetched ONCE and shared across every composer — lazily, on the first '@'
+// typed anywhere, so an idle board pays nothing. A failed fetch clears the promise so a later '@'
+// retries. (task 474) The candidate set is every mentionable principal — agents, people, and
+// identity aliases — so the auto-complete can suggest a person (@cameron) or an alias (@operator),
+// both of which already auto-link in rendered text, not just agents (task_1157, follow-on to the
+// task_1139 people-link + task_1151 fuzzy-match work).
 type MentionCandidate = { id: string; label: string }
-let mentionAgentsCache: MentionCandidate[] | null = null
-let mentionAgentsPromise: Promise<MentionCandidate[]> | null = null
-function loadMentionAgents(): Promise<MentionCandidate[]> {
-  if (mentionAgentsCache) return Promise.resolve(mentionAgentsCache)
-  if (!mentionAgentsPromise) {
-    mentionAgentsPromise = api
-      .listAgents()
-      .then((as) => {
-        const mapped = as.map((a) => ({ id: a.id, label: a.display_name || a.id }))
-        mentionAgentsCache = mapped
-        return mapped
+let mentionCandidatesCache: MentionCandidate[] | null = null
+let mentionCandidatesPromise: Promise<MentionCandidate[]> | null = null
+function loadMentionCandidates(): Promise<MentionCandidate[]> {
+  if (mentionCandidatesCache) return Promise.resolve(mentionCandidatesCache)
+  if (!mentionCandidatesPromise) {
+    // Each source is caught independently so one failing list (e.g. people) still yields the others
+    // rather than an empty dropdown.
+    const safe = <T,>(p: Promise<T[]>) => p.catch(() => [] as T[])
+    mentionCandidatesPromise = Promise.all([
+      safe(api.listAgents()),
+      safe(api.listPeople()),
+      safe(api.listIdentityAliases()),
+    ])
+      .then(([agents, people, aliases]) => {
+        // Dedup by handle, agents first then people then aliases, so an alias never shadows a real
+        // agent/person id and a handle registered as both shows once. An alias's label is its
+        // canonical target, so typing the canonical name also surfaces the alias.
+        const byId = new Map<string, MentionCandidate>()
+        for (const a of agents)
+          if (!byId.has(a.id)) byId.set(a.id, { id: a.id, label: a.display_name || a.id })
+        for (const p of people)
+          if (!byId.has(p.id)) byId.set(p.id, { id: p.id, label: p.display_name || p.id })
+        for (const al of aliases)
+          if (!byId.has(al.alias)) byId.set(al.alias, { id: al.alias, label: al.canonical })
+        const merged = [...byId.values()]
+        mentionCandidatesCache = merged
+        return merged
       })
       .catch(() => {
-        mentionAgentsPromise = null // allow a retry on the next '@'
+        mentionCandidatesPromise = null // allow a retry on the next '@'
         return []
       })
   }
-  return mentionAgentsPromise
+  return mentionCandidatesPromise
 }
 
 // The @mention token being typed immediately before the caret, if any: an '@' at a token boundary
@@ -244,8 +263,8 @@ export function AutoGrowTextarea({
   const ref = useRef<HTMLTextAreaElement>(null)
   const coarsePointer = useCoarsePointer()
   // @mention typeahead state (task 474). `mention` is the active partial token; `sel` the
-  // highlighted candidate. Agents load lazily into `agents` on the first '@'.
-  const [agents, setAgents] = useState<MentionCandidate[]>(mentionAgentsCache ?? [])
+  // highlighted candidate. The mentionable principals load lazily into `principals` on the first '@'.
+  const [principals, setPrincipals] = useState<MentionCandidate[]>(mentionCandidatesCache ?? [])
   const [mention, setMention] = useState<{ start: number; query: string } | null>(null)
   const [sel, setSel] = useState(0)
 
@@ -253,7 +272,7 @@ export function AutoGrowTextarea({
   // id or label, drop non-matches, and sort best-first (ties -> shorter label, then id) so the
   // strongest match is pre-selected at the top. Top 8 only, to keep the dropdown compact.
   const candidates = mention
-    ? agents
+    ? principals
         .map((a) => ({
           a,
           score: Math.max(
@@ -288,7 +307,7 @@ export function AutoGrowTextarea({
     const m = activeMention(v, caret)
     setMention(m)
     setSel(0)
-    if (m && agents.length === 0) loadMentionAgents().then(setAgents)
+    if (m && principals.length === 0) loadMentionCandidates().then(setPrincipals)
   }
 
   function accept(a: MentionCandidate) {
