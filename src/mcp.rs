@@ -1533,6 +1533,11 @@ pub struct SubmitToOperatorReviewArgs {
     /// so make it substantive). Required only when `template_followed` is absent.
     #[serde(default)]
     pub template_waiver_reason: Option<String>,
+    /// Acknowledge-override the placeholder / unfinished-draft submit check (task_1038), the same way
+    /// `acknowledge_banned` overrides the banned-phrase lint -- for the rare legitimate case (e.g. a
+    /// doc that discusses a marker in prose). Does NOT skip the read-the-guide attestation.
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub acknowledge: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3250,6 +3255,7 @@ impl Board {
             s(&a.actor),
             s(&a.template_followed),
             s(&a.template_waiver_reason),
+            a.acknowledge.unwrap_or(false),
             self.ipfs_api_url.as_deref(),
         )
         .await

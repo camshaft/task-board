@@ -3376,6 +3376,9 @@ struct SubmitToOperatorReviewBody {
     template_followed: Option<String>,
     /// If no template applies, a non-empty reason why. Required only when `template_followed` is absent.
     template_waiver_reason: Option<String>,
+    /// Acknowledge-override the placeholder/unfinished-draft check (task_1038); does not skip the
+    /// read-the-guide attestation.
+    acknowledge: Option<bool>,
 }
 
 async fn submit_to_operator_review(
@@ -3390,6 +3393,7 @@ async fn submit_to_operator_review(
             b.actor.as_deref(),
             b.template_followed.as_deref(),
             b.template_waiver_reason.as_deref(),
+            b.acknowledge.unwrap_or(false),
             st.ipfs_api_url.as_deref(),
         )
         .await?,

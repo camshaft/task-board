@@ -35,6 +35,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 anyhow = "1"
 thiserror = "2"
 base64 = "0.22"
+# Pattern matching for the design-doc structural submit gate (task_1038 placeholder/attestation
+# checks). Already in the tree transitively; promoted to a direct dep.
+regex = "1"
 # Socket activation: pick up a systemd-passed listening fd (LISTEN_FDS) so the socket survives a
 # restart/redeploy (mid-deploy connections queue in the backlog instead of connection-refused).
 listenfd = "1"
