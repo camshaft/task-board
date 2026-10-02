@@ -1789,6 +1789,65 @@ pub async fn detach_project_team(
     project_access(pool, project_id).await
 }
 
+/// Fail-closed preflight for enabling per-operator access enforcement (doc_26 v12 A5 safe-enablement
+/// invariant, task 542 Phase 3 Part B). Enforcement must NOT be turned on unless the seeded
+/// fleet-coordination team exists AND holds its standing grant on EVERY project -- flipping it on
+/// otherwise would strand the coordination fleet out of the projects it must reach. Read-only: returns
+/// {enablable, fleet_coordination_team, fleet_coordination_team_exists, projects_total,
+/// projects_missing_grant:[ids], blockers:[..]}. The enforcement flip (a later slice) gates on
+/// `enablable`; it is surfaced now so readiness is observable before any flip.
+pub async fn enforcement_preflight(pool: &Pool) -> anyhow::Result<Value> {
+    let team_exists = sqlx::query("SELECT 1 FROM teams WHERE id=?")
+        .bind(FLEET_COORDINATION_TEAM)
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+
+    // Projects with no fleet-coordination grant row -- the set that would be stranded if enforcement
+    // flipped on now. Empty is the safe (enablable) state.
+    let mut projects_missing_grant: Vec<i64> = Vec::new();
+    for row in sqlx::query(
+        "SELECT p.id AS id FROM projects p \
+         WHERE NOT EXISTS (SELECT 1 FROM project_teams pt \
+             WHERE pt.project_id = p.id AND pt.team_id = ?) \
+         ORDER BY p.id",
+    )
+    .bind(FLEET_COORDINATION_TEAM)
+    .fetch_all(pool)
+    .await?
+    {
+        projects_missing_grant.push(row.try_get("id")?);
+    }
+
+    let projects_total: i64 = sqlx::query("SELECT COUNT(*) AS n FROM projects")
+        .fetch_one(pool)
+        .await?
+        .try_get("n")?;
+
+    let mut blockers: Vec<String> = Vec::new();
+    if !team_exists {
+        blockers.push(format!(
+            "the fleet-coordination team ({FLEET_COORDINATION_TEAM}) does not exist"
+        ));
+    }
+    if !projects_missing_grant.is_empty() {
+        blockers.push(format!(
+            "{} project(s) lack the fleet-coordination standing grant",
+            projects_missing_grant.len()
+        ));
+    }
+    let enablable = team_exists && projects_missing_grant.is_empty();
+
+    Ok(json!({
+        "enablable": enablable,
+        "fleet_coordination_team": FLEET_COORDINATION_TEAM,
+        "fleet_coordination_team_exists": team_exists,
+        "projects_total": projects_total,
+        "projects_missing_grant": projects_missing_grant,
+        "blockers": blockers,
+    }))
+}
+
 /// A project's team grants PLUS the fully-resolved principal access map. `teams` is the raw grant
 /// list; `access` maps each reachable principal id -> {role, kind, via} where `role` is the strongest
 /// across every granting team, `kind` is "person"/"agent", and `via` is the team that conferred the
@@ -22190,6 +22249,53 @@ mod tests {
             has_grant(&get_project(&pool2, pid).await?).is_some(),
             "re-running init back-fills the standing grant on the existing project"
         );
+        Ok(())
+    }
+
+    /// Fail-closed enforcement preflight (task 542 Phase 3 Part B slice 2, doc_26 v12 A5): enablable
+    /// only when the fleet-coordination team exists AND holds its grant on every project.
+    #[tokio::test]
+    async fn enforcement_preflight_is_fail_closed() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("b.db");
+        let db_path = db_path.to_str().unwrap();
+        let pool = crate::db::init(db_path).await?;
+
+        // Freshly seeded + a project created the normal way: the team exists and every project carries
+        // the standing grant, so enforcement is enablable with no blockers.
+        let pid = create_project(&pool, "P", None, Some("concierge"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let pf = enforcement_preflight(&pool).await?;
+        assert_eq!(pf["enablable"], json!(true), "seeded state is enablable");
+        assert_eq!(pf["fleet_coordination_team_exists"], json!(true));
+        assert!(pf["projects_missing_grant"].as_array().unwrap().is_empty());
+        assert!(pf["blockers"].as_array().unwrap().is_empty());
+
+        // A project missing the grant (legacy simulation via a raw delete) strands the fleet, so the
+        // preflight fails closed and names the project.
+        sqlx::query("DELETE FROM project_teams WHERE project_id=? AND team_id=?")
+            .bind(pid)
+            .bind(FLEET_COORDINATION_TEAM)
+            .execute(&pool)
+            .await?;
+        let pf = enforcement_preflight(&pool).await?;
+        assert_eq!(
+            pf["enablable"],
+            json!(false),
+            "a stranded project blocks the flip"
+        );
+        assert_eq!(pf["projects_missing_grant"], json!([pid]));
+        assert!(!pf["blockers"].as_array().unwrap().is_empty());
+
+        // A missing fleet-coordination team also fails closed.
+        sqlx::query("DELETE FROM teams WHERE id=?")
+            .bind(FLEET_COORDINATION_TEAM)
+            .execute(&pool)
+            .await?;
+        let pf = enforcement_preflight(&pool).await?;
+        assert_eq!(pf["enablable"], json!(false));
+        assert_eq!(pf["fleet_coordination_team_exists"], json!(false));
         Ok(())
     }
 }
