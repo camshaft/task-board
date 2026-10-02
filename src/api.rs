@@ -234,6 +234,7 @@ pub fn router(state: AppState) -> Router {
             "/projects/{project_id}/duplicates",
             get(find_duplicate_tasks),
         )
+        .route("/projects/{project_id}/metrics", get(project_queue_metrics))
         .route("/enforcement/preflight", get(enforcement_preflight))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
@@ -871,6 +872,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects/{project_id}/archive-done", summary: "Retention sweep (task_1228): soft-archive every task in the project that has been done AND untouched for at least older_than_days days (default 7; 0 = no retention window). Reversible (restore), idempotent, iceboxed tasks exempt. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveDoneProposalsBody") },
     Endpoint { method: "POST", path: "/api/projects/{project_id}/age-out-todos", summary: "Age-out sweep (task_1215 sibling): soft-archive stale untriaged todos (status=todo, untouched for at least older_than_days days; default 14; 0 = no window). Scoped to status=todo, so blocked/in_progress/done/iceboxed are exempt. Reversible, idempotent. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveStaleTodosBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}/duplicates", summary: "Report-only duplicate detector (task_1215 dedup sibling): active tasks (todo/in_progress/blocked, non-archived) clustered by normalized title (case/whitespace-insensitive), returning clusters of 2+. Mutates nothing. Done/cancelled/iceboxed excluded. Returns {project_id, groups:[{title_key, count, tasks:[...]}]}.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/projects/{project_id}/metrics", summary: "Read-only queue-time metrics (task_1265): derived entirely from the events stream, no new tables. pickup_latency_secs (task creation -> first assignment), time_in_todo_secs (summed dwell in status todo), time_blocked_secs (summed dwell in status blocked, sampled over actually-blocked tasks only). Each is {count, p50, p90, max, mean} in whole seconds (nearest-rank percentiles). Mutates nothing. Returns {project_id, task_count, pickup_latency_secs, time_in_todo_secs, time_blocked_secs}.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/enforcement/preflight", summary: "Fail-closed preflight for enabling per-operator ACCESS enforcement -- checks WORKSPACE/PROJECT GRANTS, NOT document conformance (use grade_document, the doc_7 A8 rubric, for a doc's conformance). doc_26 A5: enablable=true only when the fleet-coordination team exists and holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant, blockers. Read-only.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
@@ -2097,6 +2099,17 @@ async fn find_duplicate_tasks(
 ) -> ApiResult {
     Ok(Json(
         core::find_duplicate_tasks(&st.pool, project_id).await?,
+    ))
+}
+
+/// `GET /api/projects/{project_id}/metrics` — read-only queue-time metrics (task_1265): pickup
+/// latency, time in todo, and time blocked, derived from the events stream. Mutates nothing.
+async fn project_queue_metrics(
+    State(st): State<AppState>,
+    Path(ProjectRef(project_id)): Path<ProjectRef>,
+) -> ApiResult {
+    Ok(Json(
+        core::project_queue_metrics(&st.pool, project_id).await?,
     ))
 }
 

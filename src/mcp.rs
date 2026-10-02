@@ -821,6 +821,14 @@ pub struct FindDuplicateTasksArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ProjectQueueMetricsArgs {
+    /// The project to compute queue-time metrics for.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub project_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListTasksArgs {
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub project_id: Option<i64>,
@@ -2457,6 +2465,19 @@ impl Board {
         Parameters(a): Parameters<FindDuplicateTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::find_duplicate_tasks(&self.pool, a.project_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Read-only queue-time metrics for `project_id` (task_1265), derived entirely from the events stream (no new tables). Returns {project_id, task_count, pickup_latency_secs, time_in_todo_secs, time_blocked_secs}, where pickup_latency is task creation -> first assignment, time_in_todo is summed dwell in status todo, and time_blocked is summed dwell in status blocked (sampled over actually-blocked tasks only, so a never-blocked task does not drown the percentiles). Each metric is {count, p50, p90, max, mean} in whole seconds (nearest-rank percentiles). REPORT-ONLY -- mutates nothing."
+    )]
+    async fn project_queue_metrics(
+        &self,
+        Parameters(a): Parameters<ProjectQueueMetricsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::project_queue_metrics(&self.pool, a.project_id)
             .await
             .map_err(err)
             .and_then(ok)

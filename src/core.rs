@@ -3513,6 +3513,213 @@ pub async fn find_duplicate_tasks(pool: &Pool, project_id: i64) -> anyhow::Resul
     Ok(json!({ "project_id": project_id, "groups": out }))
 }
 
+/// task_1265: read-only queue-time metrics for a project, derived entirely from the existing events
+/// table -- no new tables, the events stream IS the time series. The canonical task set + creation
+/// time come from `tasks`; first-pickup from `task.assigned`; the status timeline from
+/// `task.status_changed` (its `data` carries `{from, to}`). All durations are reported in whole
+/// seconds.
+///
+/// - pickup_latency: task creation -> first `task.assigned`.
+/// - time_in_todo: summed dwell in status `todo` across the reconstructed timeline.
+/// - time_blocked: summed dwell in status `blocked`.
+///
+/// Timeline reconstruction: the initial status is the first status_changed's `from` (else the task's
+/// current status if it never changed); each change opens a new segment; the final open segment runs
+/// to now. Time math is done in SQL via `julianday` (days) so no timestamp parsing is needed in Rust.
+pub async fn project_queue_metrics(pool: &Pool, project_id: i64) -> anyhow::Result<Value> {
+    // Canonical task set + creation time (julianday days) from the tasks table.
+    let task_rows = sqlx::query(
+        "SELECT id, status, julianday(created_at) AS jd FROM tasks \
+         WHERE project_id=? AND archived_at IS NULL",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    // Tasks that were assigned at creation (task.created carries the initial assignee in its data).
+    // These never emit a separate task.assigned event, so their pickup latency is zero wait -- the
+    // owner was set the moment the task existed. (task_1265)
+    let created_rows = sqlx::query(
+        "SELECT task_id, data FROM events \
+         WHERE type='task.created' AND project_id=? AND task_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    let mut assigned_at_creation: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for r in &created_rows {
+        let Ok(tid) = r.try_get::<i64, _>("task_id") else {
+            continue;
+        };
+        let has_assignee = r
+            .try_get::<Option<String>, _>("data")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| {
+                v.get("assignee")
+                    .map(|a| a.is_string() && !a.as_str().unwrap_or("").is_empty())
+            })
+            .unwrap_or(false);
+        if has_assignee {
+            assigned_at_creation.insert(tid);
+        }
+    }
+
+    // First post-creation assignment per task (julianday days).
+    let assign_rows = sqlx::query(
+        "SELECT task_id, MIN(julianday(created_at)) AS jd FROM events \
+         WHERE type='task.assigned' AND project_id=? AND task_id IS NOT NULL GROUP BY task_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    let mut first_assigned: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    for r in &assign_rows {
+        if let (Ok(tid), Ok(Some(jd))) = (
+            r.try_get::<i64, _>("task_id"),
+            r.try_get::<Option<f64>, _>("jd"),
+        ) {
+            first_assigned.insert(tid, jd);
+        }
+    }
+
+    // Status-change timeline per task, in emission order (seq is monotonic).
+    let change_rows = sqlx::query(
+        "SELECT task_id, julianday(created_at) AS jd, data FROM events \
+         WHERE type='task.status_changed' AND project_id=? AND task_id IS NOT NULL \
+         ORDER BY task_id, seq",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    // task_id -> ordered (jd, to, from_of_first_used_for_initial)
+    let mut timeline: std::collections::HashMap<i64, Vec<(f64, String, String)>> =
+        std::collections::HashMap::new();
+    for r in &change_rows {
+        let tid: i64 = match r.try_get("task_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let jd: f64 = match r.try_get::<Option<f64>, _>("jd") {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        let parsed: Value = r
+            .try_get::<Option<String>, _>("data")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}));
+        let from = parsed
+            .get("from")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let to = parsed
+            .get("to")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        timeline.entry(tid).or_default().push((jd, to, from));
+    }
+
+    let now_jd: f64 = sqlx::query("SELECT julianday('now') AS jd")
+        .fetch_one(pool)
+        .await?
+        .try_get("jd")?;
+
+    const DAY_SECS: f64 = 86_400.0;
+    let mut pickup: Vec<f64> = Vec::new();
+    let mut todo_dwell: Vec<f64> = Vec::new();
+    // time_blocked samples only tasks that were actually blocked at least once -- a zero from a
+    // never-blocked task would drown the percentiles and hide how long blocked tasks really wait.
+    let mut blocked_dwell: Vec<f64> = Vec::new();
+
+    for t in &task_rows {
+        let tid: i64 = t.try_get("id")?;
+        let Some(created_jd) = t.try_get::<Option<f64>, _>("jd")? else {
+            continue;
+        };
+        let cur_status: String = t
+            .try_get::<Option<String>, _>("status")?
+            .unwrap_or_default();
+
+        // Pickup latency: zero if assigned at creation; else the wait to the first assignment event.
+        // A task still unassigned (never picked up) contributes no sample.
+        if assigned_at_creation.contains(&tid) {
+            pickup.push(0.0);
+        } else if let Some(a) = first_assigned.get(&tid) {
+            let secs = (a - created_jd) * DAY_SECS;
+            if secs >= 0.0 {
+                pickup.push(secs);
+            }
+        }
+
+        let changes = timeline.get(&tid);
+        // Initial status: the first change's `from` (the state it left), else the current status.
+        let mut seg_status = changes
+            .and_then(|c| c.first())
+            .map(|(_, _, from)| from.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| cur_status.clone());
+        let mut seg_start = created_jd;
+        let mut todo = 0.0f64;
+        let mut blocked = 0.0f64;
+        let mut add = |status: &str, dur: f64| {
+            if dur > 0.0 {
+                match status {
+                    "todo" => todo += dur,
+                    "blocked" => blocked += dur,
+                    _ => {}
+                }
+            }
+        };
+        if let Some(c) = changes {
+            for (jd, to, _from) in c {
+                add(&seg_status, (jd - seg_start) * DAY_SECS);
+                seg_start = *jd;
+                seg_status = to.clone();
+            }
+        }
+        add(&seg_status, (now_jd - seg_start) * DAY_SECS);
+        todo_dwell.push(todo);
+        if blocked > 0.0 {
+            blocked_dwell.push(blocked);
+        }
+    }
+
+    Ok(json!({
+        "project_id": project_id,
+        "task_count": task_rows.len(),
+        "pickup_latency_secs": summarize(&mut pickup),
+        "time_in_todo_secs": summarize(&mut todo_dwell),
+        "time_blocked_secs": summarize(&mut blocked_dwell),
+    }))
+}
+
+/// Summarize a sample of durations (seconds) as `{count, p50, p90, max, mean}`, rounded to whole
+/// seconds; percentiles use the nearest-rank method. Mutates (sorts) the input. An empty sample
+/// reports zeros with `count: 0`. (task_1265)
+fn summarize(xs: &mut [f64]) -> Value {
+    if xs.is_empty() {
+        return json!({ "count": 0, "p50": 0, "p90": 0, "max": 0, "mean": 0 });
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = xs.len();
+    let pct = |p: f64| -> i64 {
+        let rank = ((p / 100.0) * n as f64).ceil().max(1.0) as usize;
+        xs[rank.min(n) - 1].round() as i64
+    };
+    json!({
+        "count": n,
+        "p50": pct(50.0),
+        "p90": pct(90.0),
+        "max": xs[n - 1].round() as i64,
+        "mean": (xs.iter().sum::<f64>() / n as f64).round() as i64,
+    })
+}
+
 /// Default number of most-recent comments the agent-facing MCP `get_task` inlines when the caller
 /// gives no explicit `comments_limit` (task #511). The REST/UI path stays unbounded (`None`).
 pub const DEFAULT_TASK_COMMENTS: i64 = 20;
@@ -25385,6 +25592,103 @@ mod tests {
             groups[0]["count"],
             json!(2),
             "only the two active dupes count, not done/iceboxed: {res:#?}"
+        );
+        Ok(())
+    }
+
+    /// task_1265: the read-only queue-time metrics aggregate over the real events stream -- an
+    /// assigned task reports a pickup-latency sample; a task that passed through `blocked` reports a
+    /// time_blocked sample while a never-blocked one does not; every task contributes a time_in_todo
+    /// sample. Durations are near-zero in a fast test, so this asserts the sample SHAPE and counts,
+    /// not the magnitudes.
+    #[tokio::test]
+    async fn project_queue_metrics_counts_samples_from_events() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let mk = |title: &'static str, assignee: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                create_task(
+                    &pool,
+                    pid,
+                    title,
+                    None,
+                    assignee,
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|t| t["id"].as_i64().unwrap())
+            }
+        };
+        let set_status = |id: i64, status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                update_task(
+                    &pool,
+                    id,
+                    Some(status),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+        };
+
+        // Task A: assigned at creation (pickup sample), never blocked.
+        let _a = mk("alpha", Some("worker")).await?;
+        // Task B: unassigned, driven todo -> blocked -> in_progress (blocked sample). The blocked
+        // transition requires a blocked_on target.
+        let b = mk("beta", None).await?;
+        update_task(
+            &pool,
+            b,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            Some(json!({ "kind": "external", "target": "ci" })),
+        )
+        .await?;
+        set_status(b, "in_progress").await?;
+        // Task C: unassigned, stays in todo (no pickup, no blocked sample).
+        let _c = mk("gamma", None).await?;
+
+        let m = project_queue_metrics(&pool, pid).await?;
+        assert_eq!(m["task_count"], json!(3), "all three tasks counted: {m:#?}");
+        // Only task A was ever assigned -> exactly one pickup-latency sample.
+        assert_eq!(
+            m["pickup_latency_secs"]["count"],
+            json!(1),
+            "one assigned task -> one pickup sample: {m:#?}"
+        );
+        // Only task B passed through `blocked` -> exactly one blocked sample.
+        assert_eq!(
+            m["time_blocked_secs"]["count"],
+            json!(1),
+            "only the blocked task is sampled: {m:#?}"
+        );
+        // Every task spends time in todo -> three todo samples.
+        assert_eq!(
+            m["time_in_todo_secs"]["count"],
+            json!(3),
+            "every task contributes a todo sample: {m:#?}"
         );
         Ok(())
     }
