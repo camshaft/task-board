@@ -94,6 +94,11 @@ function asCount(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : undefined
 }
 
+// Any finite number (vs asCount's non-negative integer) -- for the numeric element's bounds/step.
+function asNumber(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
 function asText(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined
 }
@@ -124,6 +129,18 @@ type FormSpec =
   | { shape: 'text'; placeholder?: string }
   | { shape: 'ranked'; options: QuestionOption[]; maxRanked?: number }
   | { shape: 'list'; min?: number; max?: number; placeholder?: string; itemLabel?: string }
+  // `number` (schema-driven, doc_3371 A1 entry 3): a single bounded number validated against the
+  // question's inline response_schema. The bounds here mirror that schema for the input's own min/
+  // max/step; the submitted value is a bare number (integer when `integer`).
+  | {
+      shape: 'number'
+      min?: number
+      max?: number
+      integer?: boolean
+      step?: number
+      placeholder?: string
+      unit?: string
+    }
   | { shape: 'age'; recipient: string }
 
 // Does a response schema expect an array value (vs a scalar)? Used to decide a single-select's
@@ -203,6 +220,16 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
           placeholder: asText(p.placeholder),
           itemLabel: asText(p.item_label),
         }
+      case 'numeric':
+        return {
+          shape: 'number',
+          min: asNumber(p.minimum),
+          max: asNumber(p.maximum),
+          integer: p.integer === true,
+          step: asNumber(p.step),
+          placeholder: asText(p.placeholder),
+          unit: asText(p.unit),
+        }
       case 'age-request': {
         const recipient = asText(p.recipient)
         // With a recipient we can encrypt in-browser; without one, fall back to the free-text escape.
@@ -262,6 +289,7 @@ function AnswerValue({
     (typeof id === 'string' ? id : JSON.stringify(id))
   if (v == null) return <Markdown source={body} className="text-sm" />
   if (typeof v === 'boolean') return <span className="text-sm font-medium">{v ? 'Yes' : 'No'}</span>
+  if (typeof v === 'number') return <span className="text-sm font-medium">{v}</span>
   if (typeof v === 'string') return <span className="text-sm">{labelFor(v)}</span>
   if (Array.isArray(v)) {
     const ordered = answer.shape === 'ranked'
@@ -376,6 +404,7 @@ function AnswerForm({
   const [choice, setChoice] = useState('')
   const [multi, setMulti] = useState<string[]>([])
   const [text, setText] = useState('')
+  const [num, setNum] = useState('')
   const [order, setOrder] = useState<string[]>(options.map((o) => o.id))
   // string-list rows (start with one empty row the operator types into).
   const [items, setItems] = useState<string[]>([''])
@@ -416,6 +445,25 @@ function AnswerForm({
   const addItem = () => setItems((xs) => [...xs, ''])
   const removeItem = (i: number) =>
     setItems((xs) => (xs.length <= 1 ? [''] : xs.filter((_, j) => j !== i)))
+
+  // number: parse the typed value and validate it against the element's bounds before enabling
+  // submit, so the client never posts a value the inline response_schema would reject.
+  const numSpec = spec?.shape === 'number' ? spec : null
+  const numParsed = num.trim() === '' ? null : Number(num)
+  const numOk =
+    numParsed != null &&
+    Number.isFinite(numParsed) &&
+    (!numSpec?.integer || Number.isInteger(numParsed)) &&
+    (numSpec?.min == null || numParsed >= numSpec.min) &&
+    (numSpec?.max == null || numParsed <= numSpec.max)
+  const numHint = (() => {
+    if (!numSpec) return null
+    const lo = numSpec.min != null
+    const hi = numSpec.max != null
+    const range = lo && hi ? `${numSpec.min}–${numSpec.max}` : lo ? `≥ ${numSpec.min}` : hi ? `≤ ${numSpec.max}` : null
+    const kind = numSpec.integer ? 'whole number' : 'number'
+    return range ? `Enter a ${kind} ${range}.` : numSpec.integer ? 'Enter a whole number.' : null
+  })()
 
   return (
     <div className="mt-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-2.5">
@@ -671,6 +719,39 @@ function AnswerForm({
               onClick={() => onSubmit('list', cleanedItems)}
             >
               Submit list
+            </button>
+          </div>
+        </div>
+      )}
+
+      {spec?.shape === 'number' && (
+        <div className="space-y-1.5">
+          {numHint && <p className="text-xs text-[var(--color-muted)]">{numHint}</p>}
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              value={num}
+              min={spec.min}
+              max={spec.max}
+              step={spec.step ?? (spec.integer ? 1 : undefined)}
+              inputMode={spec.integer ? 'numeric' : 'decimal'}
+              onChange={(e) => setNum(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && numOk && !busy) {
+                  e.preventDefault()
+                  onSubmit('number', numParsed)
+                }
+              }}
+              placeholder={spec.placeholder ?? 'Enter a number…'}
+              className="w-40 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
+            />
+            {spec.unit && <span className="text-sm text-[var(--color-muted)]">{spec.unit}</span>}
+            <button
+              disabled={busy || !numOk}
+              className={BTN}
+              onClick={() => onSubmit('number', numParsed)}
+            >
+              Submit
             </button>
           </div>
         </div>
