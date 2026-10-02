@@ -146,7 +146,7 @@ export default function Board() {
         )}
         <button
           onClick={openComposer}
-          className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
+          className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-600"
         >
           + task
         </button>
@@ -207,7 +207,7 @@ export default function Board() {
           <button
             onClick={submitNewTask}
             disabled={creating || !newTitle.trim()}
-            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-40"
+            className="rounded-md bg-sky-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-40"
           >
             Add task
           </button>

@@ -55,7 +55,7 @@ export default function Settings() {
                 <button
                   onClick={() => draftActor.trim() && setActor(draftActor)}
                   disabled={!draftActor.trim() || draftActor.trim() === actor}
-                  className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+                  className="rounded-md bg-sky-700 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
                 >
                   Save
                 </button>

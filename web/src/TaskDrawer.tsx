@@ -564,7 +564,7 @@ export function TaskDrawer() {
                           setEditDesc(null)
                           await save({ description: v })
                         }}
-                        className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+                        className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
                       >
                         Save
                       </button>
@@ -678,7 +678,7 @@ export function TaskDrawer() {
                       <button
                         disabled={busy}
                         onClick={saveMeta}
-                        className="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
+                        className="rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
                       >
                         Save
                       </button>
@@ -838,7 +838,7 @@ export function TaskDrawer() {
                 <button
                   onClick={addComment}
                   disabled={busy || !comment.trim()}
-                  className="rounded-md bg-sky-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+                  className="rounded-md bg-sky-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
                 >
                   Send
                 </button>

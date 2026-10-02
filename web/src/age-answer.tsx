@@ -9,7 +9,7 @@ import { AutoGrowTextarea } from './ui'
 // the pure-JS age-encryption library). A paste-ciphertext fallback (the question's free-text escape)
 // remains for operators who encrypt out of band.
 
-const BTN = 'rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40'
+const BTN = 'rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40'
 
 export function AgeAnswer({
   recipient,

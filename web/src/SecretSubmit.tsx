@@ -126,7 +126,7 @@ export default function SecretSubmit() {
               type="button"
               onClick={submit}
               disabled={busy || value.length === 0}
-              className="rounded-md bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {busy ? 'Encrypting + submitting…' : 'Encrypt in browser + submit'}
             </button>

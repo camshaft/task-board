@@ -341,7 +341,7 @@ function AnswerCard({
   )
 }
 
-const BTN = 'rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40'
+const BTN = 'rounded-md bg-sky-700 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40'
 const BTN_GHOST =
   'rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] ring-1 ring-inset ring-[var(--color-border)] hover:bg-[var(--color-panel-2)] disabled:opacity-40'
 
