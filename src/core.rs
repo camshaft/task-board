@@ -812,6 +812,51 @@ pub const FLEET_CONSUMED_ROSTER_FIELDS: &[&str] = &["metadata"];
 /// object. Keep every [`FLEET_CONSUMED_ROSTER_FIELDS`] entry in this list or the contract test reds.
 const COMPACT_ROSTER_FIELDS: &[&str] = &["id", "display_name", "status", "metadata"];
 
+/// Safely resolve an agent name to a single exact agent id (task_1251): the board-side guard against
+/// the prefix/substring-collision misroute (e.g. a caller resolving "v-fleet-tooling" via a
+/// list_agents(q=) substring search that also returns "v-fleet-tooling-helper", then picking the
+/// wrong one). Resolution order mirrors the fleet CLI guard (camshaft/fleet#371): (1) an EXACT id
+/// match ALWAYS wins -- a real id is never ambiguous even when it is a prefix of a longer id; (2)
+/// otherwise the candidates are agents whose id CONTAINS `name` (case-insensitive, literal substring
+/// via instr so an id's `_`/`-` are not LIKE wildcards): exactly one -> resolve it; MULTIPLE -> error
+/// listing the sorted candidate ids (disambiguate, never auto-pick); none -> error. A recipient-
+/// resolving caller uses this instead of taking the first row of a list_agents(q=) search, which is
+/// what let a substring match land on the wrong agent. Returns {name, id, match}.
+pub async fn resolve_agent(pool: &Pool, name: &str) -> anyhow::Result<Value> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("give an agent name to resolve");
+    }
+    // (1) An exact id wins outright -- never ambiguous, even when it is a prefix of a longer id.
+    if sqlx::query("SELECT 1 FROM agents WHERE id=?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
+        return Ok(json!({ "name": name, "id": name, "match": "exact" }));
+    }
+    // (2) Literal case-insensitive substring candidates (instr, so `_`/`-` are not LIKE wildcards).
+    let needle = name.to_lowercase();
+    let ids: Vec<String> =
+        sqlx::query("SELECT id FROM agents WHERE instr(lower(id), ?) > 0 ORDER BY id")
+            .bind(&needle)
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("id").ok())
+            .collect();
+    match ids.len() {
+        0 => anyhow::bail!("no agent matches '{name}' (no exact id and no substring match)"),
+        1 => Ok(json!({ "name": name, "id": ids[0], "match": "unique-substring" })),
+        _ => anyhow::bail!(
+            "'{name}' is ambiguous: it matches {} agents by substring ({}). Pass the exact agent id.",
+            ids.len(),
+            ids.join(", ")
+        ),
+    }
+}
+
 /// List agents as a lightweight ROSTER by default (task #418): each entry is a compact
 /// {id, display_name, status, metadata} — name + id + tiny presence + the small metadata bag — so a
 /// scoped read stays well under a caller's token cap (the full roster with every agent's charter
@@ -25099,6 +25144,51 @@ mod tests {
             get_task(&pool, old_icebox).await?["archived_at"].is_null(),
             "an iceboxed task is not touched by the stale-todo age-out"
         );
+        Ok(())
+    }
+
+    /// task_1251: resolve_agent prefers an EXACT id (so "v-fleet-tooling" never resolves to its
+    /// -helper superstring), resolves a unique substring, and refuses an ambiguous substring with the
+    /// sorted candidates instead of auto-picking.
+    #[tokio::test]
+    async fn resolve_agent_prefers_exact_and_disambiguates() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "v-fleet-tooling", None, None, None, None, None).await?;
+        register_agent(
+            &pool,
+            "v-fleet-tooling-helper",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        register_agent(&pool, "board-pm", None, None, None, None, None).await?;
+
+        // Exact id wins even though it is a strict prefix of the -helper id.
+        let r = resolve_agent(&pool, "v-fleet-tooling").await?;
+        assert_eq!(r["id"], json!("v-fleet-tooling"));
+        assert_eq!(r["match"], json!("exact"));
+        // The exact helper id resolves to the helper.
+        assert_eq!(
+            resolve_agent(&pool, "v-fleet-tooling-helper").await?["id"],
+            json!("v-fleet-tooling-helper")
+        );
+        // An ambiguous substring is refused, listing both candidates (never auto-picks).
+        let e = resolve_agent(&pool, "fleet-tooling")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ambiguous"), "unexpected error: {e}");
+        assert!(e.contains("v-fleet-tooling") && e.contains("v-fleet-tooling-helper"));
+        // A unique substring resolves.
+        let u = resolve_agent(&pool, "helper").await?;
+        assert_eq!(u["id"], json!("v-fleet-tooling-helper"));
+        assert_eq!(u["match"], json!("unique-substring"));
+        // No match errors.
+        assert!(resolve_agent(&pool, "nobody-here").await.is_err());
         Ok(())
     }
 }

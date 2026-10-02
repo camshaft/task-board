@@ -112,6 +112,9 @@ impl IntoResponse for ApiError {
             || msg.starts_with("cannot DM ")
             // task_1150: an operator-block with no routed question is refused -- client input error.
             || msg.contains("requires an actual ask")
+            // task_1251: resolve_agent on an ambiguous or unknown name -- a client input error.
+            || msg.contains("is ambiguous:")
+            || msg.starts_with("no agent matches ")
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
@@ -196,6 +199,7 @@ pub fn router(state: AppState) -> Router {
         .route("/meta", get(meta))
         .route("/admin/db-snapshot", get(db_snapshot))
         .route("/agents", get(list_agents).post(register_agent))
+        .route("/resolve-agent", get(resolve_agent))
         .route("/agents/{agent_id}", get(get_agent).patch(update_agent))
         .route("/agents/{agent_id}/status", post(set_status))
         .route(
@@ -843,6 +847,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/admin/db-snapshot", summary: "Download a point-in-time-consistent copy of the SQLite database (VACUUM INTO, integrity-checked), behind HTTP Basic auth. Disabled by default (404 when off); the deployment keeps it loopback/LAN-bound and off the public tunnel. The extraction primitive for host migration + DR.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&limit=int&offset=int", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
+    Endpoint { method: "GET", path: "/api/resolve-agent", summary: "Resolve an agent name to one exact agent id (task_1251): an exact id wins (never ambiguous even when it is a prefix of a longer id), a unique case-insensitive substring resolves, an ambiguous substring is refused (400) with the sorted candidate ids. The safe recipient-resolver vs picking the first row of a q= search. Returns {name, id, match}.", query: "name=str", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry). Merge-PATCH: an omitted/null field is left unchanged; to reset a nullable field to null, name it in `clear` (e.g. [\"webhook_url\"]).", query: "", body: Some("UpdateAgentBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") },
@@ -1293,6 +1298,21 @@ async fn register_agent(State(st): State<AppState>, Json(b): Json<RegisterAgentB
 
 async fn get_agent(State(st): State<AppState>, Path(agent_id): Path<String>) -> ApiResult {
     Ok(Json(core::get_agent(&st.pool, &agent_id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ResolveAgentQuery {
+    /// The agent name or id to resolve to a single exact agent id.
+    name: String,
+}
+
+/// `GET /api/resolve-agent?name=<name>` — resolve a name to one exact agent id (task_1251): an exact
+/// id wins, a unique substring resolves, an ambiguous substring is refused with the candidates.
+async fn resolve_agent(
+    State(st): State<AppState>,
+    Query(q): Query<ResolveAgentQuery>,
+) -> ApiResult {
+    Ok(Json(core::resolve_agent(&st.pool, &q.name).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]

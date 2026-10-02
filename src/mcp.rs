@@ -224,6 +224,13 @@ pub struct GetAgentArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ResolveAgentArgs {
+    /// The agent name or id to resolve to a single exact agent id.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListAgentsArgs {
     /// Filter by exact presence status (online / idle / busy / blocked / away / offline).
     #[serde(default)]
@@ -2072,6 +2079,19 @@ impl Board {
         Parameters(a): Parameters<GetAgentArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_agent(&self.pool, &a.agent_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Resolve an agent NAME to a single exact agent id (task_1251) -- the safe way to pick a DM/mention recipient instead of taking the first row of a list_agents search. An EXACT id always wins (never ambiguous even when it is a prefix of a longer id, e.g. v-fleet-tooling vs v-fleet-tooling-helper); otherwise a unique case-insensitive substring resolves, and an AMBIGUOUS substring is REFUSED with the sorted candidate ids (disambiguate, never auto-pick). Returns {name, id, match}."
+    )]
+    async fn resolve_agent(
+        &self,
+        Parameters(a): Parameters<ResolveAgentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::resolve_agent(&self.pool, &a.name)
             .await
             .map_err(err)
             .and_then(ok)
