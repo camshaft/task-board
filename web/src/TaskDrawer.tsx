@@ -818,6 +818,15 @@ export function TaskDrawer() {
             </div>
 
             <footer className="border-t border-[var(--color-border)] p-4">
+              {/* Surface a submit failure right at the composer (task_1201): the API's validation
+                  reason (non-ASCII, banned phrase, ...) is in the thrown error message, but the
+                  shared error banner is at the top of the drawer -- off-screen when you are typing
+                  down here, so a failed comment looked like nothing happened. */}
+              {error && (
+                <p className="mb-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                  {error}
+                </p>
+              )}
               <div className="flex items-end gap-2">
                 <AutoGrowTextarea
                   value={comment}
