@@ -792,6 +792,13 @@ export default function DocumentView() {
               Tip: select text in the content above to comment on it inline.
             </p>
           )}
+          {/* Show a submit failure right at the composer (task_1201): the API validation reason,
+              not just an opaque 4xx. */}
+          {actionError && (
+            <p className="mt-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+              {actionError}
+            </p>
+          )}
           <div className="mt-2 flex items-end gap-2">
             <AutoGrowTextarea
               value={draft}
