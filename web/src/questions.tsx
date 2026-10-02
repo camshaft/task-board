@@ -723,6 +723,14 @@ export function QuestionComment({
     : null
   const ageRecipient =
     elementName === 'age-request' ? asText(q?.ui?.props?.recipient) : undefined
+  // When the interactive answer form renders (an open, answerable choice / ranked question), it
+  // already draws every option as its own control (radio / buttons / scale / stars / checkboxes /
+  // rank rows). Rendering the read-only options list as well would show the options TWICE -- the
+  // doubled-question regression (task_1225). So the standalone list is for the READ-ONLY case only
+  // (viewing someone else's question, a terminal/answered state, or any build with no inline form);
+  // suppress it whenever the form below will render the same options.
+  const formShowsOptions =
+    isOpen && !!onAnswer && !!q && (spec?.shape === 'choice' || spec?.shape === 'ranked')
   return (
     <div>
       <div className="mb-1.5 flex flex-wrap items-center gap-2 text-xs text-[var(--color-muted)]">
@@ -756,8 +764,9 @@ export function QuestionComment({
         </p>
       )}
 
-      {/* Options for choice / ranked shapes (from q.options or, for a CID-keyed question, ui.props). */}
-      {options && (
+      {/* Options for choice / ranked shapes (from q.options or, for a CID-keyed question, ui.props).
+          Read-only only -- hidden when the answer form below renders the same options (task_1225). */}
+      {options && !formShowsOptions && (
         <ul className="mt-2 space-y-1">
           {options.map((o) => (
             <li
