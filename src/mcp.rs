@@ -2907,7 +2907,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Fail-closed preflight for enabling per-operator access enforcement (doc_26 A5 safe-enablement invariant). Returns whether enforcement can be safely turned on: enablable=true ONLY when the seeded fleet-coordination team exists AND holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant (ids), and blockers. Read-only; takes no arguments."
+        description = "Fail-closed preflight for enabling per-operator ACCESS enforcement -- it checks WORKSPACE/PROJECT GRANTS (team grants), NOT document conformance. (For a document's conformance/quality, use grade_document, the doc_7 A8 rubric; this tool says nothing about any doc.) doc_26 A5 safe-enablement invariant. Returns whether access enforcement can be safely turned on: enablable=true ONLY when the seeded fleet-coordination team exists AND holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant (ids), and blockers. Read-only; takes no arguments."
     )]
     async fn enforcement_preflight(
         &self,
