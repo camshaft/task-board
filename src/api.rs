@@ -285,6 +285,8 @@ pub fn router(state: AppState) -> Router {
             "/external-links",
             get(list_external_links).post(upsert_external_link),
         )
+        .route("/external-entity-tasks", post(ensure_external_entity_task))
+        .route("/external-entity-tasks/block", post(block_on_external))
         .route(
             "/workspace-kinds",
             get(list_workspace_kinds).post(set_workspace_kind),
@@ -903,8 +905,10 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log (optionally filtered to one actor). order=desc returns the latest N (newest-first) for a live feed; default asc is oldest-first for incremental pollers.", query: "since_seq=int&limit=int&actor=str&order=asc|desc", body: None },
     Endpoint { method: "GET", path: "/api/external-identities", summary: "List external (bridged) identities, optionally filtered by source.", query: "source=str", body: None },
     Endpoint { method: "POST", path: "/api/external-identities", summary: "Register/update an external identity (a bridged human/actor, e.g. slack:U123).", query: "", body: Some("UpsertExternalIdentityBody") },
-    Endpoint { method: "GET", path: "/api/external-links", summary: "List bridged links (channel-map / issue↔task / thread↔task), filter by source/board_kind/board_id.", query: "source=str&board_kind=str&board_id=int", body: None },
+    Endpoint { method: "GET", path: "/api/external-links", summary: "List bridged links (channel-map / issue↔task / thread↔task), filter by source/board_kind/board_id. Task-kind rows carry the linked task's board_status, so a sync can enumerate the live external-entity-task set and filter to non-terminal.", query: "source=str&board_kind=str&board_id=int", body: None },
     Endpoint { method: "POST", path: "/api/external-links", summary: "Map a board entity (channel|task|thread) to an external one; idempotent on (source, external_id).", query: "", body: Some("UpsertExternalLinkBody") },
+    Endpoint { method: "POST", path: "/api/external-entity-tasks", summary: "Create-or-reuse an external-entity-task for an external wait on a CR/PR (idempotent on source + lowercased owner/repo#number). State lives in metadata.external_entity; the bridge syncs it and sets it done on resolution, which auto-unblocks waiters.", query: "", body: Some("EnsureExternalEntityTaskBody") },
+    Endpoint { method: "POST", path: "/api/external-entity-tasks/block", summary: "Make a task wait on an external CR/PR: ensure the shared entity-task E and set the waiter's blocked_on={kind:task,target:E}. Collapses into blocked-on-task and auto-unblocks when the bridge resolves E.", query: "", body: Some("BlockOnExternalBody") },
     Endpoint { method: "GET", path: "/api/workspace-kinds", summary: "List custom workspace kinds (named env setup definitions fleet spin-up materializes from board data).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/workspace-kinds", summary: "Define/update a workspace kind (setup_script + config an agent is configured with); idempotent on name, config merges.", query: "", body: Some("SetWorkspaceKindBody") },
     Endpoint { method: "GET", path: "/api/workspace-kinds/{name}", summary: "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize a workspace.", query: "", body: None },
@@ -1016,6 +1020,8 @@ fn body_schemas() -> Value {
         IpfsAddBody,
         UpsertExternalIdentityBody,
         UpsertExternalLinkBody,
+        EnsureExternalEntityTaskBody,
+        BlockOnExternalBody,
         PromoteThreadBody,
         SetWorkspaceKindBody,
         AddBannedPhraseBody,
@@ -3123,6 +3129,72 @@ async fn upsert_external_link(
             &b.board_kind,
             b.board_id,
             b.metadata,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct EnsureExternalEntityTaskBody {
+    /// Originating system, e.g. "github".
+    source: String,
+    /// Repo reference: "owner/repo" or a full URL (canonicalized to lowercased owner/repo).
+    repo: String,
+    /// The CR/PR/issue number.
+    number: i64,
+    url: Option<String>,
+    /// Entity kind, e.g. "cr" | "pr" | "issue".
+    kind: Option<String>,
+    /// Project the entity-task lives in.
+    project_id: i64,
+    created_by: Option<String>,
+}
+
+async fn ensure_external_entity_task(
+    State(st): State<AppState>,
+    Json(b): Json<EnsureExternalEntityTaskBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::ensure_external_entity_task(
+            &st.pool,
+            &b.source,
+            &b.repo,
+            b.number,
+            b.url.as_deref(),
+            b.kind.as_deref(),
+            b.project_id,
+            b.created_by.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct BlockOnExternalBody {
+    /// The waiter task that should block on the external CR/PR.
+    task_id: i64,
+    source: String,
+    repo: String,
+    number: i64,
+    url: Option<String>,
+    kind: Option<String>,
+    actor: Option<String>,
+}
+
+async fn block_on_external(
+    State(st): State<AppState>,
+    Json(b): Json<BlockOnExternalBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::block_on_external(
+            &st.pool,
+            b.task_id,
+            &b.source,
+            &b.repo,
+            b.number,
+            b.url.as_deref(),
+            b.kind.as_deref(),
+            b.actor.as_deref(),
         )
         .await?,
     ))

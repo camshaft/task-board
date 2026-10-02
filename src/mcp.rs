@@ -1268,6 +1268,48 @@ pub struct ListExternalLinksArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct EnsureExternalEntityTaskArgs {
+    /// Originating system, e.g. "github".
+    pub source: String,
+    /// Repo reference: "owner/repo" or a full URL (canonicalized to lowercased owner/repo).
+    pub repo: String,
+    /// The CR/PR/issue number.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub number: i64,
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Entity kind, e.g. "cr" | "pr" | "issue".
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Project the entity-task lives in.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub project_id: i64,
+    #[serde(rename = "principal", alias = "created_by", default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BlockOnExternalArgs {
+    /// The waiter task that should block on the external CR/PR.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub task_id: i64,
+    /// Originating system, e.g. "github".
+    pub source: String,
+    /// Repo reference: "owner/repo" or a full URL.
+    pub repo: String,
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub number: i64,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(rename = "principal", alias = "actor", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PromoteThreadArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
@@ -3152,6 +3194,50 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(
+        description = "Create-or-reuse an external-entity-task for an external wait on a CR/PR (task_1328). Idempotent on the canonical key (source, lowercased owner/repo#number, board_kind=task) -- N callers resolve to ONE task E. The synced state lives in metadata.external_entity {source, kind, repo, number, url, state, last_synced}; the GitHub bridge updates it and sets E done on resolution, which auto-unblocks every waiter. `repo` may be owner/repo or a full URL. Returns the task with a `created` flag."
+    )]
+    async fn ensure_external_entity_task(
+        &self,
+        Parameters(a): Parameters<EnsureExternalEntityTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::ensure_external_entity_task(
+            &self.pool,
+            &a.source,
+            &a.repo,
+            a.number,
+            s(&a.url),
+            s(&a.kind),
+            a.project_id,
+            s(&a.created_by),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Make a task wait on an external CR/PR (task_1328): ensures the shared external-entity-task E exists (create-or-reuse in the waiter's project), then sets the waiter's blocked_on = {kind:task, target:E}. The wait collapses into the structurally-justified blocked-on-task path and auto-unblocks when the bridge resolves E. `repo` may be owner/repo or a full URL. Returns the updated waiter task."
+    )]
+    async fn block_on_external(
+        &self,
+        Parameters(a): Parameters<BlockOnExternalArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::block_on_external(
+            &self.pool,
+            a.task_id,
+            &a.source,
+            &a.repo,
+            a.number,
+            s(&a.url),
+            s(&a.kind),
+            s(&a.actor),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(
