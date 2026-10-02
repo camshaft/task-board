@@ -2297,6 +2297,16 @@ impl Board {
         )
         .await
         .map_err(err)?;
+        // task_542 B5b: filter to the authenticated caller's readable projects when enforcement is
+        // enabled (fail-closed; inert while off) BEFORE paging, so a page never surfaces a task the
+        // caller cannot see.
+        let tasks = core::filter_tasks_to_readable(
+            &self.pool,
+            tasks,
+            self.authenticated_identity().as_deref(),
+        )
+        .await
+        .map_err(err)?;
         // task_969: page the result so a large project's listing stays under the read/token cap.
         // Default 100 (task rows are larger than agent rows), max 1000; the REST/UI path is unbounded.
         let limit = a.limit.unwrap_or(100).clamp(1, 1000) as usize;

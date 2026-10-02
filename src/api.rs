@@ -1545,24 +1545,32 @@ struct ListTasksQuery {
     include_archived: Option<bool>,
 }
 
-async fn list_tasks(State(st): State<AppState>, Query(query): Query<ListTasksQuery>) -> ApiResult {
+async fn list_tasks(
+    State(st): State<AppState>,
+    viewer: Option<Extension<ForcedViewer>>,
+    Query(query): Query<ListTasksQuery>,
+) -> ApiResult {
+    let tasks = core::list_tasks(
+        &st.pool,
+        query.project_id,
+        query.status.as_deref(),
+        query.assignee.as_deref(),
+        query.unassigned.unwrap_or(false),
+        query.parent_id,
+        query.top_level.unwrap_or(false),
+        query.q.as_deref(),
+        query.blocked_on_kind.as_deref(),
+        query.blocked_on_ref.as_deref(),
+        query.meta_key.as_deref(),
+        query.meta_value.as_deref(),
+        query.include_archived.unwrap_or(false),
+    )
+    .await?;
+    // task_542 B5b: filter to the authenticated caller's readable projects when enforcement is
+    // enabled (fail-closed; a no-op while off). The viewer is stamped by force_trusted_user.
+    let viewer = viewer.map(|Extension(ForcedViewer(v))| v);
     Ok(Json(
-        core::list_tasks(
-            &st.pool,
-            query.project_id,
-            query.status.as_deref(),
-            query.assignee.as_deref(),
-            query.unassigned.unwrap_or(false),
-            query.parent_id,
-            query.top_level.unwrap_or(false),
-            query.q.as_deref(),
-            query.blocked_on_kind.as_deref(),
-            query.blocked_on_ref.as_deref(),
-            query.meta_key.as_deref(),
-            query.meta_value.as_deref(),
-            query.include_archived.unwrap_or(false),
-        )
-        .await?,
+        core::filter_tasks_to_readable(&st.pool, tasks, viewer.as_deref()).await?,
     ))
 }
 
