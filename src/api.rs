@@ -200,6 +200,14 @@ pub fn router(state: AppState) -> Router {
         .route("/comments/{comment_id}/decline", post(decline_question))
         .route("/comments/{comment_id}/cancel", post(cancel_question))
         .route("/comments/{comment_id}/supersede", post(supersede_question))
+        .route(
+            "/comments/{comment_id}/annotations",
+            get(get_comment_annotations).post(annotate_comment),
+        )
+        .route(
+            "/comment-annotations/{annotation_id}/resolve",
+            post(resolve_comment_annotation),
+        )
         .route("/tasks/awaiting", get(list_awaiting))
         .route("/tasks/{task_id}/props", patch(set_task_props))
         .route("/tasks/{task_id}/move", post(move_task))
@@ -802,6 +810,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/decline", summary: "Decline an open question with feedback (an explicit refusal, distinct from an out-of-frame answer).", query: "", body: Some("DeclineQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") },
     Endpoint { method: "POST", path: "/api/comments/{comment_id}/supersede", summary: "Supersede an open question with a replacement (doc_33 A6): the old is kept immutable + linked, the new copies its payload with a new prompt. Asker-only.", query: "", body: Some("SupersedeQuestionBody") },
+    Endpoint { method: "GET", path: "/api/comments/{comment_id}/annotations", summary: "List a task comment's annotations (oldest first), optionally filtered by status (open/resolved).", query: "status=str", body: None },
+    Endpoint { method: "POST", path: "/api/comments/{comment_id}/annotations", summary: "Annotate a task comment, optionally anchored to a highlighted span (region = free-form JSON selector, e.g. W3C/Hypothesis TextQuote+TextPosition; omit to annotate the whole comment). reply_to threads one level. Notifies the parent task's watchers.", query: "", body: Some("AnnotateCommentBody") },
+    Endpoint { method: "POST", path: "/api/comment-annotations/{annotation_id}/resolve", summary: "Mark a comment annotation resolved (open -> resolved).", query: "", body: Some("ResolveCommentBody") },
     Endpoint { method: "GET", path: "/api/tasks/awaiting", summary: "The unified 'awaiting you' queue (task_860 + task_873): everything awaiting a decision from `viewer`, keyed INDEPENDENT of assignee, team-expanded, deduped, as a FLAT array of discriminated items. kind='task' {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]} for a task blocked_on the principal OR carrying an open blocking question routed to it. kind='document' {document_id, title, status, version_no, updated_at, path} for a doc awaiting the operator's approval (status operator_review) -- emitted only when the viewer resolves to the operator.", query: "viewer=str&project_id=int&include_archived=bool", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
@@ -925,6 +936,7 @@ fn body_schemas() -> Value {
         SetDocumentPropsBody,
         CommentDocumentBody,
         ResolveCommentBody,
+        AnnotateCommentBody,
         DocumentActorBody,
         DeprecateDocumentBody,
         SubmitToOperatorReviewBody,
@@ -3349,6 +3361,67 @@ async fn resolve_comment(
 ) -> ApiResult {
     Ok(Json(
         core::resolve_comment(&st.pool, comment_id, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct CommentAnnotationsQuery {
+    status: Option<String>,
+}
+
+async fn get_comment_annotations(
+    State(st): State<AppState>,
+    Path(comment_id): Path<i64>,
+    Query(q): Query<CommentAnnotationsQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::get_comment_annotations(&st.pool, comment_id, q.status.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AnnotateCommentBody {
+    body: String,
+    #[serde(rename = "principal", alias = "author")]
+    author: Option<String>,
+    /// Free-form JSON anchor selecting a span of the comment (e.g. W3C/Hypothesis selectors). Omit
+    /// to annotate the whole comment.
+    region: Option<Value>,
+    /// Thread this annotation under another (one-level).
+    reply_to: Option<i64>,
+    /// Optional external identity id (e.g. "slack:U123") this annotation is attributed to.
+    external_author: Option<String>,
+    /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
+    acknowledge_banned: Option<bool>,
+}
+
+async fn annotate_comment(
+    State(st): State<AppState>,
+    Path(comment_id): Path<i64>,
+    Json(b): Json<AnnotateCommentBody>,
+) -> ApiResult {
+    core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
+    Ok(Json(
+        core::annotate_comment(
+            &st.pool,
+            comment_id,
+            b.author.as_deref(),
+            &b.body,
+            b.region,
+            b.reply_to,
+            b.external_author.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+async fn resolve_comment_annotation(
+    State(st): State<AppState>,
+    Path(annotation_id): Path<i64>,
+    Json(b): Json<ResolveCommentBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::resolve_comment_annotation(&st.pool, annotation_id, b.actor.as_deref()).await?,
     ))
 }
 

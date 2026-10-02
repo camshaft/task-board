@@ -8543,6 +8543,180 @@ pub async fn get_document_comments(
     ))
 }
 
+/// Turn a comment_annotation row into JSON with its `region` TEXT parsed back into a JSON object
+/// (null when the annotation covers the whole comment). Mirrors `document_comment_json`.
+fn comment_annotation_json(row: &SqliteRow) -> Value {
+    let mut obj = match row_to_json(row) {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let region: Value = obj
+        .get("region")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    obj.insert("region".into(), region);
+    Value::Object(obj)
+}
+
+/// Annotate a TASK comment, optionally anchored to a `region` (a span) of that comment (task_1033).
+/// `region` is stored verbatim as JSON (W3C/Hypothesis-style selectors) — the backend never
+/// interprets it; omit it for an annotation on the whole comment. The anchor pins to the immutable
+/// comment id. `reply_to` threads under another annotation (one level). Auto-subscribes the author
+/// to the parent task and emits `comment.annotated` to the task's fan-out.
+#[allow(clippy::too_many_arguments)]
+pub async fn annotate_comment(
+    pool: &Pool,
+    comment_id: i64,
+    author: Option<&str>,
+    body: &str,
+    region: Option<Value>,
+    reply_to: Option<i64>,
+    external_author: Option<&str>,
+) -> anyhow::Result<Value> {
+    check_bare_refs(body)?;
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    // The parent comment must exist (for a clean 404; reply_to is FK-enforced). Resolve its task so
+    // the annotation event fans out to the task's watchers, and so auto-subscribe targets the task.
+    let Some(c_row) = sqlx::query("SELECT task_id FROM comments WHERE id=?")
+        .bind(comment_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no comment {comment_id}");
+    };
+    let task_id: i64 = c_row.try_get("task_id")?;
+    let region_str = region.map(|r| r.to_string());
+    let aid: i64 = sqlx::query(
+        "INSERT INTO comment_annotations(comment_id, author, body, region, reply_to, created_at, external_author) \
+         VALUES(?,?,?,?,?,?,?) RETURNING id",
+    )
+    .bind(comment_id)
+    .bind(author)
+    .bind(body)
+    .bind(&region_str)
+    .bind(reply_to)
+    .bind(&ts)
+    .bind(external_author)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+    auto_subscribe(&mut tx, author, task_id).await?;
+    // An @mention subscribes that agent to the task, matching task-comment @mention behavior.
+    subscribe_mentions(&mut tx, body, task_id).await?;
+    let mut data = json!({ "comment_id": comment_id, "annotation_id": aid, "body": body, "reply_to": reply_to });
+    if let Some(ext) = external_author {
+        data["external_author"] = json!(ext);
+    }
+    emit(
+        &mut tx,
+        &mut hooks,
+        "comment.annotated",
+        author,
+        Some(task_id),
+        None,
+        None,
+        None,
+        data,
+        Recipients::FromTask,
+    )
+    .await?;
+    let out = sqlx::query(
+        "SELECT ca.*, ei.display_name AS external_author_name \
+         FROM comment_annotations ca LEFT JOIN external_identities ei ON ei.id = ca.external_author \
+         WHERE ca.id=?",
+    )
+    .bind(aid)
+    .fetch_optional(&mut *tx)
+    .await?
+    .as_ref()
+    .map(comment_annotation_json)
+    .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Mark a comment annotation resolved (open -> resolved) and emit `comment.annotation_resolved`.
+pub async fn resolve_comment_annotation(
+    pool: &Pool,
+    annotation_id: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    // Resolve the annotation's parent comment -> task, so the event fans out to the task's watchers.
+    let Some(row) = sqlx::query(
+        "SELECT c.task_id AS task_id FROM comment_annotations ca \
+         JOIN comments c ON c.id = ca.comment_id WHERE ca.id=?",
+    )
+    .bind(annotation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        anyhow::bail!("no comment annotation {annotation_id}");
+    };
+    let task_id: i64 = row.try_get("task_id")?;
+    sqlx::query("UPDATE comment_annotations SET status='resolved' WHERE id=?")
+        .bind(annotation_id)
+        .execute(&mut *tx)
+        .await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "comment.annotation_resolved",
+        actor,
+        Some(task_id),
+        None,
+        None,
+        None,
+        json!({ "annotation_id": annotation_id }),
+        Recipients::FromTask,
+    )
+    .await?;
+    let out = sqlx::query(
+        "SELECT ca.*, ei.display_name AS external_author_name \
+         FROM comment_annotations ca LEFT JOIN external_identities ei ON ei.id = ca.external_author \
+         WHERE ca.id=?",
+    )
+    .bind(annotation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .as_ref()
+    .map(comment_annotation_json)
+    .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// List a comment's annotations (oldest first), optionally filtered by status (open / resolved).
+pub async fn get_comment_annotations(
+    pool: &Pool,
+    comment_id: i64,
+    status: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut q = String::from(
+        "SELECT ca.*, ei.display_name AS external_author_name \
+         FROM comment_annotations ca LEFT JOIN external_identities ei ON ei.id = ca.external_author \
+         WHERE ca.comment_id=?",
+    );
+    if status.is_some() {
+        q.push_str(" AND ca.status=?");
+    }
+    q.push_str(" ORDER BY ca.id");
+    let mut query = sqlx::query(&q).bind(comment_id);
+    if let Some(s) = status {
+        query = query.bind(s);
+    }
+    let rows = query.fetch_all(pool).await?;
+    Ok(Value::Array(
+        rows.iter().map(comment_annotation_json).collect(),
+    ))
+}
+
 /// Shared driver for a document status transition: set the status (optionally stamping the
 /// current version as approved), emit an event to the doc's subscribers, and return the updated
 /// document. Approval is a stamp on a specific version, not a lock — publishing again reopens
@@ -19380,6 +19554,98 @@ mod tests {
         assert!(
             err.contains("conformance review"),
             "a non-exempt doc with no review stays blocked on conformance; got: {err}"
+        );
+        Ok(())
+    }
+
+    /// task_1033: annotate a task comment with and without a region, list, filter by status, and
+    /// resolve. region round-trips as a parsed JSON object; a whole-comment annotation has null
+    /// region; resolve flips status and the status filter reflects it; a bad comment id errors.
+    #[tokio::test]
+    async fn comment_annotations_anchor_list_and_resolve() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let c = comment_task(
+            &pool,
+            tid,
+            "the quick brown fox",
+            Some("author"),
+            None,
+            None,
+        )
+        .await?;
+        let cid = c["comment_id"].as_i64().unwrap();
+
+        // Anchored annotation: region is stored verbatim and read back as a JSON object.
+        let region = json!({
+            "type": "TextQuoteSelector",
+            "exact": "quick brown",
+            "prefix": "the ",
+            "suffix": " fox"
+        });
+        let a1 = annotate_comment(
+            &pool,
+            cid,
+            Some("reviewer"),
+            "why this phrase?",
+            Some(region.clone()),
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(a1["comment_id"].as_i64(), Some(cid));
+        assert_eq!(a1["status"], json!("open"));
+        assert_eq!(a1["region"]["exact"], json!("quick brown"));
+        let a1_id = a1["id"].as_i64().unwrap();
+
+        // Whole-comment annotation (no region) -> region is null.
+        let a2 = annotate_comment(
+            &pool,
+            cid,
+            Some("reviewer"),
+            "overall note",
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert!(a2["region"].is_null());
+
+        // List: oldest first, both present.
+        let all = get_comment_annotations(&pool, cid, None).await?;
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        assert_eq!(all[0]["id"].as_i64(), Some(a1_id));
+
+        // Resolve the first; the status filter reflects the split.
+        let resolved = resolve_comment_annotation(&pool, a1_id, Some("author")).await?;
+        assert_eq!(resolved["status"], json!("resolved"));
+        let open = get_comment_annotations(&pool, cid, Some("open")).await?;
+        assert_eq!(open.as_array().unwrap().len(), 1);
+        let done = get_comment_annotations(&pool, cid, Some("resolved")).await?;
+        assert_eq!(done.as_array().unwrap().len(), 1);
+        assert_eq!(done[0]["id"].as_i64(), Some(a1_id));
+
+        // A bad comment id is a clean error, not a silent insert.
+        assert!(
+            annotate_comment(&pool, 999_999, Some("x"), "nope", None, None, None)
+                .await
+                .is_err()
         );
         Ok(())
     }
