@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useScrollRestoration } from './scrollRestore'
+import { type DocumentSummary } from './api'
 import { useDocumentList, useProjects } from './resources'
 import { relTime } from './ui'
 
@@ -47,10 +48,32 @@ export default function Documents() {
 
   const [status, setStatus] = useState('')
   const [tag, setTag] = useState('')
+  const [query, setQuery] = useState('')
   const [showAll, setShowAll] = useState(false)
   const { data: docs, error, loading } = useDocumentList({ status, tag, showAll })
   // The default view hides charters unless pending-review; it only applies with no explicit filter.
   const defaultHideActive = !showAll && !status && !tag
+
+  // Group the flat list by project so a crowded board reads as per-project sections instead of one
+  // undifferentiated run (task_1058: "docs are a huge mess"). A client-side title filter narrows
+  // within that. Projects are name-ordered (matching the sidebar/dashboard); unfiled docs sort last
+  // under "No project"; docs within a group are most-recently-updated first.
+  const q = query.trim().toLowerCase()
+  const filtered = (docs ?? []).filter((d) => !q || d.title.toLowerCase().includes(q))
+  const groups = new Map<number | null, DocumentSummary[]>()
+  for (const d of filtered) {
+    const k = d.project_id ?? null
+    const arr = groups.get(k)
+    if (arr) arr.push(d)
+    else groups.set(k, [d])
+  }
+  for (const arr of groups.values())
+    arr.sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''))
+  const orderedKeys = [...groups.keys()].sort((a, b) => {
+    if (a === null) return 1
+    if (b === null) return -1
+    return projectName(a).localeCompare(projectName(b), undefined, { sensitivity: 'base' })
+  })
 
   return (
     <main className="flex min-w-0 flex-1 flex-col">
@@ -72,6 +95,12 @@ export default function Documents() {
             ))}
           </select>
           <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="filter by title"
+            className="w-40 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1"
+          />
+          <input
             value={tag}
             onChange={(e) => setTag(e.target.value)}
             placeholder="filter by tag"
@@ -86,11 +115,12 @@ export default function Documents() {
               · charters hidden unless pending review
             </span>
           )}
-          {(status || tag) && (
+          {(status || tag || query) && (
             <button
               onClick={() => {
                 setStatus('')
                 setTag('')
+                setQuery('')
               }}
               className="text-sky-400 hover:text-sky-300"
             >
@@ -105,41 +135,60 @@ export default function Documents() {
         {docs && docs.length === 0 && (
           <p className="text-sm text-[var(--color-muted)]">No documents yet.</p>
         )}
-        <ul className="space-y-1.5">
-          {docs?.map((d) => (
-            <li
-              key={d.id}
-              className="flex items-center gap-3 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2"
-            >
-              <DocStatusChip status={d.status} />
-              {d.deprecated_at && (
-                <span
-                  title={d.superseded_by != null ? `Deprecated, superseded by document ${d.superseded_by}` : 'Deprecated'}
-                  className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300"
-                >
-                  deprecated
-                </span>
-              )}
-              <Link
-                to={`/documents/${d.id}`}
-                className="min-w-0 flex-1 truncate text-sm hover:text-sky-300"
-              >
-                {d.title}
-              </Link>
-              {d.project_id != null && (
-                <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
-                  {projectName(d.project_id)}
-                </span>
-              )}
-              {d.created_by && (
-                <span className="font-mono text-[11px] text-[var(--color-muted)]">
-                  {d.created_by}
-                </span>
-              )}
-              <span className="text-[11px] text-[var(--color-muted)]">{relTime(d.updated_at)}</span>
-            </li>
-          ))}
-        </ul>
+        {docs && docs.length > 0 && filtered.length === 0 && (
+          <p className="text-sm text-[var(--color-muted)]">No documents match the filter.</p>
+        )}
+        <div className="space-y-5">
+          {orderedKeys.map((key) => {
+            const groupDocs = groups.get(key) ?? []
+            return (
+              <section key={key ?? 'none'}>
+                {/* Sticky project header so the section a doc belongs to stays visible while scrolling
+                    a long grouped list. */}
+                <h2 className="sticky top-0 z-10 -mx-1 mb-1.5 flex items-center gap-2 bg-[var(--color-bg)]/95 px-1 py-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)] backdrop-blur">
+                  {key == null ? (
+                    <span>No project</span>
+                  ) : (
+                    <Link to={`/projects/${key}`} className="hover:text-sky-300">
+                      {projectName(key)}
+                    </Link>
+                  )}
+                  <span className="font-mono text-[10px] normal-case">{groupDocs.length}</span>
+                </h2>
+                <ul className="space-y-1.5">
+                  {groupDocs.map((d) => (
+                    <li
+                      key={d.id}
+                      className="flex items-center gap-3 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2"
+                    >
+                      <DocStatusChip status={d.status} />
+                      {d.deprecated_at && (
+                        <span
+                          title={d.superseded_by != null ? `Deprecated, superseded by document ${d.superseded_by}` : 'Deprecated'}
+                          className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300"
+                        >
+                          deprecated
+                        </span>
+                      )}
+                      <Link
+                        to={`/documents/${d.id}`}
+                        className="min-w-0 flex-1 truncate text-sm hover:text-sky-300"
+                      >
+                        {d.title}
+                      </Link>
+                      {d.created_by && (
+                        <span className="font-mono text-[11px] text-[var(--color-muted)]">
+                          {d.created_by}
+                        </span>
+                      )}
+                      <span className="text-[11px] text-[var(--color-muted)]">{relTime(d.updated_at)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )
+          })}
+        </div>
       </div>
     </main>
   )
