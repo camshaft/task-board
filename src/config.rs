@@ -5,6 +5,7 @@
 //! a setting — it's the location of the bundled UI assets, decided by packaging, and is
 //! passed on the command line (`--web-dir`) by the Nix wrapper.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -58,6 +59,29 @@ pub struct Settings {
     /// HTTP Basic-auth password for the DB-snapshot endpoint. Required when it is enabled; deliver it
     /// via the deployment's secret manager (agenix), never role-plaintext.
     pub db_snapshot_password: Option<String>,
+    /// Per-host auth, keyed by the inbound `Host` authority's hostname (port stripped,
+    /// case-insensitive). A host whose section sets `auth_header` FORCES the acting principal of a
+    /// write to that header's value -- the client cannot attribute the write to anyone else
+    /// (`actor`/`author`/`sender`/`created_by`/`from_agent`/`invited_by` are overwritten), and a
+    /// write MISSING the header is rejected (401). A host with no `auth_header`, or any host not
+    /// listed, stays permissive (the client sets its own actor). So a tunnel-fronted public
+    /// hostname can force identity while localhost stays open for dev -- loopback is no longer
+    /// special-cased, it just has no `auth_header`. Named `hosts` (plural) because `host` above is
+    /// the bind address. Example TOML:
+    ///   [hosts.'127.0.0.1']            # permissive -- no auth_header
+    ///   [hosts.'board.example.com']
+    ///   auth_header = "x-tunnel-user"
+    #[serde(default)]
+    pub hosts: HashMap<String, HostAuth>,
+}
+
+/// Per-host auth settings (a `[hosts.'<name>']` TOML section). Extensible; only `auth_header` today.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct HostAuth {
+    /// Request header to force the acting username from, for requests whose `Host` matches this
+    /// section. Absent -> this host is permissive (the client sets its own actor).
+    pub auth_header: Option<String>,
 }
 
 impl Default for Settings {
@@ -72,6 +96,7 @@ impl Default for Settings {
             db_snapshot_enabled: false,
             db_snapshot_user: None,
             db_snapshot_password: None,
+            hosts: HashMap::new(),
         }
     }
 }
@@ -99,6 +124,10 @@ pub struct Config {
     pub db_snapshot_user: Option<String>,
     /// Basic-auth password for the DB-snapshot endpoint. See `Settings::db_snapshot_password`.
     pub db_snapshot_password: Option<String>,
+    /// Per-host auth, keyed by hostname. A host with an `auth_header` forces the acting user from
+    /// that header on writes; unlisted hosts (and hosts without `auth_header`) stay permissive. See
+    /// `Settings::hosts`.
+    pub hosts: HashMap<String, HostAuth>,
 }
 
 impl Config {
@@ -128,6 +157,7 @@ impl Config {
             db_snapshot_enabled: s.db_snapshot_enabled,
             db_snapshot_user: s.db_snapshot_user.filter(|s| !s.is_empty()),
             db_snapshot_password: s.db_snapshot_password.filter(|s| !s.is_empty()),
+            hosts: s.hosts,
         }
     }
 }
