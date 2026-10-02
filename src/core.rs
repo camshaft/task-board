@@ -2736,11 +2736,13 @@ pub async fn update_task(
             "give a `blocked_on` recording what this blocked task is waiting on. kind is one of: task, agent, team, operator, external. Examples: blocked_on:\"operator\" | blocked_on:\"task:611\" | blocked_on:{{\"kind\":\"agent\",\"target\":\"<agent-id>\"}}. The flat form blocked_on_kind:\"task\", blocked_on_ref:\"611\" also works; pass kind=\"none\" to clear."
         );
     }
-    // task_1150 (firm half, WARN): an operator-block must carry an actual ask -- an open blocking
-    // question routed to the operator. "you can't just block anymore. you have to have an actual
-    // ask" (cameron, task_1150). WARN now, not reject (seed-before-flip: the fleet loop-templates
-    // must learn to pose a question first before this hard-rejects, or every current bare
-    // operator-block breaks). The enforcement flip pairs with task_1148, which consumes this same
+    // task_1150: an operator-block must carry an actual ask -- an open blocking question routed to
+    // the operator. "you can't just block anymore. you have to have an actual ask" (cameron,
+    // task_1150). NEWLY setting one is now hard-REJECTED (the ENFORCE guard above, flipped once the
+    // seed-before-flip gate was met); the residual WARN below covers only the Leave case -- an
+    // EXISTING bare operator-block being re-touched (e.g. its question was answered/closed and the
+    // scalar block lingers) -- which must stay non-fatal so it does not brick unrelated edits to the
+    // pre-flip bare blocks. The enforcement pairs with task_1148, which consumes this same
     // question-link to auto-clear the block when the operator answers. Scoped to kind=operator (the
     // FIRM half); the PROPOSED agent/team-block rule is pending cameron.
     let effective_operator_block = new_status == "blocked"
@@ -2749,6 +2751,46 @@ pub async fn update_task(
             BlockedChange::Leave => old_blocked_kind.as_deref() == Some("operator"),
             BlockedChange::Clear => false,
         };
+    // task_1150 ENFORCE flip (seed-before-flip gate MET -- v-fleet-tooling seeded the
+    // route-via-concierge + operator-block-needs-a-question norms into every looping agent's kickoff,
+    // task_1164/task_1178): NEWLY SETTING an operator-block now HARD-REJECTS unless the task already
+    // carries an open blocking question routed to the operator. "you can't just block anymore. you
+    // have to have an actual ask" (cameron, task_1150). Scoped to a Set of kind=operator on purpose:
+    // the flip must NOT brick the pre-flip bare operator-blocks already on the board, nor an unrelated
+    // edit to one of them -- those stay a non-fatal WARN (the Leave branch below) and are cleared by
+    // owner backfill (attach a question), not by this guard. The existence check runs on the OPEN tx
+    // (a second pool connection here would deadlock the pool, the same hazard the post-commit WARN
+    // documents) via a recursive walk of the operator team-routing set -- mirroring the WARN's
+    // routed_to-in-principals_routing_to("operator") test so WARN and ENFORCE agree on "has a question".
+    if new_status == "blocked" {
+        if let BlockedChange::Set { kind, .. } = &change {
+            if kind == "operator" {
+                let has_operator_question = sqlx::query(&format!(
+                    "WITH RECURSIVE op_routes(id) AS ( \
+                        SELECT 'operator' \
+                        UNION \
+                        SELECT tm.team_id FROM team_members tm JOIN op_routes r ON tm.member_id = r.id \
+                     ) \
+                     SELECT 1 FROM comments c \
+                     WHERE c.task_id=? AND {OPEN_BLOCKING_QUESTION} \
+                       AND json_extract(c.payload,'$.routed_to') IN (SELECT id FROM op_routes) LIMIT 1"
+                ))
+                .bind(task_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+                if !has_operator_question {
+                    anyhow::bail!(
+                        "blocked_on=operator requires an actual ask: this task carries no open \
+                         blocking question routed to the operator. Pose the decision you need first \
+                         (pose_question routed_to=operator, blocking=true), then set the \
+                         operator-block (task_1150: you can't just block the operator -- you must \
+                         have a question the operator can act on)."
+                    );
+                }
+            }
+        }
+    }
     let mut blocked_changed = false;
     // Recipients to ping with task.blocked_on_you when the task newly blocks on them: a single agent
     // (kind=agent), or every person a team resolves to (kind=team).
@@ -12170,10 +12212,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_block_without_question_warns() -> anyhow::Result<()> {
-        // task_1150 WARN half: a bare operator-block (no linked operator-routed question) succeeds
-        // but carries a blocked_on_warning; attaching a blocking question routed to the operator
-        // clears the warning.
+    async fn operator_block_without_question_is_rejected() -> anyhow::Result<()> {
+        // task_1150 ENFORCE flip: NEWLY setting a bare operator-block (no linked operator-routed
+        // question) is now hard-REJECTED; posing a blocking question routed to the operator FIRST
+        // lets the operator-block succeed with no warning. A non-operator block is unaffected.
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         register_agent(&pool, "worker", None, None, None, None, None).await?;
@@ -12194,8 +12236,8 @@ mod tests {
         .await?;
         let tid = t["id"].as_i64().unwrap();
 
-        // A bare operator-block warns but still succeeds.
-        let blocked = update_task(
+        // A bare operator-block is now REJECTED (not warned-and-stored).
+        let err = update_task(
             &pool,
             tid,
             Some("blocked"),
@@ -12208,15 +12250,17 @@ mod tests {
             None,
             Some(json!({"kind": "operator"})),
         )
-        .await?;
-        assert_eq!(blocked["status"], json!("blocked"));
-        assert_eq!(blocked["blocked_on_kind"], json!("operator"));
+        .await
+        .expect_err("a bare operator-block must be rejected");
         assert!(
-            blocked
-                .get("blocked_on_warning")
-                .and_then(Value::as_str)
-                .is_some_and(|w| w.contains("no open blocking question")),
-            "a bare operator-block should warn: {blocked:#?}"
+            err.to_string().contains("requires an actual ask"),
+            "unexpected error: {err}"
+        );
+        // The reject rolled back the transaction: the task did not become blocked.
+        assert_ne!(
+            get_task(&pool, tid).await?["status"],
+            json!("blocked"),
+            "a rejected operator-block must not have been stored"
         );
 
         // Attach a blocking question routed to the operator, then re-block: no warning.
@@ -12399,6 +12443,24 @@ mod tests {
         )
         .await?;
         let qid = q["id"].as_i64().unwrap();
+        // The operator-block itself must carry an operator-routed ask (task_1150 ENFORCE). The helper
+        // question above is the one we answer to prove a NON-operator answer leaves the block intact;
+        // this operator question stays open, so the operator-block legitimately persists.
+        pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "operator ok?",
+            None,
+            "operator",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await?;
         update_task(
             &pool,
             tid,
@@ -20232,7 +20294,23 @@ mod tests {
         .await?;
         assert_eq!(on_agent.as_array().unwrap().len(), 1);
 
-        // Block on the OPERATOR -> ref is null, and the operator view lists it.
+        // Block on the OPERATOR -> ref is null, and the operator view lists it. The operator-block
+        // needs an operator-routed ask (task_1150 ENFORCE), so pose one first.
+        pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "approve?",
+            None,
+            "operator",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+        )
+        .await?;
         update_task(
             &pool,
             tid,
@@ -20384,6 +20462,23 @@ mod tests {
             }
         };
         let tid = mk("Ship it").await?;
+        // The operator-block needs an operator-routed ask (task_1150 ENFORCE); the task_902 auto-set
+        // behavior under test is kind-agnostic, so pose one so the operator example stays legal.
+        pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "approve?",
+            None,
+            "operator",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("u"),
+        )
+        .await?;
 
         // blocked_on with status OMITTED -> status auto-set to blocked AND the blocked_on persists.
         update_task(
