@@ -1839,6 +1839,19 @@ pub struct SetReviewVettedArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SetReviewMetadataArgs {
+    pub review_id: i64,
+    /// Properties to MERGE into the review's metadata bag (incoming keys overwrite, untouched keys
+    /// preserved). For a conformance review this is where `reviewed_version` (an integer) belongs --
+    /// the key the operator-submit gate reads.
+    pub metadata: JsonObject,
+    /// The agent setting the metadata (defaults to this session's identity). Recorded for audit.
+    #[serde(rename = "principal", alias = "actor", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AppendReviewLogArgs {
     pub review_id: i64,
     /// The entry type: submitted / revised / finding / finding_resolved / comment / state_change /
@@ -3858,6 +3871,27 @@ impl Board {
             a.vetted,
             actor.as_deref(),
             s(&a.note),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Post-hoc setter for a review's metadata bag - the recovery path for a review created with empty or incomplete metadata. MERGES the given properties into the review's existing metadata (incoming keys overwrite, untouched keys preserved), records a decision audit entry naming the keys set, and emits review.metadata_changed. Most important use: set `reviewed_version` (an integer) on a conformance review created without it, which the operator-submit gate reads from review.metadata.reviewed_version - previously the only fix was recreating the review. An empty object is an idempotent no-op. Audit-only: the board records the actor rather than blocking a caller."
+    )]
+    async fn set_review_metadata(
+        &self,
+        Parameters(a): Parameters<SetReviewMetadataArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // Metadata can carry the gate-relevant reviewed_version: bind the audit entry to the
+        // authenticated caller, no forged actor (task_1100).
+        let actor = Some(self.gate_author(s(&a.actor))?);
+        core::set_review_metadata(
+            &self.pool,
+            a.review_id,
+            Value::Object(a.metadata),
+            actor.as_deref(),
         )
         .await
         .map_err(err)

@@ -11337,6 +11337,96 @@ pub async fn set_review_vetted(
     Ok(out)
 }
 
+/// Post-hoc setter for a review's `metadata` bag (task_1195): MERGE `metadata` into the review's
+/// existing metadata (incoming keys overwrite, untouched keys preserved -- the same convention as the
+/// other upserts), bump `updated_at`, and record a `decision` audit entry naming the keys set. This
+/// is the recovery path for a review created with empty/incomplete metadata -- most importantly a
+/// conformance review missing `metadata.reviewed_version`, which the operator-submit gate reads
+/// (previously the only fix was recreating the review). Emits `review.metadata_changed`. Returns the
+/// normalized review (with log). Bails if the review does not exist or `metadata` is not an object; an
+/// empty object is an idempotent no-op (no write, no audit entry, no event).
+pub async fn set_review_metadata(
+    pool: &Pool,
+    review_id: i64,
+    metadata: Value,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let Value::Object(incoming) = metadata else {
+        anyhow::bail!("metadata must be a JSON object");
+    };
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT metadata, created_by, assignee FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no review {review_id}");
+    };
+    // Empty incoming -> idempotent no-op (return the review unchanged, no audit entry, no event).
+    if incoming.is_empty() {
+        let out = review_json(&mut tx, review_id, true)
+            .await?
+            .unwrap_or(Value::Null);
+        tx.commit().await?;
+        return Ok(out);
+    }
+    let created_by: Option<String> = row.try_get("created_by")?;
+    let assignee: Option<String> = row.try_get("assignee")?;
+    let existing: String = row.try_get("metadata")?;
+    let mut merged = match serde_json::from_str::<Value>(&existing) {
+        Ok(Value::Object(m)) => m,
+        _ => Map::new(),
+    };
+    let mut keys: Vec<String> = incoming.keys().cloned().collect();
+    keys.sort();
+    for (k, v) in incoming {
+        merged.insert(k, v);
+    }
+    let merged_str = Value::Object(merged).to_string();
+    sqlx::query("UPDATE reviews SET metadata=?, updated_at=? WHERE id=?")
+        .bind(&merged_str)
+        .bind(&ts)
+        .bind(review_id)
+        .execute(&mut *tx)
+        .await?;
+    // Durable audit entry naming the keys set. entry_type=decision (not state_change, so the
+    // improvement-trend transition parser never mistakes it for a status transition).
+    let body = format!("metadata set: {}", keys.join(", "));
+    sqlx::query(
+        "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
+         VALUES(?,?,?,?,NULL,NULL,?)",
+    )
+    .bind(review_id)
+    .bind("decision")
+    .bind(&body)
+    .bind(actor)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let recips = review_recipients(created_by.as_deref(), assignee.as_deref(), actor);
+    emit(
+        &mut tx,
+        &mut hooks,
+        "review.metadata_changed",
+        actor,
+        None,
+        None,
+        None,
+        None,
+        json!({ "review_id": review_id, "keys": keys }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let out = review_json(&mut tx, review_id, true)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
 /// Append an entry to a review's log. Idempotent on `external_id` when given: if an entry with
 /// the same external_id already exists on this review, return it with `appended:false` — so a
 /// bridge replaying the same upstream comment/finding never double-logs. `entry_type` is one of
@@ -20309,6 +20399,92 @@ mod tests {
         assert!(set_review_status(&pool, rid, "bogus", Some("x"), None)
             .await
             .is_err());
+        Ok(())
+    }
+
+    /// task_1195: set_review_metadata is the post-hoc recovery path for a review created with empty
+    /// metadata -- it MERGES (preserving untouched keys), is the way to add reviewed_version so the
+    /// operator-submit gate can read it, logs a decision audit entry, no-ops on an empty object, and
+    /// bails on a missing review.
+    #[tokio::test]
+    async fn set_review_metadata_merges_and_records() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // A review created with NO metadata (the review_65 situation) -- no recovery short of this.
+        let r = create_review(
+            &pool,
+            "design",
+            Some("board-document"),
+            Some("doc_7"),
+            Some("A doc"),
+            None,
+            Some("author"),
+            Some("reviewer"),
+            None,
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        assert_eq!(r["metadata"], json!({}), "starts with empty metadata");
+
+        // Set reviewed_version -- the key the operator-submit gate reads.
+        let out = set_review_metadata(
+            &pool,
+            rid,
+            json!({ "reviewed_version": 5 }),
+            Some("librarian"),
+        )
+        .await?;
+        assert_eq!(out["metadata"]["reviewed_version"], json!(5));
+        // A decision audit entry naming the key, attributed to the actor.
+        let decision = out["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rfind(|e| e["entry_type"] == json!("decision"))
+            .expect("decision entry recorded");
+        assert_eq!(decision["author"], json!("librarian"));
+        assert!(
+            decision["body"]
+                .as_str()
+                .unwrap()
+                .contains("reviewed_version"),
+            "audit body names the key set"
+        );
+
+        // MERGE: a second set adds a key WITHOUT dropping reviewed_version.
+        let merged = set_review_metadata(
+            &pool,
+            rid,
+            json!({ "conformance": "pass" }),
+            Some("librarian"),
+        )
+        .await?;
+        assert_eq!(
+            merged["metadata"]["reviewed_version"],
+            json!(5),
+            "preserved"
+        );
+        assert_eq!(merged["metadata"]["conformance"], json!("pass"), "added");
+
+        // Empty object -> idempotent no-op (no new decision entry).
+        let before = merged["log"].as_array().unwrap().len();
+        let noop = set_review_metadata(&pool, rid, json!({}), Some("librarian")).await?;
+        assert_eq!(noop["log"].as_array().unwrap().len(), before, "no-op");
+
+        // Missing review -> error. A non-object metadata -> error.
+        assert!(
+            set_review_metadata(&pool, 999_999, json!({ "x": 1 }), Some("librarian"))
+                .await
+                .is_err(),
+            "missing review rejected"
+        );
+        assert!(
+            set_review_metadata(&pool, rid, json!("not-an-object"), Some("librarian"))
+                .await
+                .is_err(),
+            "non-object metadata rejected"
+        );
         Ok(())
     }
 
