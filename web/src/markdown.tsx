@@ -33,14 +33,18 @@ import { api, ipfsUrl, type DocumentVersion } from './api'
 export type WikiResolver = (path: string) => { id: number; title: string } | null
 export const WikiLinkContext = createContext<WikiResolver>(() => null)
 
-// Resolves whether an @mention names a known agent, so only real agents autolink and an unknown
-// @word stays plain text (no dead links). Provided app-wide from the live agents list; the
-// default resolves nothing, so mentions degrade to plain text outside the provider.
-// Resolve an @mention id to the agent-page target to link to: the id itself for a known agent, an
-// alias's canonical identity for a known alias (task 532), or null when it names nothing linkable
-// (the mention then degrades to plain text). Returning the target — not just a boolean — lets an
-// alias mention (@operator) point at the canonical agent (/agents/cameron).
-export type AgentResolver = (id: string) => string | null
+// Resolve an @mention handle to a link, so a mention of a known agent OR person (OR an alias of
+// either) auto-links and highlights, while an unknown @word stays plain text (no dead links).
+// Returns the page `href` to link to plus the resolved `canonical` id (so an alias mention like
+// @operator can show "@operator -> cameron"), or null when the handle names nothing linkable (the
+// mention then degrades to plain text). Provided app-wide from the live agents + people + aliases;
+// the default resolves nothing, so mentions degrade to plain text outside the provider. (task_1139
+// extended this from agents-only to also cover people, who link to the people page.)
+export interface MentionTarget {
+  href: string
+  canonical: string
+}
+export type AgentResolver = (id: string) => MentionTarget | null
 export const AgentMentionContext = createContext<AgentResolver>(() => null)
 
 // Transclusion recursion state: how deep we are and which paths are already on the embed chain,
@@ -296,8 +300,8 @@ function AnchorRenderer(props: BoardAnchorProps) {
     const target = mentions(agentId)
     return target ? (
       <Link
-        to={`/agents/${target}`}
-        title={target !== agentId ? `alias: @${agentId} -> ${target}` : undefined}
+        to={target.href}
+        title={target.canonical !== agentId ? `alias: @${agentId} -> ${target.canonical}` : undefined}
         className={LINK_CLS}
       >
         {raw}
