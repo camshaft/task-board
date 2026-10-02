@@ -126,6 +126,7 @@ export type QuestionKind =
   | 'select_all'
   | 'fill_in_the_blank'
   | 'rank_list'
+  | 'point_allocation'
 // `open` is the only non-terminal state.
 export type QuestionState =
   | 'open'
@@ -153,8 +154,11 @@ export interface BlockingQuestion {
 }
 export interface QuestionPayload {
   kind: QuestionKind
-  // Present for multiple_choice / select_all / rank_list.
+  // Present for multiple_choice / select_all / rank_list / point_allocation.
   options?: QuestionOption[]
+  // Per-kind config. point_allocation (doc_3371 entry 8) carries { budget } -- the constant sum
+  // (integer >= 1) an allocation answer's points must total.
+  config?: Record<string, unknown>
   // Principal (person / team / agent) the question is routed to; "operator" is the seeded team.
   routed_to?: string
   blocking?: boolean
