@@ -3020,6 +3020,17 @@ pub async fn get_task_limited(
     Ok(d)
 }
 
+/// Slice a JSON array to the `[offset, offset+limit)` page for a bounded read (task_969). A non-array
+/// value passes through unchanged; an offset past the end yields an empty array. The MCP `list_tasks`
+/// tool uses this to keep a large project's listing under the read/token cap (the REST/UI path stays
+/// unbounded, mirroring the task_511 `get_task` comments bound: MCP bounds, REST/UI does not).
+pub fn page_json_array(v: Value, offset: usize, limit: usize) -> Value {
+    match v {
+        Value::Array(items) => Value::Array(items.into_iter().skip(offset).take(limit).collect()),
+        other => other,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn list_tasks(
     pool: &Pool,
@@ -22478,5 +22489,17 @@ mod tests {
         assert_eq!(pf["enablable"], json!(false));
         assert_eq!(pf["fleet_coordination_team_exists"], json!(false));
         Ok(())
+    }
+
+    /// page_json_array slices the [offset, offset+limit) page for the bounded list_tasks read
+    /// (task_969); a non-array passes through, and an offset past the end yields an empty array.
+    #[test]
+    fn page_json_array_slices_pages() {
+        let arr = json!([0, 1, 2, 3, 4]);
+        assert_eq!(page_json_array(arr.clone(), 0, 2), json!([0, 1]));
+        assert_eq!(page_json_array(arr.clone(), 2, 2), json!([2, 3]));
+        assert_eq!(page_json_array(arr.clone(), 4, 10), json!([4]));
+        assert_eq!(page_json_array(arr.clone(), 10, 5), json!([]));
+        assert_eq!(page_json_array(json!({"a": 1}), 0, 2), json!({"a": 1}));
     }
 }
