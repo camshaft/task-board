@@ -31,6 +31,7 @@ const KIND_LABEL: Record<QuestionKind, string> = {
   fill_in_the_blank: 'Fill in the blank',
   rank_list: 'Rank list',
   point_allocation: 'Point allocation',
+  quiz: 'Knowledge check',
 }
 
 const STATE_CHIP: Record<QuestionState, string> = {
@@ -392,6 +393,11 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
       }
     case 'select_all':
       return { shape: 'choice', multi: true, options: q.options ?? [] }
+    case 'quiz':
+      // Knowledge-check quiz (doc_3371 entry 10): a choice answer scored server-side against a hidden
+      // key. The answer is an array of 1+ chosen option ids (like select_all), so reuse multi-select;
+      // the correct-answer key is redacted from the open question and revealed on the answer.
+      return { shape: 'choice', multi: true, options: q.options ?? [] }
     case 'fill_in_the_blank':
       return { shape: 'text' }
     case 'rank_list':
@@ -502,6 +508,48 @@ function AnswerValue({
   )
 }
 
+// Quiz score reveal (doc_3371 A1 entry 10): shown beneath a quiz answer's chosen value. The backend
+// scores the choice server-side against the hidden key and rides the result on the answer comment, so
+// the correct-answer key + explanation are only revealed here, after the answerer has committed. The
+// correct/incorrect badge reuses the AA-safe light/dark palette; correct_answer ids resolve to labels.
+function QuizScoreReveal({
+  correct,
+  correctAnswer,
+  explanation,
+  options,
+}: {
+  correct: boolean
+  correctAnswer?: string[]
+  explanation?: string
+  options?: QuestionOption[]
+}) {
+  const labelFor = (id: string) => options?.find((o) => o.id === id)?.label ?? id
+  return (
+    <div className="mt-2 border-t border-[var(--color-border)] pt-2 text-sm">
+      <span
+        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ring-1 ring-inset ${
+          correct
+            ? 'bg-emerald-100 text-emerald-800 ring-emerald-500/30 dark:bg-emerald-500/15 dark:text-emerald-300'
+            : 'bg-rose-100 text-rose-700 ring-rose-500/30 dark:bg-rose-500/15 dark:text-rose-300'
+        }`}
+      >
+        {correct ? 'Correct' : 'Incorrect'}
+      </span>
+      {correctAnswer && correctAnswer.length > 0 && (
+        <span className="ml-2">
+          <span className="text-[var(--color-muted)]">Correct answer: </span>
+          <span className="font-medium">{correctAnswer.map(labelFor).join(', ')}</span>
+        </span>
+      )}
+      {explanation && (
+        <div className="mt-1.5 rounded-md bg-[var(--color-panel-2)] p-2">
+          <Markdown source={explanation} className="text-sm" />
+        </div>
+      )}
+    </div>
+  )
+}
+
 function AnswerCard({
   answer,
   options,
@@ -528,6 +576,14 @@ function AnswerCard({
         <span className="ml-auto">{relTime(answer.created_at)}</span>
       </div>
       <AnswerValue answer={payload} body={answer.body} options={options} />
+      {payload.correct !== undefined && (
+        <QuizScoreReveal
+          correct={payload.correct}
+          correctAnswer={payload.correct_answer}
+          explanation={payload.explanation}
+          options={options}
+        />
+      )}
     </div>
   )
 }

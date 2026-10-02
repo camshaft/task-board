@@ -127,6 +127,7 @@ export type QuestionKind =
   | 'fill_in_the_blank'
   | 'rank_list'
   | 'point_allocation'
+  | 'quiz'
 // `open` is the only non-terminal state.
 export type QuestionState =
   | 'open'
@@ -176,6 +177,12 @@ export interface AnswerPayload {
   // choice | bool | text | ranked (matches the question kind, or `text` for an out-of-frame answer).
   shape?: string
   value?: unknown
+  // Quiz score reveal (doc_3371 entry 10): a framed quiz answer is scored server-side against the
+  // hidden key, and the result rides the answer comment -- `correct`, the `correct_answer` option
+  // ids (now safe to reveal), and an optional `explanation`. Absent on non-quiz answers.
+  correct?: boolean
+  correct_answer?: string[]
+  explanation?: string
 }
 
 export interface Comment {
