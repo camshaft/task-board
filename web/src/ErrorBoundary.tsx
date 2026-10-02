@@ -64,7 +64,7 @@ export default class ErrorBoundary extends Component<Props, State> {
             </button>
             <a
               href={document.baseURI}
-              className="text-sm text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+              className="text-sm text-sky-700 dark:text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
             >
               Back to home
             </a>

@@ -73,7 +73,7 @@ export function AgeAnswer({
           {working ? 'Encrypting...' : 'Encrypt and submit'}
         </button>
       </div>
-      {err && <p className="text-xs text-rose-400">{err}</p>}
+      {err && <p className="text-xs text-rose-700 dark:text-rose-400">{err}</p>}
     </div>
   )
 }

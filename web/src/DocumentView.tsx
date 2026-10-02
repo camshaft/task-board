@@ -251,7 +251,7 @@ export default function DocumentView() {
   return (
     <main className="flex min-w-0 flex-1 flex-col">
       <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
-        <Link to="/documents" className="text-xs text-[var(--color-muted)] hover:text-sky-300">
+        <Link to="/documents" className="text-xs text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300">
           ← Documents
         </Link>
         <h1 className="truncate text-sm font-semibold">{doc?.title ?? `Document #${id}`}</h1>
@@ -280,7 +280,7 @@ export default function DocumentView() {
                 <button
                   disabled={busy}
                   onClick={requestChanges}
-                  className="rounded-md px-2.5 py-1 text-xs ring-1 ring-inset ring-amber-500/40 text-amber-300 hover:bg-amber-500/10 disabled:opacity-40"
+                  className="rounded-md px-2.5 py-1 text-xs ring-1 ring-inset ring-amber-500/40 text-amber-800 dark:text-amber-300 hover:bg-amber-500/10 disabled:opacity-40"
                 >
                   Request changes
                 </button>
@@ -291,7 +291,7 @@ export default function DocumentView() {
       </div>
 
       {error && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-700 dark:text-rose-300">
           {error}
         </div>
       )}
@@ -328,7 +328,7 @@ export default function DocumentView() {
                 }
                 className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium ring-1 ring-inset ${
                   overBudget
-                    ? 'bg-amber-500/15 text-amber-300 ring-amber-500/30'
+                    ? 'bg-amber-500/15 text-amber-800 dark:text-amber-300 ring-amber-500/30'
                     : 'bg-[var(--color-panel-2)] text-[var(--color-muted)] ring-[var(--color-border)]'
                 }`}
               >
@@ -351,7 +351,7 @@ export default function DocumentView() {
                     target="_blank"
                     rel="noreferrer noopener"
                     title={`${l.source}: ${l.metadata.url}`}
-                    className="inline-flex items-center gap-1 rounded bg-[var(--color-panel-2)] px-2 py-0.5 font-mono text-sky-400 hover:text-sky-300"
+                    className="inline-flex items-center gap-1 rounded bg-[var(--color-panel-2)] px-2 py-0.5 font-mono text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
                   >
                     {l.source}
                     <span aria-hidden>↗</span>
@@ -367,7 +367,7 @@ export default function DocumentView() {
             {editPath === null ? (
               <>
                 {doc.path ? (
-                  <Link to="/wiki" className="font-mono text-sky-400 hover:text-sky-300">
+                  <Link to="/wiki" className="font-mono text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300">
                     {doc.path}
                   </Link>
                 ) : (
@@ -376,7 +376,7 @@ export default function DocumentView() {
                 <button
                   disabled={busy}
                   onClick={() => setEditPath(doc.path ?? '')}
-                  className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)] disabled:opacity-40"
+                  className="rounded px-1.5 py-0.5 text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)] disabled:opacity-40"
                 >
                   {doc.path ? 'edit' : 'file'}
                 </button>
@@ -422,7 +422,7 @@ export default function DocumentView() {
                   {t.project_id != null ? (
                     <Link
                       to={`/projects/${t.project_id}/tasks/${t.id}`}
-                      className="text-sky-400 hover:text-sky-300"
+                      className="text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
                     >
                       #{t.id} {t.title}
                     </Link>
@@ -440,7 +440,7 @@ export default function DocumentView() {
           {/* Deprecated / superseded banner (task 722/725): a deprecated doc stays visible but
               carries this notice, linking to its replacement when superseded. */}
           {doc.deprecated_at && (
-            <div className="mb-4 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+            <div className="mb-4 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
               <span className="font-semibold uppercase tracking-wide">Deprecated</span>
               {doc.superseded_by != null && (
                 <>
@@ -485,7 +485,7 @@ export default function DocumentView() {
                   style={{ top: p.top }}
                   onClick={() => setOpenKey(openKey === p.key ? null : p.key)}
                   title="View inline comment thread"
-                  className={`absolute right-0 flex h-6 items-center gap-0.5 rounded-full border border-amber-500/40 bg-[var(--color-panel)] px-1.5 text-[11px] leading-none text-amber-300 shadow-sm hover:bg-amber-500/10 ${
+                  className={`absolute right-0 flex h-6 items-center gap-0.5 rounded-full border border-amber-500/40 bg-[var(--color-panel)] px-1.5 text-[11px] leading-none text-amber-800 dark:text-amber-300 shadow-sm hover:bg-amber-500/10 ${
                     openKey === p.key ? 'ring-1 ring-amber-400' : ''
                   }`}
                 >
@@ -555,7 +555,7 @@ export default function DocumentView() {
                   )}
                   <a
                     href={ipfsUrl(v.cid, v.content_type)}
-                    className="min-w-0 flex-1 truncate font-mono text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+                    className="min-w-0 flex-1 truncate font-mono text-xs text-sky-700 dark:text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
                     title={`open ${v.cid}`}
                   >
                     {v.cid}
@@ -581,7 +581,7 @@ export default function DocumentView() {
             <div className="mt-2">
               <button
                 onClick={() => setShowDiff((s) => !s)}
-                className="text-xs text-sky-400 hover:text-sky-300"
+                className="text-xs text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
               >
                 {showDiff ? 'Hide diff' : 'Compare versions →'}
               </button>
@@ -610,7 +610,7 @@ export default function DocumentView() {
                       {l.target_document_id != null ? (
                         <Link
                           to={`/documents/${l.target_document_id}`}
-                          className="text-sky-400 hover:text-sky-300"
+                          className="text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
                           title={l.target_path}
                         >
                           {l.label ?? l.target_title ?? l.target_path}
@@ -618,7 +618,7 @@ export default function DocumentView() {
                       ) : (
                         <Link
                           to="/wiki"
-                          className="text-rose-400/90 hover:text-rose-300"
+                          className="text-rose-700/90 dark:text-rose-400/90 hover:text-rose-800 dark:hover:text-rose-300"
                           title={`No page filed at "${l.target_path}" yet`}
                         >
                           {l.label ?? l.target_path}
@@ -644,7 +644,7 @@ export default function DocumentView() {
                       <DocStatusChip status={b.status} />
                       <Link
                         to={`/documents/${b.id}`}
-                        className="min-w-0 flex-1 truncate hover:text-sky-300"
+                        className="min-w-0 flex-1 truncate hover:text-sky-800 dark:hover:text-sky-300"
                       >
                         {b.title}
                       </Link>
@@ -678,7 +678,7 @@ export default function DocumentView() {
                       {e.target_document_id != null ? (
                         <Link
                           to={`/documents/${e.target_document_id}`}
-                          className="text-sky-400 hover:text-sky-300"
+                          className="text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
                           title={e.target_path}
                         >
                           {e.label ?? e.target_title ?? e.target_path}
@@ -686,7 +686,7 @@ export default function DocumentView() {
                       ) : (
                         <Link
                           to="/wiki"
-                          className="text-rose-400/90 hover:text-rose-300"
+                          className="text-rose-700/90 dark:text-rose-400/90 hover:text-rose-800 dark:hover:text-rose-300"
                           title={`No page filed at "${e.target_path}" yet`}
                         >
                           {e.label ?? e.target_path}
@@ -714,7 +714,7 @@ export default function DocumentView() {
                       <DocStatusChip status={e.status} />
                       <Link
                         to={`/documents/${e.id}`}
-                        className="min-w-0 flex-1 truncate hover:text-sky-300"
+                        className="min-w-0 flex-1 truncate hover:text-sky-800 dark:hover:text-sky-300"
                       >
                         {e.title}
                       </Link>
@@ -748,7 +748,7 @@ export default function DocumentView() {
                   <li>
                     <button
                       onClick={() => setShowAllComments(true)}
-                      className="w-full rounded-md border border-dashed border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-300"
+                      className="w-full rounded-md border border-dashed border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-800 dark:hover:text-sky-300"
                     >
                       Show {hidden} earlier comment{hidden === 1 ? '' : 's'}
                     </button>
@@ -799,7 +799,7 @@ export default function DocumentView() {
           {/* Show a submit failure right at the composer (task_1201): the API validation reason,
               not just an opaque 4xx. */}
           {actionError && (
-            <p className="mt-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+            <p className="mt-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
               {actionError}
             </p>
           )}
@@ -895,7 +895,7 @@ function DocContent({ version, onLoaded }: { version: DocumentVersion; onLoaded?
   const raw = (
     <a
       href={url}
-      className="font-mono text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+      className="font-mono text-xs text-sky-700 dark:text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
     >
       open raw ({version.cid})
     </a>
@@ -1007,13 +1007,13 @@ function CommentCard({
           {onReply && (
             <button
               onClick={onReply}
-              className={`hover:text-sky-300 ${replying ? 'text-sky-300' : ''}`}
+              className={`hover:text-sky-800 dark:hover:text-sky-300 ${replying ? 'text-sky-700 dark:text-sky-300' : ''}`}
             >
               reply
             </button>
           )}
           {!resolved && (
-            <button disabled={busy} onClick={onResolve} className="hover:text-emerald-300">
+            <button disabled={busy} onClick={onResolve} className="hover:text-emerald-800 dark:hover:text-emerald-300">
               resolve
             </button>
           )}
@@ -1085,7 +1085,7 @@ function ThreadPopover({
         <button
           onClick={onClose}
           aria-label="Close thread"
-          className="shrink-0 text-[var(--color-muted)] hover:text-rose-300"
+          className="shrink-0 text-[var(--color-muted)] hover:text-rose-800 dark:hover:text-rose-300"
         >
           ×
         </button>
@@ -1443,9 +1443,9 @@ function DocDiff({
               key={idx}
               className={`flex gap-1 whitespace-pre-wrap break-words ${
                 r.kind === 'add'
-                  ? 'bg-emerald-500/10 text-emerald-300'
+                  ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
                   : r.kind === 'del'
-                    ? 'bg-red-500/10 text-red-300'
+                    ? 'bg-red-500/10 text-red-700 dark:text-red-300'
                     : 'text-[var(--color-muted)]'
               }`}
             >

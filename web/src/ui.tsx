@@ -419,7 +419,7 @@ export function AutoGrowTextarea({
                   i === sel ? 'bg-sky-500/20' : 'hover:bg-[var(--color-panel)]'
                 }`}
               >
-                <span className="font-mono text-xs text-sky-300">@{a.id}</span>
+                <span className="font-mono text-xs text-sky-700 dark:text-sky-300">@{a.id}</span>
                 {a.label !== a.id && (
                   <span className="text-[11px] text-[var(--color-muted)]">{a.label}</span>
                 )}

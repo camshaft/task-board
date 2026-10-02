@@ -83,7 +83,7 @@ export default function ProjectAccess() {
   return (
     <main ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto">
       <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
-        <Link to={`/projects/${pid}`} className="text-xs text-[var(--color-muted)] hover:text-sky-300">
+        <Link to={`/projects/${pid}`} className="text-xs text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300">
           ← Board
         </Link>
         <h1 className="truncate text-sm font-semibold">Access — {projectName}</h1>
@@ -96,12 +96,12 @@ export default function ProjectAccess() {
       </div>
 
       {error && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-700 dark:text-rose-300">
           {error.message}
         </div>
       )}
       {opError && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-700 dark:text-rose-300">
           {opError}
         </div>
       )}
@@ -184,7 +184,7 @@ export default function ProjectAccess() {
                     }
                     aria-label={`Revoke ${g.team_id}`}
                     title={`Revoke ${g.team_id}`}
-                    className="shrink-0 rounded px-1.5 text-[var(--color-muted)] hover:bg-rose-500/20 hover:text-rose-300 disabled:opacity-40"
+                    className="shrink-0 rounded px-1.5 text-[var(--color-muted)] hover:bg-rose-500/20 hover:text-rose-800 dark:hover:text-rose-300 disabled:opacity-40"
                   >
                     x
                   </button>

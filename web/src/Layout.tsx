@@ -41,7 +41,7 @@ function ConnectionBanner() {
     <div
       role="status"
       aria-live="polite"
-      className="flex items-center justify-center gap-2 bg-amber-500/15 px-4 py-1 text-center text-xs text-amber-300"
+      className="flex items-center justify-center gap-2 bg-amber-500/15 px-4 py-1 text-center text-xs text-amber-800 dark:text-amber-300"
     >
       <span
         className="inline-block size-1.5 animate-pulse rounded-full bg-amber-400"
@@ -221,7 +221,7 @@ export default function Layout() {
           </svg>
         </button>
         <Link to="/" className="text-base font-semibold tracking-tight">
-          <span className="text-sky-400">task</span>-board
+          <span className="text-sky-700 dark:text-sky-400">task</span>-board
         </Link>
         <Link
           to="/awaiting"
@@ -238,50 +238,50 @@ export default function Layout() {
         </Link>
         <Link
           to="/search"
-          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
         >
           Search
         </Link>
         <Link
           to="/documents"
-          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
         >
           Docs
         </Link>
         <Link
           to="/reviews"
-          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
         >
           Reviews
         </Link>
         <Link
           to="/wiki"
-          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
         >
           Wiki
         </Link>
         <Link
           to="/channels"
-          className="flex items-center gap-1 text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="flex items-center gap-1 text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
         >
           Channels
           <UnreadBadge count={channelsUnread} dotOnly />
         </Link>
         <Link
           to="/people"
-          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
         >
           People
         </Link>
         <Link
           to="/agents"
-          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
         >
           Agents
         </Link>
         <a
           href={new URL('api', document.baseURI).href}
-          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
         >
           API docs
         </a>
@@ -290,7 +290,7 @@ export default function Layout() {
         <Link
           to="/settings"
           title="Settings"
-          className="ml-auto flex items-center gap-1.5 rounded-md px-2 py-1 text-sm text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-sky-300"
+          className="ml-auto flex items-center gap-1.5 rounded-md px-2 py-1 text-sm text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-sky-800 dark:hover:text-sky-300"
         >
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
             <circle cx="12" cy="12" r="3" />
@@ -301,7 +301,7 @@ export default function Layout() {
       </header>
 
       {projectsError && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-700 dark:text-rose-300">
           {projectsError.message}
         </div>
       )}
@@ -330,7 +330,7 @@ export default function Layout() {
                 <Link
                   to="/channels"
                   onClick={closeSidebar}
-                  className="rounded px-1.5 text-sm text-sky-400 hover:bg-[var(--color-panel-2)]"
+                  className="rounded px-1.5 text-sm text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
                 >
                   all
                 </Link>
@@ -370,7 +370,7 @@ export default function Layout() {
                 <Link
                   to="/agents"
                   onClick={closeSidebar}
-                  className="rounded px-1.5 text-sm text-sky-400 hover:bg-[var(--color-panel-2)]"
+                  className="rounded px-1.5 text-sm text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
                 >
                   all
                 </Link>
@@ -406,7 +406,7 @@ export default function Layout() {
                 <Link
                   to="/documents"
                   onClick={closeSidebar}
-                  className="rounded px-1.5 text-sm text-sky-400 hover:bg-[var(--color-panel-2)]"
+                  className="rounded px-1.5 text-sm text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
                 >
                   all
                 </Link>
@@ -427,7 +427,7 @@ export default function Layout() {
             </span>
             <button
               onClick={newProject}
-              className="rounded px-1.5 text-sm text-sky-400 hover:bg-[var(--color-panel-2)]"
+              className="rounded px-1.5 text-sm text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
             >
               + new
             </button>
@@ -513,7 +513,7 @@ export default function Layout() {
                 const body = (
                   <>
                     <div className="flex items-center gap-1.5">
-                      <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                      <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-700 dark:text-sky-300">
                         {e.type}
                       </span>
                       <span className="text-[var(--color-muted)]">{relTime(e.created_at)}</span>

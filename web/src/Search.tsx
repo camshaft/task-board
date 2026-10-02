@@ -166,7 +166,7 @@ export default function Search() {
               <StatusChip status={t.status} />
               <Link
                 to={`/projects/${t.project_id}/tasks/${t.id}`}
-                className="min-w-0 flex-1 truncate text-sm hover:text-sky-300"
+                className="min-w-0 flex-1 truncate text-sm hover:text-sky-800 dark:hover:text-sky-300"
               >
                 {t.title}
               </Link>
@@ -194,7 +194,7 @@ export default function Search() {
               </select>
               <button
                 onClick={() => void addComment(t.id)}
-                className="rounded px-1.5 py-0.5 text-xs text-sky-400 hover:bg-[var(--color-panel-2)]"
+                className="rounded px-1.5 py-0.5 text-xs text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
               >
                 comment
               </button>

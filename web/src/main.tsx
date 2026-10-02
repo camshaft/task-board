@@ -51,7 +51,7 @@ function NotFound() {
       <p className="mb-2">Page not found.</p>
       <Link
         to="/"
-        className="text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+        className="text-sky-700 dark:text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
       >
         Back to home
       </Link>

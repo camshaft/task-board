@@ -109,7 +109,7 @@ export default function ReviewView() {
   return (
     <main className="flex min-w-0 flex-1 flex-col">
       <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
-        <Link to="/reviews" className="text-xs text-[var(--color-muted)] hover:text-sky-300">
+        <Link to="/reviews" className="text-xs text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300">
           ← Reviews
         </Link>
         <h1 className="truncate text-sm font-semibold">
@@ -117,14 +117,14 @@ export default function ReviewView() {
         </h1>
         {review && <ReviewStatusChip status={review.status} />}
         {review?.vetted && (
-          <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-300">
+          <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
             vetted
           </span>
         )}
       </div>
 
       {error && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-700 dark:text-rose-300">
           {error.message}
         </div>
       )}
@@ -163,10 +163,10 @@ export default function ReviewView() {
                   disabled={busy}
                   className={`rounded-md px-2.5 py-1 text-xs ring-1 ring-inset disabled:opacity-40 ${
                     to === 'approved'
-                      ? 'text-emerald-300 ring-emerald-500/40 hover:bg-emerald-500/10'
+                      ? 'text-emerald-700 dark:text-emerald-300 ring-emerald-500/40 hover:bg-emerald-500/10'
                       : to === 'changes_requested'
-                        ? 'text-amber-300 ring-amber-500/40 hover:bg-amber-500/10'
-                        : 'text-sky-400 ring-sky-500/40 hover:bg-sky-500/10'
+                        ? 'text-amber-800 dark:text-amber-300 ring-amber-500/40 hover:bg-amber-500/10'
+                        : 'text-sky-700 dark:text-sky-400 ring-sky-500/40 hover:bg-sky-500/10'
                   }`}
                 >
                   {to.replace(/_/g, ' ')}
@@ -185,7 +185,7 @@ export default function ReviewView() {
               className={`rounded-md px-2.5 py-1 text-xs ring-1 ring-inset disabled:opacity-40 ${
                 review.vetted
                   ? 'text-zinc-300 ring-zinc-500/40 hover:bg-zinc-500/10'
-                  : 'text-emerald-300 ring-emerald-500/40 hover:bg-emerald-500/10'
+                  : 'text-emerald-700 dark:text-emerald-300 ring-emerald-500/40 hover:bg-emerald-500/10'
               }`}
             >
               {review.vetted ? 'Clear vetted' : 'Mark vetted'}
@@ -196,7 +196,7 @@ export default function ReviewView() {
           </div>
 
           {actionError && (
-            <div className="mb-4 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
+            <div className="mb-4 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
               {actionError}
             </div>
           )}
@@ -266,7 +266,7 @@ export default function ReviewView() {
                   {e.author && <span className="font-mono">{e.author}</span>}
                   <span>· {relTime(e.created_at)}</span>
                   {e.task_id != null && (
-                    <Link to={`/tasks/${e.task_id}`} className="text-sky-400 hover:text-sky-300">
+                    <Link to={`/tasks/${e.task_id}`} className="text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300">
                       task #{e.task_id}
                     </Link>
                   )}
