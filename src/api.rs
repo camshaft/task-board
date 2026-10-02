@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use schemars::{schema_for, JsonSchema};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -485,6 +485,13 @@ fn rewrite_acting_fields(bytes: &[u8], user: &str) -> Vec<u8> {
     }
 }
 
+/// The resolved trusted viewer for a request on a forcing host (task_542 B5b): `force_trusted_user`
+/// stashes it as a request extension so READ handlers can scope results to the authenticated caller.
+/// Absent when the host is permissive or no trusted header was present (then read-scoping treats the
+/// caller as unidentified -> fail-closed once enforcement is enabled; a no-op while it is off).
+#[derive(Clone)]
+struct ForcedViewer(String);
+
 /// Middleware: force the acting user from a per-host trusted header (task_1030, operator request).
 /// The behavior is driven entirely by the `[hosts.'<name>']` config matched on the request's `Host`:
 /// - no per-host config at all → pass through (client-set actor trusted everywhere, legacy).
@@ -497,7 +504,7 @@ fn rewrite_acting_fields(bytes: &[u8], user: &str) -> Vec<u8> {
 /// - matched host WITH an `auth_header`, write WITH the header → the acting-principal fields in the
 ///   JSON body are overwritten with the header value, so the client cannot attribute the write to
 ///   anyone else.
-async fn force_trusted_user(State(st): State<AppState>, req: Request, next: Next) -> Response {
+async fn force_trusted_user(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
     if st.host_auth.is_empty() {
         return next.run(req).await;
     }
@@ -505,11 +512,12 @@ async fn force_trusted_user(State(st): State<AppState>, req: Request, next: Next
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     // This host forces identity only if it is listed WITH an auth_header; otherwise permissive.
     let Some(header_name) = st
         .host_auth
-        .get(&host_authority_name(host))
+        .get(&host_authority_name(&host))
         .and_then(|h| h.as_deref())
     else {
         return next.run(req).await;
@@ -518,9 +526,6 @@ async fn force_trusted_user(State(st): State<AppState>, req: Request, next: Next
         *req.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
-    if !is_write {
-        return next.run(req).await;
-    }
     let forced_raw = req
         .headers()
         .get(header_name)
@@ -529,18 +534,32 @@ async fn force_trusted_user(State(st): State<AppState>, req: Request, next: Next
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let Some(forced_raw) = forced_raw else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": format!("missing trusted user header `{header_name}` on a non-loopback write")
-            })),
-        )
-            .into_response();
+        // A write on a forcing host MUST carry the header (a missing header is a misconfig or a
+        // bypass attempt).
+        if is_write {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": format!("missing trusted user header `{header_name}` on a non-loopback write")
+                })),
+            )
+                .into_response();
+        }
+        // A read without the header passes through UNSTAMPED: read-scoping then treats the caller as
+        // unidentified (fail-closed under enforcement; a no-op while enforcement is off).
+        return next.run(req).await;
     };
     // Resolve the front-door username through the identity-alias table (task_1030): a tunnel's
-    // "bythewc" forces as its canonical "cameron", so the write acts as the SAME principal the board
-    // already keys ownership / subscriptions / operator-routing to. No alias => the raw value.
+    // "bythewc" forces as its canonical "cameron", so the request acts as the SAME principal the board
+    // already keys ownership / subscriptions / operator-routing / access to. No alias => the raw value.
     let forced = core::resolve_identity_alias(&st.pool, &forced_raw).await;
+    // task_542 B5b: stash the resolved viewer so READ handlers can scope results to the authenticated
+    // caller (a read carries no acting-field body to rewrite). Writes ALSO rewrite the acting fields
+    // below; the extension rides on the request parts across the into_parts/from_parts rebuild.
+    req.extensions_mut().insert(ForcedViewer(forced.clone()));
+    if !is_write {
+        return next.run(req).await;
+    }
     let (parts, body) = req.into_parts();
     // API JSON bodies are small; buffer to rewrite the acting fields. 16 MiB cap guards against a
     // runaway body (a document `content` is well under this).
@@ -1396,9 +1415,13 @@ async fn create_project(State(st): State<AppState>, Json(b): Json<CreateProjectB
 
 async fn get_project(
     State(st): State<AppState>,
+    viewer: Option<Extension<ForcedViewer>>,
     Path(ProjectRef(project_id)): Path<ProjectRef>,
 ) -> ApiResult {
-    found(core::get_project(&st.pool, project_id).await?)
+    // task_542 B5b: scope the read to the authenticated caller when enforcement is enabled
+    // (fail-closed; a no-op while enforcement is off). The viewer is stamped by force_trusted_user.
+    let viewer = viewer.map(|Extension(ForcedViewer(v))| v);
+    found(core::get_project_scoped(&st.pool, project_id, viewer.as_deref()).await?)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4080,6 +4103,69 @@ mod tests {
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "missing trusted header is rejected"
+        );
+        Ok(())
+    }
+
+    /// task_542 B5b: a REST read on a forcing host is scoped to the trusted-header viewer once
+    /// enforcement is enabled -- the project creator reads it, a stranger gets not-found (scoped
+    /// out, indistinguishable from "no such project"); while enforcement is OFF, both read it.
+    #[tokio::test]
+    async fn get_project_rest_scopes_to_trusted_viewer_under_enforcement() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let pid = core::create_project(&pool, "P", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let (events_tx, _rx) = broadcast::channel(16);
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "board.example.com".to_string(),
+            Some("x-tunnel-user".to_string()),
+        );
+        let state = AppState {
+            pool: pool.clone(),
+            events_tx,
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: std::sync::Arc::new(map),
+        };
+        let get = |user: &'static str| {
+            let app = router(state.clone());
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/projects/{pid}"))
+                        .header("host", "board.example.com:8079")
+                        .header("x-tunnel-user", user)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Enforcement OFF: both the creator and a stranger read the project.
+        assert_eq!(get("boss").await.status(), StatusCode::OK);
+        assert_eq!(get("stranger").await.status(), StatusCode::OK);
+
+        // Enable enforcement (the freshly seeded state is enablable).
+        core::set_enforcement_enabled(&pool, true, Some("boss")).await?;
+
+        // Creator still reads; the stranger is scoped out to a not-found.
+        assert_eq!(
+            get("boss").await.status(),
+            StatusCode::OK,
+            "creator reads under enforcement"
+        );
+        assert_ne!(
+            get("stranger").await.status(),
+            StatusCode::OK,
+            "a stranger is scoped out under enforcement"
         );
         Ok(())
     }
