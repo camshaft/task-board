@@ -564,11 +564,23 @@ export interface SecretRequest {
 }
 
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${API_ROOT}${path}`, {
-    method,
-    headers: body ? { 'content-type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  })
+  // The crash-report POST must never route through the failure reporter -- reporting its own
+  // failure would loop. (reportCrash also swallows this call's rejection, but exclude it here too.)
+  const telemetered = path !== '/crash-reports'
+  let res: Response
+  try {
+    res = await fetch(`${API_ROOT}${path}`, {
+      method,
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    })
+  } catch (e) {
+    // Network-level failure (offline, DNS, CORS, server unreachable): auto-report so an outage is
+    // not invisible. A full outage self-limits, since the crash-report POST also fails and is
+    // swallowed; this fires on a PARTIAL failure where the crash endpoint is still reachable.
+    if (telemetered) apiFailureReporter?.({ method, path, message: (e as Error).message || 'network error' })
+    throw e
+  }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`
     try {
@@ -577,6 +589,9 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
     } catch {
       /* non-JSON body */
     }
+    // Auto-report UNEXPECTED server failures (5xx); a 4xx is an expected client/validation error
+    // (now surfaced to the author inline, task_1201) and is not telemetry.
+    if (telemetered && res.status >= 500) apiFailureReporter?.({ method, path, status: res.status, message: msg })
     throw new Error(msg)
   }
   return res.json() as Promise<T>
@@ -586,7 +601,9 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
 // by signature (build + top stack frames) and files/bumps an investigation task. All fields but
 // `message` are optional so a bare onerror with nothing else still reports.
 export interface CrashReport {
-  kind: 'error' | 'unhandledrejection'
+  // 'api' is an unexpected API failure (5xx / network), distinct from an uncaught JS 'error' or
+  // 'unhandledrejection' (task_1201). The backend treats kind as a free-form label.
+  kind: 'error' | 'unhandledrejection' | 'api'
   message: string
   stack?: string
   component_stack?: string
@@ -594,6 +611,16 @@ export interface CrashReport {
   build?: string
   user_agent?: string
   occurred_at?: string
+}
+
+// Reporter for an UNEXPECTED API failure (set by the crash reporter at startup; null until then, so
+// api calls before install -- or in a non-browser context -- simply do not report). req() invokes it
+// only for 5xx and network-level failures, never for an expected 4xx (those are surfaced to the user
+// inline), and never for the crash-report endpoint itself (that would loop). task_1201.
+export type ApiFailure = { method: string; path: string; status?: number; message: string }
+let apiFailureReporter: ((f: ApiFailure) => void) | null = null
+export function setApiFailureReporter(fn: (f: ApiFailure) => void) {
+  apiFailureReporter = fn
 }
 
 export const api = {
