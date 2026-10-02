@@ -251,7 +251,9 @@ type FormSpec =
   // {option_id: integer_points} whose values must total the budget exactly (enforced in-form before
   // submit and re-validated by the backend).
   | { shape: 'allocation'; options: QuestionOption[]; budget: number }
-  | { shape: 'age'; recipient: string }
+  // `age` (age-request element, task_713): encrypt the secret in-browser to one or more age
+  // recipients; only the ciphertext is submitted. `target` is optional advisory destination metadata.
+  | { shape: 'age'; recipients: string[]; target?: string }
 
 // Does a response schema expect an array value (vs a scalar)? Used to decide a single-select's
 // submitted value shape so it satisfies the question's inline response_schema.
@@ -371,9 +373,13 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
         }
       }
       case 'age-request': {
-        const recipient = asText(p.recipient)
-        // With a recipient we can encrypt in-browser; without one, fall back to the free-text escape.
-        return recipient ? { shape: 'age', recipient } : null
+        // Recipients (one or more age pubkeys) ride props.recipient_pubkeys; target is optional
+        // advisory metadata. With at least one recipient we can encrypt in-browser; otherwise fall
+        // back to the free-text (paste-ciphertext) escape.
+        const recipients = Array.isArray(p.recipient_pubkeys)
+          ? p.recipient_pubkeys.filter((r): r is string => typeof r === 'string' && r.length > 0)
+          : []
+        return recipients.length > 0 ? { shape: 'age', recipients, target: asText(p.target) } : null
       }
       default:
         // Any future element with no inline form: handled read-only + free text.
@@ -1211,7 +1217,12 @@ function AnswerForm({
       )}
 
       {spec?.shape === 'age' && (
-        <AgeAnswer recipient={spec.recipient} busy={busy} onSubmit={onSubmit} />
+        <AgeAnswer
+          recipients={spec.recipients}
+          target={spec.target}
+          busy={busy}
+          onSubmit={onSubmit}
+        />
       )}
 
       {/* Out-of-frame escape: answer in free text when there is no inline text field (so a bool /
@@ -1292,8 +1303,17 @@ export function QuestionComment({
   const kindLabel = q
     ? (elementMeta(elementName)?.title ?? KIND_LABEL[q.kind] ?? elementName ?? q.kind)
     : null
-  const ageRecipient =
-    elementName === 'age-request' ? asText(q?.ui?.props?.recipient) : undefined
+  const ageProps =
+    elementName === 'age-request'
+      ? {
+          recipients: Array.isArray(q?.ui?.props?.recipient_pubkeys)
+            ? (q!.ui!.props!.recipient_pubkeys as unknown[]).filter(
+                (r): r is string => typeof r === 'string' && r.length > 0,
+              )
+            : [],
+          target: asText(q?.ui?.props?.target),
+        }
+      : null
   // When the interactive answer form renders (an open, answerable choice / ranked question), it
   // already draws every option as its own control (radio / buttons / scale / stars / checkboxes /
   // rank rows). Rendering the read-only options list as well would show the options TWICE -- the
@@ -1327,11 +1347,20 @@ export function QuestionComment({
       {/* The prompt. */}
       <Markdown source={comment.body} className="text-sm" />
 
-      {/* An encrypted-secret request names the age recipient the answer is encrypted to. */}
-      {ageRecipient && (
+      {/* An encrypted-secret request names the age recipient(s) the answer is encrypted to, plus any
+          advisory destination (target). */}
+      {ageProps && ageProps.recipients.length > 0 && (
         <p className="mt-1.5 text-xs text-[var(--color-muted)]">
-          Encrypted to <span className="font-mono break-all">{ageRecipient}</span> client-side; no
-          plaintext is stored on the board.
+          Encrypted client-side to {ageProps.recipients.length} recipient
+          {ageProps.recipients.length === 1 ? '' : 's'} (
+          <span className="font-mono break-all">{ageProps.recipients.join(', ')}</span>); no plaintext
+          is stored on the board.
+          {ageProps.target && (
+            <>
+              {' '}
+              Destination: <span className="font-mono break-all">{ageProps.target}</span>.
+            </>
+          )}
         </p>
       )}
 
