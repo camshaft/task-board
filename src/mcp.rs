@@ -773,6 +773,14 @@ pub struct ListTasksArgs {
     /// Include archived tasks. Archived tasks are hidden by default; set true to list them too.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub include_archived: Option<bool>,
+    /// Max tasks to return (task_969 pagination; default 100, max 1000) so a large project stays
+    /// under the read/token cap. Order is by id, so a stable page.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub limit: Option<i64>,
+    /// Skip this many tasks before the page (task_969 pagination; default 0). Pair with `limit` to
+    /// page a large project, e.g. offset=100 for the second page.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2240,13 +2248,13 @@ impl Board {
     }
 
     #[tool(
-        description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator|external) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, blocked_on_kind=external for tasks waiting on infra, or blocked_on_ref=<agent> for what is blocked on that agent. Archived tasks are hidden by default; pass `include_archived: true` to list them too."
+        description = "List tasks, optionally filtered by project, status, and/or assignee. Pass `unassigned: true` to list only tasks with no assignee. Nesting: `parent_id` lists an epic's direct children; `top_level: true` lists only unparented tasks (epics + loose tasks — the default board view). `q` is a free-text search over title + description (across all projects when project_id is omitted). `blocked_on_kind` (task|agent|operator|external) and `blocked_on_ref` give the \"what is waiting on X\" views — e.g. blocked_on_kind=operator for everything awaiting the operator, blocked_on_kind=external for tasks waiting on infra, or blocked_on_ref=<agent> for what is blocked on that agent. Archived tasks are hidden by default; pass `include_archived: true` to list them too. Returns a COMPACT projection (no description body - fetch a task's full description via get_task) and is PAGINATED (task_969): up to `limit` tasks (default 100, max 1000) ordered by id, starting at `offset`; page a large project with offset, or narrow with the filters above, to stay under the read cap."
     )]
     async fn list_tasks(
         &self,
         Parameters(a): Parameters<ListTasksArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_tasks(
+        let tasks = core::list_tasks(
             &self.pool,
             a.project_id,
             s(&a.status),
@@ -2262,8 +2270,12 @@ impl Board {
             a.include_archived.unwrap_or(false),
         )
         .await
-        .map_err(err)
-        .and_then(ok)
+        .map_err(err)?;
+        // task_969: page the result so a large project's listing stays under the read/token cap.
+        // Default 100 (task rows are larger than agent rows), max 1000; the REST/UI path is unbounded.
+        let limit = a.limit.unwrap_or(100).clamp(1, 1000) as usize;
+        let offset = a.offset.unwrap_or(0).max(0) as usize;
+        ok(core::page_json_array(tasks, offset, limit))
     }
 
     #[tool(
