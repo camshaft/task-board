@@ -334,13 +334,13 @@ export default function ReviewView() {
 }
 
 const ENTRY_TYPE_CLS: Record<string, string> = {
-  finding: 'text-amber-300',
-  finding_resolved: 'text-emerald-300',
-  state_change: 'text-sky-300',
-  decision: 'text-violet-300',
-  adversarial_review: 'text-rose-300',
-  submitted: 'text-slate-300',
-  revised: 'text-slate-300',
+  finding: 'text-amber-800 dark:text-amber-300',
+  finding_resolved: 'text-emerald-700 dark:text-emerald-300',
+  state_change: 'text-sky-700 dark:text-sky-300',
+  decision: 'text-violet-700 dark:text-violet-300',
+  adversarial_review: 'text-rose-700 dark:text-rose-300',
+  submitted: 'text-slate-600 dark:text-slate-300',
+  revised: 'text-slate-600 dark:text-slate-300',
   comment: 'text-[var(--color-muted)]',
 }
 
