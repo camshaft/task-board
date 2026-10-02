@@ -312,6 +312,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/people", get(list_people).post(create_person))
         .route("/people/{id}", delete(delete_person))
+        .route("/operators/bindings", get(list_operator_bindings))
+        .route(
+            "/operators/{person}/binding",
+            get(get_operator_binding)
+                .post(bind_operator)
+                .delete(unbind_operator),
+        )
         .route("/teams", get(list_teams).post(create_team))
         .route("/teams/{team_id}", get(get_team).delete(delete_team))
         .route(
@@ -923,6 +930,10 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/people", summary: "List people (first-class human identities, multi-operator model doc_26). A separate registry from agents; resolved together with agents at read time.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/people", summary: "Create or upsert a person by stable string id (e.g. cameron).", query: "", body: Some("CreatePersonBody") },
     Endpoint { method: "DELETE", path: "/api/people/{id}", summary: "Delete a person and drop their team memberships.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/operators/bindings", summary: "List all per-operator concierge bindings (person -> handling agent, task_1259) -- the operator routing map.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/operators/{person}/binding", summary: "Read an operator's per-operator-concierge binding (person -> handling agent, task_1259), or null if unbound (default handling).", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/operators/{person}/binding", summary: "Bind an operator (person) to the agent that handles them (e.g. zyork -> concierge-zyork). Idempotent upsert; a question routed to a bound person wakes that agent, an unbound person is unchanged.", query: "", body: Some("BindOperatorBody") },
+    Endpoint { method: "DELETE", path: "/api/operators/{person}/binding", summary: "Clear an operator's handling-agent binding (idempotent); the person falls back to default handling.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/teams", summary: "List teams (addressable groups whose members are people OR other teams).", query: "", body: None },
     Endpoint { method: "POST", path: "/api/teams", summary: "Create or upsert a team by stable string id (e.g. operator).", query: "", body: Some("CreateTeamBody") },
     Endpoint { method: "GET", path: "/api/teams/{team_id}", summary: "Get a team with its direct members and its fully-resolved person AND agent sets (resolved_people + resolved_agents, kept separate; nested teams expanded, cycle-guarded).", query: "", body: None },
@@ -1039,6 +1050,7 @@ fn body_schemas() -> Value {
         ApproveReviewBody,
         SetIdentityAliasBody,
         CreatePersonBody,
+        BindOperatorBody,
         CreateTeamBody,
         TeamMemberBody,
         ProjectTeamBody,
@@ -2744,6 +2756,42 @@ async fn create_person(State(st): State<AppState>, Json(b): Json<CreatePersonBod
 
 async fn delete_person(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult {
     Ok(Json(core::delete_person(&st.pool, &id).await?))
+}
+
+// --- Per-operator concierge binding (task_1259): person -> handling agent. ---
+
+#[derive(Deserialize, JsonSchema)]
+struct BindOperatorBody {
+    /// The agent that handles this operator (e.g. "concierge-zyork").
+    handling_agent: String,
+    #[serde(rename = "principal", alias = "actor")]
+    actor: Option<String>,
+}
+
+async fn list_operator_bindings(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_operator_bindings(&st.pool).await?))
+}
+
+async fn get_operator_binding(State(st): State<AppState>, Path(person): Path<String>) -> ApiResult {
+    Ok(Json(
+        core::get_operator_binding(&st.pool, &person)
+            .await?
+            .unwrap_or(Value::Null),
+    ))
+}
+
+async fn bind_operator(
+    State(st): State<AppState>,
+    Path(person): Path<String>,
+    Json(b): Json<BindOperatorBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::bind_operator(&st.pool, &person, &b.handling_agent, b.actor.as_deref()).await?,
+    ))
+}
+
+async fn unbind_operator(State(st): State<AppState>, Path(person): Path<String>) -> ApiResult {
+    Ok(Json(core::unbind_operator(&st.pool, &person, None).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]

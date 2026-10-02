@@ -1174,6 +1174,26 @@ pub struct PersonIdArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct BindOperatorArgs {
+    /// The operator (person id, e.g. "zyork") whose board routing is bound.
+    pub person: String,
+    /// The agent that handles that operator (e.g. "concierge-zyork").
+    pub handling_agent: String,
+    #[serde(rename = "principal", alias = "actor", alias = "created_by", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPersonArgs {
+    /// The operator (person id).
+    pub person: String,
+    #[serde(rename = "principal", alias = "actor", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TeamIdArgs {
     /// The team's stable string handle.
     pub team_id: String,
@@ -3010,6 +3030,57 @@ impl Board {
         Parameters(a): Parameters<PersonIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::delete_person(&self.pool, &a.id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Bind an operator (person) to the agent that handles them -- e.g. person \"zyork\" -> \"concierge-zyork\" (task_1259 per-operator concierge). Idempotent upsert / reconcile-on-reclaim. A question routed to a BOUND person then wakes that handling agent; an UNBOUND person is unchanged (surfaced via the Awaiting queue). Typically written at concierge mint."
+    )]
+    async fn bind_operator(
+        &self,
+        Parameters(a): Parameters<BindOperatorArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::bind_operator(&self.pool, &a.person, &a.handling_agent, actor.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Clear an operator's handling-agent binding (task_1259). Idempotent; the person falls back to the default handling (Awaiting queue / operator-team fan-out)."
+    )]
+    async fn unbind_operator(
+        &self,
+        Parameters(a): Parameters<OperatorPersonArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::unbind_operator(&self.pool, &a.person, actor.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Read an operator's handling-agent binding (task_1259), or null if the person is unbound (default handling)."
+    )]
+    async fn get_operator_binding(
+        &self,
+        Parameters(a): Parameters<OperatorPersonArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let b = core::get_operator_binding(&self.pool, &a.person)
+            .await
+            .map_err(err)?;
+        ok(b.unwrap_or(Value::Null))
+    }
+
+    #[tool(
+        description = "List all per-operator concierge bindings (person -> handling agent, task_1259) -- the operator routing map."
+    )]
+    async fn list_operator_bindings(&self) -> Result<CallToolResult, McpError> {
+        core::list_operator_bindings(&self.pool)
             .await
             .map_err(err)
             .and_then(ok)
