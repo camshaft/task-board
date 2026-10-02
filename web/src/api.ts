@@ -134,6 +134,10 @@ export type QuestionState =
 export interface QuestionOption {
   id: string
   label: string
+  // Optional per-option image for the visual/image-choice render variant (doc_3371 A1 entry 9):
+  // an IPFS reference (ipfs://<cid> or a board-relative /ipfs/ path) resolved + confidentiality-
+  // gated by the renderer exactly like a markdown image. Absent for a text-only option.
+  image?: string
 }
 // One open blocking question, as summarized by a single-task fetch's derived block (doc_33 A7).
 // `kind` is null for a CID-keyed question (its element is named by ui.element_schema_cid instead).

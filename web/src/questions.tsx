@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import {
+  ipfsUrl,
   type AnswerPayload,
   type Comment,
   type QuestionKind,
@@ -8,7 +9,7 @@ import {
   type QuestionState,
 } from './api'
 import { AgeAnswer } from './age-answer'
-import { Markdown } from './markdown'
+import { ipfsCidFromSrc, Markdown } from './markdown'
 import { AuthorLabel, AutoGrowTextarea, relTime } from './ui'
 import { elementMeta, elementNameForCid } from './ui-registry'
 
@@ -79,7 +80,10 @@ function asOptions(v: unknown): QuestionOption[] {
     if (o && typeof o === 'object') {
       const rec = o as Record<string, unknown>
       if (typeof rec.id === 'string' && typeof rec.label === 'string') {
-        out.push({ id: rec.id, label: rec.label })
+        // Carry an optional per-option image through for the image-choice variant (entry 9); the
+        // renderer confidentiality-gates it like a markdown image, so a non-IPFS src is dropped.
+        const image = typeof rec.image === 'string' ? rec.image : undefined
+        out.push({ id: rec.id, label: rec.label, ...(image ? { image } : {}) })
       }
     }
   }
@@ -113,7 +117,7 @@ type FormSpec =
       min?: number
       max?: number
       scalar?: boolean
-      display?: 'buttons' | 'scale' | 'stars' | 'nps'
+      display?: 'buttons' | 'scale' | 'stars' | 'nps' | 'image'
       minLabel?: string
       maxLabel?: string
     }
@@ -133,7 +137,7 @@ function isArraySchema(s: unknown): boolean {
 // change). 'buttons' = inline button row (task_1179); 'scale' = ordered rating/Likert row (doc_3371
 // A1 entry 1); 'stars' = star-glyph rating row (A1 entry 2). Each element's aliases map here;
 // honored via ui.element or a variant/display prop.
-function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | 'stars' | 'nps' | undefined {
+function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | 'stars' | 'nps' | 'image' | undefined {
   const el = q.ui?.element
   const p = q.ui?.props
   const anyIs = (names: string[]) => (v: unknown) => typeof v === 'string' && names.includes(v)
@@ -145,13 +149,14 @@ function choiceDisplay(q: QuestionPayload): 'buttons' | 'scale' | 'stars' | 'nps
   if (matches(['scale', 'rating', 'likert'])) return 'scale'
   if (matches(['stars', 'star', 'rating-stars'])) return 'stars'
   if (matches(['nps', 'net-promoter', 'net_promoter'])) return 'nps'
+  if (matches(['image', 'image-choice', 'visual', 'visual-choice'])) return 'image'
   return undefined
 }
 
 // NPS is a 0-10 scale, so it shares the scale render but carries conventional default end labels
 // when the question did not supply its own (doc_3371 A1 entry 5).
 function endLabels(
-  display: 'buttons' | 'scale' | 'stars' | 'nps' | undefined,
+  display: 'buttons' | 'scale' | 'stars' | 'nps' | 'image' | undefined,
   min: string | undefined,
   max: string | undefined,
 ): { minLabel?: string; maxLabel?: string } {
@@ -444,6 +449,38 @@ function AnswerForm({
 
       {spec?.shape === 'choice' && !spec.multi && spec.display === 'stars' && (
         <StarRating options={options} busy={busy} scalar={spec.scalar} onSubmit={onSubmit} />
+      )}
+
+      {spec?.shape === 'choice' && !spec.multi && spec.display === 'image' && (
+        // Visual / image choice (doc_3371 A1 entry 9, task_1198): each option is a tappable image
+        // tile (image + label); one tap submits the option id -- same value as the radio variant.
+        // The image is an IPFS reference resolved + confidentiality-gated like a markdown image (a
+        // non-IPFS / absolute src renders an inert placeholder, never fetched), so a tile still
+        // answers via its label even when its image is blocked or absent.
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+          {options.map((o) => {
+            const cid = ipfsCidFromSrc(o.image)
+            return (
+              <button
+                key={o.id}
+                type="button"
+                disabled={busy}
+                aria-label={o.label}
+                onClick={() => onSubmit('choice', spec.scalar ? o.id : [o.id])}
+                className="flex flex-col items-center gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-2 text-sm hover:border-sky-500/50 disabled:opacity-40"
+              >
+                {cid ? (
+                  <img src={ipfsUrl(cid)} alt={o.label} className="h-24 w-full rounded object-cover" />
+                ) : (
+                  <span className="flex h-24 w-full items-center justify-center rounded bg-[var(--color-panel)] text-xs text-[var(--color-muted)]">
+                    [image]
+                  </span>
+                )}
+                <span className="text-center">{o.label}</span>
+              </button>
+            )
+          })}
+        </div>
       )}
 
       {spec?.shape === 'choice' && !spec.multi && (spec.display === 'scale' || spec.display === 'nps') && (

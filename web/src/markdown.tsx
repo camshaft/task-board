@@ -463,7 +463,7 @@ function validCid(c: string): string | null {
 // returns null and is blocked by the caller, so a public-gateway URL (even one containing /ipfs/)
 // never fetches: confidentiality is enforced by the renderer, not by author convention. An embedded
 // CID always resolves through ipfsUrl() to the board's internal /api/ipfs route.
-function ipfsCidFromSrc(src: string | undefined): string | null {
+export function ipfsCidFromSrc(src: string | undefined): string | null {
   if (!src) return null
   const s = src.trim()
   const scheme = /^ipfs:\/\/([^/?#]+)/i.exec(s)
