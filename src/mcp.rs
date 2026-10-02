@@ -2180,6 +2180,16 @@ impl Board {
             })
             .or(flat_blocked_on);
         let verbose = a.verbose.unwrap_or(false);
+        // task_542 B5c: gate the write on the authenticated caller's access to the task's project
+        // when enforcement is enabled (fail-closed; inert while off). Keyed on the authenticated
+        // identity, not the client-supplied actor.
+        core::ensure_can_write_task(
+            &self.pool,
+            self.authenticated_identity().as_deref(),
+            a.task_id,
+        )
+        .await
+        .map_err(err)?;
         core::update_task(
             &self.pool,
             a.task_id,

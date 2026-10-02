@@ -1694,9 +1694,14 @@ struct UpdateTaskBody {
 
 async fn update_task(
     State(st): State<AppState>,
+    viewer: Option<Extension<ForcedViewer>>,
     Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<UpdateTaskBody>,
 ) -> ApiResult {
+    // task_542 B5c: gate the write on the authenticated caller's access to the task's project when
+    // enforcement is enabled (fail-closed; a no-op while off). The actor is the forced viewer.
+    let actor = viewer.map(|Extension(ForcedViewer(v))| v);
+    core::ensure_can_write_task(&st.pool, actor.as_deref(), task_id).await?;
     // `unassign: true` clears the owner via the core empty-string sentinel and wins over `assignee`.
     let assignee = if b.unassign.unwrap_or(false) {
         Some("")

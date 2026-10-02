@@ -2063,6 +2063,29 @@ pub async fn ensure_can_write_project(
     Ok(())
 }
 
+/// Write-gate for a mutating operation targeting a TASK (task_542 Phase 3 Part B5c): resolves the
+/// task's project and defers to `ensure_can_write_project`. A no-op while enforcement is OFF, and a
+/// no-op for a non-existent task (the underlying mutation then returns its own "no task" error, so
+/// enforcement does not alter not-found behavior). The task-targeting mutating handlers call this.
+pub async fn ensure_can_write_task(
+    pool: &Pool,
+    actor: Option<&str>,
+    task_id: i64,
+) -> anyhow::Result<()> {
+    if enforcement_enabled(pool).await? {
+        let project_id: Option<i64> = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?
+            .map(|r| r.try_get::<i64, _>("project_id"))
+            .transpose()?;
+        if let Some(pid) = project_id {
+            ensure_can_write_project(pool, actor, pid).await?;
+        }
+    }
+    Ok(())
+}
+
 /// `get_project` scoped to `viewer` when enforcement is enabled (task_542 Phase 3 Part B5b). With
 /// enforcement OFF (today) it returns the project unchanged -- recorded-not-enforced. With enforcement
 /// ON it is FAIL-CLOSED: an identified viewer that cannot read the project -- OR no identified viewer
@@ -7718,6 +7741,9 @@ const EXTERNAL_LINK_KINDS: &[&str] = &["channel", "task", "thread", "comment", "
 /// on (source, external_id): re-linking the same external entity updates its board target /
 /// parent / metadata (metadata MERGED) and bumps `updated_at`. Returns the stored record.
 #[allow(clippy::too_many_arguments)]
+// clippy 1.98 collapsible_match wants the per-arm existence `if` folded into a match guard, but the
+// condition runs an `.await?` query, which a match guard cannot hold -- so the nested `if` stays.
+#[allow(clippy::collapsible_match)]
 pub async fn upsert_external_link(
     pool: &Pool,
     source: &str,
@@ -14335,8 +14361,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["type"] == json!("document.updated"))
-            .next_back()
+            .rfind(|e| e["type"] == json!("document.updated"))
             .expect("document.updated emitted");
         assert_eq!(ev["actor"], json!("dreamer"));
         assert_eq!(ev["data"]["document_id"].as_i64().unwrap(), id);
@@ -18570,11 +18595,10 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| {
+            .rfind(|e| {
                 e["type"] == json!("channel.outbound_reflect")
                     && e["data"]["author"] == json!("frank")
             })
-            .next_back()
             .unwrap();
         assert_eq!(top["data"]["metadata"]["k"], json!("v"));
         assert!(
@@ -23354,6 +23378,69 @@ mod tests {
             ensure_can_write_project(&pool, None, pid).await.is_err(),
             "an unidentified caller is rejected"
         );
+        Ok(())
+    }
+
+    /// task_542 B5c: ensure_can_write_task resolves the task's project and defers to the project
+    /// write-gate -- a no-op while enforcement is OFF, rejecting a non-writer once enabled, and a
+    /// no-op for a non-existent task (enforcement must not alter not-found behavior).
+    #[tokio::test]
+    async fn ensure_can_write_task_gates_via_project_when_enabled() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["boss", "reader", "bob"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let pid = create_project(&pool, "P", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let tid = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("boss"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        create_team(&pool, "readers", None, Some("boss"), None).await?;
+        add_team_member(&pool, "readers", "reader", "agent", Some("boss")).await?;
+        attach_project_team(&pool, pid, "readers", "read", true, Some("boss")).await?;
+
+        // Enforcement OFF: everyone, even an unidentified caller, passes.
+        ensure_can_write_task(&pool, Some("bob"), tid).await?;
+        ensure_can_write_task(&pool, None, tid).await?;
+
+        set_enforcement_enabled(&pool, true, Some("boss")).await?;
+
+        // Creator writes; a read-only grantee, a stranger, and an unidentified caller are rejected.
+        ensure_can_write_task(&pool, Some("boss"), tid).await?;
+        assert!(
+            ensure_can_write_task(&pool, Some("reader"), tid)
+                .await
+                .is_err(),
+            "a read-only grantee is rejected"
+        );
+        assert!(
+            ensure_can_write_task(&pool, Some("bob"), tid)
+                .await
+                .is_err(),
+            "a stranger is rejected"
+        );
+        assert!(
+            ensure_can_write_task(&pool, None, tid).await.is_err(),
+            "an unidentified caller is rejected"
+        );
+
+        // A non-existent task resolves to no project -- enforcement is a no-op, leaving the
+        // underlying mutation to report its own not-found error unchanged.
+        ensure_can_write_task(&pool, Some("bob"), 999_999).await?;
         Ok(())
     }
 
