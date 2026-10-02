@@ -813,6 +813,14 @@ pub struct ArchiveStaleTodosArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct FindDuplicateTasksArgs {
+    /// The project to scan for duplicate active tasks.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub project_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListTasksArgs {
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub project_id: Option<i64>,
@@ -2439,6 +2447,19 @@ impl Board {
         .await
         .map_err(err)
         .and_then(ok)
+    }
+
+    #[tool(
+        description = "Report-only duplicate detector (task_1215 dedup sibling): group the ACTIVE tasks in `project_id` (non-archived, status todo/in_progress/blocked) by a normalized title (case- and whitespace-insensitive) and return every cluster with 2+ members. REPORT-ONLY -- mutates nothing; a reviewer decides archive/merge. Done/cancelled (resolved) and iceboxed (parked) tasks are excluded. Returns {project_id, groups:[{title_key, count, tasks:[{id, title, status, updated_at}]}]} ordered by descending count."
+    )]
+    async fn find_duplicate_tasks(
+        &self,
+        Parameters(a): Parameters<FindDuplicateTasksArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::find_duplicate_tasks(&self.pool, a.project_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(

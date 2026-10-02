@@ -3389,6 +3389,55 @@ async fn archive_stale_by_status(
     }))
 }
 
+/// Report-only duplicate DETECTOR (task_1215 dedup sibling): group the ACTIVE tasks in `project_id`
+/// (non-archived, status in todo/in_progress/blocked) by a normalized title -- lowercased, trimmed,
+/// internal whitespace collapsed -- and return every group with 2+ members, the candidate duplicate
+/// clusters. REPORT-ONLY: it mutates nothing, so a hygiene daemon or board-pm reviews the clusters
+/// and decides archive/merge; the destructive step is a deliberate follow-on, not defaulted on
+/// guessed semantics. Done/cancelled tasks are excluded (already resolved; done ones age out via
+/// archive_done_proposals) and iceboxed tasks are excluded (deliberately parked). Returns
+/// {project_id, groups:[{title_key, count, tasks:[{id, title, status, updated_at}]}]}, groups ordered
+/// by descending count then title_key.
+pub async fn find_duplicate_tasks(pool: &Pool, project_id: i64) -> anyhow::Result<Value> {
+    let rows = sqlx::query(
+        "SELECT id, title, status, updated_at FROM tasks \
+         WHERE project_id=? AND archived_at IS NULL \
+           AND status IN ('todo','in_progress','blocked') ORDER BY id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    // Group by a normalized title key (case-insensitive, whitespace-insensitive).
+    let mut groups: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    for r in &rows {
+        let title: String = r.try_get("title").unwrap_or_default();
+        let key = title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        groups.entry(key).or_default().push(json!({
+            "id": r.try_get::<i64, _>("id")?,
+            "title": title,
+            "status": r.try_get::<Option<String>, _>("status")?,
+            "updated_at": r.try_get::<Option<String>, _>("updated_at")?,
+        }));
+    }
+    // Keep only clusters with 2+ members; order by descending size, then title_key for stability.
+    let mut dup: Vec<(String, Vec<Value>)> =
+        groups.into_iter().filter(|(_, v)| v.len() >= 2).collect();
+    dup.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    let out: Vec<Value> = dup
+        .into_iter()
+        .map(|(key, tasks)| json!({ "title_key": key, "count": tasks.len(), "tasks": tasks }))
+        .collect();
+    Ok(json!({ "project_id": project_id, "groups": out }))
+}
+
 /// Default number of most-recent comments the agent-facing MCP `get_task` inlines when the caller
 /// gives no explicit `comments_limit` (task #511). The REST/UI path stays unbounded (`None`).
 pub const DEFAULT_TASK_COMMENTS: i64 = 20;
@@ -25189,6 +25238,79 @@ mod tests {
         assert_eq!(u["match"], json!("unique-substring"));
         // No match errors.
         assert!(resolve_agent(&pool, "nobody-here").await.is_err());
+        Ok(())
+    }
+
+    /// task_1215 dedup sibling: the report-only detector clusters ACTIVE tasks sharing a normalized
+    /// title (case/whitespace-insensitive) and ignores done, cancelled, and iceboxed tasks.
+    #[tokio::test]
+    async fn find_duplicate_tasks_groups_active_dupes_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let mk = |title: &'static str| {
+            let pool = pool.clone();
+            async move {
+                create_task(
+                    &pool,
+                    pid,
+                    title,
+                    None,
+                    Some("worker"),
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|t| t["id"].as_i64().unwrap())
+            }
+        };
+        let set_status = |id: i64, status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                update_task(
+                    &pool,
+                    id,
+                    Some(status),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+        };
+
+        // Two ACTIVE tasks with the same title (varied case + whitespace) -> one dup cluster.
+        let _a = mk("Fix the gate").await?; // todo
+        let b = mk("  fix   the GATE ").await?;
+        set_status(b, "in_progress").await?;
+        // A unique active task.
+        let _u = mk("Unrelated thing").await?;
+        // A DONE task with the same title -> excluded (resolved).
+        let done = mk("Fix the gate").await?;
+        set_status(done, "done").await?;
+        // An ICEBOX task with the same title -> excluded (deliberately parked).
+        let iced = mk("Fix the gate").await?;
+        set_status(iced, "icebox").await?;
+
+        let res = find_duplicate_tasks(&pool, pid).await?;
+        let groups = res["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "exactly one active dup cluster: {res:#?}");
+        assert_eq!(groups[0]["title_key"], json!("fix the gate"));
+        assert_eq!(
+            groups[0]["count"],
+            json!(2),
+            "only the two active dupes count, not done/iceboxed: {res:#?}"
+        );
         Ok(())
     }
 }
