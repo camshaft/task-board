@@ -2226,10 +2226,17 @@ impl Board {
     ) -> Result<CallToolResult, McpError> {
         // Agent-facing default: bound to the most-recent slice unless the caller asks otherwise.
         let limit = a.comments_limit.unwrap_or(core::DEFAULT_TASK_COMMENTS);
-        core::get_task_limited(&self.pool, a.task_id, Some(limit))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        // task_542 B5b: scope the read to the authenticated caller when enforcement is enabled
+        // (fail-closed; inert while enforcement is off).
+        core::get_task_scoped(
+            &self.pool,
+            a.task_id,
+            Some(limit),
+            self.authenticated_identity().as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(

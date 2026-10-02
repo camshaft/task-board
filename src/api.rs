@@ -1614,10 +1614,14 @@ struct GetTaskQuery {
 
 async fn get_task(
     State(st): State<AppState>,
+    viewer: Option<Extension<ForcedViewer>>,
     Path(TaskRef(task_id)): Path<TaskRef>,
     Query(q): Query<GetTaskQuery>,
 ) -> ApiResult {
-    found(core::get_task_limited(&st.pool, task_id, q.comments_limit).await?)
+    // task_542 B5b: scope the read to the authenticated caller when enforcement is enabled
+    // (fail-closed; a no-op while enforcement is off). The viewer is stamped by force_trusted_user.
+    let viewer = viewer.map(|Extension(ForcedViewer(v))| v);
+    found(core::get_task_scoped(&st.pool, task_id, q.comments_limit, viewer.as_deref()).await?)
 }
 
 /// What a blocked task is waiting on. `kind` is task | agent | team | operator | external (or "none"/""
