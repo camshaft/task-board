@@ -2850,13 +2850,26 @@ pub async fn update_task(
         )
         .await?;
     }
-    // Auto-unblock fan-out (task 614): when THIS task completes, notify the subscribers of every task
-    // that was blocked_on it (kind=task, ref=this task) so they learn the blocker cleared and can
-    // start -- the durable auto-unblock mechanism, not a manual sweep. Keyed on "done" per the
-    // operator directive (a cancelled blocker is a re-plan, not an auto-start, so it is NOT fanned).
-    if status_changed && new_status == "done" {
+    // Auto-unblock fan-out (task 614 + task_1220): when THIS task reaches a terminal state, every
+    // task that was blocked_on it (kind=task, ref=this task) is no longer validly blocked -- CLEAR
+    // that now-stale blocked_on, return the dependent to `todo`, and emit task.unblocked so its owner
+    // resumes. This eliminates the stale-blocked-pointer class (a dependent left blocked_on a
+    // long-finished task) at the source, not via a manual re-validation sweep. DONE => the dependency
+    // was satisfied (resume); CANCELLED => it will not happen (the reason tells the owner to
+    // re-validate -- resume or cancel). Either way the stale pointer must not persist, so task_1220
+    // fans cancelled too (superseding task 614's done-only behavior per cameron's directive). Only
+    // currently-`blocked` dependents are touched, so a dependent that already moved on is left alone.
+    let terminal = status_changed
+        && (new_status == "done" || new_status == "cancelled" || new_status == "canceled");
+    if terminal {
+        let reason = if new_status == "done" {
+            "blocker_done"
+        } else {
+            "blocker_cancelled"
+        };
         let dependents = sqlx::query(
-            "SELECT id, project_id, title FROM tasks WHERE blocked_on_kind='task' AND blocked_on_ref=?",
+            "SELECT id, project_id, title FROM tasks \
+             WHERE blocked_on_kind='task' AND blocked_on_ref=? AND status='blocked'",
         )
         .bind(task_id.to_string())
         .fetch_all(&mut *tx)
@@ -2865,6 +2878,16 @@ pub async fn update_task(
             let dep_id: i64 = d.try_get("id")?;
             let dep_project: i64 = d.try_get("project_id")?;
             let dep_title: Option<String> = d.try_get("title").ok().flatten();
+            // Clear the dependent's blocked_on and return it to todo (actionable). A `blocked`
+            // status requires a blocked_on, so clearing it necessarily flips status off `blocked`.
+            sqlx::query(
+                "UPDATE tasks SET blocked_on_kind=NULL, blocked_on_ref=NULL, blocked_on_note=NULL, \
+                 status='todo', updated_at=? WHERE id=?",
+            )
+            .bind(&ts)
+            .bind(dep_id)
+            .execute(&mut *tx)
+            .await?;
             emit(
                 &mut tx,
                 &mut hooks,
@@ -2874,7 +2897,7 @@ pub async fn update_task(
                 Some(dep_project),
                 None,
                 None,
-                json!({ "blocker_task_id": task_id, "blocker_title": old_title, "title": dep_title }),
+                json!({ "blocker_task_id": task_id, "blocker_title": old_title, "title": dep_title, "reason": reason, "status": "todo" }),
                 Recipients::FromTask,
             )
             .await?;
@@ -13785,11 +13808,13 @@ mod tests {
         Ok(())
     }
 
-    /// Auto-unblock (task 614): completing a blocker task fans a task.unblocked notification out to
-    /// the subscribers of every task that was blocked_on it, so dependents learn the blocker cleared
-    /// without a manual sweep.
+    /// Auto-unblock (task 614 + task_1220): a blocker task reaching a terminal state (done OR
+    /// cancelled) auto-CLEARS every dependent's stale blocked_on, returns it to `todo`, and fans a
+    /// task.unblocked (carrying the reason) to its owner -- so no dependent is left blocked_on a
+    /// finished task, no manual re-validation sweep needed. A task blocked on a DIFFERENT blocker is
+    /// untouched.
     #[tokio::test]
-    async fn completing_a_blocker_notifies_dependents() -> anyhow::Result<()> {
+    async fn completing_a_blocker_clears_and_notifies_dependents() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let p = create_project(&pool, "P", None, Some("u"), None).await?;
@@ -13910,6 +13935,26 @@ mod tests {
                 json!(b_id),
                 "names the blocker"
             );
+            assert_eq!(
+                hit.unwrap()["data"]["reason"],
+                json!("blocker_done"),
+                "a done blocker carries reason=blocker_done"
+            );
+            // task_1220: the dependent is auto-cleared to todo (stale pointer gone), not just notified.
+            let row = sqlx::query("SELECT status, blocked_on_kind FROM tasks WHERE id=?")
+                .bind(dep)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(
+                row.try_get::<String, _>("status")?,
+                "todo",
+                "dep {dep} returned to todo"
+            );
+            assert!(
+                row.try_get::<Option<String>, _>("blocked_on_kind")?
+                    .is_none(),
+                "dep {dep} blocked_on cleared"
+            );
         }
 
         // `other` (blocked on D1, not B) is NOT spuriously unblocked by B completing.
@@ -13921,6 +13966,94 @@ mod tests {
                 .iter()
                 .any(|n| n["type"] == json!("task.unblocked")),
             "a task blocked on a different blocker is not spuriously unblocked: {o_notes}"
+        );
+
+        // task_1220: a CANCELLED blocker also clears its dependents (reason=blocker_cancelled), so a
+        // task never sits blocked_on a cancelled task -- the owner re-validates (resume or cancel).
+        let bc = create_task(
+            &pool,
+            pid,
+            "blocker-cancel",
+            None,
+            None,
+            None,
+            Some("bc-owner"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let dc = create_task(
+            &pool,
+            pid,
+            "dep-cancel",
+            None,
+            None,
+            None,
+            Some("dc"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        update_task(
+            &pool,
+            dc,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("dc"),
+            None,
+            None,
+            Some(json!({"kind": "task", "target": bc.to_string()})),
+        )
+        .await?;
+        check_notifications(&pool, "dc", true, 100, None).await?;
+        update_task(
+            &pool,
+            bc,
+            Some("cancelled"),
+            None,
+            None,
+            None,
+            None,
+            Some("bc-owner"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let dc_row = sqlx::query("SELECT status, blocked_on_kind FROM tasks WHERE id=?")
+            .bind(dc)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            dc_row.try_get::<String, _>("status")?,
+            "todo",
+            "cancelled-blocker dependent returned to todo"
+        );
+        assert!(
+            dc_row
+                .try_get::<Option<String>, _>("blocked_on_kind")?
+                .is_none(),
+            "cancelled-blocker dependent blocked_on cleared"
+        );
+        let dc_notes = check_notifications(&pool, "dc", true, 100, None).await?;
+        let dc_hit = dc_notes["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == json!("task.unblocked") && n["task_id"] == json!(dc));
+        assert_eq!(
+            dc_hit.unwrap()["data"]["reason"],
+            json!("blocker_cancelled"),
+            "a cancelled blocker carries reason=blocker_cancelled"
         );
         Ok(())
     }
