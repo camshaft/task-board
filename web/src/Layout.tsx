@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from 'react'
-import { Link, Outlet, useOutletContext, useParams } from 'react-router-dom'
+import { Link, Outlet, useLocation, useOutletContext, useParams } from 'react-router-dom'
+import { type Channel } from './api'
 import { useLiveUpdates } from './live'
 import {
   AgentMentionContext,
@@ -12,6 +13,7 @@ import {
   eventHref,
   useAgents,
   useAwaiting,
+  useChannels,
   useEvents,
   useIdentityAliases,
   useProjects,
@@ -129,6 +131,23 @@ export default function Layout() {
   // static column on lg+. Navigating from a drawer link closes it so the content is visible.
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const closeSidebar = () => setSidebarOpen(false)
+
+  // Phase 2 (doc_3346): the left sidebar is contextual to the active section rather than always the
+  // project list. First migrated section is Channels -- on a channel route the sidebar lists the
+  // reader's channels/DMs so they switch conversations in one click; every other section keeps the
+  // project list for now (later sub-tasks migrate docs/agents). Section is derived from the route.
+  const { pathname } = useLocation()
+  const section: 'channels' | 'board' = pathname.startsWith('/channels') ? 'channels' : 'board'
+  const activeChannelMatch = pathname.match(/^\/channels\/(\d+)/)
+  const activeChannel = activeChannelMatch ? Number(activeChannelMatch[1]) : null
+  // Public channels + the actor's channels (incl. private/DMs), deduped and id-ordered -- the same
+  // merge the Channels index uses. Fetched app-wide so the rail is ready when a channel route opens.
+  const { data: pubChannels = [] } = useChannels()
+  const { data: myChannels = [] } = useChannels(actor)
+  const channelById = new Map<number, Channel>()
+  for (const c of [...pubChannels, ...myChannels]) channelById.set(c.id, c)
+  const channels = [...channelById.values()].sort((a, b) => a.id - b.id)
+  const channelLabel = (c: Channel) => c.name || (c.private ? 'Direct message' : `#${c.id}`)
   // Order the sidebar by project name (case-insensitive), not the server's creation-id order, so
   // the list is stable and scannable (task_1058 goal: projects appeared in an arbitrary order).
   // .filter() returns a copy, so sorting here does not mutate the shared store data.
@@ -263,6 +282,43 @@ export default function Layout() {
             sidebarOpen ? 'translate-x-0' : '-translate-x-full'
           }`}
         >
+          {section === 'channels' ? (
+            <>
+              <div className="flex items-center justify-between px-4 py-3">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Channels
+                </span>
+                <Link
+                  to="/channels"
+                  onClick={closeSidebar}
+                  className="rounded px-1.5 text-sm text-sky-400 hover:bg-[var(--color-panel-2)]"
+                >
+                  all
+                </Link>
+              </div>
+              <nav className="flex-1 overflow-y-auto px-2">
+                {channels.map((c) => (
+                  <Link
+                    key={c.id}
+                    to={`/channels/${c.id}`}
+                    onClick={closeSidebar}
+                    className={`mb-1 flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm ${
+                      c.id === activeChannel
+                        ? 'bg-sky-500/15 font-medium'
+                        : 'hover:bg-[var(--color-panel-2)]'
+                    }`}
+                  >
+                    <span className="text-[var(--color-muted)]">{c.private ? '🔒' : '#'}</span>
+                    <span className="truncate">{channelLabel(c)}</span>
+                  </Link>
+                ))}
+                {channels.length === 0 && (
+                  <p className="px-3 py-2 text-sm text-[var(--color-muted)]">No channels yet.</p>
+                )}
+              </nav>
+            </>
+          ) : (
+          <>
           <div className="flex items-center justify-between px-4 py-3">
             <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
               Projects
@@ -327,6 +383,8 @@ export default function Layout() {
               </div>
             )}
           </nav>
+          </>
+          )}
         </aside>
 
         {/* Whatever the URL points at: the board for a project, plus the task drawer. Wrapped so
