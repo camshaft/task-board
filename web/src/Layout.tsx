@@ -21,7 +21,7 @@ import {
 } from './resources'
 import { useConnectionHealth } from './store'
 import { type ThemePref, useTheme } from './theme'
-import { relTime } from './ui'
+import { AGENT_DOT, relTime } from './ui'
 
 // A thin top banner shown while the backend is unreachable (e.g. the 502 window during a backend
 // deploy) or the live stream is down. The board keeps its last-good content and auto-retries in
@@ -133,13 +133,20 @@ export default function Layout() {
   const closeSidebar = () => setSidebarOpen(false)
 
   // Phase 2 (doc_3346): the left sidebar is contextual to the active section rather than always the
-  // project list. First migrated section is Channels -- on a channel route the sidebar lists the
-  // reader's channels/DMs so they switch conversations in one click; every other section keeps the
-  // project list for now (later sub-tasks migrate docs/agents). Section is derived from the route.
+  // project list. Migrated sections so far are Channels (list channels/DMs) and Agents (list the
+  // roster); every other section keeps the project list for now (later sub-tasks migrate docs).
+  // Section is derived from the route, and so is the active item within it (for highlighting).
   const { pathname } = useLocation()
-  const section: 'channels' | 'board' = pathname.startsWith('/channels') ? 'channels' : 'board'
+  const section: 'channels' | 'agents' | 'board' = pathname.startsWith('/channels')
+    ? 'channels'
+    : pathname.startsWith('/agents')
+      ? 'agents'
+      : 'board'
   const activeChannelMatch = pathname.match(/^\/channels\/(\d+)/)
   const activeChannel = activeChannelMatch ? Number(activeChannelMatch[1]) : null
+  const activeAgentMatch = pathname.match(/^\/agents\/(.+)/)
+  const activeAgent = activeAgentMatch ? decodeURIComponent(activeAgentMatch[1]) : null
+  const sortedAgents = [...agents].sort((a, b) => a.id.localeCompare(b.id))
   // Public channels + the actor's channels (incl. private/DMs), deduped and id-ordered -- the same
   // merge the Channels index uses. Fetched app-wide so the rail is ready when a channel route opens.
   const { data: pubChannels = [] } = useChannels()
@@ -314,6 +321,42 @@ export default function Layout() {
                 ))}
                 {channels.length === 0 && (
                   <p className="px-3 py-2 text-sm text-[var(--color-muted)]">No channels yet.</p>
+                )}
+              </nav>
+            </>
+          ) : section === 'agents' ? (
+            <>
+              <div className="flex items-center justify-between px-4 py-3">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Agents
+                </span>
+                <Link
+                  to="/agents"
+                  onClick={closeSidebar}
+                  className="rounded px-1.5 text-sm text-sky-400 hover:bg-[var(--color-panel-2)]"
+                >
+                  all
+                </Link>
+              </div>
+              <nav className="flex-1 overflow-y-auto px-2">
+                {sortedAgents.map((a) => (
+                  <Link
+                    key={a.id}
+                    to={`/agents/${encodeURIComponent(a.id)}`}
+                    onClick={closeSidebar}
+                    className={`mb-1 flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm ${
+                      a.id === activeAgent ? 'bg-sky-500/15 font-medium' : 'hover:bg-[var(--color-panel-2)]'
+                    }`}
+                  >
+                    <span
+                      className={`size-2 shrink-0 rounded-full ${AGENT_DOT[a.status] ?? 'bg-zinc-600'}`}
+                      title={a.status}
+                    />
+                    <span className="truncate font-mono">{a.id}</span>
+                  </Link>
+                ))}
+                {sortedAgents.length === 0 && (
+                  <p className="px-3 py-2 text-sm text-[var(--color-muted)]">No agents yet.</p>
                 )}
               </nav>
             </>
