@@ -570,23 +570,42 @@ export interface SecretRequest {
   expires_at: string | null
 }
 
+// Transient-blip handling (task_1286): a fetch that THROWS (TypeError "Failed to fetch" -- a lab/
+// tunnel or client network blip, offline, DNS; the request never completed) is TRANSIENT, not a
+// server defect. Idempotent GETs are safe to replay, so retry a couple of times with short backoff to
+// ride out a sub-second blip transparently; a non-idempotent request is never auto-replayed (it may
+// have reached the server). Crucially, a network rejection is NO LONGER auto-filed as a crash task:
+// the store already retries + keeps stale data for GET-backed views and surfaces a "Reconnecting..."
+// banner via useConnectionHealth, and a true outage self-limits (the crash POST fails too), so a
+// momentary blip must neither spawn an investigation task nor interrupt the operator. Only a
+// server-side 5xx (below) -- a real server defect the store's retry won't fix -- is still telemetered.
+const NET_BACKOFF_MS = [200, 600]
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   // The crash-report POST must never route through the failure reporter -- reporting its own
   // failure would loop. (reportCrash also swallows this call's rejection, but exclude it here too.)
   const telemetered = path !== '/crash-reports'
+  const idempotent = method.toUpperCase() === 'GET'
   let res: Response
-  try {
-    res = await fetch(`${API_ROOT}${path}`, {
-      method,
-      headers: body ? { 'content-type': 'application/json' } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
-    })
-  } catch (e) {
-    // Network-level failure (offline, DNS, CORS, server unreachable): auto-report so an outage is
-    // not invisible. A full outage self-limits, since the crash-report POST also fails and is
-    // swallowed; this fires on a PARTIAL failure where the crash endpoint is still reachable.
-    if (telemetered) apiFailureReporter?.({ method, path, message: (e as Error).message || 'network error' })
-    throw e
+  for (let attempt = 0; ; attempt++) {
+    try {
+      res = await fetch(`${API_ROOT}${path}`, {
+        method,
+        headers: body ? { 'content-type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      })
+      break
+    } catch (e) {
+      // Network-level failure (the fetch threw -- no response). Retry an idempotent GET a couple of
+      // times to ride out a sub-second blip; otherwise give up to the caller / the store's slower
+      // backoff retry. No crash is filed for a transient network failure (task_1286).
+      if (idempotent && attempt < NET_BACKOFF_MS.length) {
+        await sleep(NET_BACKOFF_MS[attempt])
+        continue
+      }
+      throw e
+    }
   }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`
