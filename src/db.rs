@@ -451,6 +451,18 @@ CREATE TABLE IF NOT EXISTS review_log (
 -- (WHERE review_id=? AND external_id=?) both key on review_id first.
 CREATE INDEX IF NOT EXISTS idx_review_log_review ON review_log(review_id, external_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
+-- MULTI-REVIEWER (task_1323): extra reviewers assigned to a review beyond the single `reviews.assignee`
+-- primary. Additive and back-compat: the authoritative assignee set is reviews.assignee UNION these
+-- rows, so an existing single-assignee review (no rows here) is unchanged. Each reviewer's approval is
+-- a review_log entry (entry_type='approval'); the approval policy lives in reviews.metadata.
+CREATE TABLE IF NOT EXISTS review_assignees (
+    review_id   INTEGER NOT NULL REFERENCES reviews(id),
+    assignee    TEXT NOT NULL,
+    assigned_by TEXT,
+    assigned_at TEXT NOT NULL,
+    PRIMARY KEY(review_id, assignee)
+);
+CREATE INDEX IF NOT EXISTS idx_review_assignees_review ON review_assignees(review_id);
 CREATE INDEX IF NOT EXISTS idx_inbox_unread  ON inbox(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);

@@ -323,6 +323,12 @@ pub fn router(state: AppState) -> Router {
         .route("/reviews/{review_id}/vetted", post(set_review_vetted))
         .route("/reviews/{review_id}/metadata", post(set_review_metadata))
         .route("/reviews/{review_id}/log", post(append_review_log))
+        .route("/reviews/{review_id}/assignees", post(add_review_assignee))
+        .route(
+            "/reviews/{review_id}/assignees/remove",
+            post(remove_review_assignee),
+        )
+        .route("/reviews/{review_id}/approve", post(approve_review))
         .route("/ipfs/add", post(ipfs_add))
         .route("/ipfs/{cid}", get(ipfs_cat))
         .route("/wiki", get(list_wiki))
@@ -928,6 +934,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/reviews/{review_id}/vetted", summary: "Set/clear a review's vetted gate (adversarial review run + addressed). Audit-only per D17: records the actor + logs the change (a decision entry), emits review.vetted_changed. Same value = idempotent no-op.", query: "", body: Some("SetReviewVettedBody") },
     Endpoint { method: "POST", path: "/api/reviews/{review_id}/metadata", summary: "Post-hoc setter for a review's metadata bag (recovery path for a review created with empty/incomplete metadata). MERGES the given properties (incoming keys overwrite), logs a decision entry naming the keys set, emits review.metadata_changed. Most important use: set reviewed_version on a conformance review that lacks it (the key the operator-submit gate reads). Empty object = idempotent no-op.", query: "", body: Some("SetReviewMetadataBody") },
     Endpoint { method: "POST", path: "/api/reviews/{review_id}/log", summary: "Append a log entry (comment / finding / decision / ...). Pass external_id for idempotent ingest (a bridge replaying an upstream item returns appended:false).", query: "", body: Some("AppendReviewLogBody") },
+    Endpoint { method: "POST", path: "/api/reviews/{review_id}/assignees", summary: "Assign an ADDITIONAL reviewer (task_1323 multi-reviewer). The reviewer set is the primary assignee UNION the added reviewers; all are woken on review events. Logs assignee_added, emits review.assignee_added. Idempotent. Returns the review with its assignees + derived approval_state.", query: "", body: Some("ReviewAssigneeBody") },
+    Endpoint { method: "POST", path: "/api/reviews/{review_id}/assignees/remove", summary: "Remove an added reviewer (task_1323). The single primary assignee set at create time is not removed by this. Logs assignee_removed, emits review.assignee_removed to the pre-removal reviewer set. Idempotent.", query: "", body: Some("ReviewAssigneeBody") },
+    Endpoint { method: "POST", path: "/api/reviews/{review_id}/approve", summary: "Record a reviewer's approval (task_1323). Appends an approval log entry; approval_state is derived from all assignees' approvals against metadata.approval_policy (all [default] / any / k_of_n via metadata.approval_k). Emits review.approved_by.", query: "", body: Some("ApproveReviewBody") },
     Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
     Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
     Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/exclude_tag/task_id/author; archived hidden unless include_archived=true). status accepts a comma-separated set + the operator vocabulary (pending-review/published); exclude_tag hides a tag (default-hide primitive). Agent-memory docs (the reserved agent-memory tag, or the repos/ and agents/ path prefixes) are hidden unless include_memory=true.", query: "project_id=int&status=str&tag=str&exclude_tag=str&task_id=int&author=str&include_archived=bool&include_memory=bool", body: None },
@@ -1020,6 +1029,8 @@ fn body_schemas() -> Value {
         SetReviewVettedBody,
         SetReviewMetadataBody,
         AppendReviewLogBody,
+        ReviewAssigneeBody,
+        ApproveReviewBody,
         SetIdentityAliasBody,
         CreatePersonBody,
         CreateTeamBody,
@@ -2823,9 +2834,12 @@ struct CreateReviewBody {
     /// The agent that created/produced the review.
     #[serde(rename = "principal", alias = "created_by")]
     created_by: Option<String>,
-    /// The reviewer(s) assigned (a single agent id in increment 1).
+    /// The PRIMARY reviewer assigned (back-compat single assignee).
     assignee: Option<String>,
-    /// Arbitrary properties: producing agent id, predecessor review id, tags, ...
+    /// Additional reviewers for a multi-reviewer review (task_1323), added on top of the primary.
+    /// Approval state is derived against metadata.approval_policy (all | any | k_of_n; default all).
+    assignees: Option<Vec<String>>,
+    /// Arbitrary properties: producing agent id, predecessor review id, tags, approval_policy, ...
     metadata: Option<Value>,
     /// Optional external reference for idempotent ingest: a review already linked on
     /// (source, external_id) is returned (`created:false`) instead of a duplicate.
@@ -2833,21 +2847,27 @@ struct CreateReviewBody {
 }
 
 async fn create_review(State(st): State<AppState>, Json(b): Json<CreateReviewBody>) -> ApiResult {
-    Ok(Json(
-        core::create_review(
-            &st.pool,
-            &b.kind,
-            b.source.as_deref(),
-            b.target_ref.as_deref(),
-            b.title.as_deref(),
-            b.status.as_deref(),
-            b.created_by.as_deref(),
-            b.assignee.as_deref(),
-            b.metadata,
-            b.external_link,
-        )
-        .await?,
-    ))
+    let review = core::create_review(
+        &st.pool,
+        &b.kind,
+        b.source.as_deref(),
+        b.target_ref.as_deref(),
+        b.title.as_deref(),
+        b.status.as_deref(),
+        b.created_by.as_deref(),
+        b.assignee.as_deref(),
+        b.metadata,
+        b.external_link,
+    )
+    .await?;
+    // Multi-reviewer (task_1323): layer any extra assignees on top of the single-primary core create.
+    if let (Some(extra), Some(rid)) = (&b.assignees, review.get("id").and_then(Value::as_i64)) {
+        if !extra.is_empty() {
+            core::add_review_assignees(&st.pool, rid, extra, b.created_by.as_deref()).await?;
+            return Ok(Json(core::get_review(&st.pool, rid).await?));
+        }
+    }
+    Ok(Json(review))
 }
 
 #[derive(Deserialize)]
@@ -2993,6 +3013,60 @@ async fn append_review_log(
             b.author.as_deref(),
             b.task_id,
             b.external_id.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReviewAssigneeBody {
+    /// The reviewer's agent id to add/remove.
+    assignee: String,
+    /// The agent making the change.
+    #[serde(rename = "principal", alias = "actor")]
+    actor: Option<String>,
+}
+
+async fn add_review_assignee(
+    State(st): State<AppState>,
+    Path(review_id): Path<i64>,
+    Json(b): Json<ReviewAssigneeBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::add_review_assignee(&st.pool, review_id, &b.assignee, b.actor.as_deref()).await?,
+    ))
+}
+
+async fn remove_review_assignee(
+    State(st): State<AppState>,
+    Path(review_id): Path<i64>,
+    Json(b): Json<ReviewAssigneeBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::remove_review_assignee(&st.pool, review_id, &b.assignee, b.actor.as_deref()).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ApproveReviewBody {
+    /// The reviewer approving.
+    #[serde(rename = "principal", alias = "reviewer", alias = "actor")]
+    reviewer: Option<String>,
+    /// An optional note recorded on the approval log entry.
+    note: Option<String>,
+}
+
+async fn approve_review(
+    State(st): State<AppState>,
+    Path(review_id): Path<i64>,
+    Json(b): Json<ApproveReviewBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::record_review_approval(
+            &st.pool,
+            review_id,
+            b.reviewer.as_deref(),
+            b.note.as_deref(),
         )
         .await?,
     ))

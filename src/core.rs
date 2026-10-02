@@ -11422,7 +11422,7 @@ const REVIEW_STATUSES: [&str; 5] = [
 /// The A1 log entry types. A finding is an entry of type `finding` (NOT a separate collection);
 /// an actionable finding links a child `task_id`. Any count/trend (open findings, etc.) is
 /// derived by reading the log in order — the log is the single source of truth.
-const REVIEW_LOG_TYPES: [&str; 8] = [
+const REVIEW_LOG_TYPES: [&str; 11] = [
     "submitted",
     "revised",
     "finding",
@@ -11431,6 +11431,11 @@ const REVIEW_LOG_TYPES: [&str; 8] = [
     "state_change",
     "adversarial_review",
     "decision",
+    // Multi-reviewer (task_1323): per-reviewer approval + assignee changes are log entries too, so
+    // the append-only log stays the single source of truth and approval state is derived, not stored.
+    "approval",
+    "assignee_added",
+    "assignee_removed",
 ];
 
 fn is_review_status(s: &str) -> bool {
@@ -11474,6 +11479,51 @@ async fn review_json(
         other => return Ok(Some(other)),
     };
     let mut out = normalize_review_obj(obj);
+    // Multi-reviewer (task_1323): surface the full assignee set + the DERIVED approval state (read
+    // from the append-only log, never stored) against the review's approval policy.
+    let assignees = review_assignee_set_tx(tx, review_id).await?;
+    let appr_rows = sqlx::query(
+        "SELECT DISTINCT author FROM review_log WHERE review_id=? AND entry_type='approval' AND author IS NOT NULL",
+    )
+    .bind(review_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let approvals: Vec<String> = appr_rows
+        .iter()
+        .filter_map(|r| r.try_get::<Option<String>, _>("author").ok().flatten())
+        .collect();
+    if let Value::Object(ref mut m) = out {
+        let policy = m
+            .get("metadata")
+            .and_then(|v| v.get("approval_policy"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("all")
+            .to_string();
+        let k = m
+            .get("metadata")
+            .and_then(|v| v.get("approval_k"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        let approved_assignees: Vec<String> = assignees
+            .iter()
+            .filter(|a| approvals.contains(a))
+            .cloned()
+            .collect();
+        let approved = match policy.as_str() {
+            "any" => !approved_assignees.is_empty(),
+            "k_of_n" => approved_assignees.len() as u64 >= k,
+            // default "all": every assignee must have approved (and there must be at least one).
+            _ => !assignees.is_empty() && approved_assignees.len() == assignees.len(),
+        };
+        m.insert("assignees".into(), json!(assignees));
+        m.insert("approvals".into(), json!(approvals));
+        m.insert("approved_assignees".into(), json!(approved_assignees));
+        m.insert("approval_policy".into(), json!(policy));
+        m.insert(
+            "approval_state".into(),
+            json!(if approved { "approved" } else { "pending" }),
+        );
+    }
     if with_log {
         let rows = sqlx::query("SELECT * FROM review_log WHERE review_id=? ORDER BY id ASC")
             .bind(review_id)
@@ -11487,20 +11537,52 @@ async fn review_json(
     Ok(Some(out))
 }
 
-/// Who hears about a review event: its creator and its assignee (reviewers), minus the actor.
-/// The whole-board firehose union in `emit` adds board subscribers on top. Increment 1 has no
-/// per-review subscription table; a richer links/watchers model arrives in a later increment.
-fn review_recipients(
+/// The authoritative reviewer set for a review (task_1323): the single `reviews.assignee` primary
+/// UNION every `review_assignees` row. A legacy single-assignee review (no review_assignees rows)
+/// returns just its primary, so existing reviews are unchanged. Sorted + deduped.
+async fn review_assignee_set_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    review_id: i64,
+) -> anyhow::Result<Vec<String>> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    if let Some(row) = sqlx::query("SELECT assignee FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        if let Some(a) = row.try_get::<Option<String>, _>("assignee")? {
+            if !a.is_empty() {
+                set.insert(a);
+            }
+        }
+    }
+    let rows = sqlx::query("SELECT assignee FROM review_assignees WHERE review_id=?")
+        .bind(review_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    for r in &rows {
+        let a: String = r.try_get("assignee")?;
+        if !a.is_empty() {
+            set.insert(a);
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
+/// Who hears about a review event: its creator and ALL assigned reviewers, minus the actor. The
+/// whole-board firehose union in `emit` adds board subscribers on top. (task_1323 widened this from
+/// the single-assignee `review_recipients` so every assigned reviewer is woken.)
+fn review_recipients_multi(
     created_by: Option<&str>,
-    assignee: Option<&str>,
+    assignees: &[String],
     actor: Option<&str>,
 ) -> BTreeSet<String> {
     let mut recips = BTreeSet::new();
     if let Some(c) = created_by {
         recips.insert(c.to_string());
     }
-    if let Some(a) = assignee {
-        recips.insert(a.to_string());
+    for a in assignees {
+        recips.insert(a.clone());
     }
     if let Some(actor) = actor {
         recips.remove(actor);
@@ -11588,7 +11670,8 @@ pub async fn create_review(
     .bind(&ts)
     .execute(&mut *tx)
     .await?;
-    let recips = review_recipients(created_by, assignee, created_by);
+    let primary: Vec<String> = assignee.map(|a| a.to_string()).into_iter().collect();
+    let recips = review_recipients_multi(created_by, &primary, created_by);
     emit(
         &mut tx,
         &mut hooks,
@@ -11717,7 +11800,7 @@ pub async fn set_review_status(
     };
     let old_status: String = row.try_get("status")?;
     let created_by: Option<String> = row.try_get("created_by")?;
-    let assignee: Option<String> = row.try_get("assignee")?;
+    let assignees = review_assignee_set_tx(&mut tx, review_id).await?;
     // Same status -> idempotent no-op (no log entry, no event).
     if old_status == new_status {
         let out = review_json(&mut tx, review_id, true)
@@ -11749,7 +11832,7 @@ pub async fn set_review_status(
     .bind(&ts)
     .execute(&mut *tx)
     .await?;
-    let recips = review_recipients(created_by.as_deref(), assignee.as_deref(), actor);
+    let recips = review_recipients_multi(created_by.as_deref(), &assignees, actor);
     emit(
         &mut tx,
         &mut hooks,
@@ -11828,7 +11911,7 @@ pub async fn set_review_vetted(
     };
     let old_vetted: bool = row.try_get::<i64, _>("vetted")? != 0;
     let created_by: Option<String> = row.try_get("created_by")?;
-    let assignee: Option<String> = row.try_get("assignee")?;
+    let assignees = review_assignee_set_tx(&mut tx, review_id).await?;
     // Same value -> idempotent no-op (no audit entry, no event).
     if old_vetted == vetted {
         let out = review_json(&mut tx, review_id, true)
@@ -11860,7 +11943,7 @@ pub async fn set_review_vetted(
     .bind(&ts)
     .execute(&mut *tx)
     .await?;
-    let recips = review_recipients(created_by.as_deref(), assignee.as_deref(), actor);
+    let recips = review_recipients_multi(created_by.as_deref(), &assignees, actor);
     emit(
         &mut tx,
         &mut hooks,
@@ -11918,7 +12001,7 @@ pub async fn set_review_metadata(
         return Ok(out);
     }
     let created_by: Option<String> = row.try_get("created_by")?;
-    let assignee: Option<String> = row.try_get("assignee")?;
+    let assignees = review_assignee_set_tx(&mut tx, review_id).await?;
     let existing: String = row.try_get("metadata")?;
     let mut merged = match serde_json::from_str::<Value>(&existing) {
         Ok(Value::Object(m)) => m,
@@ -11950,7 +12033,7 @@ pub async fn set_review_metadata(
     .bind(&ts)
     .execute(&mut *tx)
     .await?;
-    let recips = review_recipients(created_by.as_deref(), assignee.as_deref(), actor);
+    let recips = review_recipients_multi(created_by.as_deref(), &assignees, actor);
     emit(
         &mut tx,
         &mut hooks,
@@ -12004,7 +12087,7 @@ pub async fn append_review_log(
         anyhow::bail!("no review {review_id}");
     };
     let created_by: Option<String> = row.try_get("created_by")?;
-    let assignee: Option<String> = row.try_get("assignee")?;
+    let assignees = review_assignee_set_tx(&mut tx, review_id).await?;
     // Idempotent on external_id (scoped to this review): a replayed upstream item returns the
     // existing entry rather than logging a duplicate.
     if let Some(ext) = external_id {
@@ -12034,7 +12117,7 @@ pub async fn append_review_log(
     .fetch_one(&mut *tx)
     .await?
     .try_get("id")?;
-    let recips = review_recipients(created_by.as_deref(), assignee.as_deref(), author);
+    let recips = review_recipients_multi(created_by.as_deref(), &assignees, author);
     emit(
         &mut tx,
         &mut hooks,
@@ -12053,6 +12136,227 @@ pub async fn append_review_log(
     Ok(
         json!({ "review_id": review_id, "entry_id": eid, "appended": true, "entry_type": entry_type }),
     )
+}
+
+/// Assign an additional reviewer to a review (task_1323). Additive on top of the single
+/// `reviews.assignee` primary: inserts a `review_assignees` row (idempotent on (review_id,
+/// assignee)), logs an `assignee_added` entry, and emits `review.assignee_added` to the full
+/// reviewer set (so the new assignee is woken). Returns the normalized review (with log). Bails if
+/// the review does not exist.
+pub async fn add_review_assignee(
+    pool: &Pool,
+    review_id: i64,
+    assignee: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let assignee = assignee.trim();
+    if assignee.is_empty() {
+        anyhow::bail!("give a non-empty assignee");
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT created_by FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no review {review_id}");
+    };
+    let created_by: Option<String> = row.try_get("created_by")?;
+    sqlx::query(
+        "INSERT INTO review_assignees(review_id, assignee, assigned_by, assigned_at) VALUES(?,?,?,?) \
+         ON CONFLICT(review_id, assignee) DO NOTHING",
+    )
+    .bind(review_id)
+    .bind(assignee)
+    .bind(actor)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE reviews SET updated_at=? WHERE id=?")
+        .bind(&ts)
+        .bind(review_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
+         VALUES(?,?,?,?,NULL,NULL,?)",
+    )
+    .bind(review_id)
+    .bind("assignee_added")
+    .bind(assignee)
+    .bind(actor)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let assignees = review_assignee_set_tx(&mut tx, review_id).await?;
+    let recips = review_recipients_multi(created_by.as_deref(), &assignees, actor);
+    emit(
+        &mut tx,
+        &mut hooks,
+        "review.assignee_added",
+        actor,
+        None,
+        None,
+        None,
+        None,
+        json!({ "review_id": review_id, "assignee": assignee }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let out = review_json(&mut tx, review_id, true)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Assign several extra reviewers in one call (task_1323) — the create-time multi-assignee path the
+/// MCP/REST `create_review` surfaces layer on top of the single-primary core create (so core
+/// create_review keeps its signature). Skips blanks and the empty set; each add is logged + emitted.
+pub async fn add_review_assignees(
+    pool: &Pool,
+    review_id: i64,
+    assignees: &[String],
+    actor: Option<&str>,
+) -> anyhow::Result<()> {
+    for a in assignees {
+        if a.trim().is_empty() {
+            continue;
+        }
+        add_review_assignee(pool, review_id, a, actor).await?;
+    }
+    Ok(())
+}
+
+/// Remove an extra reviewer from a review (task_1323). Deletes the `review_assignees` row, logs an
+/// `assignee_removed` entry, and emits `review.assignee_removed` to the reviewer set captured BEFORE
+/// the removal (so the removed reviewer is told). Note: the single `reviews.assignee` primary is set
+/// at create time and is not removed by this call. Idempotent. Bails if the review does not exist.
+pub async fn remove_review_assignee(
+    pool: &Pool,
+    review_id: i64,
+    assignee: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let assignee = assignee.trim();
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT created_by FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no review {review_id}");
+    };
+    let created_by: Option<String> = row.try_get("created_by")?;
+    // Capture the set BEFORE removal so the departing reviewer still gets the notification.
+    let before = review_assignee_set_tx(&mut tx, review_id).await?;
+    sqlx::query("DELETE FROM review_assignees WHERE review_id=? AND assignee=?")
+        .bind(review_id)
+        .bind(assignee)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE reviews SET updated_at=? WHERE id=?")
+        .bind(&ts)
+        .bind(review_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
+         VALUES(?,?,?,?,NULL,NULL,?)",
+    )
+    .bind(review_id)
+    .bind("assignee_removed")
+    .bind(assignee)
+    .bind(actor)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let recips = review_recipients_multi(created_by.as_deref(), &before, actor);
+    emit(
+        &mut tx,
+        &mut hooks,
+        "review.assignee_removed",
+        actor,
+        None,
+        None,
+        None,
+        None,
+        json!({ "review_id": review_id, "assignee": assignee }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let out = review_json(&mut tx, review_id, true)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Record a reviewer's approval of a review (task_1323): appends an `approval` log entry authored by
+/// the reviewer. The review's `approval_state` is DERIVED from these entries against the review's
+/// `metadata.approval_policy` (all | any | k_of_n; default all) — see `review_json`, which computes
+/// it; nothing is stored. Emits `review.approved_by` to the reviewer set. Returns the normalized
+/// review (with log + the recomputed approval_state). Bails if the review does not exist.
+pub async fn record_review_approval(
+    pool: &Pool,
+    review_id: i64,
+    reviewer: Option<&str>,
+    note: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(row) = sqlx::query("SELECT created_by FROM reviews WHERE id=?")
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no review {review_id}");
+    };
+    let created_by: Option<String> = row.try_get("created_by")?;
+    sqlx::query(
+        "INSERT INTO review_log(review_id, entry_type, body, author, external_id, task_id, created_at) \
+         VALUES(?,?,?,?,NULL,NULL,?)",
+    )
+    .bind(review_id)
+    .bind("approval")
+    .bind(note)
+    .bind(reviewer)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE reviews SET updated_at=? WHERE id=?")
+        .bind(&ts)
+        .bind(review_id)
+        .execute(&mut *tx)
+        .await?;
+    let assignees = review_assignee_set_tx(&mut tx, review_id).await?;
+    let recips = review_recipients_multi(created_by.as_deref(), &assignees, reviewer);
+    emit(
+        &mut tx,
+        &mut hooks,
+        "review.approved_by",
+        reviewer,
+        None,
+        None,
+        None,
+        None,
+        json!({ "review_id": review_id, "reviewer": reviewer }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    let out = review_json(&mut tx, review_id, true)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
 }
 
 // --- Reviews: improvement trend (Document #5, increment 5 / BUILD 5) ---
@@ -21290,6 +21594,134 @@ mod tests {
 
         let all = list_reviews(&pool, None, None, None).await?;
         assert_eq!(all["reviews"].as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// task_1323 multi-reviewer: one review, N assignees (primary UNION review_assignees), approval
+    /// DERIVED from the log against the policy, and every assigned reviewer woken on review events.
+    #[tokio::test]
+    async fn multi_reviewer_assignees_notifications_and_approval() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["r1", "r2", "r3"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let typ = |n: &Value, t: &str| {
+            n["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["type"] == json!(t))
+        };
+
+        // Create with a single PRIMARY assignee -> assignees == [r1] (legacy fallback, no rows).
+        let r = create_review(
+            &pool,
+            "document",
+            Some("board-document"),
+            Some("doc_1"),
+            Some("Thing"),
+            None,
+            Some("author"),
+            Some("r1"),
+            None,
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        assert_eq!(r["assignees"], json!(["r1"]), "legacy single-assignee set");
+        assert_eq!(r["approval_state"], json!("pending"));
+        let n1 = check_notifications(&pool, "r1", true, 50, None).await?;
+        assert!(typ(&n1, "review.created"), "primary woken on create");
+
+        // Add extras r2, r3 -> union set, sorted.
+        add_review_assignees(&pool, rid, &["r2".into(), "r3".into()], Some("author")).await?;
+        assert_eq!(
+            get_review(&pool, rid).await?["assignees"],
+            json!(["r1", "r2", "r3"])
+        );
+        let n2 = check_notifications(&pool, "r2", true, 50, None).await?;
+        assert!(typ(&n2, "review.assignee_added"), "added reviewer woken");
+
+        // A review event now unions ALL assignees: r3 hears the status change.
+        set_review_status(&pool, rid, "in_review", Some("author"), None).await?;
+        let n3 = check_notifications(&pool, "r3", true, 50, None).await?;
+        assert!(
+            typ(&n3, "review.status_changed"),
+            "all assignees woken on events"
+        );
+
+        // Default policy = all: not approved until every assignee approves.
+        record_review_approval(&pool, rid, Some("r1"), None).await?;
+        record_review_approval(&pool, rid, Some("r2"), None).await?;
+        assert_eq!(
+            get_review(&pool, rid).await?["approval_state"],
+            json!("pending")
+        );
+        let done = record_review_approval(&pool, rid, Some("r3"), None).await?;
+        assert_eq!(done["approval_state"], json!("approved"), "all approved");
+
+        // Remove r3 -> set {r1,r2}, both approved -> still approved under all.
+        remove_review_assignee(&pool, rid, "r3", Some("author")).await?;
+        let g = get_review(&pool, rid).await?;
+        assert_eq!(g["assignees"], json!(["r1", "r2"]));
+        assert_eq!(g["approval_state"], json!("approved"));
+
+        // ANY policy: the first approval concludes it.
+        let ra = create_review(
+            &pool,
+            "document",
+            None,
+            None,
+            Some("Any"),
+            None,
+            Some("author"),
+            Some("a1"),
+            Some(json!({"approval_policy": "any"})),
+            None,
+        )
+        .await?;
+        let raid = ra["id"].as_i64().unwrap();
+        add_review_assignee(&pool, raid, "a2", Some("author")).await?;
+        assert_eq!(
+            get_review(&pool, raid).await?["approval_state"],
+            json!("pending")
+        );
+        record_review_approval(&pool, raid, Some("a2"), None).await?;
+        assert_eq!(
+            get_review(&pool, raid).await?["approval_state"],
+            json!("approved"),
+            "any"
+        );
+
+        // k_of_n policy (k=2, n=3): approved at the 2nd approval.
+        let rk = create_review(
+            &pool,
+            "document",
+            None,
+            None,
+            Some("K"),
+            None,
+            Some("author"),
+            Some("k1"),
+            Some(json!({"approval_policy": "k_of_n", "approval_k": 2})),
+            None,
+        )
+        .await?;
+        let rkid = rk["id"].as_i64().unwrap();
+        add_review_assignees(&pool, rkid, &["k2".into(), "k3".into()], Some("author")).await?;
+        record_review_approval(&pool, rkid, Some("k1"), None).await?;
+        assert_eq!(
+            get_review(&pool, rkid).await?["approval_state"],
+            json!("pending"),
+            "1<k"
+        );
+        record_review_approval(&pool, rkid, Some("k2"), None).await?;
+        assert_eq!(
+            get_review(&pool, rkid).await?["approval_state"],
+            json!("approved"),
+            "2>=k"
+        );
         Ok(())
     }
 

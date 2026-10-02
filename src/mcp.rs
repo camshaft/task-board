@@ -1832,10 +1832,15 @@ pub struct CreateReviewArgs {
     /// The agent that created/produced the review (defaults to this session's identity).
     #[serde(rename = "principal", alias = "created_by", default)]
     pub created_by: Option<String>,
-    /// The reviewer(s) assigned. A single agent id in increment 1.
+    /// The PRIMARY reviewer assigned (back-compat single assignee).
     #[serde(default)]
     pub assignee: Option<String>,
-    /// Arbitrary properties: producing agent id, a predecessor review id, tags, ...
+    /// Additional reviewers for a multi-reviewer review (task_1323). Each is added on top of the
+    /// primary `assignee`; the review's approval state is derived against `metadata.approval_policy`
+    /// (all | any | k_of_n; default all). Omit for a single-reviewer review.
+    #[serde(default)]
+    pub assignees: Option<Vec<String>>,
+    /// Arbitrary properties: producing agent id, a predecessor review id, tags, approval_policy, ...
     #[serde(default)]
     pub metadata: Option<JsonObject>,
     /// Optional external reference for idempotent ingest (a bridge). If a review is already linked
@@ -1938,6 +1943,30 @@ pub struct AppendReviewLogArgs {
     /// `appended:false` instead of a duplicate.
     #[serde(default)]
     pub external_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAssigneeArgs {
+    pub review_id: i64,
+    /// The reviewer's agent id to add/remove.
+    pub assignee: String,
+    /// The agent making the change (defaults to this session's identity).
+    #[serde(rename = "principal", alias = "actor", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveReviewArgs {
+    pub review_id: i64,
+    /// The reviewer approving (defaults to this session's identity). Gate-relevant: bound to the
+    /// authenticated caller, no forged approver.
+    #[serde(rename = "principal", alias = "reviewer", alias = "actor", default)]
+    pub reviewer: Option<String>,
+    /// An optional note recorded on the approval log entry.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -3877,7 +3906,7 @@ impl Board {
         Parameters(a): Parameters<CreateReviewArgs>,
     ) -> Result<CallToolResult, McpError> {
         let created_by = self.me_opt(s(&a.created_by));
-        core::create_review(
+        let review = core::create_review(
             &self.pool,
             &a.kind,
             s(&a.source),
@@ -3890,8 +3919,21 @@ impl Board {
             a.external_link,
         )
         .await
-        .map_err(err)
-        .and_then(ok)
+        .map_err(err)?;
+        // Multi-reviewer (task_1323): layer any extra assignees on top of the single-primary core
+        // create, then return the review with its full assignee set + derived approval state.
+        if let (Some(extra), Some(rid)) = (&a.assignees, review.get("id").and_then(Value::as_i64)) {
+            if !extra.is_empty() {
+                core::add_review_assignees(&self.pool, rid, extra, created_by.as_deref())
+                    .await
+                    .map_err(err)?;
+                return core::get_review(&self.pool, rid)
+                    .await
+                    .map_err(err)
+                    .and_then(ok);
+            }
+        }
+        ok(review)
     }
 
     #[tool(
@@ -4029,6 +4071,48 @@ impl Board {
         .await
         .map_err(err)
         .and_then(ok)
+    }
+
+    #[tool(
+        description = "Assign an ADDITIONAL reviewer to a review (task_1323 multi-reviewer). Added on top of the single primary `assignee`; the authoritative reviewer set is the primary UNION the added reviewers, and every assigned reviewer is woken on review events. Logs an assignee_added entry and emits review.assignee_added. Idempotent per (review, assignee). Returns the review incl. its assignees + derived approval_state."
+    )]
+    async fn add_review_assignee(
+        &self,
+        Parameters(a): Parameters<ReviewAssigneeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::add_review_assignee(&self.pool, a.review_id, &a.assignee, actor.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Remove an added reviewer from a review (task_1323). Removes the extra assignee (the single primary assignee set at create time is not removed by this). Logs an assignee_removed entry and emits review.assignee_removed to the reviewer set captured before removal (so the departing reviewer is told). Idempotent. Returns the updated review."
+    )]
+    async fn remove_review_assignee(
+        &self,
+        Parameters(a): Parameters<ReviewAssigneeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::remove_review_assignee(&self.pool, a.review_id, &a.assignee, actor.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Record YOUR approval of a review as an assigned reviewer (task_1323). Appends an approval log entry; the review's approval_state is DERIVED from all assignees' approvals against metadata.approval_policy (all = every assignee must approve [default]; any = first approval; k_of_n = metadata.approval_k approvals). Gate-relevant: bound to the authenticated caller, no forged approver. Emits review.approved_by. Returns the review with the recomputed approval_state."
+    )]
+    async fn approve_review(
+        &self,
+        Parameters(a): Parameters<ApproveReviewArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let reviewer = Some(self.gate_author(s(&a.reviewer))?);
+        core::record_review_approval(&self.pool, a.review_id, reviewer.as_deref(), s(&a.note))
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 }
 
