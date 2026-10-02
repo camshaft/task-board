@@ -6,15 +6,29 @@
 # deliberately un-piped: each stage runs to the terminal so a failure is never hidden, and
 # `set -euo pipefail` aborts on the first non-zero exit with that exit code.
 #
-# Run it INSIDE the flake devShell (which pins the toolchain — the host PATH node may be too old
-# for the web build):
+# The toolchain is pinned by the flake devShell. This script SELF-PINS: if it is not already running
+# inside the devShell (cargo-clippy not resolving into the nix store), it re-execs itself through
+# `nix develop .#default -c`, so both of these run the pinned clippy/rustc/node and a host rustup
+# clippy can never leak in (a floating clippy fires upstream lints the pinned toolchain never would):
 #
-#     nix develop -c scripts/gate.sh
+#     scripts/gate.sh                  # self-pins into the devShell
+#     nix develop -c scripts/gate.sh   # also fine (already pinned; guard falls through)
 #
 # Exit code is authoritative: 0 = all stages passed, non-zero = something failed. Never decide
 # "green" by eyeballing a truncated tail of the output — trust the exit code (that is the whole
 # point of this script; piping each stage to `tail` masks the real exit status).
 set -euo pipefail
+
+# Self-pin to the flake toolchain. A rustup clippy lives in ~/.cargo/bin (not a store path), so if
+# cargo-clippy does not resolve into the nix store we are not in the pinned devShell -- re-exec the
+# whole gate through it. After the re-exec cargo-clippy resolves to /nix/store and the guard falls
+# through, so there is no loop. Closes the drift where a bare invocation inherited host clippy 1.98
+# and fired lints the pinned 1.90 never would.
+clippy_path="$(command -v cargo-clippy || true)"
+case "$clippy_path" in
+  /nix/store/*) : ;; # already pinned -- proceed
+  *) exec nix develop .#default -c "$0" "$@" ;;
+esac
 
 echo "== gate: cargo fmt --check =="
 cargo fmt --check
