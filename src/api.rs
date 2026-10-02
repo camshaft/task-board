@@ -349,10 +349,13 @@ async fn api_not_found() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response()
 }
 
-/// Acting-principal field names a write body may carry — the fields that attribute WHO is acting.
-/// When the trusted-user header forces the identity, these are overwritten; target fields
-/// (assignee, routed_to, to_agent, blocked_on_ref, agent_id, subscriber, ...) are deliberately NOT
-/// here, so forcing the actor never rewrites who a write is ABOUT.
+/// Acting-principal field names a write body may carry — the fields that attribute WHO is acting,
+/// enumerated from an audit of every REST write handler. When the trusted-user header forces the
+/// identity, these are overwritten. TARGET fields that name who a write is ABOUT (assignee,
+/// routed_to, to_agent, blocked_on_ref, agent_id, member_id, to_project_id) are deliberately NOT
+/// here, so forcing the actor never rewrites the subject. `subscriber` (POST /subscriptions) is
+/// intentionally omitted too: it names who gets subscribed, so forcing it would break subscribing
+/// another agent on their behalf — treated as a target, not the actor.
 const ACTING_FIELDS: &[&str] = &[
     "actor",
     "author",
@@ -360,6 +363,7 @@ const ACTING_FIELDS: &[&str] = &[
     "created_by",
     "from_agent",
     "invited_by",
+    "requested_by",
 ];
 
 /// The hostname of a `Host` header authority, lowercased, with the port stripped and an IPv6
@@ -3600,12 +3604,22 @@ mod tests {
         // Present acting fields are overwritten; a target field (assignee) and an unrelated field
         // are left untouched; a missing acting field is NOT added (keeps deny_unknown_fields safe).
         let out = rewrite_acting_fields(
-            br#"{"author":"evil","assignee":"bob","body":"hi"}"#,
+            br#"{"author":"evil","requested_by":"evil","assignee":"bob","subscriber":"carol","body":"hi"}"#,
             "alice",
         );
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["author"], json!("alice"));
+        assert_eq!(
+            v["requested_by"],
+            json!("alice"),
+            "secret-request actor forced"
+        );
         assert_eq!(v["assignee"], json!("bob"), "target field untouched");
+        assert_eq!(
+            v["subscriber"],
+            json!("carol"),
+            "subscriber is a target, not forced"
+        );
         assert_eq!(v["body"], json!("hi"));
         assert!(v.get("actor").is_none(), "absent acting field not injected");
         // Non-JSON / non-object bodies pass through unchanged.
