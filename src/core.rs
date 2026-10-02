@@ -2021,10 +2021,7 @@ pub async fn principal_can_read_project(
 /// cannot write). Reuses `project_access`, so it is cascade-correct, the creator (implicit admin) and
 /// a fleet-coordination member (admin via the standing grant) can write, and a non-cascade grant does
 /// not admit a sub-team member. The authoritative write-gating predicate (task_542 Phase 3 Part B5c);
-/// the mutating handlers call it, gated behind `enforcement_enabled`, in the write-gating wiring.
-// Consumed by the B5c write-gating wiring that lands next; allow it ahead of its first caller so the
-// predicate lands + is tested as its own reviewable slice.
-#[allow(dead_code)]
+/// the mutating handlers call it via `ensure_can_write_project`, gated behind `enforcement_enabled`.
 pub async fn principal_can_write_project(
     pool: &Pool,
     principal: &str,
@@ -2038,6 +2035,32 @@ pub async fn principal_can_write_project(
         .and_then(|e| e.get("role"))
         .and_then(Value::as_str);
     Ok(matches!(role, Some("admin") | Some("read-write")))
+}
+
+/// Write-gate for a mutating operation on `project_id` (task_542 Phase 3 Part B5c): when enforcement
+/// is enabled, REJECT (Err) unless `actor` has write access (`principal_can_write_project`); a no-op
+/// while enforcement is OFF (recorded-not-enforced). Keyed on the AUTHENTICATED actor (the MCP
+/// X-Fleet-Agent / session identity, or the REST forced-trusted-user) -- NOT a client-supplied
+/// attribution field, since the gate is about access, not attribution. FAIL-CLOSED: an unidentified
+/// actor is rejected under enforcement. The mutating handlers call this before the core mutation.
+pub async fn ensure_can_write_project(
+    pool: &Pool,
+    actor: Option<&str>,
+    project_id: i64,
+) -> anyhow::Result<()> {
+    if enforcement_enabled(pool).await? {
+        let allowed = match actor {
+            Some(a) => principal_can_write_project(pool, a, project_id).await?,
+            None => false,
+        };
+        if !allowed {
+            anyhow::bail!(
+                "enforcement: {} does not have write access to project {project_id}",
+                actor.unwrap_or("<unidentified caller>")
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `get_project` scoped to `viewer` when enforcement is enabled (task_542 Phase 3 Part B5b). With
@@ -23286,6 +23309,50 @@ mod tests {
         assert!(
             principal_can_write_project(&pool, "coord", pid).await?,
             "fleet-coordination admin standing grant confers write"
+        );
+        Ok(())
+    }
+
+    /// task_542 B5c: ensure_can_write_project is a no-op while enforcement is OFF, and once enabled
+    /// rejects an actor without write access (a read-only grantee, a stranger, an unidentified
+    /// caller) while allowing a writer.
+    #[tokio::test]
+    async fn ensure_can_write_project_gates_only_when_enabled() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["boss", "reader", "bob"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let pid = create_project(&pool, "P", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        create_team(&pool, "readers", None, Some("boss"), None).await?;
+        add_team_member(&pool, "readers", "reader", "agent", Some("boss")).await?;
+        attach_project_team(&pool, pid, "readers", "read", true, Some("boss")).await?;
+
+        // Enforcement OFF: everyone, even an unidentified caller, passes.
+        ensure_can_write_project(&pool, Some("bob"), pid).await?;
+        ensure_can_write_project(&pool, None, pid).await?;
+
+        set_enforcement_enabled(&pool, true, Some("boss")).await?;
+
+        // Creator writes; a read-only grantee, a stranger, and an unidentified caller are rejected.
+        ensure_can_write_project(&pool, Some("boss"), pid).await?;
+        assert!(
+            ensure_can_write_project(&pool, Some("reader"), pid)
+                .await
+                .is_err(),
+            "a read-only grantee is rejected"
+        );
+        assert!(
+            ensure_can_write_project(&pool, Some("bob"), pid)
+                .await
+                .is_err(),
+            "a stranger is rejected"
+        );
+        assert!(
+            ensure_can_write_project(&pool, None, pid).await.is_err(),
+            "an unidentified caller is rejected"
         );
         Ok(())
     }
