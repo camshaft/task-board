@@ -879,7 +879,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents/{document_id}/comments", summary: "Comment on a document, optionally region-anchored to a version.", query: "", body: Some("CommentDocumentBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/comments/{comment_id}/resolve", summary: "Mark a document comment resolved.", query: "", body: Some("ResolveCommentBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-review", summary: "Submit a document for review (status -> in_review).", query: "", body: Some("DocumentActorBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-to-operator-review", summary: "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator sees it. Rejected unless a template attestation (template_followed or template_waiver_reason) is given AND a design-conformance review has run against the current version with zero open findings.", query: "", body: Some("SubmitToOperatorReviewBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-to-operator-review", summary: "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator sees it. Rejected unless a template attestation (template_followed or template_waiver_reason) is given AND a design-conformance review has run against the current version with zero open findings. A design-doc submission also requires the read-the-guide attestation (the read_guide_attested field, or the legacy in-body marker).", query: "", body: Some("SubmitToOperatorReviewBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/request-changes", summary: "Request changes on a document (status -> changes_requested).", query: "", body: Some("RequestChangesBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/approve", summary: "Approve a document (stamps the current version, status -> approved).", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/attach", summary: "Attach a document to a task (notifies both sides).", query: "", body: Some("AttachDocumentBody") },
@@ -3376,6 +3376,9 @@ struct SubmitToOperatorReviewBody {
     template_followed: Option<String>,
     /// If no template applies, a non-empty reason why. Required only when `template_followed` is absent.
     template_waiver_reason: Option<String>,
+    /// Read-the-guide attestation (the agent id). On a design-doc submission, required unless the
+    /// legacy in-body marker is present; stamped into the doc metadata (task_1056).
+    read_guide_attested: Option<String>,
     /// Acknowledge-override the placeholder/unfinished-draft check (task_1038); does not skip the
     /// read-the-guide attestation.
     acknowledge: Option<bool>,
@@ -3393,6 +3396,7 @@ async fn submit_to_operator_review(
             b.actor.as_deref(),
             b.template_followed.as_deref(),
             b.template_waiver_reason.as_deref(),
+            b.read_guide_attested.as_deref(),
             b.acknowledge.unwrap_or(false),
             st.ipfs_api_url.as_deref(),
         )

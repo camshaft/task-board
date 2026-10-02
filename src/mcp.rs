@@ -1545,6 +1545,12 @@ pub struct SubmitToOperatorReviewArgs {
     /// so make it substantive). Required only when `template_followed` is absent.
     #[serde(default)]
     pub template_waiver_reason: Option<String>,
+    /// The read-the-guide attestation (your agent id), confirming you read the design-doc guide
+    /// (doc_7) before submitting. On a design-doc submission this is REQUIRED unless the legacy
+    /// in-body marker <!-- read-guide-attested: ... --> is present; it is stamped into the doc
+    /// metadata (the canonical provenance home). Not needed on a template_waiver / non-design doc.
+    #[serde(default)]
+    pub read_guide_attested: Option<String>,
     /// Acknowledge-override the placeholder / unfinished-draft submit check (task_1038), the same way
     /// `acknowledge_banned` overrides the banned-phrase lint -- for the rare legitimate case (e.g. a
     /// doc that discusses a marker in prose). Does NOT skip the read-the-guide attestation.
@@ -3256,7 +3262,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator first sees it. REJECTED unless BOTH hold: (1) you name the doc template you followed (template_followed) or give a non-empty template_waiver_reason, and (2) a design-conformance review has run against the CURRENT version (an adversarial_review summary entry recording reviewed_version == the current version) with zero open findings (every finding's child task done/cancelled). Fail-closed: a doc can never reach the operator un-reviewed. Notifies the document's subscribers."
+        description = "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator first sees it. REJECTED unless BOTH hold: (1) you name the doc template you followed (template_followed) or give a non-empty template_waiver_reason, and (2) a design-conformance review has run against the CURRENT version (an adversarial_review summary entry recording reviewed_version == the current version) with zero open findings (every finding's child task done/cancelled). A DESIGN-DOC submission additionally requires the read-the-guide attestation: pass read_guide_attested (your agent id) or carry the legacy in-body marker. Fail-closed: a doc can never reach the operator un-reviewed. Notifies the document's subscribers."
     )]
     async fn submit_to_operator_review(
         &self,
@@ -3268,6 +3274,7 @@ impl Board {
             s(&a.actor),
             s(&a.template_followed),
             s(&a.template_waiver_reason),
+            s(&a.read_guide_attested),
             a.acknowledge.unwrap_or(false),
             self.ipfs_api_url.as_deref(),
         )
