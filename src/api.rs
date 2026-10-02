@@ -383,6 +383,54 @@ fn host_authority_name(host: &str) -> String {
     host_part.to_ascii_lowercase()
 }
 
+/// HTML-escape a string for use inside a double-quoted attribute value.
+fn html_escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The RAW trusted-front-door username on this request: `Some(value)` when the request arrives on a
+/// host configured to force identity (task_1030) AND carries that host's trusted header; `None` on a
+/// permissive/unlisted host or when the header is absent. The caller resolves it through the alias
+/// table (so a tunnel's "bythewc" becomes "cameron") before using it.
+pub(crate) fn trusted_user_header_value(
+    headers: &HeaderMap,
+    host_auth: &std::collections::HashMap<String, Option<String>>,
+) -> Option<String> {
+    if host_auth.is_empty() {
+        return None;
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let header_name = host_auth.get(&host_authority_name(host))?.as_deref()?;
+    headers
+        .get(header_name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Build the `<meta name="board-user" content="...">` tag the web app reads on boot (task_1036
+/// server half) for an already-resolved username. The content is HTML-escaped.
+pub(crate) fn board_user_meta_html(user: &str) -> String {
+    format!(
+        "<meta name=\"board-user\" content=\"{}\">",
+        html_escape_attr(user)
+    )
+}
+
 /// Overwrite every present [`ACTING_FIELDS`] key in a JSON object body with `user`. Only existing
 /// keys are changed (so `deny_unknown_fields` is never tripped by an injected key, and an endpoint
 /// without an acting field is untouched). Non-object / non-JSON bodies pass through unchanged.
@@ -443,14 +491,14 @@ async fn force_trusted_user(State(st): State<AppState>, req: Request, next: Next
     if !is_write {
         return next.run(req).await;
     }
-    let forced = req
+    let forced_raw = req
         .headers()
         .get(header_name)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let Some(forced) = forced else {
+    let Some(forced_raw) = forced_raw else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({
@@ -459,6 +507,10 @@ async fn force_trusted_user(State(st): State<AppState>, req: Request, next: Next
         )
             .into_response();
     };
+    // Resolve the front-door username through the identity-alias table (task_1030): a tunnel's
+    // "bythewc" forces as its canonical "cameron", so the write acts as the SAME principal the board
+    // already keys ownership / subscriptions / operator-routing to. No alias => the raw value.
+    let forced = core::resolve_identity_alias(&st.pool, &forced_raw).await;
     let (parts, body) = req.into_parts();
     // API JSON bodies are small; buffer to rewrite the acting fields. 16 MiB cap guards against a
     // runaway body (a document `content` is well under this).
@@ -3641,6 +3693,53 @@ mod tests {
         assert_eq!(host_authority_name("127.0.0.1:8079"), "127.0.0.1");
         assert_eq!(host_authority_name("[::1]:8079"), "::1");
         assert_eq!(host_authority_name("localhost"), "localhost");
+    }
+
+    #[test]
+    fn trusted_user_header_value_only_on_forcing_host_with_header() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "board.example.com".to_string(),
+            Some("x-tunnel-user".to_string()),
+        );
+        map.insert("127.0.0.1".to_string(), None); // listed but permissive
+        let val = |host: &str, user: Option<&str>| {
+            let mut h = HeaderMap::new();
+            h.insert("host", host.parse().unwrap());
+            if let Some(u) = user {
+                h.insert("x-tunnel-user", u.parse().unwrap());
+            }
+            trusted_user_header_value(&h, &map)
+        };
+        // Forcing host + header -> the raw value (resolution happens in the caller).
+        assert_eq!(
+            val("board.example.com:8079", Some("bythewc")),
+            Some("bythewc".to_string())
+        );
+        // Permissive host (listed, no auth_header) -> none.
+        assert_eq!(val("127.0.0.1:8079", Some("bythewc")), None);
+        // Unlisted host -> none.
+        assert_eq!(val("other.example.com", Some("bythewc")), None);
+        // Forcing host, header absent -> none.
+        assert_eq!(val("board.example.com", None), None);
+        // No per-host config at all -> never fires.
+        assert_eq!(
+            trusted_user_header_value(&HeaderMap::new(), &std::collections::HashMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn board_user_meta_html_escapes_the_username() {
+        assert_eq!(
+            board_user_meta_html("cameron"),
+            r#"<meta name="board-user" content="cameron">"#
+        );
+        // No attribute/script breakout: &, <, >, " are escaped.
+        assert_eq!(
+            board_user_meta_html("a\"<b>&"),
+            r#"<meta name="board-user" content="a&quot;&lt;b&gt;&amp;">"#
+        );
     }
 
     #[test]

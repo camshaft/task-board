@@ -1292,6 +1292,28 @@ pub async fn set_identity_alias(
     Ok(json!({ "alias": alias, "canonical": canonical }))
 }
 
+/// Resolve an identity through the alias table (task_1030/1035): if `name` (case-insensitively) is
+/// an alias, return its canonical identity; otherwise return `name` trimmed unchanged. One level of
+/// resolution (aliases are not chained). Used to canonicalize a trusted-front-door forced username
+/// (e.g. an AWS tunnel's "bythewc" -> "cameron") so a forced write acts as the SAME principal the
+/// board already keys ownership / subscriptions / operator-routing to -- no identity fracture.
+pub async fn resolve_identity_alias(pool: &Pool, name: &str) -> String {
+    let key = name.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return name.trim().to_string();
+    }
+    match sqlx::query("SELECT canonical FROM identity_aliases WHERE alias=?")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(row)) => row
+            .try_get::<String, _>("canonical")
+            .unwrap_or_else(|_| name.trim().to_string()),
+        _ => name.trim().to_string(),
+    }
+}
+
 // --- People / teams: the multi-operator identity model (doc_26 / task 542, Phase 1) ---
 // People are first-class human identities in their own registry (separate from `agents`); teams are
 // addressable groups whose members are people OR other teams (recursive). Ids are stable string
@@ -11240,6 +11262,23 @@ mod tests {
     /// force-cancel), or -- when ORPHANED (null author, e.g. a REST pose with no `actor`) -- by any
     /// identified actor. An anonymous caller never may. This keeps an orphaned question from being
     /// permanently stuck on the operator /awaiting view.
+    #[tokio::test]
+    async fn resolve_identity_alias_canonicalizes_and_passes_through() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        set_identity_alias(&pool, "bythewc", "cameron", Some("test")).await?;
+        // An alias resolves to its canonical (case-insensitive on the alias key).
+        assert_eq!(resolve_identity_alias(&pool, "bythewc").await, "cameron");
+        assert_eq!(resolve_identity_alias(&pool, "ByTheWc").await, "cameron");
+        // A non-alias passes through unchanged (trimmed).
+        assert_eq!(
+            resolve_identity_alias(&pool, "someone-else").await,
+            "someone-else"
+        );
+        assert_eq!(resolve_identity_alias(&pool, "  cameron ").await, "cameron");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn owner_and_orphan_question_cancel() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
