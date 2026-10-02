@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useBoardContext } from './Layout'
-import { QuestionComment } from './questions'
+import { ConversationalFlow, groupQuestions, QuestionComment } from './questions'
 import {
   answerQuestion,
   cancelQuestion,
@@ -170,9 +170,11 @@ export default function Awaiting() {
                     </p>
                   )}
 
-                  {(it.questions?.length ?? 0) > 0 && (
-                    <div className="space-y-3">
-                      {(it.questions ?? []).map((q) => (
+                  {(it.questions?.length ?? 0) > 0 &&
+                    (() => {
+                      // Grouped questions (shared ui.props.group) render as one conversational
+                      // sequence shown one at a time (doc_3371 A1 entry 12); the rest render normally.
+                      const renderQ = (q: (typeof it.questions)[number]) => (
                         <QuestionComment
                           key={q.id}
                           comment={q}
@@ -185,9 +187,17 @@ export default function Awaiting() {
                           onCancel={() => cancelQ(it.task_id, q.id)}
                           onSupersede={() => supersedeQ(it.task_id, q.id)}
                         />
-                      ))}
-                    </div>
-                  )}
+                      )
+                      const { groups, ungrouped } = groupQuestions(it.questions ?? [])
+                      return (
+                        <div className="space-y-3">
+                          {groups.map((g) => (
+                            <ConversationalFlow key={g.key} group={g.items} renderQuestion={renderQ} />
+                          ))}
+                          {ungrouped.map(renderQ)}
+                        </div>
+                      )
+                    })()}
 
                   {(it.questions?.length ?? 0) === 0 && (
                     <Link

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import {
   ipfsUrl,
   type AnswerPayload,
@@ -64,6 +64,91 @@ function asQuestion(payload: unknown): QuestionPayload | null {
     return payload as QuestionPayload
   }
   return null
+}
+
+// Conversational one-at-a-time flow (doc_3371 A1 entry 12). Not a new answer element: a UI flow that
+// groups several EXISTING atomic questions into a sequence shown one screen at a time (progressive
+// disclosure), each still answered separately. The grouping signal rides the opaque ui descriptor --
+// no schema/backend change: ui.props.group (shared key), ui.props.group_order (1-based position),
+// and optional ui.props.group_size (total N, for "Question k of N").
+function questionGroup(comment: Comment): { key: string; order: number; size?: number } | null {
+  const p = asQuestion(comment.payload)?.ui?.props
+  const key = p && typeof p.group === 'string' && p.group ? p.group : null
+  if (!key) return null
+  return {
+    key,
+    order: p && typeof p.group_order === 'number' ? p.group_order : 0,
+    size: p && typeof p.group_size === 'number' ? p.group_size : undefined,
+  }
+}
+
+// Partition a question list into ordered sequence groups (by shared group key) and the rest. Used by
+// a question surface (e.g. the awaiting view) to render a grouped set as one ConversationalFlow and
+// the ungrouped questions normally.
+export function groupQuestions(questions: Comment[]): {
+  groups: { key: string; items: Comment[] }[]
+  ungrouped: Comment[]
+} {
+  const ungrouped: Comment[] = []
+  const byKey = new Map<string, Comment[]>()
+  for (const c of questions) {
+    const g = questionGroup(c)
+    if (!g) {
+      ungrouped.push(c)
+      continue
+    }
+    const arr = byKey.get(g.key) ?? []
+    arr.push(c)
+    byKey.set(g.key, arr)
+  }
+  const groups = [...byKey.entries()].map(([key, items]) => ({
+    key,
+    items: items.sort((a, b) => (questionGroup(a)?.order ?? 0) - (questionGroup(b)?.order ?? 0)),
+  }))
+  return { groups, ungrouped }
+}
+
+// Render a sequence group one question at a time: only the first still-open question is answerable
+// (the caller passes the already-open set, so answering one drops it and the next becomes current on
+// the next data refresh), with a progress header and a count of what remains. Progressive disclosure
+// without bundling -- each question stays atomic and separately answered.
+export function ConversationalFlow({
+  group,
+  renderQuestion,
+}: {
+  group: Comment[]
+  renderQuestion: (q: Comment) => ReactNode
+}) {
+  if (group.length === 0) return null
+  const current = group[0]
+  const g = questionGroup(current)
+  const order = g?.order || 1
+  const size = g?.size
+  const rest = group.length - 1
+  return (
+    <div className="rounded-lg border border-sky-500/20 bg-sky-500/5 p-3">
+      <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-muted)]">
+        <span className="inline-flex items-center rounded-full bg-sky-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-sky-300 ring-1 ring-inset ring-sky-500/30">
+          Sequence
+        </span>
+        <span>{size != null ? `Question ${order} of ${size}` : `Question ${order}`} · one at a time</span>
+        {size != null && (
+          <span className="ml-auto h-1.5 w-24 overflow-hidden rounded-full bg-[var(--color-panel-2)]">
+            <span
+              className="block h-full bg-sky-500"
+              style={{ width: `${Math.min(100, Math.round((order / size) * 100))}%` }}
+            />
+          </span>
+        )}
+      </div>
+      {renderQuestion(current)}
+      {rest > 0 && (
+        <p className="mt-2 border-t border-[var(--color-border)] pt-2 text-xs text-[var(--color-muted)]">
+          {rest} more in this sequence after you answer.
+        </p>
+      )}
+    </div>
+  )
 }
 
 function asAnswer(payload: unknown): AnswerPayload {
