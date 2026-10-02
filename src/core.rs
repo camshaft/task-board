@@ -2462,6 +2462,19 @@ pub async fn update_task(
             "give a `blocked_on` recording what this blocked task is waiting on. kind is one of: task, agent, team, operator, external. Examples: blocked_on:\"operator\" | blocked_on:\"task:611\" | blocked_on:{{\"kind\":\"agent\",\"target\":\"<agent-id>\"}}. The flat form blocked_on_kind:\"task\", blocked_on_ref:\"611\" also works; pass kind=\"none\" to clear."
         );
     }
+    // task_1150 (firm half, WARN): an operator-block must carry an actual ask -- an open blocking
+    // question routed to the operator. "you can't just block anymore. you have to have an actual
+    // ask" (cameron, task_1150). WARN now, not reject (seed-before-flip: the fleet loop-templates
+    // must learn to pose a question first before this hard-rejects, or every current bare
+    // operator-block breaks). The enforcement flip pairs with task_1148, which consumes this same
+    // question-link to auto-clear the block when the operator answers. Scoped to kind=operator (the
+    // FIRM half); the PROPOSED agent/team-block rule is pending cameron.
+    let effective_operator_block = new_status == "blocked"
+        && match &change {
+            BlockedChange::Set { kind, .. } => kind == "operator",
+            BlockedChange::Leave => old_blocked_kind.as_deref() == Some("operator"),
+            BlockedChange::Clear => false,
+        };
     let mut blocked_changed = false;
     // Recipients to ping with task.blocked_on_you when the task newly blocks on them: a single agent
     // (kind=agent), or every person a team resolves to (kind=team).
@@ -2667,6 +2680,33 @@ pub async fn update_task(
         m.insert("assignee_warning".into(), json!(w));
     }
     tx.commit().await?;
+    // task_1150 WARN: flag a bare operator-block (no linked operator-routed question). Computed on
+    // the pool AFTER commit -- a second pool connection while the tx is open would deadlock the pool
+    // (same hazard the kind=team fan-out resolves on the open tx to avoid).
+    if effective_operator_block {
+        let operator_routes = principals_routing_to(pool, "operator").await?;
+        let has_operator_question = open_blocking_questions_json(pool, task_id)
+            .await?
+            .iter()
+            .any(|q| {
+                q.get("routed_to")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| operator_routes.contains(r))
+            });
+        if !has_operator_question {
+            if let Value::Object(ref mut m) = out {
+                m.insert(
+                    "blocked_on_warning".into(),
+                    json!(
+                        "blocked_on=operator but this task carries no open blocking question routed \
+                         to the operator. An operator-block must be an actual ask: pose a blocking \
+                         question (pose_question routed_to=operator) with the decision you need. \
+                         Advisory now; this will become a hard requirement."
+                    ),
+                );
+            }
+        }
+    }
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
 }
@@ -11607,6 +11647,114 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no CID in the manifest"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn operator_block_without_question_warns() -> anyhow::Result<()> {
+        // task_1150 WARN half: a bare operator-block (no linked operator-routed question) succeeds
+        // but carries a blocked_on_warning; attaching a blocking question routed to the operator
+        // clears the warning.
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // A bare operator-block warns but still succeeds.
+        let blocked = update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            Some(json!({"kind": "operator"})),
+        )
+        .await?;
+        assert_eq!(blocked["status"], json!("blocked"));
+        assert_eq!(blocked["blocked_on_kind"], json!("operator"));
+        assert!(
+            blocked
+                .get("blocked_on_warning")
+                .and_then(Value::as_str)
+                .is_some_and(|w| w.contains("no open blocking question")),
+            "a bare operator-block should warn: {blocked:#?}"
+        );
+
+        // Attach a blocking question routed to the operator, then re-block: no warning.
+        pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "ship it?",
+            None,
+            "operator",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await?;
+        let reblocked = update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            Some(json!({"kind": "operator"})),
+        )
+        .await?;
+        assert!(
+            reblocked.get("blocked_on_warning").is_none(),
+            "an operator-block WITH an open operator-routed question should not warn: {reblocked:#?}"
+        );
+
+        // A non-operator block (kind=agent) never carries this warning.
+        register_agent(&pool, "helper", None, None, None, None, None).await?;
+        let agent_blocked = update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            Some(json!({"kind": "agent", "target": "helper"})),
+        )
+        .await?;
+        assert!(
+            agent_blocked.get("blocked_on_warning").is_none(),
+            "an agent-block must not carry the operator-block warning: {agent_blocked:#?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
