@@ -214,6 +214,16 @@ async fn main() -> anyhow::Result<()> {
     let events_tx = sse::channel();
     sse::spawn_tailer(pool.clone(), events_tx.clone());
 
+    // Per-host trusted-identity map (task_1030), shared by the force-identity middleware and the
+    // index.html username injection (task_1036): hostname -> optional trusted header.
+    let host_auth: std::sync::Arc<std::collections::HashMap<String, Option<String>>> =
+        std::sync::Arc::new(
+            cfg.hosts
+                .iter()
+                .map(|(name, h)| (name.to_ascii_lowercase(), h.auth_header.clone()))
+                .collect(),
+        );
+
     // REST API at /api.
     let api_router = api::router(api::AppState {
         pool: pool.clone(),
@@ -232,12 +242,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             api::DbSnapshotCfg::disabled()
         },
-        host_auth: std::sync::Arc::new(
-            cfg.hosts
-                .iter()
-                .map(|(name, h)| (name.to_ascii_lowercase(), h.auth_header.clone()))
-                .collect(),
-        ),
+        host_auth: host_auth.clone(),
     });
 
     // Reverse tunnel for fleet hosts with no inbound path: they dial /tunnel/ws and the board
@@ -262,11 +267,15 @@ async fn main() -> anyhow::Result<()> {
     // miss in ServeDir and fall through to that handler instead of the raw file.
     if let Some(dir) = &cfg.web_dir {
         let index_path: std::sync::Arc<str> = format!("{dir}/index.html").into();
+        let index_host_auth = host_auth.clone();
+        let index_pool = pool.clone();
         let serve = ServeDir::new(dir)
             .append_index_html_on_directories(false)
             .fallback(axum::routing::get(move |headers: axum::http::HeaderMap| {
                 let index_path = index_path.clone();
-                async move { serve_index(&index_path, &headers).await }
+                let host_auth = index_host_auth.clone();
+                let pool = index_pool.clone();
+                async move { serve_index(&index_path, &headers, &host_auth, &pool).await }
             }));
         router = router.fallback_service(serve);
         tracing::info!("serving web UI from {dir}");
@@ -337,6 +346,8 @@ async fn shutdown_signal() {
 async fn serve_index(
     index_path: &str,
     headers: &axum::http::HeaderMap,
+    host_auth: &std::collections::HashMap<String, Option<String>>,
+    pool: &db::Pool,
 ) -> axum::response::Response {
     let html = match tokio::fs::read_to_string(index_path).await {
         Ok(h) => h,
@@ -352,8 +363,16 @@ async fn serve_index(
         .filter(|p| !p.is_empty())
         .map(|p| format!("/{p}/"))
         .unwrap_or_else(|| "/".to_string());
-    // Inject right after <head> so it precedes every asset reference in the document.
-    let injected = format!("<base href=\"{prefix}\">");
+    // Inject right after <head> so it precedes every asset reference in the document: the
+    // <base href>, and — on a trusted-front-door host that carries the username (task_1036) — a
+    // <meta name="board-user"> the web app reads on boot to show + fix the authenticated identity.
+    let mut injected = format!("<base href=\"{prefix}\">");
+    if let Some(raw) = api::trusted_user_header_value(headers, host_auth) {
+        // Inject the RESOLVED canonical identity (bythewc -> cameron) so the UI shows the same
+        // principal the server attributes writes to -- not the raw tunnel username.
+        let resolved = core::resolve_identity_alias(pool, &raw).await;
+        injected.push_str(&api::board_user_meta_html(&resolved));
+    }
     let html = match html.split_once("<head>") {
         Some((head, rest)) => format!("{head}<head>{injected}{rest}"),
         None => format!("{injected}{html}"),
