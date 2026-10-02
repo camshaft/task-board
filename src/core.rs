@@ -3871,6 +3871,10 @@ pub async fn pose_question_full(
     if routed_to.is_empty() {
         anyhow::bail!("give a `routed_to` principal (a person, team, or agent id)");
     }
+    // Bind a REAL asker or none (task_972): an empty/whitespace actor (a REST pose that sent a
+    // blank `actor`) becomes a null author rather than author="", so it is a genuine orphan the
+    // owner / any identified actor can later cancel -- not an author="" that matches no canceller.
+    let actor = actor.map(str::trim).filter(|s| !s.is_empty());
     // A question's type identity is EITHER a legacy kind string OR, in the CID-keyed model
     // (doc_33 v16), its element CID -- the content id of the element's schema that the client
     // branches on. A kind selects the legacy per-kind validation; omitting it means a CID-keyed
@@ -4315,9 +4319,32 @@ pub async fn cancel_question(
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let (task_id, author, payload) = load_open_question(&mut tx, comment_id).await?;
-    if author.as_deref() != actor || actor.is_none() {
+    // Who may cancel an open question (task_972):
+    //  - the asking agent (the original asker-scoped rule), or
+    //  - the task's owner (owning-agent force-cancel), or
+    //  - any identified actor when the question is ORPHANED (null author) -- e.g. a question
+    //    posed via the REST path with no `actor`, which recorded no asker. Without this an
+    //    orphaned question was permanently uncancellable (the old guard rejected a null actor
+    //    unconditionally AND no actor could match a null author), so it kept its task -- even a
+    //    cancelled one -- stuck on the operator /awaiting view, clearable only by an operator
+    //    ANSWER. An anonymous caller (no actor) still may never cancel.
+    let Some(actor_id) = actor else {
+        anyhow::bail!("give an `actor` to cancel a question");
+    };
+    let owner: Option<String> = match sqlx::query("SELECT assignee FROM tasks WHERE id=?")
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        Some(row) => row.try_get("assignee")?,
+        None => None,
+    };
+    let is_asker = author.as_deref() == Some(actor_id);
+    let is_owner = owner.as_deref() == Some(actor_id);
+    let is_orphan = author.is_none();
+    if !(is_asker || is_owner || is_orphan) {
         anyhow::bail!(
-            "only the asking agent can cancel a question (it was posed by {})",
+            "only the asking agent ({}) or the task owner can cancel this question",
             author.as_deref().unwrap_or("someone else")
         );
     }
@@ -11206,6 +11233,106 @@ mod tests {
         assert_eq!(q5["payload"]["blocking"], json!(false));
         assert_eq!(q5["payload"]["default"], json!(true));
         assert_eq!(q5["payload"]["wait_period_seconds"], json!(3600));
+        Ok(())
+    }
+
+    /// task_972: a question is cancellable by the asker, by the task OWNER (owning-agent
+    /// force-cancel), or -- when ORPHANED (null author, e.g. a REST pose with no `actor`) -- by any
+    /// identified actor. An anonymous caller never may. This keeps an orphaned question from being
+    /// permanently stuck on the operator /awaiting view.
+    #[tokio::test]
+    async fn owner_and_orphan_question_cancel() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["asker", "owner", "other"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("owner"),
+            None,
+            Some("asker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Owner force-cancel: a question posed by "asker" is cancellable by the task owner, even
+        // though the owner is not the asker. A third party ("other") still cannot.
+        let q = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "ship it?",
+            None,
+            "owner",
+            true,
+            None,
+            None,
+            Some("asker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+        assert!(
+            cancel_question(&pool, qid, Some("other")).await.is_err(),
+            "a non-asker non-owner cannot cancel"
+        );
+        cancel_question(&pool, qid, Some("owner")).await?;
+        assert_eq!(get_comment(&pool, qid).await?["state"], json!("cancelled"));
+
+        // Orphaned question (no asker, as a blank-actor REST pose records): any identified actor
+        // may clear it; an anonymous caller may not.
+        let orphan = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "still need?",
+            None,
+            "owner",
+            true,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let oid = orphan["id"].as_i64().unwrap();
+        assert_eq!(
+            get_comment(&pool, oid).await?["author"],
+            json!(null),
+            "a None actor records a null author (true orphan)"
+        );
+        assert!(
+            cancel_question(&pool, oid, None).await.is_err(),
+            "an anonymous caller cannot cancel"
+        );
+        cancel_question(&pool, oid, Some("other")).await?;
+        assert_eq!(get_comment(&pool, oid).await?["state"], json!("cancelled"));
+
+        // A blank-actor pose is normalized to a true orphan (null author), not author="".
+        let blank = pose_question(
+            &pool,
+            tid,
+            "yes_no",
+            "blank?",
+            None,
+            "owner",
+            true,
+            None,
+            None,
+            Some("   "),
+        )
+        .await?;
+        assert_eq!(
+            get_comment(&pool, blank["id"].as_i64().unwrap()).await?["author"],
+            json!(null)
+        );
         Ok(())
     }
 
