@@ -15,13 +15,14 @@ const ROLES: ProjectRole[] = ['admin', 'read-write', 'read']
 
 // Role -> chip classes. admin is the strongest (amber), read-write mid (sky), read weakest (muted).
 const ROLE_CHIP: Record<string, string> = {
-  admin: 'bg-amber-500/15 text-amber-300 ring-amber-500/30',
-  'read-write': 'bg-sky-500/15 text-sky-300 ring-sky-500/30',
-  read: 'bg-zinc-500/15 text-zinc-300 ring-zinc-500/30',
+  admin: 'bg-amber-100 text-amber-800 ring-amber-500/30 dark:bg-amber-500/15 dark:text-amber-300',
+  'read-write': 'bg-sky-100 text-sky-800 ring-sky-500/30 dark:bg-sky-500/15 dark:text-sky-300',
+  read: 'bg-zinc-100 text-zinc-700 ring-zinc-500/30 dark:bg-zinc-500/15 dark:text-zinc-300',
 }
 
 function RoleChip({ role }: { role: string }) {
-  const chip = ROLE_CHIP[role] ?? 'bg-zinc-500/15 text-zinc-300 ring-zinc-500/30'
+  const chip =
+    ROLE_CHIP[role] ?? 'bg-zinc-100 text-zinc-700 ring-zinc-500/30 dark:bg-zinc-500/15 dark:text-zinc-300'
   return (
     <span
       className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${chip}`}
