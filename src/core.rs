@@ -4295,7 +4295,23 @@ pub fn comment_row_json(row: &SqliteRow) -> Value {
     let mut v = row_to_json(row);
     if let Value::Object(ref mut m) = v {
         if let Some(payload_str) = m.get("payload").and_then(|p| p.as_str()) {
-            let parsed = serde_json::from_str::<Value>(payload_str).unwrap_or_else(|_| json!({}));
+            let mut parsed =
+                serde_json::from_str::<Value>(payload_str).unwrap_or_else(|_| json!({}));
+            // doc_3371 entry 10: strip a kind's SECRET config keys (the quiz correct-answer key +
+            // explanation) from the returned question comment, so the answerer cannot read them off
+            // the open question. The stored payload keeps them; scoring reads the raw row, and the
+            // answer comment reveals them with the score. Non-secret config (e.g. the
+            // point_allocation budget) is untouched.
+            if let Some(kind) = parsed.get("kind").and_then(|k| k.as_str()) {
+                let secrets = secret_config_keys(kind);
+                if !secrets.is_empty() {
+                    if let Some(cfg) = parsed.get_mut("config").and_then(|c| c.as_object_mut()) {
+                        for key in secrets {
+                            cfg.remove(*key);
+                        }
+                    }
+                }
+            }
             m.insert("payload".into(), parsed);
         }
         insert_ref(m, "comment");
@@ -4701,6 +4717,11 @@ pub const QUESTION_KINDS: &[&str] = &[
     // sum to a fixed budget -- a constant-sum constraint JSON Schema cannot express, so it is a
     // genuine new kind with a custom server-side validator (not the schema-driven path).
     "point_allocation",
+    // doc_3371 entry 10 (task_1257): a knowledge-check quiz -- the answer (a choice among the
+    // options) is SCORED server-side against a stored correct-answer key, which is behavior, not
+    // schema. The key lives in `config` and is redacted from the question comment on read (so the
+    // answerer cannot peek), then revealed with the score on the answer comment.
+    "quiz",
 ];
 /// The answer-shape discriminators (doc_33 A2): choice covers single + multi select. `allocation` is
 /// the point_allocation answer (doc_3371 entry 8): an object mapping option id -> integer points. The
@@ -4721,7 +4742,7 @@ pub const QUESTION_STATES: &[&str] = &[
 fn kind_expected_shape(kind: &str) -> &'static str {
     match kind {
         "yes_no" => "bool",
-        "multiple_choice" | "select_all" => "choice",
+        "multiple_choice" | "select_all" | "quiz" => "choice",
         "fill_in_the_blank" => "text",
         "rank_list" => "ranked",
         "point_allocation" => "allocation",
@@ -4732,28 +4753,44 @@ fn kind_expected_shape(kind: &str) -> &'static str {
 fn kind_needs_options(kind: &str) -> bool {
     matches!(
         kind,
-        "multiple_choice" | "select_all" | "rank_list" | "point_allocation"
+        "multiple_choice" | "select_all" | "rank_list" | "point_allocation" | "quiz"
     )
 }
 /// Whether a kind carries a `config` object (per-kind validation parameters beyond the options list).
-/// point_allocation (doc_3371 entry 8) carries `{budget}`, the constant sum the allocation must hit.
+/// point_allocation (doc_3371 entry 8) carries `{budget}` (the constant sum the allocation must hit);
+/// quiz (entry 10) carries `{answer, explanation?}` (the scored correct-answer key, kept server-side).
 fn kind_uses_config(kind: &str) -> bool {
-    matches!(kind, "point_allocation")
+    matches!(kind, "point_allocation" | "quiz")
+}
+/// The `config` keys that are SECRET for a kind and must be stripped from the question comment when
+/// it is serialized for return (doc_3371 entry 10): the quiz's correct-answer key + explanation,
+/// so the answerer cannot read them off the open question. Revealed with the score on the answer.
+fn secret_config_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "quiz" => &["answer", "explanation"],
+        _ => &[],
+    }
 }
 
-/// Validate + normalize a question's `config` for its kind (doc_3371 entry 8 / task_1257). A kind
-/// that uses config requires it with the expected fields; a kind that does not must not carry one.
-/// For point_allocation: `{budget}` where budget is an integer >= 1 (the constant sum answers hit).
-fn normalize_question_config(kind: &str, config: Option<Value>) -> anyhow::Result<Option<Value>> {
+/// Validate + normalize a question's `config` for its kind (doc_3371 entries 8 + 10 / task_1257). A
+/// kind that uses config requires it with the expected fields; a kind that does not must not carry
+/// one. `options` is the already-normalized option list, so a kind whose config references option ids
+/// (quiz's answer key) can cross-check against it.
+/// - point_allocation: `{budget}`, an integer >= 1 (the constant sum answers hit).
+/// - quiz: `{answer: [option_id, ...], explanation?: string}` -- a non-empty set of correct option
+///   ids (each a real option), plus an optional explanation revealed with the score.
+fn normalize_question_config(
+    kind: &str,
+    options: &Value,
+    config: Option<Value>,
+) -> anyhow::Result<Option<Value>> {
     if !kind_uses_config(kind) {
         if config.is_some() {
             anyhow::bail!("kind '{kind}' takes no `config`");
         }
         return Ok(None);
     }
-    let cfg = config.ok_or_else(|| {
-        anyhow::anyhow!("kind '{kind}' requires a `config` object (e.g. {{\"budget\": 100}})")
-    })?;
+    let cfg = config.ok_or_else(|| anyhow::anyhow!("kind '{kind}' requires a `config` object"))?;
     match kind {
         "point_allocation" => {
             let budget = cfg.get("budget").and_then(|b| b.as_i64()).ok_or_else(|| {
@@ -4764,8 +4801,66 @@ fn normalize_question_config(kind: &str, config: Option<Value>) -> anyhow::Resul
             }
             Ok(Some(json!({ "budget": budget })))
         }
+        "quiz" => {
+            let ids: BTreeSet<String> = option_ids(options).into_iter().collect();
+            let answer = cfg
+                .get("answer")
+                .and_then(|a| a.as_array())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quiz `config.answer` must be an array of correct option ids")
+                })?;
+            if answer.is_empty() {
+                anyhow::bail!("quiz `config.answer` must name at least one correct option id");
+            }
+            let mut key: BTreeSet<String> = BTreeSet::new();
+            for a in answer {
+                let id = a.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("each quiz `config.answer` entry must be a string option id")
+                })?;
+                if !ids.contains(id) {
+                    anyhow::bail!(
+                        "quiz `config.answer` id '{id}' is not one of the question's options"
+                    );
+                }
+                key.insert(id.to_string());
+            }
+            let mut out = json!({ "answer": key.into_iter().collect::<Vec<_>>() });
+            if let Some(exp) = cfg.get("explanation") {
+                if let Some(s) = exp.as_str() {
+                    if !s.trim().is_empty() {
+                        out["explanation"] = json!(s);
+                    }
+                } else {
+                    anyhow::bail!("quiz `config.explanation` must be a string");
+                }
+            }
+            Ok(Some(out))
+        }
         _ => unreachable!("kind_uses_config and this match must agree"),
     }
+}
+
+/// Score a quiz answer: the chosen option ids (an `allocation`/`choice` array value) are correct iff
+/// they exactly match the stored `config.answer` key set. Returns (correct, correct_answer_ids).
+fn score_quiz(config: &Value, value: &Value) -> (bool, Vec<String>) {
+    let key: BTreeSet<String> = config
+        .get("answer")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let chosen: BTreeSet<String> = value
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    (chosen == key, key.into_iter().collect())
 }
 
 /// The constant-sum `budget` a point_allocation question requires answers to hit, read from its
@@ -4840,12 +4935,17 @@ fn validate_answer_value(
                 anyhow::bail!("a fill_in_the_blank answer must be non-empty text");
             }
         }
-        "multiple_choice" | "select_all" => {
+        "multiple_choice" | "select_all" | "quiz" => {
+            // quiz (doc_3371 entry 10) takes a choice-shaped answer like select_all (1+ option ids);
+            // correctness is scored separately in answer_question against the stored key.
             let arr = value
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("a {kind} answer must be an array of option ids"))?;
             if kind == "multiple_choice" && arr.len() != 1 {
                 anyhow::bail!("a multiple_choice answer must be exactly one option id");
+            }
+            if kind == "quiz" && arr.is_empty() {
+                anyhow::bail!("a quiz answer must choose at least one option id");
             }
             let mut chosen = BTreeSet::new();
             for v in arr {
@@ -5300,10 +5400,11 @@ pub async fn pose_question_configured(
             json!([])
         }
     };
-    // Per-kind config (doc_3371 entry 8 / task_1257): e.g. point_allocation's constant-sum budget.
-    // A CID-keyed question (no legacy kind) carries no config.
+    // Per-kind config (doc_3371 entries 8 + 10 / task_1257): point_allocation's constant-sum budget;
+    // the quiz's correct-answer key (cross-checked against `options`). A CID-keyed question (no
+    // legacy kind) carries no config.
     let config = match kind {
-        Some(k) => normalize_question_config(k, config)?,
+        Some(k) => normalize_question_config(k, &options, config)?,
         None => {
             if config.is_some() {
                 anyhow::bail!("a CID-keyed question (no `kind`) takes no `config`");
@@ -5633,7 +5734,19 @@ pub async fn answer_question(
         QUESTION_STATES.contains(&new_state),
         "answer must leave the question in a known lifecycle state"
     );
-    let ans_payload = json!({ "shape": shape, "value": value }).to_string();
+    let mut ans_obj = json!({ "shape": shape, "value": value });
+    // doc_3371 entry 10: a FRAMED quiz answer is scored against the stored key; the result plus the
+    // now-safe-to-reveal correct answer + explanation ride on the answer comment (feedback). An
+    // out-of-frame text answer is not scored.
+    if kind == "quiz" && !out_of_frame {
+        let (correct, correct_answer) = score_quiz(&config, &value);
+        ans_obj["correct"] = json!(correct);
+        ans_obj["correct_answer"] = json!(correct_answer);
+        if let Some(exp) = config.get("explanation") {
+            ans_obj["explanation"] = exp.clone();
+        }
+    }
+    let ans_payload = ans_obj.to_string();
     let body = answer_body_summary(shape, &value);
     let aid: i64 = sqlx::query(
         "INSERT INTO comments(task_id, author, body, type, payload, reply_to, created_at) \
@@ -26011,6 +26124,138 @@ mod tests {
             .await
             .is_err(),
             "a kind that takes no config rejects one"
+        );
+        Ok(())
+    }
+
+    /// doc_3371 entry 10 (task_1257): the quiz kind hides its correct-answer key on the open question
+    /// (redacted from the serialized comment) and scores a framed answer against it server-side,
+    /// revealing correct / correct_answer / explanation on the answer comment. Pose-time: the answer
+    /// key must reference real options and config is required.
+    #[tokio::test]
+    async fn quiz_scores_against_hidden_key() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "quiz",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let opts = json!([
+            {"id": "a", "label": "A"},
+            {"id": "b", "label": "B"},
+            {"id": "c", "label": "C"}
+        ]);
+
+        let q = pose_question_configured(
+            &pool,
+            tid,
+            Some("quiz"),
+            "pick the right one",
+            Some(opts.clone()),
+            "worker",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({ "answer": ["b"], "explanation": "B is correct" })),
+            Some("worker"),
+        )
+        .await?;
+        let qid = q["id"].as_i64().unwrap();
+
+        // The OPEN question comment must not leak the key or explanation on read.
+        let fetched = get_comment(&pool, qid).await?;
+        let cfg = &fetched["payload"]["config"];
+        assert!(
+            cfg.get("answer").is_none(),
+            "answer key redacted on read: {fetched:#?}"
+        );
+        assert!(
+            cfg.get("explanation").is_none(),
+            "explanation redacted on read: {fetched:#?}"
+        );
+
+        // A wrong choice is accepted (answered) but scored incorrect, and now reveals the key.
+        let wrong = answer_question(&pool, qid, "choice", json!(["a"]), Some("worker")).await?;
+        assert_eq!(wrong["payload"]["correct"], json!(false));
+        assert_eq!(wrong["payload"]["correct_answer"], json!(["b"]));
+        assert_eq!(wrong["payload"]["explanation"], json!("B is correct"));
+
+        // A second quiz answered correctly scores correct.
+        let q2 = pose_question_configured(
+            &pool,
+            tid,
+            Some("quiz"),
+            "again",
+            Some(opts.clone()),
+            "worker",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({ "answer": ["b"] })),
+            Some("worker"),
+        )
+        .await?;
+        let qid2 = q2["id"].as_i64().unwrap();
+        let right = answer_question(&pool, qid2, "choice", json!(["b"]), Some("worker")).await?;
+        assert_eq!(right["payload"]["correct"], json!(true));
+
+        // Pose-time: an answer id not among the options is rejected; missing config is rejected.
+        assert!(
+            pose_question_configured(
+                &pool,
+                tid,
+                Some("quiz"),
+                "bad key",
+                Some(opts.clone()),
+                "worker",
+                true,
+                None,
+                None,
+                None,
+                None,
+                Some(json!({ "answer": ["z"] })),
+                Some("worker"),
+            )
+            .await
+            .is_err(),
+            "an answer id not among the options is rejected"
+        );
+        assert!(
+            pose_question_configured(
+                &pool,
+                tid,
+                Some("quiz"),
+                "no config",
+                Some(opts),
+                "worker",
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("worker"),
+            )
+            .await
+            .is_err(),
+            "quiz requires a config"
         );
         Ok(())
     }
