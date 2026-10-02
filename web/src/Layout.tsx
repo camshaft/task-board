@@ -22,6 +22,7 @@ import {
 import { useConnectionHealth } from './store'
 import { type ThemePref, useTheme } from './theme'
 import { AGENT_DOT, relTime } from './ui'
+import { WikiTree } from './WikiTree'
 
 // A thin top banner shown while the backend is unreachable (e.g. the 502 window during a backend
 // deploy) or the live stream is down. The board keeps its last-good content and auto-retries in
@@ -133,19 +134,23 @@ export default function Layout() {
   const closeSidebar = () => setSidebarOpen(false)
 
   // Phase 2 (doc_3346): the left sidebar is contextual to the active section rather than always the
-  // project list. Migrated sections so far are Channels (list channels/DMs) and Agents (list the
-  // roster); every other section keeps the project list for now (later sub-tasks migrate docs).
-  // Section is derived from the route, and so is the active item within it (for highlighting).
+  // project list. Migrated sections so far are Channels (list channels/DMs), Agents (the roster),
+  // and Docs (the wiki tree); every other section keeps the project list. Section is derived from
+  // the route, and so is the active item within it (for highlighting).
   const { pathname } = useLocation()
-  const section: 'channels' | 'agents' | 'board' = pathname.startsWith('/channels')
+  const section: 'channels' | 'agents' | 'docs' | 'board' = pathname.startsWith('/channels')
     ? 'channels'
     : pathname.startsWith('/agents')
       ? 'agents'
-      : 'board'
+      : pathname.startsWith('/documents') || pathname.startsWith('/wiki')
+        ? 'docs'
+        : 'board'
   const activeChannelMatch = pathname.match(/^\/channels\/(\d+)/)
   const activeChannel = activeChannelMatch ? Number(activeChannelMatch[1]) : null
   const activeAgentMatch = pathname.match(/^\/agents\/(.+)/)
   const activeAgent = activeAgentMatch ? decodeURIComponent(activeAgentMatch[1]) : null
+  const activeDocMatch = pathname.match(/^\/documents\/(\d+)/)
+  const activeDoc = activeDocMatch ? Number(activeDocMatch[1]) : null
   const sortedAgents = [...agents].sort((a, b) => a.id.localeCompare(b.id))
   // Public channels + the actor's channels (incl. private/DMs), deduped and id-ordered -- the same
   // merge the Channels index uses. Fetched app-wide so the rail is ready when a channel route opens.
@@ -357,6 +362,28 @@ export default function Layout() {
                 ))}
                 {sortedAgents.length === 0 && (
                   <p className="px-3 py-2 text-sm text-[var(--color-muted)]">No agents yet.</p>
+                )}
+              </nav>
+            </>
+          ) : section === 'docs' ? (
+            <>
+              <div className="flex items-center justify-between px-4 py-3">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Docs
+                </span>
+                <Link
+                  to="/documents"
+                  onClick={closeSidebar}
+                  className="rounded px-1.5 text-sm text-sky-400 hover:bg-[var(--color-panel-2)]"
+                >
+                  all
+                </Link>
+              </div>
+              <nav className="flex-1 overflow-y-auto px-2 py-1">
+                {wikiDocs.length > 0 ? (
+                  <WikiTree docs={wikiDocs} activeDocId={activeDoc} onNavigate={closeSidebar} />
+                ) : (
+                  <p className="px-3 py-2 text-sm text-[var(--color-muted)]">No filed pages yet.</p>
                 )}
               </nav>
             </>
