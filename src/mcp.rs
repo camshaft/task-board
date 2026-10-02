@@ -102,6 +102,21 @@ impl Board {
         })
     }
 
+    /// Resolve the TARGET of a subscription write (subscribe/unsubscribe). The `subscriber` names WHO
+    /// to (un)subscribe -- a target, not the acting identity -- so an explicitly-named agent is
+    /// authoritative even for a forced-identity (X-Fleet-Agent) session: a coordinator must be able to
+    /// (un)subscribe ANOTHER agent (the param's documented purpose), which `me_req`'s forced > explicit
+    /// precedence silently blocked -- every call pinned the subscriber to the caller, so a forced
+    /// session could only ever (un)subscribe itself. Explicit wins; falls back to the session/forced
+    /// identity when omitted. Mirror of `awaiting_viewer` (task_1226); (un)subscribing is a benign,
+    /// reversible notification change, so honoring an explicit target is safe.
+    fn subscriber_target(&self, explicit: Option<&str>) -> Result<String, McpError> {
+        match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => Ok(s.to_string()),
+            None => self.me_req(None),
+        }
+    }
+
     /// This session's AUTHENTICATED principal, independent of any client-supplied value: a trusted
     /// forced identity (X-Fleet-Agent) if present, else the identity this session registered as.
     /// `None` for an unregistered, header-less session. (task_1100)
@@ -2445,7 +2460,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let sub = self.me_req(a.subscriber.as_deref())?;
+        let sub = self.subscriber_target(a.subscriber.as_deref())?;
         let board = a.board.unwrap_or(false);
         match (a.thread_root, a.event_classes.as_deref()) {
             (Some(root), _) => core::subscribe_thread(&self.pool, &sub, root).await,
@@ -2486,7 +2501,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<SubscribeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let sub = self.me_req(a.subscriber.as_deref())?;
+        let sub = self.subscriber_target(a.subscriber.as_deref())?;
         match a.thread_root {
             Some(root) => core::unsubscribe_thread(&self.pool, &sub, root).await,
             None => {
@@ -4799,6 +4814,35 @@ mod tests {
         );
         // With no explicit viewer it falls back to the forced/session identity ("defaults to you").
         assert_eq!(board.awaiting_viewer(None).as_deref(), Some("v-task-board"));
+        Ok(())
+    }
+
+    // task_1251-adjacent: subscribe/unsubscribe's `subscriber` is a TARGET, not the acting identity,
+    // so an explicit subscriber is authoritative even under a forced (X-Fleet-Agent) identity --
+    // otherwise a forced session can only ever (un)subscribe itself and a coordinator cannot subscribe
+    // another agent (the param's documented purpose). Same me_opt-forced-override class as task_1226.
+    #[tokio::test]
+    async fn subscriber_target_honors_explicit_over_forced() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool, None);
+        // No identity at all: an explicit subscriber is used; omitted/blank errors (me_req).
+        assert_eq!(board.subscriber_target(Some("v-foo"))?, "v-foo");
+        assert!(board.subscriber_target(None).is_err());
+        assert!(
+            board.subscriber_target(Some("   ")).is_err(),
+            "a blank subscriber falls back to the (here absent) session identity"
+        );
+        // A forced fleet identity: an explicit subscriber STILL wins (unlike me_req), so a coordinator
+        // can subscribe ANOTHER agent.
+        *board.forced_identity.lock().unwrap() = Some("v-task-board".to_string());
+        assert_eq!(
+            board.subscriber_target(Some("v-fleet-tooling"))?,
+            "v-fleet-tooling",
+            "an explicit subscriber is authoritative even under a forced identity"
+        );
+        // Omitted -> falls back to the forced/session identity.
+        assert_eq!(board.subscriber_target(None)?, "v-task-board");
         Ok(())
     }
 
