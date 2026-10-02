@@ -8757,8 +8757,16 @@ pub async fn list_external_links(
     board_kind: Option<&str>,
     board_id: Option<i64>,
 ) -> anyhow::Result<Value> {
-    // Build a filtered query with only the provided predicates (all optional).
-    let mut sql = String::from("SELECT * FROM external_links WHERE 1=1");
+    // Build a filtered query with only the provided predicates (all optional). For task-kind links
+    // we also surface the linked board task's current `board_status` (NULL for non-task kinds) via a
+    // gated scalar subquery, so a sync loop (task_1328) can enumerate the live external-entity-task
+    // set and filter to non-terminal without a second round-trip per row.
+    let mut sql = String::from(
+        "SELECT external_links.*, \
+         (SELECT status FROM tasks WHERE tasks.id = external_links.board_id \
+          AND external_links.board_kind='task') AS board_status \
+         FROM external_links WHERE 1=1",
+    );
     if source.is_some() {
         sql.push_str(" AND source=?");
     }
@@ -8797,6 +8805,130 @@ fn hydrate_external_link(r: &SqliteRow) -> Value {
         m.insert("metadata".into(), meta);
     }
     v
+}
+
+/// Canonicalize a repo reference + number into the stable `external_id` the GitHub bridge uses for
+/// an external-wait entity-task (task_1328 contract A): lowercased `owner/repo` + "#" + number.
+/// Accepts `repo` as a bare "owner/repo" OR a full URL (e.g. https://github.com/Owner/Repo or
+/// .../pull/42); it strips scheme/host and any trailing path so a waiter's helper call and the
+/// bridge's normalize_repo_ref resolve to the SAME external_links row.
+pub fn canonical_external_entity_id(repo: &str, number: i64) -> String {
+    let r = repo.trim();
+    // Drop a scheme ("https://") if present, then split the path.
+    let after_scheme = r.rsplit("://").next().unwrap_or(r);
+    let mut segs: Vec<&str> = after_scheme.split('/').filter(|s| !s.is_empty()).collect();
+    // Drop a leading host segment (contains a dot, e.g. github.com).
+    if segs.first().is_some_and(|s| s.contains('.')) {
+        segs.remove(0);
+    }
+    let owner_repo = if segs.len() >= 2 {
+        format!("{}/{}", segs[0], segs[1])
+    } else {
+        after_scheme.to_string()
+    };
+    let owner_repo = owner_repo.trim_end_matches(".git");
+    format!("{}#{number}", owner_repo.to_ascii_lowercase())
+}
+
+/// Create-or-reuse an external-entity-task representing an external wait on a CR/PR (task_1328).
+/// Idempotent on the canonical external_links key (source, owner/repo#number, board_kind='task') --
+/// the SAME dedup `create_task` uses for external items, so N waiters and the bridge's sync all
+/// resolve to ONE task E. The synced human/state fields live in `metadata.external_entity`; the
+/// bridge updates `state`/`last_synced` on each sync and sets E terminal (done) on resolution, which
+/// auto-unblocks every waiter via the existing kind=task fan-out. Returns the task with `created`.
+#[allow(clippy::too_many_arguments)]
+pub async fn ensure_external_entity_task(
+    pool: &Pool,
+    source: &str,
+    repo: &str,
+    number: i64,
+    url: Option<&str>,
+    kind: Option<&str>,
+    project_id: i64,
+    created_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let ext_id = canonical_external_entity_id(repo, number);
+    let owner_repo = ext_id.rsplit_once('#').map(|(o, _)| o).unwrap_or(&ext_id);
+    let mut ee = serde_json::Map::new();
+    ee.insert("source".into(), json!(source));
+    if let Some(k) = kind {
+        ee.insert("kind".into(), json!(k));
+    }
+    ee.insert("repo".into(), json!(owner_repo));
+    ee.insert("number".into(), json!(number));
+    if let Some(u) = url {
+        ee.insert("url".into(), json!(u));
+    }
+    ee.insert("state".into(), json!("open"));
+    ee.insert("last_synced".into(), json!(now_iso()));
+    let metadata = json!({ "external_entity": Value::Object(ee) });
+    // Title carries no bare "#N" (check_bare_refs would reject it); the canonical id lives in the
+    // external_links row + metadata.external_entity.
+    let title = format!(
+        "external wait: {source} {owner_repo} {} {number}",
+        kind.unwrap_or("item")
+    );
+    create_task(
+        pool,
+        project_id,
+        &title,
+        None,
+        None,
+        None,
+        created_by,
+        Some(metadata),
+        None,
+        Some(ExternalRef {
+            source: source.to_string(),
+            external_id: ext_id,
+            external_parent_id: None,
+        }),
+    )
+    .await
+}
+
+/// Convenience (task_1328): make task `waiter_task_id` wait on an external CR/PR. Ensures the shared
+/// external-entity-task E exists (create-or-reuse) in the WAITER's project, then sets the waiter's
+/// blocked_on = {kind:task, target:E} -- so it collapses into the structurally-justified
+/// blocked-on-task path and auto-unblocks when the bridge resolves E. Returns the updated waiter.
+#[allow(clippy::too_many_arguments)]
+pub async fn block_on_external(
+    pool: &Pool,
+    waiter_task_id: i64,
+    source: &str,
+    repo: &str,
+    number: i64,
+    url: Option<&str>,
+    kind: Option<&str>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let project_id: i64 = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+        .bind(waiter_task_id)
+        .fetch_optional(pool)
+        .await?
+        .map(|r| r.try_get("project_id"))
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("no task {waiter_task_id}"))?;
+    let e = ensure_external_entity_task(pool, source, repo, number, url, kind, project_id, actor)
+        .await?;
+    let e_id = e
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("ensure_external_entity_task returned no id"))?;
+    update_task(
+        pool,
+        waiter_task_id,
+        None,
+        None,
+        None,
+        None,
+        None,
+        actor,
+        None,
+        None,
+        Some(json!({ "kind": "task", "target": e_id })),
+    )
+    .await
 }
 
 /// Merge case-insensitive duplicate projects into one canonical row each. For every group
@@ -18064,6 +18196,173 @@ mod tests {
             again["id"].as_i64().unwrap(),
             tid,
             "resolves to the same moved task, no duplicate"
+        );
+        Ok(())
+    }
+
+    /// External-wait entity-tasks (task_1328): the canonical dedup key normalizes case + full-URL,
+    /// ensure_external_entity_task create-or-reuses ONE shared task E, block_on_external sets the
+    /// waiter's blocked_on=kind:task, N waiters share one E, list_external_links surfaces the linked
+    /// board_status (the sync enumeration primitive), and setting E done auto-unblocks every waiter
+    /// (contract C -- the existing kind=task fan-out, which fires on done AND cancelled).
+    #[tokio::test]
+    async fn external_entity_task_wait_lifecycle() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "w1", None, None, None, None, None).await?;
+        let proj = create_project(&pool, "P", None, Some("w1"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // Canonical id: lowercased owner/repo#number, from a bare ref, a full URL, or a .git suffix.
+        assert_eq!(
+            canonical_external_entity_id("Owner/Repo", 42),
+            "owner/repo#42"
+        );
+        assert_eq!(
+            canonical_external_entity_id("https://github.com/Owner/Repo/pull/42", 42),
+            "owner/repo#42"
+        );
+        assert_eq!(
+            canonical_external_entity_id("Owner/Repo.git", 42),
+            "owner/repo#42"
+        );
+
+        // ensure: first call creates E; a case/URL variant of the same CR/PR reuses the SAME task.
+        let e1 = ensure_external_entity_task(
+            &pool,
+            "github",
+            "Owner/Repo",
+            42,
+            None,
+            Some("pr"),
+            proj,
+            Some("w1"),
+        )
+        .await?;
+        assert_eq!(e1["created"], json!(true));
+        let e_id = e1["id"].as_i64().unwrap();
+        let e2 = ensure_external_entity_task(
+            &pool,
+            "github",
+            "https://github.com/owner/repo/pull/42",
+            42,
+            None,
+            Some("pr"),
+            proj,
+            Some("w1"),
+        )
+        .await?;
+        assert_eq!(e2["created"], json!(false));
+        assert_eq!(
+            e2["id"].as_i64().unwrap(),
+            e_id,
+            "URL variant dedups to the same E"
+        );
+
+        // metadata.external_entity carries the synced shape (handle string-or-object metadata).
+        let meta = &e1["metadata"];
+        let meta: Value = if meta.is_string() {
+            serde_json::from_str(meta.as_str().unwrap())?
+        } else {
+            meta.clone()
+        };
+        assert_eq!(meta["external_entity"]["repo"], json!("owner/repo"));
+        assert_eq!(meta["external_entity"]["number"], json!(42));
+        assert_eq!(meta["external_entity"]["state"], json!("open"));
+
+        // Two waiters block on the SAME CR/PR via block_on_external -> both blocked on E (kind=task).
+        let w_a = create_task(
+            &pool,
+            proj,
+            "waiter A",
+            None,
+            None,
+            None,
+            Some("w1"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let w_b = create_task(
+            &pool,
+            proj,
+            "waiter B",
+            None,
+            None,
+            None,
+            Some("w1"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        block_on_external(
+            &pool,
+            w_a,
+            "github",
+            "owner/repo",
+            42,
+            None,
+            Some("pr"),
+            Some("w1"),
+        )
+        .await?;
+        block_on_external(
+            &pool,
+            w_b,
+            "github",
+            "owner/repo",
+            42,
+            None,
+            Some("pr"),
+            Some("w1"),
+        )
+        .await?;
+        let ga = get_task(&pool, w_a).await?;
+        assert_eq!(ga["status"], json!("blocked"));
+        assert_eq!(ga["blocked_on"]["kind"], json!("task"));
+
+        // Exactly ONE E shared by both waiters, and list_external_links surfaces its board_status.
+        let links = list_external_links(&pool, Some("github"), Some("task"), None).await?;
+        let links = links.as_array().unwrap().clone();
+        assert_eq!(links.len(), 1, "one entity-task for the shared CR/PR");
+        assert_eq!(links[0]["board_id"].as_i64().unwrap(), e_id);
+        assert_eq!(
+            links[0]["board_status"],
+            json!("todo"),
+            "enumeration surfaces live status"
+        );
+
+        // Resolve: set E done -> both waiters auto-unblock to todo (contract C).
+        update_task(
+            &pool,
+            e_id,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("bridge"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            get_task(&pool, w_a).await?["status"],
+            json!("todo"),
+            "waiter A auto-unblocked on E done"
+        );
+        assert_eq!(
+            get_task(&pool, w_b).await?["status"],
+            json!("todo"),
+            "waiter B auto-unblocked on E done"
         );
         Ok(())
     }
