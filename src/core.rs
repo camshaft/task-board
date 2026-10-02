@@ -1027,6 +1027,23 @@ pub async fn create_project(
         Recipients::Explicit(BTreeSet::new()),
     )
     .await?;
+
+    // Standing fleet-coordination grant (doc_26 v12 A5 safe-enablement invariant, task 542 Phase 3
+    // Part B): every new project carries an admin grant to the fleet-coordination team. admin
+    // preserves the coordination fleet's reach-unchanged -- the fleet is the automation that runs
+    // the board -- but as an explicit, auditable grant that replaces the old hardcoded bypass. It is
+    // written in the SAME tx as the project so a project never exists without it, and it is
+    // non-removable (detach_project_team rejects it). Idempotent on the get-or-create path above.
+    sqlx::query(
+        "INSERT INTO project_teams(project_id, team_id, role, cascade_nested, created_by, created_at) \
+         VALUES(?,?,'admin',1,'(system)',?) ON CONFLICT(project_id, team_id) DO NOTHING",
+    )
+    .bind(pid)
+    .bind(FLEET_COORDINATION_TEAM)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+
     let out = project_json(&mut tx, pid).await?.unwrap_or(Value::Null);
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
@@ -1644,6 +1661,17 @@ pub async fn delete_team(pool: &Pool, id: &str) -> anyhow::Result<Value> {
 /// every granting path that reaches them (doc_26 A5 "strongest role wins").
 const PROJECT_ROLES: [&str; 3] = ["admin", "read-write", "read"];
 
+/// The seeded fleet-coordination team (doc_26 v12 A5 "safe-enablement invariant", task 542 Phase 3
+/// Part B). Its members are the cross-project coordination agents (board-pm, concierge, v-task-board,
+/// the nudge daemon, ...) that must reach every project to route, nudge, and build. EVERY project,
+/// existing and future, carries a STANDING admin grant to this team (added in create_project and
+/// back-filled for existing projects in db::init), and that grant is NON-REMOVABLE
+/// (detach_project_team rejects it), so making a project private never locks the coordination fleet
+/// out. The team is seeded with NO members; membership is managed via add_team_member as a separate
+/// operational step before enforcement is ever enabled -- this slice RECORDS the grant, it does not
+/// enforce anything.
+pub const FLEET_COORDINATION_TEAM: &str = "fleet-coordination";
+
 fn role_rank(role: &str) -> u8 {
     match role {
         "admin" => 3,
@@ -1741,11 +1769,18 @@ pub async fn attach_project_team(
 }
 
 /// Detach a team's grant from a project (idempotent). Returns the project with its remaining grants.
+/// The fleet-coordination standing grant is NON-REMOVABLE (doc_26 v12 A5 safe-enablement invariant):
+/// detaching it is rejected so making a project private never locks the coordination fleet out.
 pub async fn detach_project_team(
     pool: &Pool,
     project_id: i64,
     team_id: &str,
 ) -> anyhow::Result<Value> {
+    if team_id == FLEET_COORDINATION_TEAM {
+        anyhow::bail!(
+            "the fleet-coordination standing grant cannot be detached (doc_26 A5 safe-enablement invariant)"
+        );
+    }
     sqlx::query("DELETE FROM project_teams WHERE project_id=? AND team_id=?")
         .bind(project_id)
         .bind(team_id)
@@ -22032,14 +22067,16 @@ mod tests {
         assert_eq!(out["access"]["concierge"]["role"], json!("admin"));
         assert_eq!(out["access"]["concierge"]["via"], json!("(creator)"));
         assert_eq!(out["access"]["concierge"]["kind"], json!("agent"));
-        // Raw grants surface on the returned project AND on a plain get_project read.
-        assert_eq!(out["teams"].as_array().unwrap().len(), 2);
+        // Raw grants surface on the returned project AND on a plain get_project read. Three grants:
+        // eng + leads + the standing fleet-coordination grant every project carries (task 542 Part B);
+        // the fleet-coordination team is empty so it adds no principal to the access map above.
+        assert_eq!(out["teams"].as_array().unwrap().len(), 3);
         assert_eq!(
             get_project(&pool, pid).await?["teams"]
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            3
         );
 
         // Cascade: team 'div' nests 'eng' and has a direct member 'bob'. A non-cascade grant counts
@@ -22085,10 +22122,74 @@ mod tests {
         );
 
         // Detach removes the grant (idempotent): alice falls back to eng=read once leads is gone.
+        // Two grants remain: eng + the non-removable fleet-coordination standing grant.
         let after = detach_project_team(&pool, pid, "leads").await?;
         assert_eq!(after["access"]["alice"]["role"], json!("read"));
-        assert_eq!(after["teams"].as_array().unwrap().len(), 1);
+        assert_eq!(after["teams"].as_array().unwrap().len(), 2);
         detach_project_team(&pool, pid, "leads").await?; // idempotent -- no error on a second detach
+        Ok(())
+    }
+
+    /// Fleet-coordination standing grant (task 542 Phase 3 Part B, doc_26 v12 A5 safe-enablement
+    /// invariant): the team is seeded empty, every project (new + existing) carries an admin grant to
+    /// it, the grant is non-removable, and a legacy project missing it is back-filled on the next init.
+    #[tokio::test]
+    async fn fleet_coordination_standing_grant_is_seeded_and_non_removable() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("b.db");
+        let db_path = db_path.to_str().unwrap();
+        let pool = crate::db::init(db_path).await?;
+
+        // The team is seeded by init with NO members (membership is a separate operational step).
+        let team = get_team(&pool, FLEET_COORDINATION_TEAM).await?;
+        assert_eq!(team["display_name"], json!("Fleet Coordination"));
+        assert!(team["members"].as_array().unwrap().is_empty());
+
+        // (a) create_project auto-attaches the fleet-coordination admin grant (cascade on).
+        let pid = create_project(&pool, "P", None, Some("concierge"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let has_grant = |proj: &Value| {
+            proj["teams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|g| g["team_id"] == json!(FLEET_COORDINATION_TEAM))
+                .cloned()
+        };
+        let grant = has_grant(&get_project(&pool, pid).await?).expect("standing grant present");
+        assert_eq!(grant["role"], json!("admin"));
+        assert_eq!(grant["cascade"], json!(true));
+
+        // (c) detaching the fleet-coordination team is rejected, and it survives the attempt.
+        assert!(
+            detach_project_team(&pool, pid, FLEET_COORDINATION_TEAM)
+                .await
+                .is_err(),
+            "the fleet-coordination standing grant is non-removable"
+        );
+        assert!(
+            has_grant(&get_project(&pool, pid).await?).is_some(),
+            "a rejected detach leaves the standing grant in place"
+        );
+
+        // (b) existing-project back-fill: simulate a legacy project missing the grant (raw delete,
+        // bypassing the detach guard), then (d) re-run init on the SAME db path -- idempotent, and it
+        // back-fills the standing grant for the pre-existing project.
+        sqlx::query("DELETE FROM project_teams WHERE project_id=? AND team_id=?")
+            .bind(pid)
+            .bind(FLEET_COORDINATION_TEAM)
+            .execute(&pool)
+            .await?;
+        assert!(
+            has_grant(&get_project(&pool, pid).await?).is_none(),
+            "the grant is removed for the legacy-project simulation"
+        );
+        let pool2 = crate::db::init(db_path).await?;
+        assert!(
+            has_grant(&get_project(&pool2, pid).await?).is_some(),
+            "re-running init back-fills the standing grant on the existing project"
+        );
         Ok(())
     }
 }

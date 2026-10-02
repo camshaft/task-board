@@ -927,6 +927,36 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     .execute(&pool)
     .await?;
 
+    // Seed the fleet-coordination team + its STANDING grant on every existing project (task 542
+    // Phase 3 Part B, doc_26 v12 A5 safe-enablement invariant). The team is seeded with NO members;
+    // membership (board-pm, concierge, v-task-board, the nudge daemon, ...) is managed via
+    // add_team_member as a separate operational step before enforcement is ever enabled -- this
+    // RECORDS the grant, it does not enforce anything. New projects get the grant in
+    // core::create_project; existing projects are back-filled here so a legacy DB opens in place and
+    // gains it. Both are idempotent (ON CONFLICT DO NOTHING), so this is safe on every boot.
+    sqlx::query(
+        "INSERT INTO teams(id, display_name, created_by, created_at) \
+         VALUES(?,'Fleet Coordination','system',?) ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(crate::core::FLEET_COORDINATION_TEAM)
+    .bind(&now)
+    .execute(&pool)
+    .await?;
+    // admin preserves the coordination fleet's reach-unchanged; the grant is non-removable
+    // (core::detach_project_team rejects it). INSERT ... SELECT so every current project gets it.
+    sqlx::query(
+        // `WHERE true` disambiguates the upsert `ON CONFLICT` from a SELECT join's `ON` clause --
+        // without it SQLite parses `FROM projects ON CONFLICT ...` as a join and errors at `DO`
+        // (a documented INSERT ... SELECT ... ON CONFLICT gotcha).
+        "INSERT INTO project_teams(project_id, team_id, role, cascade_nested, created_by, created_at) \
+         SELECT id, ?, 'admin', 1, '(system)', ? FROM projects WHERE true \
+         ON CONFLICT(project_id, team_id) DO NOTHING",
+    )
+    .bind(crate::core::FLEET_COORDINATION_TEAM)
+    .bind(&now)
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }
 
