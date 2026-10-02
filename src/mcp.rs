@@ -1676,12 +1676,12 @@ pub struct GetCommentAnnotationsArgs {
 pub struct PoseQuestionArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
-    /// Legacy kind -- one of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list. OMIT it for a CID-keyed question that instead carries its own `response_schema` plus a `ui.element_schema_cid` (the element's content id, its canonical type identifier).
+    /// Legacy kind -- one of: yes_no, multiple_choice, select_all, fill_in_the_blank, rank_list, point_allocation. OMIT it for a CID-keyed question that instead carries its own `response_schema` plus a `ui.element_schema_cid` (the element's content id, its canonical type identifier).
     #[serde(default)]
     pub kind: Option<String>,
     /// The question prompt.
     pub prompt: String,
-    /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list.
+    /// Options as [{id, label}] -- required for multiple_choice / select_all / rank_list / point_allocation.
     #[serde(default)]
     pub options: Option<serde_json::Value>,
     /// The principal (person, team, or agent id) the question routes to; "operator" is the seeded team.
@@ -1701,6 +1701,9 @@ pub struct PoseQuestionArgs {
     /// Optional UI descriptor stored verbatim (element name, props, element-schema CID); resolved by the client, not the board.
     #[serde(default)]
     pub ui: Option<serde_json::Value>,
+    /// Per-kind config object. Required for point_allocation: {"budget": N} -- the constant sum (integer >= 1) a point_allocation answer must total. Not accepted by kinds that take no config.
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
     #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
 }
@@ -1711,9 +1714,9 @@ pub struct AnswerQuestionArgs {
     /// The question comment id to answer.
     #[serde(deserialize_with = "de_i64_lenient")]
     pub comment_id: i64,
-    /// The answer shape: bool / choice / text / ranked. Use text for an out-of-frame answer to a non-text kind.
+    /// The answer shape: bool / choice / text / ranked / allocation. Use text for an out-of-frame answer to a non-text kind.
     pub shape: String,
-    /// The answer value: a boolean (bool); an array of option ids (choice: 1 for multiple_choice, N for select_all); a string (text); or the option ids in order (ranked).
+    /// The answer value: a boolean (bool); an array of option ids (choice: 1 for multiple_choice, N for select_all); a string (text); the option ids in order (ranked); or an object {option_id: integer_points} summing to the budget (allocation, for point_allocation).
     pub value: serde_json::Value,
     #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
@@ -3678,13 +3681,13 @@ impl Board {
     }
 
     #[tool(
-        description = "Pose a structured question on a task (doc_33), routed to a person/team/agent. Give EITHER a legacy kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list) OR -- for a CID-keyed question (doc_33 v16) -- omit kind and carry an inline response_schema (the validation contract) plus a ui.element_schema_cid (the element's content id, its canonical type identifier the client branches on). When a response_schema is present, submitted answers are validated against it generically. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Returns the question comment; notifies the routed-to principal."
+        description = "Pose a structured question on a task (doc_33), routed to a person/team/agent. Give EITHER a legacy kind (yes_no / multiple_choice / select_all / fill_in_the_blank / rank_list / point_allocation) OR -- for a CID-keyed question (doc_33 v16) -- omit kind and carry an inline response_schema (the validation contract) plus a ui.element_schema_cid (the element's content id, its canonical type identifier the client branches on). When a response_schema is present, submitted answers are validated against it generically. point_allocation (doc_3371 entry 8) needs options plus config={\"budget\": N}: its answer is an object {option_id: integer_points} that must sum to the budget. Blocking by default (contributes to the task's question-block until resolved); pass blocking=false for a non-blocking question the asker proceeds on, optionally with a default + wait_period_seconds. Returns the question comment; notifies the routed-to principal."
     )]
     async fn pose_question(
         &self,
         Parameters(a): Parameters<PoseQuestionArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::pose_question_full(
+        core::pose_question_configured(
             &self.pool,
             a.task_id,
             a.kind.as_deref(),
@@ -3696,6 +3699,7 @@ impl Board {
             a.wait_period_seconds,
             a.response_schema,
             a.ui,
+            a.config,
             self.me_opt(s(&a.actor)).as_deref(),
         )
         .await
