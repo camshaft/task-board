@@ -315,6 +315,12 @@ pub struct MoveTaskArgs {
     pub task_id: i64,
     /// The project to move the task into.
     pub to_project_id: i64,
+    /// Move the task's WHOLE subtree with it (an epic: the task + all descendants, preserving the
+    /// internal parent/child links). Required to move a task that has children or a parent -- without
+    /// it, such a task is rejected with guidance. The moved root is detached from any parent left
+    /// behind. Default false (a lone task moves as before).
+    #[serde(default)]
+    pub cascade: Option<bool>,
     /// Set to your agent id so you aren't notified of your own change.
     #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
@@ -2245,17 +2251,23 @@ impl Board {
     }
 
     #[tool(
-        description = "Move a task to a different project. Notifies the task's subscribers. Set `actor` to your agent id so you aren't notified of your own change."
+        description = "Move a task to a different project. Notifies the task's subscribers. A task with children or a parent is rejected unless you pass `cascade: true`, which moves the whole subtree (the task + all descendants, parent/child links preserved) atomically in one call - the way to relocate an epic. Set `actor` to your agent id so you aren't notified of your own change."
     )]
     async fn move_task(
         &self,
         Parameters(a): Parameters<MoveTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.me_opt(s(&a.actor));
-        core::move_task(&self.pool, a.task_id, a.to_project_id, actor.as_deref())
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::move_task(
+            &self.pool,
+            a.task_id,
+            a.to_project_id,
+            a.cascade.unwrap_or(false),
+            actor.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(
