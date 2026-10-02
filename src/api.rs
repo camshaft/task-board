@@ -1101,10 +1101,19 @@ fn render_index_html(doc: &Value, prefix: &str) -> String {
         } else {
             format!("<span>{}</span>", html_escape(path))
         };
+        // Render the query string as one wrapping chip per `key=type` param, not a single long
+        // unbroken string -- a long query (e.g. GET /api/tasks) otherwise overflowed horizontally
+        // and pushed the whole page past the viewport (task_1223). Each chip stays on one line; the
+        // row of chips wraps within the Path cell.
         let query_html = if query.is_empty() {
             String::new()
         } else {
-            format!("<div class=\"q\">?{}</div>", html_escape(query))
+            let chips: String = query
+                .split('&')
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("<span class=\"qp\">{}</span>", html_escape(p)))
+                .collect();
+            format!("<div class=\"q\">{chips}</div>")
         };
         let body_html = match e["body_schema"].as_str() {
             Some(name) => format!(
@@ -1151,11 +1160,18 @@ fn render_index_html(doc: &Value, prefix: &str) -> String {
   a:hover {{ text-decoration: underline; }}
   table {{ width:100%; border-collapse: collapse; }}
   th,td {{ text-align:left; padding:.5rem .6rem; border-bottom:1px solid #1c2128; vertical-align: top; }}
-  th {{ color:#9aa4af; font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; }}
+  th {{ color:#9aa4af; font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; white-space:nowrap; }}
   code {{ font-family: ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.82rem; }}
-  .path code {{ color:#e6e8eb; }}
-  .q {{ color:#6b7684; font-size:.72rem; margin-top:.1rem; }}
-  .m {{ font-weight:600; padding:.05rem .4rem; border-radius:.3rem; font-size:.72rem; }}
+  /* Let a long path wrap within its cell (no spaces to break on) so a narrow viewport does not
+     overflow horizontally; scoped to the path so the Method badge column is never squeezed. */
+  .path code {{ color:#e6e8eb; overflow-wrap:anywhere; }}
+  /* A dense 4-column table cannot shrink below its columns' min-content; scroll it inside its own
+     box at narrow widths so the PAGE never gains horizontal overflow (task_1223). No-op at desktop
+     width, where the table fits the 960px wrap. */
+  .tablewrap {{ overflow-x:auto; }}
+  .q {{ display:flex; flex-wrap:wrap; gap:.25rem; margin-top:.3rem; }}
+  .qp {{ color:#9aa4af; background:#11151a; border:1px solid #1c2128; border-radius:.3rem; padding:.03rem .35rem; font-family: ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.72rem; white-space:nowrap; }}
+  .m {{ font-weight:600; padding:.05rem .4rem; border-radius:.3rem; font-size:.72rem; white-space:nowrap; }}
   .m-get {{ background:#0e2a3a; color:#7dd3fc; }}
   .m-post {{ background:#0f2e1c; color:#86efac; }}
   .m-patch {{ background:#2e2410; color:#fcd34d; }}
@@ -1176,10 +1192,12 @@ fn render_index_html(doc: &Value, prefix: &str) -> String {
     <span class="badge">· <a href="{prefix}/">web UI</a> · MCP at <code>{prefix}/mcp</code></span>
   </div>
   <p class="lede">REST surface for the agent coordination board. GET links are live — click to try them. This page is also available as JSON (send <code>Accept: application/json</code> or fetch <code>{prefix}/api</code>).</p>
+  <div class="tablewrap">
   <table>
     <thead><tr><th>Method</th><th>Path</th><th>Summary</th><th>Body</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
+  </div>
   <hr>
   <h2 style="font-size:1rem;color:#cbd5e1;">Request body schemas</h2>
   {schema_blocks}
