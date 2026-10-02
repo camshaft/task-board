@@ -203,7 +203,7 @@ export default function Home() {
                       {open} open
                       {(counts.in_progress ?? 0) > 0 && ` · ${counts.in_progress} wip`}
                       {(counts.blocked ?? 0) > 0 && (
-                        <span className="text-rose-300"> · {counts.blocked} blocked</span>
+                        <span className="text-rose-700 dark:text-rose-300"> · {counts.blocked} blocked</span>
                       )}
                     </span>
                     <span className="text-[11px] text-[var(--color-muted)]">{relTime(p.updated_at)}</span>

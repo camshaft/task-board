@@ -308,7 +308,7 @@ export default function DocumentView() {
             )}
             <span>· updated {relTime(doc.updated_at)}</span>
             {doc.approved_version_id != null && (
-              <span className="text-emerald-300">
+              <span className="text-emerald-700 dark:text-emerald-300">
                 · approved v
                 {doc.versions.find((v) => v.id === doc.approved_version_id)?.version_no ?? '?'}
                 {doc.approved_by ? ` by ${doc.approved_by}` : ''}
@@ -540,9 +540,13 @@ export default function DocumentView() {
                   className="flex items-center gap-3 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 text-sm"
                 >
                   <span className="font-mono text-xs text-[var(--color-muted)]">v{v.version_no}</span>
-                  {isCurrent && <span className="text-[10px] uppercase text-sky-300">current</span>}
+                  {isCurrent && (
+                    <span className="text-[10px] uppercase text-sky-700 dark:text-sky-300">current</span>
+                  )}
                   {isApproved && (
-                    <span className="text-[10px] uppercase text-emerald-300">approved</span>
+                    <span className="text-[10px] uppercase text-emerald-700 dark:text-emerald-300">
+                      approved
+                    </span>
                   )}
                   {v.content_type && v.content_type !== 'text/markdown' && (
                     <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-muted)]">
@@ -998,7 +1002,7 @@ function CommentCard({
         {versionNo != null && <span>· on v{versionNo}</span>}
         {c.region != null && <span title="region-anchored">· 📌</span>}
         <span>· {relTime(c.created_at)}</span>
-        {resolved && <span className="text-emerald-300">· resolved</span>}
+        {resolved && <span className="text-emerald-700 dark:text-emerald-300">· resolved</span>}
         <span className="ml-auto flex items-center gap-2">
           {onReply && (
             <button
@@ -1413,8 +1417,8 @@ function DocDiff({
         </select>
         {!loading && !result.error && (
           <span className="ml-auto font-mono">
-            <span className="text-emerald-300">+{adds}</span>{' '}
-            <span className="text-red-300">−{dels}</span>
+            <span className="text-emerald-700 dark:text-emerald-300">+{adds}</span>{' '}
+            <span className="text-red-700 dark:text-red-300">−{dels}</span>
           </span>
         )}
       </div>

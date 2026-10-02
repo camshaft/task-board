@@ -50,16 +50,16 @@ function TrendBody() {
 // Improving = fewer findings later (good); worsening = more. Falling escaped = good; rising = bad.
 function findingsTrendCls(t: string): string {
   return t === 'improving'
-    ? 'text-emerald-300'
+    ? 'text-emerald-700 dark:text-emerald-300'
     : t === 'worsening'
-      ? 'text-rose-300'
+      ? 'text-rose-700 dark:text-rose-300'
       : 'text-[var(--color-muted)]'
 }
 function escapedTrendCls(t: string): string {
   return t === 'falling'
-    ? 'text-emerald-300'
+    ? 'text-emerald-700 dark:text-emerald-300'
     : t === 'rising'
-      ? 'text-rose-300'
+      ? 'text-rose-700 dark:text-rose-300'
       : 'text-[var(--color-muted)]'
 }
 
@@ -86,7 +86,7 @@ function SliceRow({ label, slice }: { label: string; slice: ReviewTrendSlice }) 
           escaped {slice.escaped_trend.replace(/_/g, ' ')}
         </span>
         {slice.flagged && (
-          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 ring-1 ring-inset ring-amber-500/30">
+          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 ring-1 ring-inset ring-amber-500/30 dark:bg-amber-500/15 dark:text-amber-300">
             flagged
           </span>
         )}
