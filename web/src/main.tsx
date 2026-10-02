@@ -14,6 +14,7 @@ import ErrorBoundary from './ErrorBoundary.tsx'
 import Home from './Home.tsx'
 import Layout from './Layout.tsx'
 import People from './People.tsx'
+import ProjectAccess from './ProjectAccess.tsx'
 import ReviewView from './ReviewView.tsx'
 import Reviews from './Reviews.tsx'
 import Search from './Search.tsx'
@@ -86,6 +87,7 @@ createRoot(document.getElementById('root')!).render(
             <Route path="channels/:channelId" element={<ChannelView />} />
             {/* Bare task deep-link: resolves the task's project and redirects to the nested URL. */}
             <Route path="tasks/:taskId" element={<TaskRedirect />} />
+            <Route path="projects/:projectId/access" element={<ProjectAccess />} />
             <Route path="projects/:projectId" element={<Board />}>
               <Route path="tasks/:taskId" element={<TaskDrawer />} />
             </Route>

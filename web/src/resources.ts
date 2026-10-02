@@ -20,6 +20,7 @@ import {
   type IdentityAlias,
   type Person,
   type Project,
+  type ProjectAccess,
   type Team,
   type TeamDetail,
   type Review,
@@ -66,6 +67,7 @@ const keys = {
   teams: 'teams',
   team: (id: string) => `team:${id}`,
   teamDetails: 'teamDetails:all',
+  projectTeams: (id: number) => `projectTeams:${id}`,
   reviews: 'reviews',
   review: (id: number) => `review:${id}`,
   reviewTrend: 'reviewTrend',
@@ -647,6 +649,35 @@ export async function removeTeamMember(
   invalidate(keys.teams)
   invalidate(keys.teamDetails)
   return t
+}
+
+// Project visibility + roles (task 542 Phase 3). The grants + resolved access map for one project;
+// not on the SSE stream, so the grant mutations below invalidate it (and the projects list, which
+// carries the raw grants) directly.
+export function useProjectTeams(projectId: number) {
+  return useResource<ProjectAccess>(keys.projectTeams(projectId), () =>
+    api.getProjectTeams(projectId),
+  )
+}
+
+export async function attachProjectTeam(
+  projectId: number,
+  b: Parameters<typeof api.attachProjectTeam>[1],
+) {
+  const r = await api.attachProjectTeam(projectId, b)
+  invalidate(keys.projectTeams(projectId))
+  invalidate(keys.projects)
+  return r
+}
+
+export async function detachProjectTeam(
+  projectId: number,
+  b: Parameters<typeof api.detachProjectTeam>[1],
+) {
+  const r = await api.detachProjectTeam(projectId, b)
+  invalidate(keys.projectTeams(projectId))
+  invalidate(keys.projects)
+  return r
 }
 
 // The compact event the SSE feed pushes (mirrors sse::StreamEvent on the server), plus the

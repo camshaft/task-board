@@ -152,6 +152,9 @@ export default function Board() {
         </button>
         {/* Project actions. Kept as small text buttons so the board stays the focus. */}
         <div className="ml-auto flex items-center gap-1 text-xs text-[var(--color-muted)]">
+          <Link to={`/projects/${project}/access`} className="rounded px-2 py-1 hover:bg-[var(--color-panel-2)]">
+            Access
+          </Link>
           <button onClick={renameProject} className="rounded px-2 py-1 hover:bg-[var(--color-panel-2)]">
             Rename
           </button>
