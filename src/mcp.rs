@@ -7,9 +7,10 @@
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
-    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ServerCapabilities, ServerConfig,
+    CallToolResult, ContentBlock, Implementation, InitializeRequestParams, InitializeResult,
+    ListResourcesResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerConfig,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{
@@ -41,15 +42,26 @@ pub struct Board {
     /// tools default `created_by`/`assignee`/`author`/`agent_id` from it when omitted. A
     /// reconnect/restart mints a fresh session (identity gone) — recover by re-registering.
     identity: Arc<Mutex<Option<String>>>,
+    /// Trusted-front-door forced identity (task_1039): when the MCP session's `initialize` request
+    /// carried an `X-Fleet-Agent` header (a per-session value the fleet launcher sets), the agent id
+    /// is forced to it (resolved through identity_aliases) for the WHOLE session -- `me_opt` prefers
+    /// it over any explicitly-passed id, the MCP analog of task_1030's REST force. This lets a fleet
+    /// agent skip register_agent / login / remembering its own name. `None` when no (valid) header
+    /// arrived, so a non-fleet session behaves exactly as before.
+    forced_identity: Arc<Mutex<Option<String>>>,
     // Populated and consumed by the #[tool_router]/#[tool_handler] macros.
     #[allow(dead_code)]
     tool_router: ToolRouter<Board>,
 }
 
 impl Board {
-    /// Resolve an identity param: an explicit non-empty value wins; otherwise fall back to the
-    /// agent this session registered as. `None` if neither is available.
+    /// Resolve an identity param: a trusted-front-door FORCED identity (task_1039) wins over
+    /// everything; otherwise an explicit non-empty value wins; otherwise fall back to the agent this
+    /// session registered as. `None` if none is available.
     fn me_opt(&self, explicit: Option<&str>) -> Option<String> {
+        if let Some(forced) = self.forced_identity.lock().unwrap().clone() {
+            return Some(forced);
+        }
         match explicit.map(str::trim).filter(|s| !s.is_empty()) {
             Some(x) => Some(x.to_string()),
             None => self.identity.lock().unwrap().clone(),
@@ -1689,6 +1701,7 @@ impl Board {
             pool,
             ipfs_api_url,
             identity: Arc::new(Mutex::new(None)),
+            forced_identity: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
@@ -3527,8 +3540,43 @@ const UI_ELEMENTS_DOC_PATH: &str = "system/ui-elements";
 /// (doc_728 Solution B) so an agent resolves the live element->CID mapping in one resources/read.
 const UI_ELEMENTS_URI: &str = "file://system/ui-elements";
 
+/// Extract a valid trusted-front-door agent id from an MCP request's HTTP headers (task_1039): the
+/// `X-Fleet-Agent` value, trimmed. `None` if absent, empty, or an UNEXPANDED env placeholder -- a
+/// session launched without `FLEET_AGENT` sends the literal `${FLEET_AGENT}`, which must NOT become
+/// an identity, so such a (non-fleet / not-yet-relaunched) session falls through to the normal
+/// identity path untouched.
+fn trusted_agent_header(parts: Option<&axum::http::request::Parts>) -> Option<String> {
+    let v = parts?.headers.get("x-fleet-agent")?.to_str().ok()?.trim();
+    if v.is_empty() || v.contains("${") {
+        return None;
+    }
+    Some(v.to_string())
+}
+
 #[tool_handler]
 impl ServerHandler for Board {
+    /// task_1039: force the session identity from the trusted per-session `X-Fleet-Agent` header the
+    /// fleet launcher injects, resolved through identity_aliases (so MCP identity canonicalizes
+    /// identically to the REST path). This is what lets a fleet agent skip register_agent / login /
+    /// remembering its own name. Dormant + fully back-compat: a session with no (valid) header
+    /// leaves `forced_identity` None and behaves exactly as before. Otherwise delegates to the
+    /// default initialize (negotiate + record the peer).
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        if let Some(name) =
+            trusted_agent_header(context.extensions.get::<axum::http::request::Parts>())
+        {
+            let canonical = core::resolve_identity_alias(&self.pool, &name).await;
+            *self.forced_identity.lock().unwrap() = Some(canonical.clone());
+            *self.identity.lock().unwrap() = Some(canonical);
+        }
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
             ServerCapabilities::builder()
@@ -4157,6 +4205,53 @@ mod tests {
             .unwrap()
             .subscriber
             .is_none());
+    }
+
+    // task_1039: the trusted X-Fleet-Agent header guard -- a real value is taken (trimmed), while an
+    // absent / empty / UNEXPANDED-placeholder value yields None so a non-fleet session is untouched.
+    #[test]
+    fn trusted_agent_header_guards_empty_and_unexpanded() {
+        let mk = |v: Option<&str>| {
+            let mut b = axum::http::Request::builder();
+            if let Some(x) = v {
+                b = b.header("x-fleet-agent", x);
+            }
+            let (parts, _) = b.body(()).unwrap().into_parts();
+            trusted_agent_header(Some(&parts))
+        };
+        assert_eq!(mk(Some("v-foo")), Some("v-foo".to_string()));
+        assert_eq!(mk(Some("  v-foo  ")), Some("v-foo".to_string()));
+        assert_eq!(
+            mk(Some("${FLEET_AGENT}")),
+            None,
+            "unexpanded literal ignored"
+        );
+        assert_eq!(mk(Some("")), None);
+        assert_eq!(mk(None), None, "header absent");
+        assert_eq!(trusted_agent_header(None), None, "no parts at all");
+    }
+
+    // task_1039: a forced identity (set from the header at initialize) wins over BOTH an
+    // explicitly-passed id and the register_agent session identity; with none set, behavior is
+    // unchanged (explicit wins, else session identity).
+    #[tokio::test]
+    async fn forced_identity_wins_in_me_opt() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool, None);
+        assert_eq!(board.me_opt(Some("passed")).as_deref(), Some("passed"));
+        assert_eq!(board.me_opt(None), None);
+        *board.identity.lock().unwrap() = Some("registered".to_string());
+        assert_eq!(board.me_opt(None).as_deref(), Some("registered"));
+        assert_eq!(board.me_opt(Some("passed")).as_deref(), Some("passed"));
+        *board.forced_identity.lock().unwrap() = Some("forced".to_string());
+        assert_eq!(
+            board.me_opt(Some("passed")).as_deref(),
+            Some("forced"),
+            "forced beats an explicit value"
+        );
+        assert_eq!(board.me_opt(None).as_deref(), Some("forced"));
+        Ok(())
     }
 
     // The board advertises tools/list_changed so a client refetches its tool list after a
