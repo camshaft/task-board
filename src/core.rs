@@ -3267,10 +3267,13 @@ pub async fn get_task_limited(
         // Surface metadata.monitor_exempt as a derived top-level bool (default false) so the nudge
         // daemon + the #506 holding-work watchdog can read it from a list/get scan (task from
         // board-pm; consumed by v-fleet-tooling). metadata stays the source of truth.
+        // An iceboxed task is monitor-exempt by its status alone (task_1221), so the nudge daemon +
+        // #506 watchdog skip it via this same bool without a daemon-side change.
         let monitor_exempt = meta
             .get("monitor_exempt")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || m.get("status").and_then(|v| v.as_str()) == Some("icebox");
         m.insert("metadata".into(), meta);
         m.insert("monitor_exempt".into(), Value::Bool(monitor_exempt));
 
@@ -3483,6 +3486,11 @@ pub async fn list_tasks(
     }
     if status.is_some() {
         conds.push("status=?");
+    } else {
+        // Iceboxed tasks (task_1221) are a deliberate deprioritization -- a real, worth-keeping want
+        // with no near-term window. They stay OUT of the default active-backlog view, but remain
+        // searchable on demand via an explicit `status=icebox` filter (which takes the branch above).
+        conds.push("status != 'icebox'");
     }
     // "What is waiting on me/the operator/agent X" views: filter by blocked_on kind and/or ref.
     if blocked_on_kind.is_some() {
@@ -3557,7 +3565,11 @@ pub async fn list_tasks(
         .map(|r| {
             let mut v = row_to_json_ref(r, "task");
             if let Value::Object(ref mut m) = v {
-                let exempt = matches!(m.get("monitor_exempt"), Some(x) if x.as_i64() == Some(1) || x.as_bool() == Some(true));
+                // An iceboxed task is monitor-exempt by its status alone (task_1221): the nudge daemon
+                // + #506 watchdog read this bool, so deriving it true for status=icebox makes them skip
+                // iceboxed tasks without a daemon-side change.
+                let exempt = matches!(m.get("monitor_exempt"), Some(x) if x.as_i64() == Some(1) || x.as_bool() == Some(true))
+                    || m.get("status").and_then(Value::as_str) == Some("icebox");
                 m.insert("monitor_exempt".into(), Value::Bool(exempt));
             }
             v
@@ -24523,6 +24535,242 @@ mod tests {
         // a bridged person is reachable: delivered.
         let r = send_message(&pool, "alice", "human2", "hi").await?;
         assert_eq!(r["delivered"], json!(true), "bridged person allowed: {r}");
+        Ok(())
+    }
+
+    /// task_1221: a first-class `icebox` status drops a task out of the default active view (but it
+    /// stays searchable via status=icebox) and makes it monitor-exempt, so the nudge/stall daemons
+    /// skip it; a one-step update back to todo restores it to the active view and un-exempts it.
+    #[tokio::test]
+    async fn iceboxed_task_hidden_from_default_view_and_monitor_exempt() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "Someday",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // Icebox it.
+        let iced = update_task(
+            &pool,
+            tid,
+            Some("icebox"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(iced["status"], json!("icebox"));
+
+        // get_task: status=icebox, monitor-exempt (so the nudge/stall daemons skip it).
+        let got = get_task(&pool, tid).await?;
+        assert_eq!(got["status"], json!("icebox"));
+        assert_eq!(
+            got["monitor_exempt"],
+            json!(true),
+            "an iceboxed task is monitor-exempt: {got:#?}"
+        );
+
+        // Default list view (no status filter) hides it.
+        let default = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert!(
+            !default
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == json!(tid)),
+            "an iceboxed task must be hidden from the default view: {default:#?}"
+        );
+
+        // Explicit status=icebox surfaces it, still monitor-exempt (searchable on demand).
+        let iced_view = list_tasks(
+            &pool,
+            Some(pid),
+            Some("icebox"),
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        let rows = iced_view.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "status=icebox lists it: {iced_view:#?}");
+        assert_eq!(rows[0]["monitor_exempt"], json!(true));
+
+        // One-step restore to todo returns it to the active view and un-exempts it.
+        update_task(
+            &pool,
+            tid,
+            Some("todo"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let restored = get_task(&pool, tid).await?;
+        assert_eq!(restored["status"], json!("todo"));
+        assert_eq!(restored["monitor_exempt"], json!(false));
+        let default2 = list_tasks(
+            &pool,
+            Some(pid),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        assert!(
+            default2
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == json!(tid)),
+            "the restored task is back in the default view"
+        );
+        Ok(())
+    }
+
+    /// task_1221 exemption: the blocker-done auto-unblock (task_1220) must not pull an iceboxed
+    /// dependent back to todo. Iceboxing clears the block (status=icebox is not `blocked`), so the
+    /// auto-unblock -- which touches only status='blocked' dependents -- leaves it iceboxed.
+    #[tokio::test]
+    async fn iceboxed_dependent_is_not_auto_unblocked() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let blocker = create_task(
+            &pool,
+            pid,
+            "Blocker",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let bid = blocker["id"].as_i64().unwrap();
+        let dep = create_task(
+            &pool,
+            pid,
+            "Dependent",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = dep["id"].as_i64().unwrap();
+
+        // Block the dependent on the blocker, then icebox it (which clears the block).
+        update_task(
+            &pool,
+            did,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            Some(json!({"kind": "task", "target": bid})),
+        )
+        .await?;
+        update_task(
+            &pool,
+            did,
+            Some("icebox"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(get_task(&pool, did).await?["status"], json!("icebox"));
+
+        // Completing the blocker must NOT resurrect the iceboxed dependent to todo.
+        update_task(
+            &pool,
+            bid,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            get_task(&pool, did).await?["status"],
+            json!("icebox"),
+            "an iceboxed dependent stays iceboxed when its former blocker completes"
+        );
         Ok(())
     }
 }
