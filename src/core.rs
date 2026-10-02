@@ -2068,6 +2068,38 @@ pub async fn get_task_scoped(
     get_task_limited(pool, task_id, comments_limit).await
 }
 
+/// `list_projects` filtered to the projects `viewer` can read when enforcement is enabled (task_542
+/// Phase 3 Part B5b). Passthrough while enforcement is OFF. FAIL-CLOSED under enforcement: an
+/// unidentified viewer gets an empty list, and each project is kept only if
+/// `principal_can_read_project` holds. (O(projects) access checks under enforcement --
+/// correctness-first, reusing the cascade-correct predicate; can be optimized to one joined query
+/// over the viewer's granted teams if it becomes hot.)
+pub async fn list_projects_scoped(
+    pool: &Pool,
+    status: Option<&str>,
+    viewer: Option<&str>,
+) -> anyhow::Result<Value> {
+    let projects = list_projects(pool, status).await?;
+    if !enforcement_enabled(pool).await? {
+        return Ok(projects);
+    }
+    let Some(viewer) = viewer else {
+        return Ok(json!([])); // fail-closed: an unidentified caller sees no projects
+    };
+    let Value::Array(items) = projects else {
+        return Ok(projects);
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for p in items {
+        if let Some(pid) = p.get("id").and_then(Value::as_i64) {
+            if principal_can_read_project(pool, viewer, pid).await? {
+                out.push(p);
+            }
+        }
+    }
+    Ok(Value::Array(out))
+}
+
 /// Resolve an addressable principal id to the set of principal ids who can act on it (task 542): a
 /// team expands to its people AND its agents (cycle-guarded); anything else (a person id, or an
 /// agent id) resolves to itself. The read-time primitive for team-aware addressing + visibility in
@@ -23252,6 +23284,65 @@ mod tests {
         assert!(
             get_task_scoped(&pool, tid, None, None).await?.is_null(),
             "an unidentified caller is scoped out"
+        );
+        Ok(())
+    }
+
+    /// task_542 B5b: list_projects_scoped is a passthrough while enforcement is OFF, and once enabled
+    /// filters to the viewer's readable projects -- a creator sees only its own, an unidentified
+    /// caller sees none, and a fleet-coordination member sees all via the standing grant.
+    #[tokio::test]
+    async fn list_projects_scoped_filters_to_readable_under_enforcement() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["boss", "other", "coord"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let p1 = create_project(&pool, "P1", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let p2 = create_project(&pool, "P2", None, Some("other"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let ids = |v: &Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p.get("id").and_then(Value::as_i64))
+                .collect::<BTreeSet<_>>()
+        };
+
+        // Enforcement OFF: everyone sees both projects.
+        assert_eq!(
+            ids(&list_projects_scoped(&pool, None, Some("boss")).await?),
+            BTreeSet::from([p1, p2])
+        );
+
+        set_enforcement_enabled(&pool, true, Some("boss")).await?;
+
+        // boss (creator of P1 only) sees just P1; an unidentified caller sees none.
+        assert_eq!(
+            ids(&list_projects_scoped(&pool, None, Some("boss")).await?),
+            BTreeSet::from([p1])
+        );
+        assert!(list_projects_scoped(&pool, None, None)
+            .await?
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // A fleet-coordination member sees both via the standing grant.
+        add_team_member(
+            &pool,
+            FLEET_COORDINATION_TEAM,
+            "coord",
+            "agent",
+            Some("boss"),
+        )
+        .await?;
+        assert_eq!(
+            ids(&list_projects_scoped(&pool, None, Some("coord")).await?),
+            BTreeSet::from([p1, p2])
         );
         Ok(())
     }

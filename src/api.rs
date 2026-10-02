@@ -1384,10 +1384,14 @@ struct ListProjectsQuery {
 
 async fn list_projects(
     State(st): State<AppState>,
+    viewer: Option<Extension<ForcedViewer>>,
     Query(q): Query<ListProjectsQuery>,
 ) -> ApiResult {
+    // task_542 B5b: filter to the authenticated caller's readable projects when enforcement is
+    // enabled (fail-closed; a no-op while off). The viewer is stamped by force_trusted_user.
+    let viewer = viewer.map(|Extension(ForcedViewer(v))| v);
     Ok(Json(
-        core::list_projects(&st.pool, q.status.as_deref()).await?,
+        core::list_projects_scoped(&st.pool, q.status.as_deref(), viewer.as_deref()).await?,
     ))
 }
 

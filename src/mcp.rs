@@ -2053,10 +2053,16 @@ impl Board {
         &self,
         Parameters(a): Parameters<ListProjectsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_projects(&self.pool, s(&a.status))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        // task_542 B5b: filter to the authenticated caller's readable projects when enforcement is
+        // enabled (fail-closed; inert while off).
+        core::list_projects_scoped(
+            &self.pool,
+            s(&a.status),
+            self.authenticated_identity().as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(description = "Get one project and its tasks.")]
