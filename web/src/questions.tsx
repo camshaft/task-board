@@ -35,16 +35,18 @@ const KIND_LABEL: Record<QuestionKind, string> = {
 }
 
 const STATE_CHIP: Record<QuestionState, string> = {
-  open: 'bg-sky-500/15 text-sky-300 ring-sky-500/30',
-  answered: 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30',
-  answered_outside_frame: 'bg-amber-500/15 text-amber-300 ring-amber-500/30',
-  declined: 'bg-rose-500/15 text-rose-300 ring-rose-500/30',
-  cancelled: 'bg-zinc-500/15 text-zinc-400 ring-zinc-500/30',
-  superseded: 'bg-zinc-500/15 text-zinc-400 ring-zinc-500/30',
+  open: 'bg-sky-100 text-sky-800 ring-sky-500/30 dark:bg-sky-500/15 dark:text-sky-300',
+  answered: 'bg-emerald-100 text-emerald-800 ring-emerald-500/30 dark:bg-emerald-500/15 dark:text-emerald-300',
+  answered_outside_frame: 'bg-amber-100 text-amber-800 ring-amber-500/30 dark:bg-amber-500/15 dark:text-amber-300',
+  declined: 'bg-rose-100 text-rose-700 ring-rose-500/30 dark:bg-rose-500/15 dark:text-rose-300',
+  cancelled: 'bg-zinc-100 text-zinc-600 ring-zinc-500/30 dark:bg-zinc-500/15 dark:text-zinc-400',
+  superseded: 'bg-zinc-100 text-zinc-600 ring-zinc-500/30 dark:bg-zinc-500/15 dark:text-zinc-400',
 }
 
 function StateChip({ state }: { state: string }) {
-  const chip = STATE_CHIP[state as QuestionState] ?? 'bg-zinc-500/15 text-zinc-400 ring-zinc-500/30'
+  const chip =
+    STATE_CHIP[state as QuestionState] ??
+    'bg-zinc-100 text-zinc-600 ring-zinc-500/30 dark:bg-zinc-500/15 dark:text-zinc-400'
   return (
     <span
       className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ring-1 ring-inset ${chip}`}

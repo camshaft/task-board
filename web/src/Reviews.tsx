@@ -11,15 +11,17 @@ import { Identity, relTime } from './ui'
 // Backed by the resource store; the list omits each review's log (fetch one for its timeline).
 
 const REVIEW_STATUS_CHIP: Record<string, string> = {
-  open: 'bg-slate-500/15 text-slate-300 ring-slate-500/30',
-  in_review: 'bg-sky-500/15 text-sky-300 ring-sky-500/30',
-  changes_requested: 'bg-amber-500/15 text-amber-300 ring-amber-500/30',
-  approved: 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30',
-  closed: 'bg-zinc-500/15 text-zinc-400 ring-zinc-500/30',
+  open: 'bg-slate-100 text-slate-700 ring-slate-500/30 dark:bg-slate-500/15 dark:text-slate-300',
+  in_review: 'bg-sky-100 text-sky-800 ring-sky-500/30 dark:bg-sky-500/15 dark:text-sky-300',
+  changes_requested: 'bg-amber-100 text-amber-800 ring-amber-500/30 dark:bg-amber-500/15 dark:text-amber-300',
+  approved: 'bg-emerald-100 text-emerald-800 ring-emerald-500/30 dark:bg-emerald-500/15 dark:text-emerald-300',
+  closed: 'bg-zinc-100 text-zinc-600 ring-zinc-500/30 dark:bg-zinc-500/15 dark:text-zinc-400',
 }
 
 export function ReviewStatusChip({ status }: { status: string }) {
-  const chip = REVIEW_STATUS_CHIP[status] ?? 'bg-zinc-500/15 text-zinc-400 ring-zinc-500/30'
+  const chip =
+    REVIEW_STATUS_CHIP[status] ??
+    'bg-zinc-100 text-zinc-600 ring-zinc-500/30 dark:bg-zinc-500/15 dark:text-zinc-400'
   return (
     <span
       className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${chip}`}
