@@ -243,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
             api::DbSnapshotCfg::disabled()
         },
         host_auth: host_auth.clone(),
+        link_rules: std::sync::Arc::new(cfg.link_rules.clone()),
     });
 
     // Reverse tunnel for fleet hosts with no inbound path: they dial /tunnel/ws and the board

@@ -57,3 +57,16 @@ mcp_allowed_hosts = []
 #   [hosts.'127.0.0.1']            # permissive -- no auth_header, client sets the actor
 #   [hosts.'board.example.com']
 #   auth_header = "x-tunnel-user"
+
+# Link-tag rules (task_1243): regex pattern -> URL template, served read-only at
+# GET /api/system/link-rules for the UI to linkify custom references (e.g. CR-NNNN) in rendered
+# content, generalizing the built-in typed-ref linkification. `$1`, `$2`, ... in the template are
+# the pattern's capture groups. These patterns live HERE in the deployment config, never in the
+# task-board / fleet source, so each deployment defines its own tags and the platform stays
+# org-agnostic. A pattern that is not a valid regex fails startup loudly. Empty by default.
+#   [[link_rules]]
+#   pattern = "CR-(\\d+)"
+#   url_template = "https://code.example.com/reviews/CR-$1"
+#   [[link_rules]]
+#   pattern = "SIM-(\\d+)"
+#   url_template = "https://sim.example.com/issues/SIM-$1"

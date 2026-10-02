@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Reference vocabulary. Not hard-enforced (agents may use others), but these are the
 /// blessed values the UI understands.
@@ -73,6 +73,26 @@ pub struct Settings {
     ///   auth_header = "x-tunnel-user"
     #[serde(default)]
     pub hosts: HashMap<String, HostAuth>,
+    /// Deployment-defined link-tag rules (task_1243): each a regex `pattern` + a `url_template` with
+    /// `$1`, `$2`, ... capture substitutions. The UI linkifies matches of these patterns in rendered
+    /// content (generalizing the built-in typed-ref linkification to custom refs like CR-NNNN). The
+    /// patterns live HERE in the deployment config, never in source, so each deployment customizes
+    /// its own tags and the open-source platform stays org-agnostic. Empty by default. Example TOML:
+    ///   [[link_rules]]
+    ///   pattern = "CR-(\\d+)"
+    ///   url_template = "https://code.example.com/reviews/CR-$1"
+    #[serde(default)]
+    pub link_rules: Vec<LinkRule>,
+}
+
+/// A single deployment-configured link-tag rule (task_1243). See `Settings::link_rules`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct LinkRule {
+    /// A regex matched against rendered content; capture groups feed `url_template`.
+    pub pattern: String,
+    /// The link target, with `$1`, `$2`, ... replaced by the pattern's capture groups.
+    pub url_template: String,
 }
 
 /// Per-host auth settings (a `[hosts.'<name>']` TOML section). Extensible; only `auth_header` today.
@@ -97,6 +117,7 @@ impl Default for Settings {
             db_snapshot_user: None,
             db_snapshot_password: None,
             hosts: HashMap::new(),
+            link_rules: Vec::new(),
         }
     }
 }
@@ -128,6 +149,10 @@ pub struct Config {
     /// that header on writes; unlisted hosts (and hosts without `auth_header`) stay permissive. See
     /// `Settings::hosts`.
     pub hosts: HashMap<String, HostAuth>,
+    /// Deployment-defined link-tag rules (regex pattern -> URL template), served to the UI for
+    /// custom-ref linkification. See `Settings::link_rules`. Each pattern is validated to compile as
+    /// a regex at startup (a bad pattern fails the load loudly).
+    pub link_rules: Vec<LinkRule>,
 }
 
 impl Config {
@@ -137,7 +162,19 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("reading config file {}: {e}", path.display()))?;
         let settings: Settings = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parsing config file {}: {e}", path.display()))?;
-        Ok(Self::from_settings(settings, web_dir))
+        let cfg = Self::from_settings(settings, web_dir);
+        // Fail the load loudly on a bad link-tag pattern (task_1243) rather than silently serving a
+        // rule the UI cannot apply.
+        for rule in &cfg.link_rules {
+            regex::Regex::new(&rule.pattern).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid link_rules pattern {:?} in {}: {e}",
+                    rule.pattern,
+                    path.display()
+                )
+            })?;
+        }
+        Ok(cfg)
     }
 
     /// Build a config from built-in defaults (used when no `--config` is given).
@@ -158,6 +195,40 @@ impl Config {
             db_snapshot_user: s.db_snapshot_user.filter(|s| !s.is_empty()),
             db_snapshot_password: s.db_snapshot_password.filter(|s| !s.is_empty()),
             hosts: s.hosts,
+            link_rules: s.link_rules,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_parses_link_rules_and_rejects_a_bad_pattern() {
+        // task_1243: valid [[link_rules]] parse through; an un-compilable regex fails the load.
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("good.toml");
+        std::fs::write(
+            &good,
+            "[[link_rules]]\npattern = 'CR-(\\d+)'\nurl_template = 'https://code.example.com/reviews/CR-$1'\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&good, None).expect("valid link_rules parse");
+        assert_eq!(cfg.link_rules.len(), 1);
+        assert_eq!(cfg.link_rules[0].pattern, "CR-(\\d+)");
+        assert_eq!(
+            cfg.link_rules[0].url_template,
+            "https://code.example.com/reviews/CR-$1"
+        );
+
+        let bad = tmp.path().join("bad.toml");
+        std::fs::write(
+            &bad,
+            "[[link_rules]]\npattern = 'CR-([0-9'\nurl_template = 'https://x'\n",
+        )
+        .unwrap();
+        let err = Config::load(&bad, None).unwrap_err().to_string();
+        assert!(err.contains("invalid link_rules pattern"), "got: {err}");
     }
 }
