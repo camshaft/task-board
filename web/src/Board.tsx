@@ -146,14 +146,14 @@ export default function Board() {
       <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
         <h2 className="truncate text-sm font-semibold">{current?.name ?? `Project #${project}`}</h2>
         {current?.status === 'archived' && (
-          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
+          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-800 dark:bg-amber-500/20 dark:text-amber-300">
             archived
           </span>
         )}
         {repo && (
           <a
             href={repo}
-            className="max-w-[16rem] truncate text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+            className="max-w-[16rem] truncate text-xs text-sky-700 underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300"
             title={repo}
           >
             {repo.replace(/^https?:\/\//, '')}
@@ -188,14 +188,14 @@ export default function Board() {
           {current?.status === 'archived' ? (
             <button
               onClick={restoreProject}
-              className="rounded px-2 py-1 text-sky-400 hover:bg-[var(--color-panel-2)]"
+              className="rounded px-2 py-1 text-sky-700 hover:bg-[var(--color-panel-2)] dark:text-sky-400"
             >
               Restore
             </button>
           ) : (
             <button
               onClick={archiveProject}
-              className="rounded px-2 py-1 text-rose-400 hover:bg-[var(--color-panel-2)]"
+              className="rounded px-2 py-1 text-rose-700 hover:bg-[var(--color-panel-2)] dark:text-rose-400"
             >
               Archive
             </button>
@@ -245,7 +245,7 @@ export default function Board() {
       )}
 
       {shownError && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-800 dark:text-rose-300">
           {shownError}
         </div>
       )}
@@ -264,13 +264,13 @@ export default function Board() {
                 className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2.5 py-1.5"
               >
                 <PriorityDot priority={t.priority} />
-                <Link to={`tasks/${t.id}`} className="max-w-xs truncate text-sm hover:text-sky-300">
+                <Link to={`tasks/${t.id}`} className="max-w-xs truncate text-sm hover:text-sky-700 dark:hover:text-sky-300">
                   {t.title}
                 </Link>
                 <span className="font-mono text-[11px] text-[var(--color-muted)]">#{t.id}</span>
                 <button
                   onClick={() => restoreFromIcebox(t.id)}
-                  className="rounded px-1.5 py-0.5 text-xs text-sky-400 hover:bg-[var(--color-panel)] hover:text-sky-300"
+                  className="rounded px-1.5 py-0.5 text-xs text-sky-700 hover:bg-[var(--color-panel)] hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300"
                   title="Restore to To do"
                 >
                   Restore
@@ -319,7 +319,7 @@ export default function Board() {
                             {t.monitor_exempt && (
                               <span
                                 title="Exempt from the liveness monitor / nudge daemon"
-                                className="rounded bg-amber-500/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-300"
+                                className="rounded bg-amber-500/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-800 dark:bg-amber-500/20 dark:text-amber-300"
                               >
                                 exempt
                               </span>
