@@ -139,7 +139,7 @@ export default function AgentView() {
   return (
     <main className="flex min-w-0 flex-1 flex-col">
       <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
-        <Link to="/" className="text-xs text-[var(--color-muted)] hover:text-sky-300">
+        <Link to="/" className="text-xs text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300">
           ← Home
         </Link>
         {agent && (

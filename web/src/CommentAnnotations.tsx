@@ -80,7 +80,7 @@ export function CommentAnnotations({
         <Markdown source={body} className="text-sm" />
       </div>
 
-      {error && <p className="mt-1 text-xs text-rose-400">{error}</p>}
+      {error && <p className="mt-1 text-xs text-rose-700 dark:text-rose-400">{error}</p>}
 
       {pending && (
         <AnnotationComposer
@@ -101,7 +101,7 @@ export function CommentAnnotations({
         <div className="mt-2">
           <button
             onClick={() => setOpen((v) => !v)}
-            className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-300"
+            className="text-xs text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:hover:text-sky-300"
           >
             {open ? 'Hide' : 'Show'} {topLevel.length} annotation{topLevel.length === 1 ? '' : 's'}
             {openCount > 0 ? ` (${openCount} open)` : ''}
@@ -232,7 +232,7 @@ function AnnotationThread({
           <button
             onClick={onResolve}
             disabled={busy}
-            className="underline decoration-dotted underline-offset-2 hover:text-emerald-300 disabled:opacity-40"
+            className="underline decoration-dotted underline-offset-2 hover:text-emerald-800 dark:hover:text-emerald-300 disabled:opacity-40"
           >
             Resolve
           </button>

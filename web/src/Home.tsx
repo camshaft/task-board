@@ -109,7 +109,7 @@ export default function Home() {
                     to={`/documents/${t.document_id}`}
                     className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 hover:border-amber-500/50"
                   >
-                    <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">
+                    <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-700 dark:text-violet-300">
                       doc
                     </span>
                     <span className="min-w-0 flex-1 truncate text-sm">{t.title}</span>
@@ -130,7 +130,7 @@ export default function Home() {
                     <StatusChip status={t.status} />
                     <span className="min-w-0 flex-1 truncate text-sm">{t.task_title}</span>
                     {(t.questions?.length ?? 0) > 0 && (
-                      <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">
+                      <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-700 dark:text-violet-300">
                         {t.questions?.length} q
                       </span>
                     )}
@@ -246,7 +246,7 @@ export default function Home() {
             const href = eventHref(e)
             const body = (
               <>
-                <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-700 dark:text-sky-300">
                   {e.type}
                 </span>
                 {e.actor && <span className="font-mono text-[var(--color-muted)]">{e.actor}</span>}

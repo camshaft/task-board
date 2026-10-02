@@ -17,7 +17,7 @@ export default function ReviewTrend() {
         <span className="font-semibold uppercase tracking-wide text-[var(--color-muted)]">
           Improvement trend
         </span>
-        <span className="text-sky-400">{open ? 'hide' : 'show'}</span>
+        <span className="text-sky-700 dark:text-sky-400">{open ? 'hide' : 'show'}</span>
       </button>
       {open && <TrendBody />}
     </div>

@@ -132,7 +132,7 @@ export function ConversationalFlow({
   return (
     <div className="rounded-lg border border-sky-500/20 bg-sky-500/5 p-3">
       <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-muted)]">
-        <span className="inline-flex items-center rounded-full bg-sky-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-sky-300 ring-1 ring-inset ring-sky-500/30">
+        <span className="inline-flex items-center rounded-full bg-sky-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-sky-700 dark:text-sky-300 ring-1 ring-inset ring-sky-500/30">
           Sequence
         </span>
         <span>{size != null ? `Question ${order} of ${size}` : `Question ${order}`} · one at a time</span>
@@ -572,7 +572,7 @@ function AnswerCard({
   return (
     <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-2.5">
       <div className="mb-1 flex items-center gap-2 text-xs text-[var(--color-muted)]">
-        <span className="inline-flex items-center rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-300 ring-1 ring-inset ring-emerald-500/30">
+        <span className="inline-flex items-center rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-300 ring-1 ring-inset ring-emerald-500/30">
           Answer
         </span>
         <AuthorLabel
@@ -936,7 +936,7 @@ function AnswerForm({
                 <button
                   disabled={busy || i === 0}
                   onClick={() => move(i, -1)}
-                  className="px-1 text-[var(--color-muted)] hover:text-sky-300 disabled:opacity-30"
+                  className="px-1 text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300 disabled:opacity-30"
                   aria-label="Move up"
                 >
                   ^
@@ -944,7 +944,7 @@ function AnswerForm({
                 <button
                   disabled={busy || i === order.length - 1}
                   onClick={() => move(i, 1)}
-                  className="px-1 text-[var(--color-muted)] hover:text-sky-300 disabled:opacity-30"
+                  className="px-1 text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300 disabled:opacity-30"
                   aria-label="Move down"
                 >
                   v
@@ -985,7 +985,7 @@ function AnswerForm({
               <button
                 disabled={busy || (items.length <= 1 && !v)}
                 onClick={() => removeItem(i)}
-                className="px-1 text-[var(--color-muted)] hover:text-rose-300 disabled:opacity-30"
+                className="px-1 text-[var(--color-muted)] hover:text-rose-800 dark:hover:text-rose-300 disabled:opacity-30"
                 aria-label="Remove row"
               >
                 x
@@ -1254,7 +1254,7 @@ function AnswerForm({
           ) : (
             <button
               onClick={() => setShowFree(true)}
-              className="text-xs text-sky-400 hover:text-sky-300"
+              className="text-xs text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
             >
               {spec?.shape === 'age'
                 ? 'Paste pre-encrypted ciphertext instead'
@@ -1327,7 +1327,7 @@ export function QuestionComment({
   return (
     <div>
       <div className="mb-1.5 flex flex-wrap items-center gap-2 text-xs text-[var(--color-muted)]">
-        <span className="inline-flex items-center rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-300 ring-1 ring-inset ring-violet-500/30">
+        <span className="inline-flex items-center rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-700 dark:text-violet-300 ring-1 ring-inset ring-violet-500/30">
           Question
         </span>
         {kindLabel && <span>{kindLabel}</span>}

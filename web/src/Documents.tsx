@@ -124,7 +124,7 @@ export default function Documents() {
                 setTag('')
                 setQuery('')
               }}
-              className="text-sky-400 hover:text-sky-300"
+              className="text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
             >
               clear
             </button>
@@ -151,7 +151,7 @@ export default function Documents() {
                   {key == null ? (
                     <span>No project</span>
                   ) : (
-                    <Link to={`/projects/${key}`} className="hover:text-sky-300">
+                    <Link to={`/projects/${key}`} className="hover:text-sky-800 dark:hover:text-sky-300">
                       {projectName(key)}
                     </Link>
                   )}
@@ -167,14 +167,14 @@ export default function Documents() {
                       {d.deprecated_at && (
                         <span
                           title={d.superseded_by != null ? `Deprecated, superseded by document ${d.superseded_by}` : 'Deprecated'}
-                          className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300"
+                          className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-800 dark:text-amber-300"
                         >
                           deprecated
                         </span>
                       )}
                       <Link
                         to={`/documents/${d.id}`}
-                        className="min-w-0 flex-1 truncate text-sm hover:text-sky-300"
+                        className="min-w-0 flex-1 truncate text-sm hover:text-sky-800 dark:hover:text-sky-300"
                       >
                         {d.title}
                       </Link>

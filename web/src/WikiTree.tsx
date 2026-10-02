@@ -70,7 +70,7 @@ function TreeRows({
                 <button
                   onClick={() => toggle(n.full)}
                   aria-label={isOpen ? 'Collapse' : 'Expand'}
-                  className="w-4 shrink-0 text-left text-[var(--color-muted)] hover:text-sky-300"
+                  className="w-4 shrink-0 text-left text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300"
                 >
                   {isOpen ? '▾' : '▸'}
                 </button>
@@ -83,7 +83,7 @@ function TreeRows({
                   <Link
                     to={`/documents/${n.doc.id}`}
                     onClick={onNavigate}
-                    className="min-w-0 flex-1 truncate text-sm hover:text-sky-300"
+                    className="min-w-0 flex-1 truncate text-sm hover:text-sky-800 dark:hover:text-sky-300"
                   >
                     {n.name}
                   </Link>

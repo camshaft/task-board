@@ -155,7 +155,7 @@ export default function ChannelView() {
   return (
     <main className="flex min-w-0 flex-1 flex-col">
       <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
-        <Link to="/channels" className="text-xs text-[var(--color-muted)] hover:text-sky-300">
+        <Link to="/channels" className="text-xs text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300">
           ← Channels
         </Link>
         <h1 className="truncate text-sm font-semibold">{title}</h1>
@@ -168,7 +168,7 @@ export default function ChannelView() {
           <button
             onClick={invite}
             disabled={busy}
-            className="ml-auto rounded-md px-2 py-1 text-xs text-sky-400 hover:bg-[var(--color-panel-2)]"
+            className="ml-auto rounded-md px-2 py-1 text-xs text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
           >
             + invite
           </button>
@@ -176,7 +176,7 @@ export default function ChannelView() {
       </div>
 
       {error && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-700 dark:text-rose-300">
           {error}
         </div>
       )}
@@ -201,7 +201,7 @@ export default function ChannelView() {
             <button
               onClick={loadEarlier}
               disabled={loadingEarlier}
-              className="rounded-md border border-[var(--color-border)] px-3 py-1 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-300 disabled:opacity-40"
+              className="rounded-md border border-[var(--color-border)] px-3 py-1 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-800 dark:hover:text-sky-300 disabled:opacity-40"
             >
               {loadingEarlier ? 'Loading…' : 'Load earlier messages'}
             </button>
@@ -232,7 +232,7 @@ export default function ChannelView() {
         {/* Show a send failure right at the composer (task_1201) -- the API validation reason, not
             just an opaque 400 in the console. */}
         {actionError && (
-          <p className="mb-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+          <p className="mb-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
             {actionError}
           </p>
         )}
@@ -288,7 +288,7 @@ function PostRow({
         />
         <span>· {relTime(p.created_at)}</span>
         {onReply && (
-          <button onClick={onReply} className="ml-auto hover:text-sky-300">
+          <button onClick={onReply} className="ml-auto hover:text-sky-800 dark:hover:text-sky-300">
             reply
           </button>
         )}

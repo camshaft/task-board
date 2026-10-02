@@ -98,12 +98,12 @@ export default function Reviews() {
               <ReviewStatusChip status={r.status} />
               <Link
                 to={`/reviews/${r.id}`}
-                className="min-w-0 flex-1 truncate text-sm hover:text-sky-300"
+                className="min-w-0 flex-1 truncate text-sm hover:text-sky-800 dark:hover:text-sky-300"
               >
                 {r.title || `${r.kind} review #${r.id}`}
               </Link>
               {r.vetted && (
-                <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-300">
+                <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
                   vetted
                 </span>
               )}

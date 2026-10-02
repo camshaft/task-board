@@ -357,7 +357,7 @@ export function TaskDrawer() {
                     }
                     className={`rounded px-1.5 py-0.5 ring-1 ring-inset transition disabled:opacity-40 ${
                       task.monitor_exempt
-                        ? 'bg-amber-500/15 text-amber-300 ring-amber-500/30'
+                        ? 'bg-amber-500/15 text-amber-800 dark:text-amber-300 ring-amber-500/30'
                         : 'text-[var(--color-muted)] ring-[var(--color-border)] hover:bg-[var(--color-panel-2)]'
                     }`}
                   >
@@ -397,7 +397,7 @@ export function TaskDrawer() {
 
             <div className="flex-1 overflow-y-auto p-5">
               {shownError && (
-                <div className="mb-3 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
+                <div className="mb-3 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                   {shownError}
                 </div>
               )}
@@ -424,7 +424,7 @@ export function TaskDrawer() {
                   <button
                     disabled={busy}
                     onClick={() => setStatus('todo')}
-                    className="ml-1 rounded-md px-2.5 py-1 text-xs text-sky-300 ring-1 ring-inset ring-sky-500/40 transition hover:bg-[var(--color-panel-2)]"
+                    className="ml-1 rounded-md px-2.5 py-1 text-xs text-sky-700 dark:text-sky-300 ring-1 ring-inset ring-sky-500/40 transition hover:bg-[var(--color-panel-2)]"
                   >
                     Restore to To do
                   </button>
@@ -433,7 +433,7 @@ export function TaskDrawer() {
                     disabled={busy}
                     onClick={() => setStatus('icebox')}
                     title="Icebox: kept, but not now — off the active board, no nudges"
-                    className="ml-1 rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] ring-1 ring-inset ring-[var(--color-border)] transition hover:bg-[var(--color-panel-2)] hover:text-cyan-300"
+                    className="ml-1 rounded-md px-2.5 py-1 text-xs text-[var(--color-muted)] ring-1 ring-inset ring-[var(--color-border)] transition hover:bg-[var(--color-panel-2)] hover:text-cyan-800 dark:hover:text-cyan-300"
                   >
                     Icebox
                   </button>
@@ -492,14 +492,14 @@ export function TaskDrawer() {
                     <span className="flex items-center gap-2">
                       <Link
                         to={`/projects/${task.project_id}/tasks/${task.parent_id}`}
-                        className="text-sky-400 hover:text-sky-300"
+                        className="text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
                       >
                         #{task.parent_id} {task.parent_title ?? ''}
                       </Link>
                       <button
                         onClick={clearParent}
                         disabled={busy}
-                        className="text-xs text-[var(--color-muted)] hover:text-rose-300"
+                        className="text-xs text-[var(--color-muted)] hover:text-rose-800 dark:hover:text-rose-300"
                       >
                         clear
                       </button>
@@ -508,7 +508,7 @@ export function TaskDrawer() {
                     <button
                       onClick={reparent}
                       disabled={busy}
-                      className="text-xs text-[var(--color-muted)] hover:text-sky-300"
+                      className="text-xs text-[var(--color-muted)] hover:text-sky-800 dark:hover:text-sky-300"
                     >
                       — set parent —
                     </button>
@@ -556,7 +556,7 @@ export function TaskDrawer() {
                     <button
                       onClick={() => setEditDesc(task.description ?? '')}
                       disabled={busy}
-                      className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)]"
+                      className="rounded px-1.5 py-0.5 text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
                     >
                       edit
                     </button>
@@ -614,7 +614,7 @@ export function TaskDrawer() {
                     <button
                       onClick={addSubtask}
                       disabled={busy}
-                      className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)]"
+                      className="rounded px-1.5 py-0.5 text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
                     >
                       + subtask
                     </button>
@@ -651,7 +651,7 @@ export function TaskDrawer() {
                         <DocStatusChip status={d.status} />
                         <Link
                           to={`/documents/${d.id}`}
-                          className="min-w-0 flex-1 truncate text-sm text-sky-400 hover:text-sky-300"
+                          className="min-w-0 flex-1 truncate text-sm text-sky-700 dark:text-sky-400 hover:text-sky-800 dark:hover:text-sky-300"
                         >
                           {d.title}
                         </Link>
@@ -668,7 +668,7 @@ export function TaskDrawer() {
                     <button
                       onClick={() => setEditMeta(JSON.stringify(task.metadata ?? {}, null, 2))}
                       disabled={busy}
-                      className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)]"
+                      className="rounded px-1.5 py-0.5 text-sky-700 dark:text-sky-400 hover:bg-[var(--color-panel-2)]"
                     >
                       edit
                     </button>
@@ -716,11 +716,11 @@ export function TaskDrawer() {
 
               {task.blocking_questions && task.blocking_questions.length > 0 && (
                 <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3">
-                  <div className="mb-1.5 text-xs font-medium text-amber-300">
+                  <div className="mb-1.5 text-xs font-medium text-amber-800 dark:text-amber-300">
                     Blocked by {task.blocking_questions.length} open question
                     {task.blocking_questions.length > 1 ? 's' : ''}
                     {task.question_blocked_on && task.question_blocked_on.length > 0 && (
-                      <span className="font-normal text-amber-300/70">
+                      <span className="font-normal text-amber-800/90 dark:text-amber-300/70">
                         {' '}
                         (awaiting {task.question_blocked_on.join(', ')})
                       </span>
@@ -735,7 +735,7 @@ export function TaskDrawer() {
                         >
                           {q.prompt.length > 90 ? `${q.prompt.slice(0, 90)}...` : q.prompt}
                           {q.routed_to && (
-                            <span className="text-amber-300/70"> - {q.routed_to}</span>
+                            <span className="text-amber-800/90 dark:text-amber-300/70"> - {q.routed_to}</span>
                           )}
                         </button>
                       </li>
@@ -778,7 +778,7 @@ export function TaskDrawer() {
                         <li>
                           <button
                             onClick={() => setShowAllComments(true)}
-                            className="w-full rounded-md border border-dashed border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-300"
+                            className="w-full rounded-md border border-dashed border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-800 dark:hover:text-sky-300"
                           >
                             Show {hidden} earlier comment{hidden === 1 ? '' : 's'}
                           </button>
@@ -844,7 +844,7 @@ export function TaskDrawer() {
                   shared error banner is at the top of the drawer -- off-screen when you are typing
                   down here, so a failed comment looked like nothing happened. */}
               {error && (
-                <p className="mb-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                <p className="mb-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
                   {error}
                 </p>
               )}

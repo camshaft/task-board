@@ -116,7 +116,7 @@ export default function Awaiting() {
                     </span>
                     <Link
                       to={`/documents/${it.document_id}`}
-                      className="min-w-0 flex-1 truncate text-sm font-medium hover:text-sky-300"
+                      className="min-w-0 flex-1 truncate text-sm font-medium hover:text-sky-800 dark:hover:text-sky-300"
                     >
                       {it.title}
                     </Link>
@@ -149,7 +149,7 @@ export default function Awaiting() {
                     <StatusChip status={it.status} />
                     <Link
                       to={`/tasks/${it.task_id}`}
-                      className="min-w-0 flex-1 truncate text-sm font-medium hover:text-sky-300"
+                      className="min-w-0 flex-1 truncate text-sm font-medium hover:text-sky-800 dark:hover:text-sky-300"
                     >
                       {it.task_title}
                     </Link>

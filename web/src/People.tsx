@@ -303,7 +303,7 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
                 className="flex items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-panel-2)] py-0.5 pl-2 pr-1 text-xs"
               >
                 <span
-                  className={`font-mono ${m.member_kind === 'team' ? 'text-violet-300' : m.member_kind === 'agent' ? 'text-sky-300' : ''}`}
+                  className={`font-mono ${m.member_kind === 'team' ? 'text-violet-700 dark:text-violet-300' : m.member_kind === 'agent' ? 'text-sky-700 dark:text-sky-300' : ''}`}
                   title={m.member_kind}
                 >
                   {m.member_kind === 'team' ? `@${m.member_id}` : m.member_id}
@@ -312,7 +312,7 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
                   type="button"
                   onClick={() => void remove(m)}
                   aria-label={`Remove ${m.member_kind} ${m.member_id}`}
-                  className="rounded-full px-1 text-[var(--color-muted)] hover:bg-rose-500/20 hover:text-rose-300"
+                  className="rounded-full px-1 text-[var(--color-muted)] hover:bg-rose-500/20 hover:text-rose-800 dark:hover:text-rose-300"
                 >
                   x
                 </button>
@@ -334,7 +334,7 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
             {team.resolved_people.map((pid) => (
               <span
                 key={pid}
-                className="rounded-full bg-emerald-500/15 px-2 py-0.5 font-mono text-xs text-emerald-300"
+                className="rounded-full bg-emerald-500/15 px-2 py-0.5 font-mono text-xs text-emerald-700 dark:text-emerald-300"
               >
                 {pid}
               </span>
@@ -355,7 +355,7 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
             {team.resolved_agents.map((aid) => (
               <span
                 key={aid}
-                className="rounded-full bg-sky-500/15 px-2 py-0.5 font-mono text-xs text-sky-300"
+                className="rounded-full bg-sky-500/15 px-2 py-0.5 font-mono text-xs text-sky-700 dark:text-sky-300"
               >
                 {aid}
               </span>
@@ -449,7 +449,7 @@ function PersonDetailPanel({
         type="button"
         onClick={() => onSelectTeam(id)}
         title={`Open team ${id}`}
-        className="rounded-full bg-violet-500/15 px-2 py-0.5 font-mono text-xs text-violet-300 hover:bg-violet-500/25"
+        className="rounded-full bg-violet-500/15 px-2 py-0.5 font-mono text-xs text-violet-700 dark:text-violet-300 hover:bg-violet-500/25"
       >
         {teamName(id)}
       </button>
@@ -541,7 +541,7 @@ function DeleteButton({ label, onDelete }: { label: string; onDelete: () => Prom
           setBusy(false)
         }
       }}
-      className="shrink-0 rounded px-1.5 text-[var(--color-muted)] hover:bg-rose-500/20 hover:text-rose-300 disabled:opacity-40"
+      className="shrink-0 rounded px-1.5 text-[var(--color-muted)] hover:bg-rose-500/20 hover:text-rose-800 dark:hover:text-rose-300 disabled:opacity-40"
     >
       x
     </button>
