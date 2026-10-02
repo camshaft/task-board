@@ -1,4 +1,4 @@
-import { api, type CrashReport } from './api'
+import { api, setApiFailureReporter, type CrashReport } from './api'
 
 // UI crash telemetry reporter (task_879, Slice B). Funnels uncaught errors -- window 'error' and
 // 'unhandledrejection' events, plus the top-level ErrorBoundary's componentDidCatch -- into a
@@ -92,5 +92,17 @@ export function installCrashReporting() {
   window.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
     const { message, stack } = describe(e.reason)
     reportCrash({ kind: 'unhandledrejection', message, stack })
+  })
+  // Auto-file UNEXPECTED API failures (5xx / network) that a component caught locally and so never
+  // reached the handlers above -- cameron's "errors that would be caught by this" (task_1201). req()
+  // only invokes this for 5xx + network errors (not expected 4xx), so this is server/outage
+  // telemetry, not user-input rejections. Deduped by signature like every other report.
+  setApiFailureReporter((f) => {
+    const where = `${f.method} ${f.path}`
+    const message =
+      f.status != null
+        ? `API ${f.status} on ${where}: ${f.message}`
+        : `API request failed on ${where}: ${f.message}`
+    reportCrash({ kind: 'api', message })
   })
 }
