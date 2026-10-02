@@ -219,6 +219,10 @@ pub fn router(state: AppState) -> Router {
             "/projects/{project_id}/archive-done",
             post(archive_done_proposals),
         )
+        .route(
+            "/projects/{project_id}/age-out-todos",
+            post(archive_stale_todos),
+        )
         .route("/enforcement/preflight", get(enforcement_preflight))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
@@ -853,6 +857,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/projects/{project_id}/teams", summary: "Grant a team access to a project with a role (admin/read-write/read), idempotent. cascade (default true) extends to nested sub-teams.", query: "", body: Some("ProjectTeamBody") },
     Endpoint { method: "DELETE", path: "/api/projects/{project_id}/teams", summary: "Revoke a team's grant on a project (idempotent).", query: "", body: Some("ProjectTeamBody") },
     Endpoint { method: "POST", path: "/api/projects/{project_id}/archive-done", summary: "Retention sweep (task_1228): soft-archive every task in the project that has been done AND untouched for at least older_than_days days (default 7; 0 = no retention window). Reversible (restore), idempotent, iceboxed tasks exempt. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveDoneProposalsBody") },
+    Endpoint { method: "POST", path: "/api/projects/{project_id}/age-out-todos", summary: "Age-out sweep (task_1215 sibling): soft-archive stale untriaged todos (status=todo, untouched for at least older_than_days days; default 14; 0 = no window). Scoped to status=todo, so blocked/in_progress/done/iceboxed are exempt. Reversible, idempotent. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveStaleTodosBody") },
     Endpoint { method: "GET", path: "/api/enforcement/preflight", summary: "Fail-closed preflight for enabling per-operator ACCESS enforcement -- checks WORKSPACE/PROJECT GRANTS, NOT document conformance (use grade_document, the doc_7 A8 rubric, for a doc's conformance). doc_26 A5: enablable=true only when the fleet-coordination team exists and holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant, blockers. Read-only.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
@@ -980,6 +985,7 @@ fn body_schemas() -> Value {
         MoveTaskBody,
         ArchiveTaskBody,
         ArchiveDoneProposalsBody,
+        ArchiveStaleTodosBody,
         MuteTaskBody,
         CommentBody,
         SubscribeBody,
@@ -2022,6 +2028,33 @@ async fn archive_done_proposals(
             &st.pool,
             project_id,
             b.older_than_days.unwrap_or(7),
+            b.actor.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ArchiveStaleTodosBody {
+    /// Archive a todo only after it has been untouched for at least this many days.
+    /// Defaults to 14; 0 archives every todo immediately (no age-out window).
+    #[serde(default)]
+    older_than_days: Option<i64>,
+    /// The agent performing the sweep (event actor).
+    #[serde(rename = "principal", alias = "actor", default)]
+    actor: Option<String>,
+}
+
+async fn archive_stale_todos(
+    State(st): State<AppState>,
+    Path(ProjectRef(project_id)): Path<ProjectRef>,
+    Json(b): Json<ArchiveStaleTodosBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::archive_stale_todos(
+            &st.pool,
+            project_id,
+            b.older_than_days.unwrap_or(14),
             b.actor.as_deref(),
         )
         .await?,
