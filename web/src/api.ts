@@ -384,6 +384,22 @@ export interface DocumentComment {
   external_author?: string | null
 }
 
+// An anchored annotation on a comment body (task_1033): a highlighted span plus a note, mirroring
+// the document-comment model. `region` is an opaque text-quote selector (see RegionQuote in
+// DocumentView). `reply_to` threads one level. Lives at /api/comments/{comment_id}/annotations.
+export interface CommentAnnotation {
+  id: number
+  comment_id: number
+  author: string | null
+  body: string
+  region: unknown
+  status: string
+  reply_to: number | null
+  created_at: string
+  // Bridged human this annotation is attributed to; author is then the ingester.
+  external_author?: string | null
+}
+
 export interface Channel {
   id: number
   name: string | null
@@ -748,6 +764,28 @@ export const api = {
   ) => req<DocumentComment>('POST', `/documents/${id}/comments`, b),
   resolveComment: (id: number, commentId: number, b: { principal?: string } = {}) =>
     req<DocumentComment>('POST', `/documents/${id}/comments/${commentId}/resolve`, b),
+
+  // Anchored comment annotations (task_1033): highlight a span of a comment body and attach a note.
+  // `region` is a text-quote selector; send `principal` as the acting field. Live-update via the
+  // comment.annotated / comment.annotation_resolved events.
+  getCommentAnnotations: (commentId: number, q: { status?: string } = {}) =>
+    req<CommentAnnotation[]>(
+      'GET',
+      `/comments/${commentId}/annotations${q.status ? `?status=${encodeURIComponent(q.status)}` : ''}`,
+    ),
+  annotateComment: (
+    commentId: number,
+    b: {
+      body: string
+      principal?: string
+      region?: unknown
+      reply_to?: number
+      external_author?: string
+      acknowledge_banned?: boolean
+    },
+  ) => req<CommentAnnotation>('POST', `/comments/${commentId}/annotations`, b),
+  resolveCommentAnnotation: (annotationId: number, b: { principal?: string } = {}) =>
+    req<CommentAnnotation>('POST', `/comment-annotations/${annotationId}/resolve`, b),
   submitDocumentForReview: (id: number, b: { principal?: string } = {}) =>
     req<Document>('POST', `/documents/${id}/submit-review`, b),
   requestDocumentChanges: (id: number, b: { principal?: string; note?: string } = {}) =>
