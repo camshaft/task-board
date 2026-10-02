@@ -2481,6 +2481,7 @@ dependencies = [
  "jsonschema",
  "listenfd",
  "pulldown-cmark",
+ "regex",
  "reqwest 0.12.28",
  "rmcp",
  "schemars",

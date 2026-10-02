@@ -10,7 +10,10 @@ use crate::db::Pool;
 use crate::events::{emit, fire_webhooks, now_iso, Recipients, WebhookDelivery};
 
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+use regex::Regex;
 
 /// Convert a dynamically-typed SQLite row into a JSON object, matching how the Python
 /// `sqlite3.Row` -> dict conversion behaves (ints, floats, text, null).
@@ -8705,12 +8708,125 @@ fn is_design_doc_template(template_followed: &str) -> bool {
     template_followed.to_ascii_lowercase().contains("design")
 }
 
+/// A net-new design-doc structural violation (task_1038): a check slug + human message + 1-based
+/// line (0 = whole-doc). Composes with [`grade_document`]'s finding shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Violation {
+    pub check: &'static str,
+    pub message: String,
+    pub line: usize,
+}
+
+/// CHECK 2: the required read-the-guide attestation marker, scanned on the RAW stored markdown body
+/// (so the HTML comment is seen even though it is invisible in the render).
+static ATTESTATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?im)^\s*<!--\s*read-guide-attested:\s*\S+\s*-->\s*$").unwrap());
+
+/// CHECK 1: placeholder / unfinished-draft markers (case-insensitive), scanned per line on the
+/// CODE-STRIPPED body so a legit code sample containing e.g. TODO is never flagged.
+static PLACEHOLDERS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    vec![
+        (
+            "placeholder-token",
+            Regex::new(r"(?i)\b(TODO|TBD|FIXME|XXX|WIP|PLACEHOLDER)\b").unwrap(),
+        ),
+        (
+            "placeholder-fill-in",
+            Regex::new(r"(?i)\[[^\]]*\b(TODO|TBD|FILL[ -]?IN|PLACEHOLDER|YOUR[ -]TEXT)\b[^\]]*\]")
+                .unwrap(),
+        ),
+        (
+            "placeholder-angle",
+            Regex::new(r"(?i)<[^>]*\b(PLACEHOLDER|FILL[ -]?IN|TODO)\b[^>]*>").unwrap(),
+        ),
+        ("placeholder-lorem", Regex::new(r"(?i)lorem ipsum").unwrap()),
+        (
+            "placeholder-draft-status",
+            Regex::new(r"(?i)^\s*(status|state)\s*:\s*draft\s*$").unwrap(),
+        ),
+        (
+            "placeholder-draft-watermark",
+            Regex::new(r"^\s*DRAFT\s*$").unwrap(),
+        ),
+    ]
+});
+
+/// Blank fenced code blocks + inline-code spans, preserving line COUNT so reported line numbers
+/// match the source.
+fn strip_code(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut in_fence = false;
+    for (i, line) in body.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut in_code = false;
+        for ch in line.chars() {
+            if ch == '`' {
+                in_code = !in_code;
+                out.push(' ');
+            } else if in_code {
+                out.push(' ');
+            } else {
+                out.push(ch);
+            }
+        }
+    }
+    out
+}
+
+/// NET-NEW design-doc structural checks (task_1038; required-sections is already enforced by
+/// [`grade_document`]). Pure: body text in, violations out. CHECK 1 (placeholder/draft) is
+/// acknowledge-able (operator override, mirrors `check_content`); CHECK 2 (read-the-guide
+/// attestation) is NOT. The caller composes this AFTER the required-sections + conformance checks so
+/// section/shape failures surface first. Spec + reference impl from v-fleet-tooling.
+pub fn design_doc_structural_violations(body: &str, acknowledge: bool) -> Vec<Violation> {
+    let mut v = Vec::new();
+    if !acknowledge {
+        let scrubbed = strip_code(body);
+        for (i, line) in scrubbed.lines().enumerate() {
+            for (check, re) in PLACEHOLDERS.iter() {
+                if let Some(m) = re.find(line) {
+                    v.push(Violation {
+                        check,
+                        line: i + 1,
+                        message: format!(
+                            "design-doc has an unfinished-draft/placeholder marker ('{}') at line {}; resolve it before operator submit (or acknowledge to override).",
+                            m.as_str().trim(),
+                            i + 1
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    if !ATTESTATION.is_match(body) {
+        v.push(Violation {
+            check: "read-guide-attestation",
+            line: 0,
+            message:
+                "design-doc is missing the read-the-guide attestation; add the marker <!-- read-guide-attested: <your-agent-id> --> once you have read the design-doc guide (doc_7)."
+                    .to_string(),
+        });
+    }
+    v
+}
+
 pub async fn submit_to_operator_review(
     pool: &Pool,
     document_id: i64,
     actor: Option<&str>,
     template_followed: Option<&str>,
     template_waiver_reason: Option<&str>,
+    acknowledge: bool,
     ipfs_api_url: Option<&str>,
 ) -> anyhow::Result<Value> {
     // 1. Template attestation: one of the two must be non-empty after trimming.
@@ -8760,6 +8876,20 @@ pub async fn submit_to_operator_review(
                              structure, or -- if this is not a design doc -- submit with a \
                              template_waiver_reason instead of attesting the design-doc template",
                             structural.join("; ")
+                        );
+                    }
+                    // task_1038: net-new structural checks on the same body -- no unfinished-draft/
+                    // placeholder markers (acknowledge-able) and a read-the-guide attestation marker
+                    // (NOT acknowledge-able). Composes after required-sections so shape surfaces first.
+                    let violations = design_doc_structural_violations(text, acknowledge);
+                    if !violations.is_empty() {
+                        anyhow::bail!(
+                            "document {document_id} is not ready for operator review: {}",
+                            violations
+                                .iter()
+                                .map(|v| v.message.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
                         );
                     }
                 }
@@ -18724,14 +18854,22 @@ mod tests {
 
         // No template attestation and no waiver -> rejected before any state is touched.
         assert!(
-            submit_to_operator_review(&pool, did, Some("author"), None, None, None)
+            submit_to_operator_review(&pool, did, Some("author"), None, None, false, None)
                 .await
                 .is_err()
         );
         assert!(
-            submit_to_operator_review(&pool, did, Some("author"), Some("  "), Some(""), None)
-                .await
-                .is_err(),
+            submit_to_operator_review(
+                &pool,
+                did,
+                Some("author"),
+                Some("  "),
+                Some(""),
+                false,
+                None
+            )
+            .await
+            .is_err(),
             "whitespace-only attestations don't count"
         );
 
@@ -18757,6 +18895,7 @@ mod tests {
             Some("author"),
             Some("design-doc-template"),
             None,
+            false,
             None
         )
         .await
@@ -18804,6 +18943,7 @@ mod tests {
             Some("author"),
             Some("design-doc-template"),
             None,
+            false,
             None
         )
         .await
@@ -18831,6 +18971,7 @@ mod tests {
             Some("author"),
             Some("design-doc-template"),
             None,
+            false,
             None,
         )
         .await?;
@@ -18849,6 +18990,7 @@ mod tests {
             Some("author"),
             None,
             Some("no template fits an experiment note"),
+            false,
             None
         )
         .await
@@ -18869,6 +19011,7 @@ mod tests {
             Some("author"),
             None,
             Some("no template fits an experiment note"),
+            false,
             None,
         )
         .await?;
@@ -18943,6 +19086,7 @@ mod tests {
             Some("author"),
             Some("doc_7 incl A8"),
             None,
+            false,
             None,
         )
         .await?;
@@ -18982,6 +19126,43 @@ mod tests {
         format!("http://{addr}")
     }
 
+    // task_1038: the net-new design-doc structural checks (placeholder/draft + read-the-guide
+    // attestation). Pure-fn tests ported from v-fleet-tooling's reference impl.
+    #[test]
+    fn flags_placeholder_tokens_outside_code() {
+        let b = "## Design\nThe plan is TBD here.\n<!-- read-guide-attested: v-x -->\n";
+        let v = design_doc_structural_violations(b, false);
+        assert!(v
+            .iter()
+            .any(|x| x.check == "placeholder-token" && x.line == 2));
+        assert!(!v.iter().any(|x| x.check == "read-guide-attestation"));
+    }
+    #[test]
+    fn code_blocks_and_inline_code_are_exempt() {
+        let b = "## Design\nSample:\n```\n// TODO: fill this in\n```\nUse `TODO` as a label.\n<!-- read-guide-attested: v-x -->\n";
+        assert!(design_doc_structural_violations(b, false).is_empty());
+    }
+    #[test]
+    fn acknowledge_overrides_check1_but_not_check2() {
+        let b = "## Design\nTODO finish this.\n";
+        let strict = design_doc_structural_violations(b, false);
+        assert!(strict.iter().any(|x| x.check == "placeholder-token"));
+        assert!(strict.iter().any(|x| x.check == "read-guide-attestation"));
+        let ack = design_doc_structural_violations(b, true);
+        assert!(!ack.iter().any(|x| x.check.starts_with("placeholder")));
+        assert!(ack.iter().any(|x| x.check == "read-guide-attestation"));
+    }
+    #[test]
+    fn draft_status_line_flagged_but_not_prose_draft() {
+        let ok =
+            "## Design\nThis is a draft proposal we refined.\n<!-- read-guide-attested: v-x -->\n";
+        assert!(design_doc_structural_violations(ok, false).is_empty());
+        let bad = "status: draft\n## Design\n<!-- read-guide-attested: v-x -->\n";
+        assert!(design_doc_structural_violations(bad, false)
+            .iter()
+            .any(|x| x.check == "placeholder-draft-status"));
+    }
+
     /// The A8 structural pre-submit gate (task_888): a design-doc-attested doc whose body is missing
     /// the required H2 sections is rejected BEFORE the transaction with the design-doc-structure
     /// error -- but attesting a NON-design template skips the structural check (it falls through to
@@ -19017,6 +19198,7 @@ mod tests {
             Some("author"),
             Some("design-doc template"),
             None,
+            false,
             Some(&url),
         )
         .await
@@ -19035,6 +19217,7 @@ mod tests {
             Some("author"),
             Some("runbook template"),
             None,
+            false,
             Some(&url),
         )
         .await
@@ -19096,6 +19279,7 @@ mod tests {
             Some("librarian"),
             None,
             Some("tenet: operator approves via plain approve_document, conformance-exempt"),
+            false,
             None,
         )
         .await?;
@@ -19119,11 +19303,18 @@ mod tests {
         )
         .await?;
         let did2 = d2["id"].as_i64().unwrap();
-        let err =
-            submit_to_operator_review(&pool, did2, Some("author"), None, Some("no template"), None)
-                .await
-                .unwrap_err()
-                .to_string();
+        let err = submit_to_operator_review(
+            &pool,
+            did2,
+            Some("author"),
+            None,
+            Some("no template"),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("conformance review"),
             "a non-exempt doc with no review stays blocked on conformance; got: {err}"
