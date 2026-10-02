@@ -1378,6 +1378,13 @@ pub struct ListWikiArgs {
     /// Include archived (retired) documents in the tree. Hidden by default.
     #[serde(default, deserialize_with = "de_bool_lenient")]
     pub include_archived: bool,
+    /// Max pages to return (task_1101 pagination; default 100, max 1000) so a large wiki stays under
+    /// the read/token cap. Ordered by path, so a stable page.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub limit: Option<i64>,
+    /// Skip this many pages before the page (default 0). Pair with `limit` to page a large wiki.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3271,16 +3278,20 @@ impl Board {
     }
 
     #[tool(
-        description = "List path-filed documents as a wiki tree, ordered by path. Pass `prefix` to list only what's filed under that path (the prefix itself and everything beneath it); omit it for the whole wiki. Unfiled documents (no path) are excluded — use list_documents for those."
+        description = "List path-filed documents as a wiki tree, ordered by path. Pass `prefix` to list only what's filed under that path (the prefix itself and everything beneath it); omit it for the whole wiki. Unfiled documents (no path) are excluded — use list_documents for those. Returns a metadata projection (no page body — read a page's body via get_document/read_document) and is PAGINATED (task_1101): up to `limit` pages (default 100, max 1000) from `offset`; page a large wiki with offset, or narrow with `prefix`, to stay under the read cap."
     )]
     async fn list_wiki(
         &self,
         Parameters(a): Parameters<ListWikiArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::list_wiki(&self.pool, s(&a.prefix), a.include_archived)
+        let wiki = core::list_wiki(&self.pool, s(&a.prefix), a.include_archived)
             .await
-            .map_err(err)
-            .and_then(ok)
+            .map_err(err)?;
+        // task_1101: page the tree so a large wiki stays under the read/token cap (sibling of
+        // task_969 list_tasks). Default 100, max 1000; the REST/UI path stays unbounded.
+        let limit = a.limit.unwrap_or(100).clamp(1, 1000) as usize;
+        let offset = a.offset.unwrap_or(0).max(0) as usize;
+        ok(core::page_json_array(wiki, offset, limit))
     }
 
     #[tool(
