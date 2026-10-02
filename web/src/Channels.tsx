@@ -97,7 +97,7 @@ export default function Channels() {
               setDmError(null)
             }}
             aria-expanded={picking}
-            className="rounded-md px-2.5 py-1 text-xs text-sky-400 ring-1 ring-inset ring-sky-500/40 hover:bg-sky-500/10"
+            className="rounded-md px-2.5 py-1 text-xs text-sky-700 ring-1 ring-inset ring-sky-500/40 hover:bg-sky-500/10 dark:text-sky-400"
           >
             New DM
           </button>
@@ -120,7 +120,7 @@ export default function Channels() {
             placeholder="Message an agent — type to filter…"
             className="mb-2 w-full rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-sm outline-none focus:border-sky-500/50"
           />
-          {dmError && <p className="mb-2 text-xs text-rose-400">{dmError}</p>}
+          {dmError && <p className="mb-2 text-xs text-rose-700 dark:text-rose-400">{dmError}</p>}
           <ul className="max-h-64 space-y-1 overflow-y-auto">
             {pickable.map((a) => (
               <li key={a.id}>

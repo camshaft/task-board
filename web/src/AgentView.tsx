@@ -158,7 +158,7 @@ export default function AgentView() {
             <button
               onClick={openDmChannel}
               disabled={dmBusy}
-              className="rounded-md px-2.5 py-1 text-xs text-sky-400 ring-1 ring-inset ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-40"
+              className="rounded-md px-2.5 py-1 text-xs text-sky-700 ring-1 ring-inset ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-40 dark:text-sky-400"
             >
               Open DM
             </button>
@@ -171,7 +171,7 @@ export default function AgentView() {
             <button
               onClick={requestSpinDown}
               disabled={sending || standDownPending}
-              className="rounded-md px-2.5 py-1 text-xs text-amber-300 ring-1 ring-inset ring-amber-500/40 hover:bg-amber-500/10 disabled:opacity-40"
+              className="rounded-md px-2.5 py-1 text-xs text-amber-800 ring-1 ring-inset ring-amber-500/40 hover:bg-amber-500/10 disabled:opacity-40 dark:text-amber-300"
             >
               {standDownPending ? 'Spin-down requested' : 'Request spin-down'}
             </button>
@@ -189,7 +189,7 @@ export default function AgentView() {
         </div>
       )}
       {opError && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-700 dark:text-rose-300">
           {opError}
         </div>
       )}
@@ -198,7 +198,7 @@ export default function AgentView() {
       {nudgeOpen && agent && actor && id !== actor && (
         <div className="border-b border-[var(--color-border)] bg-[var(--color-panel)]/40 px-5 py-2">
           {nudgeError && (
-            <div className="mb-2 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
+            <div className="mb-2 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
               {nudgeError}
             </div>
           )}
@@ -231,12 +231,12 @@ export default function AgentView() {
               Cancel
             </button>
           </div>
-          {nudgeSent && <p className="mt-1 text-[11px] text-emerald-300">Message sent.</p>}
+          {nudgeSent && <p className="mt-1 text-[11px] text-emerald-700 dark:text-emerald-300">Message sent.</p>}
         </div>
       )}
 
       {error && (
-        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-300">
+        <div className="border-b border-rose-500/30 bg-rose-500/10 px-5 py-2 text-sm text-rose-700 dark:text-rose-300">
           {error.message}
         </div>
       )}
@@ -324,14 +324,14 @@ export default function AgentView() {
                     setSaveError(null)
                     setEditMeta(JSON.stringify(agent.metadata ?? {}, null, 2))
                   }}
-                  className="rounded px-1.5 py-0.5 text-sky-400 hover:bg-[var(--color-panel-2)]"
+                  className="rounded px-1.5 py-0.5 text-sky-700 hover:bg-[var(--color-panel-2)] dark:text-sky-400"
                 >
                   edit
                 </button>
               )}
             </div>
             {saveError && (
-              <div className="mb-2 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-300">
+              <div className="mb-2 rounded-md bg-rose-500/15 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {saveError}
               </div>
             )}
@@ -388,7 +388,7 @@ export default function AgentView() {
                 const body = (
                   <>
                     <div className="flex items-center gap-1.5">
-                      <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                      <span className="rounded bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-sky-700 dark:text-sky-300">
                         {e.type}
                       </span>
                       <span className="text-[var(--color-muted)]">{relTime(e.created_at)}</span>

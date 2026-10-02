@@ -82,7 +82,7 @@ export default function Awaiting() {
       </p>
 
       {error && (
-        <p className="mb-3 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+        <p className="mb-3 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
           {error}
         </p>
       )}
@@ -111,7 +111,7 @@ export default function Awaiting() {
                   className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
                 >
                   <div className="flex items-center gap-2">
-                    <span className="inline-flex items-center rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-300 ring-1 ring-inset ring-violet-500/30">
+                    <span className="inline-flex items-center rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-800 ring-1 ring-inset ring-violet-500/30 dark:bg-violet-500/15 dark:text-violet-300">
                       Doc approval
                     </span>
                     <Link
@@ -135,7 +135,7 @@ export default function Awaiting() {
                   </p>
                   <Link
                     to={`/documents/${it.document_id}`}
-                    className="mt-1 inline-block text-xs text-sky-400 hover:text-sky-300"
+                    className="mt-1 inline-block text-xs text-sky-700 hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300"
                   >
                     Review &amp; approve →
                   </Link>
@@ -202,7 +202,7 @@ export default function Awaiting() {
                   {(it.questions?.length ?? 0) === 0 && (
                     <Link
                       to={`/tasks/${it.task_id}`}
-                      className="text-xs text-sky-400 hover:text-sky-300"
+                      className="text-xs text-sky-700 hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300"
                     >
                       Open task →
                     </Link>
