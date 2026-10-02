@@ -133,7 +133,9 @@ type FormSpec =
       minLabel?: string
       maxLabel?: string
     }
-  | { shape: 'text'; placeholder?: string }
+  // `text` also backs the editable-value element (doc_3371 A1 entry 11, approve-with-edit): `initial`
+  // prefills the field with a proposed value the operator edits before accepting.
+  | { shape: 'text'; placeholder?: string; initial?: string }
   | { shape: 'ranked'; options: QuestionOption[]; maxRanked?: number }
   | { shape: 'list'; min?: number; max?: number; placeholder?: string; itemLabel?: string }
   // `number` (schema-driven, doc_3371 A1 entry 3): a single bounded number validated against the
@@ -226,6 +228,10 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
         }
       case 'text':
         return { shape: 'text', placeholder: asText(p.placeholder) }
+      case 'editable-value':
+        // Approve-with-edit (entry 11, text/scalar form): prefill the proposed value for the operator
+        // to adjust and accept in one step. Validated as a string by the inline response_schema.
+        return { shape: 'text', placeholder: asText(p.placeholder), initial: asText(p.proposed) }
       case 'rank':
         return { shape: 'ranked', options: asOptions(p.options), maxRanked: asCount(p.max_ranked) }
       case 'string-list':
@@ -465,7 +471,8 @@ function AnswerForm({
   const options = spec && (spec.shape === 'choice' || spec.shape === 'ranked') ? spec.options : []
   const [choice, setChoice] = useState('')
   const [multi, setMulti] = useState<string[]>([])
-  const [text, setText] = useState('')
+  // Prefill with the proposed value for an editable-value question (entry 11); '' otherwise.
+  const [text, setText] = useState(() => (spec?.shape === 'text' ? (spec.initial ?? '') : ''))
   const [num, setNum] = useState('')
   const [dt, setDt] = useState('')
   const [confChoice, setConfChoice] = useState('')
@@ -681,21 +688,26 @@ function AnswerForm({
       )}
 
       {spec?.shape === 'text' && (
-        <div className="flex items-end gap-2">
-          <AutoGrowTextarea
-            value={text}
-            onChange={setText}
-            onSubmit={() => text.trim() && onSubmit('text', text.trim())}
-            placeholder={spec.placeholder ?? 'Your answer...'}
-            className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
-          />
-          <button
-            disabled={busy || !text.trim()}
-            className={BTN}
-            onClick={() => onSubmit('text', text.trim())}
-          >
-            Submit
-          </button>
+        <div className="space-y-1.5">
+          {spec.initial != null && (
+            <p className="text-xs text-[var(--color-muted)]">Proposed value — edit if needed, then accept.</p>
+          )}
+          <div className="flex items-end gap-2">
+            <AutoGrowTextarea
+              value={text}
+              onChange={setText}
+              onSubmit={() => text.trim() && onSubmit('text', text.trim())}
+              placeholder={spec.placeholder ?? 'Your answer...'}
+              className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-sm outline-none focus:border-sky-500/50"
+            />
+            <button
+              disabled={busy || !text.trim()}
+              className={BTN}
+              onClick={() => onSubmit('text', text.trim())}
+            >
+              {spec.initial != null ? 'Accept' : 'Submit'}
+            </button>
+          </div>
         </div>
       )}
 

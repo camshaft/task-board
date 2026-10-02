@@ -303,6 +303,24 @@
         "required": ["options"],
         "additionalProperties": false
       }
+    },
+    "editable-value": {
+      "title": "Editable value (approve with edit)",
+      "description": "Approve a proposed value the operator may adjust before accepting -- correct a near-right proposal in one step instead of rejecting and re-asking. The text/scalar form prefills a text field with props.proposed; the operator edits if needed and accepts, submitting the (possibly edited) string, which the inline response_schema validates (a string, optionally pattern/length-constrained). No new kind.",
+      "component": "EditableValue",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "proposed": {
+            "type": "string",
+            "description": "The proposed value prefilled into the editable field for the operator to accept or adjust."
+          },
+          "placeholder": { "type": "string" }
+        },
+        "required": ["proposed"],
+        "additionalProperties": false
+      }
     }
   }
 }
