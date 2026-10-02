@@ -2016,6 +2016,30 @@ pub async fn principal_can_read_project(
         .is_some_and(|m| m.contains_key(principal)))
 }
 
+/// Whether `principal` has WRITE access to `project_id` under the doc_26 A5 model: its resolved role
+/// in the project's access map is `admin` or `read-write` (a `read`-only grantee, or a non-grantee,
+/// cannot write). Reuses `project_access`, so it is cascade-correct, the creator (implicit admin) and
+/// a fleet-coordination member (admin via the standing grant) can write, and a non-cascade grant does
+/// not admit a sub-team member. The authoritative write-gating predicate (task_542 Phase 3 Part B5c);
+/// the mutating handlers call it, gated behind `enforcement_enabled`, in the write-gating wiring.
+// Consumed by the B5c write-gating wiring that lands next; allow it ahead of its first caller so the
+// predicate lands + is tested as its own reviewable slice.
+#[allow(dead_code)]
+pub async fn principal_can_write_project(
+    pool: &Pool,
+    principal: &str,
+    project_id: i64,
+) -> anyhow::Result<bool> {
+    let pa = project_access(pool, project_id).await?;
+    let role = pa
+        .get("access")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get(principal))
+        .and_then(|e| e.get("role"))
+        .and_then(Value::as_str);
+    Ok(matches!(role, Some("admin") | Some("read-write")))
+}
+
 /// `get_project` scoped to `viewer` when enforcement is enabled (task_542 Phase 3 Part B5b). With
 /// enforcement OFF (today) it returns the project unchanged -- recorded-not-enforced. With enforcement
 /// ON it is FAIL-CLOSED: an identified viewer that cannot read the project -- OR no identified viewer
@@ -23212,6 +23236,56 @@ mod tests {
         assert!(
             !principal_can_read_project(&pool, "carol", pid).await?,
             "a non-cascade grant must not admit a sub-team member"
+        );
+        Ok(())
+    }
+
+    /// task_542 B5c: principal_can_write_project requires role >= read-write -- the creator (admin),
+    /// a read-write grantee, and a fleet-coordination member (admin via the standing grant) can
+    /// write; a READ-only grantee (who can still read) and a non-member cannot.
+    #[tokio::test]
+    async fn principal_can_write_project_requires_write_role() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        for a in ["boss", "writer", "reader", "bob", "coord"] {
+            register_agent(&pool, a, None, None, None, None, None).await?;
+        }
+        let pid = create_project(&pool, "P", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // Creator (implicit admin) writes; a stranger cannot.
+        assert!(principal_can_write_project(&pool, "boss", pid).await?);
+        assert!(!principal_can_write_project(&pool, "bob", pid).await?);
+
+        // A read-write grantee writes.
+        create_team(&pool, "writers", None, Some("boss"), None).await?;
+        add_team_member(&pool, "writers", "writer", "agent", Some("boss")).await?;
+        attach_project_team(&pool, pid, "writers", "read-write", true, Some("boss")).await?;
+        assert!(principal_can_write_project(&pool, "writer", pid).await?);
+
+        // A read-only grantee can READ but NOT write.
+        create_team(&pool, "readers", None, Some("boss"), None).await?;
+        add_team_member(&pool, "readers", "reader", "agent", Some("boss")).await?;
+        attach_project_team(&pool, pid, "readers", "read", true, Some("boss")).await?;
+        assert!(principal_can_read_project(&pool, "reader", pid).await?);
+        assert!(
+            !principal_can_write_project(&pool, "reader", pid).await?,
+            "a read-only grantee cannot write"
+        );
+
+        // A fleet-coordination member writes via the admin standing grant.
+        add_team_member(
+            &pool,
+            FLEET_COORDINATION_TEAM,
+            "coord",
+            "agent",
+            Some("boss"),
+        )
+        .await?;
+        assert!(
+            principal_can_write_project(&pool, "coord", pid).await?,
+            "fleet-coordination admin standing grant confers write"
         );
         Ok(())
     }
