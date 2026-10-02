@@ -840,12 +840,14 @@ pub struct SubscribeArgs {
     /// Whole-board firehose: subscribe to EVERY event on the board (for a coordinator/auto-assigner).
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub board: Option<bool>,
-    /// Optional event-class filter (#462): a subset of ["created", "done", "blocked", "status",
-    /// "comment", "assigned", "review", "doc"]. When given, this subscription is delivery-gated to
-    /// just those classes - only matching events reach your inbox AND wake you, everything else is
-    /// dropped for this subscription. Omit for every event (the default). Applies to ANY target
-    /// (board/project/channel/task): e.g. board + ["created"] wakes a triage agent only on new
-    /// tasks; a gap-ticket owner uses task/project + ["done", "blocked"]. (Ignored by unsubscribe.)
+    /// Optional event-class filter (#462): a subset of ["created", "moved", "done", "blocked",
+    /// "status", "comment", "assigned", "review", "doc"]. When given, this subscription is
+    /// delivery-gated to just those classes - only matching events reach your inbox AND wake you,
+    /// everything else is dropped for this subscription. Omit for every event (the default). Applies
+    /// to ANY target (board/project/channel/task): e.g. board + ["created"] wakes a triage agent only
+    /// on new tasks; an intake router uses project + ["created", "moved"] to catch a task that enters
+    /// by creation OR by a move-in; a gap-ticket owner uses task/project + ["done", "blocked"].
+    /// (Ignored by unsubscribe.)
     #[serde(default)]
     pub event_classes: Option<Vec<String>>,
     /// Subscribe to a channel THREAD (#438): the thread ROOT is a channel post's event seq. Delivers

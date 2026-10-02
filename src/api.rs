@@ -1976,10 +1976,10 @@ struct SubscribeBody {
     document_id: Option<i64>,
     /// Whole-board firehose: subscribe to EVERY event on the board (for a coordinator/auto-assigner).
     board: Option<bool>,
-    /// Optional event-class filter (#462): a subset of ["created", "done", "blocked", "status",
-    /// "comment", "assigned", "review", "doc"]. When given, this subscription is delivery-gated to
-    /// just those classes (only they reach the inbox and wake the subscriber); omit for every event.
-    /// Applies to any target. (Ignored by unsubscribe.)
+    /// Optional event-class filter (#462): a subset of ["created", "moved", "done", "blocked",
+    /// "status", "comment", "assigned", "review", "doc"]. When given, this subscription is
+    /// delivery-gated to just those classes (only they reach the inbox and wake the subscriber); omit
+    /// for every event. Applies to any target. (Ignored by unsubscribe.)
     event_classes: Option<Vec<String>>,
     /// Subscribe to a channel THREAD (#438): the root is a channel post's event seq. Delivers +
     /// wakes on in-thread follow-ups (reply_to = this root) without a re-mention. When set, takes
