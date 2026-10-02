@@ -82,6 +82,11 @@ fn event_in_classes(event_type: &str, data: &Value, classes: &[String]) -> bool 
         "assigned" => event_type == "task.assigned",
         "blocked" => event_type == "task.blocked_on_you",
         "status" => event_type == "task.status_changed",
+        // moved = a task reparented onto another project (task.moved). Lets an intake router (e.g.
+        // board-triage, project_29) keep a tight filter yet still see a task that ENTERS its project
+        // by a move, not just by creation -- task.moved is in no other class, so a filtered
+        // subscription would otherwise silently drop it (task_1216).
+        "moved" => event_type == "task.moved",
         // done = a task reaching the terminal "done" status; cancelled is excluded (not "ready").
         "done" => {
             event_type == "task.status_changed"
@@ -718,6 +723,17 @@ mod tests {
             "task.status_changed",
             &json!({ "to": "blocked" }),
             &["status".to_string()]
+        ));
+        assert!(event_in_classes(
+            "task.moved",
+            &json!({ "to_project_id": 29 }),
+            &["moved".to_string()]
+        ));
+        // moved is its own class: a created-only filter does NOT catch a move-in (task_1216).
+        assert!(!event_in_classes(
+            "task.moved",
+            &json!({ "to_project_id": 29 }),
+            &["created".to_string()]
         ));
         assert!(event_in_classes(
             "review.status_changed",
