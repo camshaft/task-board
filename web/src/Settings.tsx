@@ -12,8 +12,11 @@ const THEME_OPTIONS: { value: ThemePref; label: string; hint: string }[] = [
 ]
 
 export default function Settings() {
-  const { actor, setActor, theme } = useBoardContext()
+  const { actor, setActor, forcedUser, theme } = useBoardContext()
   const [draftActor, setDraftActor] = useState(actor)
+  // On a trusted front-door host the server injects + enforces the identity, so the username is
+  // read-only here; on localhost / a permissive host it stays a client-local, editable id.
+  const locked = forcedUser != null
 
   return (
     <main className="flex min-w-0 flex-1 flex-col">
@@ -32,26 +35,35 @@ export default function Settings() {
               Identity
             </h2>
             <p className="mb-2 text-xs text-[var(--color-muted)]">
-              The id your actions are attributed to. Trust-on-first-use, no auth.
+              {locked
+                ? 'Set by your authenticated session and enforced by the server. It cannot be changed here.'
+                : 'The id your actions are attributed to. Trust-on-first-use, no auth.'}
             </p>
             <div className="flex items-center gap-2">
               <input
-                value={draftActor}
-                onChange={(e) => setDraftActor(e.target.value)}
+                value={locked ? actor : draftActor}
+                onChange={(e) => !locked && setDraftActor(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
-                onBlur={() => draftActor.trim() && draftActor.trim() !== actor && setActor(draftActor)}
-                className="w-56 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1.5 font-mono text-sm outline-none focus:border-sky-500/50"
+                onBlur={() =>
+                  !locked && draftActor.trim() && draftActor.trim() !== actor && setActor(draftActor)
+                }
+                disabled={locked}
+                aria-readonly={locked}
+                className="w-56 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1.5 font-mono text-sm outline-none focus:border-sky-500/50 disabled:cursor-not-allowed disabled:opacity-60"
               />
-              <button
-                onClick={() => draftActor.trim() && setActor(draftActor)}
-                disabled={!draftActor.trim() || draftActor.trim() === actor}
-                className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
-              >
-                Save
-              </button>
+              {!locked && (
+                <button
+                  onClick={() => draftActor.trim() && setActor(draftActor)}
+                  disabled={!draftActor.trim() || draftActor.trim() === actor}
+                  className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+                >
+                  Save
+                </button>
+              )}
             </div>
             <p className="mt-1 text-[11px] text-[var(--color-muted)]">
-              You are <span className="font-mono text-[var(--color-ink)]">{actor}</span>.
+              You are <span className="font-mono text-[var(--color-ink)]">{actor}</span>
+              {locked && ' (signed in)'}.
             </p>
           </section>
 
