@@ -9351,6 +9351,12 @@ async fn document_transition(
     // approver is the event `actor`, already surfaced on the notification. (task #310)
     if let Value::Object(ref mut m) = data {
         m.insert("document_id".into(), json!(document_id));
+        // task_1147: carry the canonical typed id (doc_<id>, the insert_ref convention) alongside
+        // the numeric document_id so a notification renderer uses the ref verbatim -- an approval
+        // reads "[approval] doc_123", not a doubled "doc doc_123" synthesized by prepending "doc "
+        // to a numeric id. (The broader sweep -- a canonical ref on every event type -- is split to
+        // its own task; this is the document.* slice cameron named.)
+        m.insert("ref".into(), json!(format!("doc_{document_id}")));
         if let Some(t) = &title {
             m.insert("title".into(), json!(t));
         }
@@ -14899,6 +14905,8 @@ mod tests {
             "the approver is surfaced as the event actor"
         );
         assert_eq!(n["data"]["document_id"], json!(did));
+        // task_1147: the canonical typed ref travels on the event so a renderer shows "doc_<id>".
+        assert_eq!(n["data"]["ref"], json!(format!("doc_{did}")));
         assert_eq!(n["data"]["title"], json!("Design X"));
         assert_eq!(n["data"]["status"], json!("approved"));
         // The approver is not notified of their own action.
