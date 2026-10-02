@@ -361,7 +361,7 @@ export async function createTask(b: Parameters<typeof api.createTask>[0]) {
 // Reparent a task under an epic (parentId = target id), or clear its parent (parentId = 0)
 // back to top-level. Refreshes the task, its board (grouping), and the target parent's view.
 export async function reparentTask(id: number, parentId: number, actor?: string) {
-  const t = await api.updateTask(id, { parent_id: parentId, actor })
+  const t = await api.updateTask(id, { parent_id: parentId, principal: actor })
   touched({ taskId: id, projectId: t.project_id, activity: true })
   if (parentId > 0) touched({ taskId: parentId, activity: false })
   return t

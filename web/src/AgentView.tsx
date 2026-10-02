@@ -91,7 +91,7 @@ export default function AgentView() {
     setSending(true)
     setOpError(null)
     try {
-      await requestStandDown(id, { requested_by: actor, reason: reason || undefined })
+      await requestStandDown(id, { principal: actor, reason: reason || undefined })
     } catch (e) {
       setOpError((e as Error).message)
     } finally {

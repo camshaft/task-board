@@ -48,7 +48,7 @@ export default function People() {
           </h2>
           <CreateForm
             idPlaceholder="person id (e.g. cameron)"
-            onCreate={(id, display_name) => createPerson({ id, display_name, created_by: actor })}
+            onCreate={(id, display_name) => createPerson({ id, display_name, principal: actor })}
           />
           {peopleLoading && people.length === 0 && (
             <p className="text-sm text-[var(--color-muted)]">Loading...</p>
@@ -86,7 +86,7 @@ export default function People() {
           </h2>
           <CreateForm
             idPlaceholder="team id (e.g. operator)"
-            onCreate={(id, display_name) => createTeam({ id, display_name, created_by: actor })}
+            onCreate={(id, display_name) => createTeam({ id, display_name, principal: actor })}
           />
           {teamsLoading && teams.length === 0 && (
             <p className="text-sm text-[var(--color-muted)]">Loading...</p>
@@ -218,7 +218,7 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
     if (!id || busy) return
     setBusy(true)
     try {
-      await addTeamMember(teamId, { member_id: id, member_kind: memberKind, created_by: actor })
+      await addTeamMember(teamId, { member_id: id, member_kind: memberKind, principal: actor })
       setMemberId('')
     } catch (e) {
       window.alert((e as Error).message)

@@ -30,7 +30,7 @@ export default function Channels() {
     const name = window.prompt('Channel name:')
     if (!name?.trim()) return
     try {
-      await createChannel({ name: name.trim(), created_by: actor })
+      await createChannel({ name: name.trim(), principal: actor })
     } catch (e) {
       window.alert((e as Error).message)
     }
