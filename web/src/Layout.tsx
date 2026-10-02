@@ -225,13 +225,13 @@ export default function Layout() {
         </Link>
         <Link
           to="/awaiting"
-          className={`inline-flex items-center gap-1 text-xs underline decoration-dotted underline-offset-2 hover:text-amber-200 ${
-            awaiting.length > 0 ? 'font-medium text-amber-300' : 'text-[var(--color-muted)]'
+          className={`inline-flex items-center gap-1 text-xs underline decoration-dotted underline-offset-2 hover:text-amber-800 dark:hover:text-amber-200 ${
+            awaiting.length > 0 ? 'font-medium text-amber-700 dark:text-amber-300' : 'text-[var(--color-muted)]'
           }`}
         >
           Awaiting
           {awaiting.length > 0 && (
-            <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] text-amber-200">
+            <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-800 dark:bg-amber-500/20 dark:text-amber-200">
               {awaiting.length}
             </span>
           )}

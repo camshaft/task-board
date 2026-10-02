@@ -88,12 +88,12 @@ export default function Home() {
           there are any; the full answerable view is at /awaiting. */}
       {waitingOnMe.length > 0 && (
         <section className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
-          <h2 className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-amber-300">
+          <h2 className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
             Awaiting you
-            <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px]">
+            <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-800 dark:bg-amber-500/20 dark:text-amber-200">
               {waitingOnMe.length}
             </span>
-            <Link to="/awaiting" className="ml-auto text-[11px] normal-case text-amber-300 hover:text-amber-200">
+            <Link to="/awaiting" className="ml-auto text-[11px] normal-case text-amber-700 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200">
               answer all →
             </Link>
           </h2>
