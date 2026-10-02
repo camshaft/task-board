@@ -10187,6 +10187,12 @@ pub async fn comment_document(
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
     }
+    // task_1269: carry the canonical doc ref (doc_<id>) on the document.comment event. The fleet
+    // kickoff's actionable-wake filter keys on the frame's `ref` / `data.ref` to fire a subscribed
+    // doc owner's loop on a reviewer comment; document.* STATUS events already carry this ref
+    // (task_1147), but comment_document was the lone document.* emitter missing it -- so reviewer
+    // comments reached the inbox (poll) yet did not event-wake the owner. Adding it closes that gap.
+    data["ref"] = json!(format!("doc_{document_id}"));
     emit(
         &mut tx,
         &mut hooks,
@@ -16268,6 +16274,13 @@ mod tests {
         assert!(
             hit.is_some(),
             "mentioned agent notified of the doc comment: {lib}"
+        );
+        // task_1269: the document.comment event carries the canonical doc ref (doc_<id>) so the
+        // fleet kickoff's doc-ref-keyed actionable-wake filter fires for a reviewer comment.
+        assert_eq!(
+            hit.unwrap()["data"]["ref"],
+            json!(format!("doc_{did}")),
+            "document.comment data must carry the doc_<id> ref: {lib}"
         );
 
         // The unregistered @token was ignored: no subscription row was created for it.
