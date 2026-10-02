@@ -9,7 +9,11 @@ import {
   type ReactNode,
 } from 'react'
 import { Link } from 'react-router-dom'
-import ReactMarkdown, { type Components, type ExtraProps } from 'react-markdown'
+import ReactMarkdown, {
+  defaultUrlTransform,
+  type Components,
+  type ExtraProps,
+} from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { visit } from 'unist-util-visit'
 import { findAndReplace } from 'mdast-util-find-and-replace'
@@ -446,6 +450,39 @@ function Td({ children }: ComponentProps<'td'> & ExtraProps) {
   return <td className="border border-[var(--color-border)] px-2 py-1">{children}</td>
 }
 
+// A CID is base58 (CIDv0 Qm...) or base32 (CIDv1 bafy...) -- alphanumeric, no separators. This is a
+// shape check to avoid treating a stray path as a CID, not a cryptographic validation (the backend
+// resolves the real bytes); 40 chars is below the shortest real CID so it never clips a valid one.
+function validCid(c: string): string | null {
+  return /^[A-Za-z0-9]{40,}$/.test(c) ? c : null
+}
+
+// The IPFS CID an image src refers to, or null if it is not a board-internal IPFS reference
+// (task_1185). Accepts the canonical ipfs://<cid> form and board-RELATIVE CAS paths (ipfs/<cid> or
+// api/ipfs/<cid>, no scheme/host). An ABSOLUTE src -- any scheme other than ipfs:, or a //host --
+// returns null and is blocked by the caller, so a public-gateway URL (even one containing /ipfs/)
+// never fetches: confidentiality is enforced by the renderer, not by author convention. An embedded
+// CID always resolves through ipfsUrl() to the board's internal /api/ipfs route.
+function ipfsCidFromSrc(src: string | undefined): string | null {
+  if (!src) return null
+  const s = src.trim()
+  const scheme = /^ipfs:\/\/([^/?#]+)/i.exec(s)
+  if (scheme) return validCid(scheme[1])
+  // Reject anything else carrying a scheme (http:, https:, data:, ...) or a protocol-relative host.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s) || s.startsWith('//')) return null
+  const path = /(?:^|\/)(?:api\/)?ipfs\/([^/?#]+)/i.exec(s)
+  return path ? validCid(path[1]) : null
+}
+
+// react-markdown's default urlTransform drops any scheme outside its safe list (http/https/mailto/
+// tel/relative), which would blank an ipfs://<cid> src before our img component ever sees it. Let the
+// ipfs: scheme through (the img component resolves it to the internal /api/ipfs route and the anchor
+// renderer treats a non-navigable scheme as inert text); everything else keeps the default
+// sanitization, so javascript:/data: are still stripped.
+function boardUrlTransform(url: string): string {
+  return /^ipfs:/i.test(url) ? url : defaultUrlTransform(url)
+}
+
 function makeComponents(anchors: boolean): Components {
   return {
     a: AnchorRenderer,
@@ -460,7 +497,17 @@ function makeComponents(anchors: boolean): Components {
       </blockquote>
     ),
     hr: () => <hr className="border-[var(--color-border)]" />,
-    img: ({ src, alt }) => <img src={src} alt={alt} className="max-h-[70vh] rounded" />,
+    img: ({ src, alt }) => {
+      // Only a board-internal IPFS CID renders, resolved to the internal /api/ipfs route via
+      // ipfsUrl() (task_1185). A non-CID / absolute src is rendered inert -- never fetched -- so an
+      // internal graph cannot leak and a prompt-injected external image URL cannot load.
+      const cid = ipfsCidFromSrc(typeof src === 'string' ? src : undefined)
+      if (!cid)
+        return (
+          <span className="text-sm text-[var(--color-muted)]">[image{alt ? `: ${alt}` : ''}]</span>
+        )
+      return <img src={ipfsUrl(cid)} alt={alt} className="max-h-[70vh] rounded" />
+    },
     table: Table,
     th: Th,
     td: Td,
@@ -499,7 +546,11 @@ export function Markdown({
 
   return (
     <div className={`space-y-2 ${className ?? ''}`}>
-      <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+      <ReactMarkdown
+        remarkPlugins={remarkPlugins}
+        components={components}
+        urlTransform={boardUrlTransform}
+      >
         {source}
       </ReactMarkdown>
     </div>
