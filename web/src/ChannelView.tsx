@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, type ChannelPost } from './api'
 import { channelLabel } from './Channels'
@@ -6,6 +6,7 @@ import { useBoardContext } from './Layout'
 import { Markdown } from './markdown'
 import {
   inviteToChannel,
+  markChannelRead,
   postToChannel,
   useChannel,
   useChannelPosts,
@@ -39,6 +40,16 @@ export default function ChannelView() {
   const preserveHeight = useRef<number | null>(null)
 
   const author = (p: ChannelPost) => p.data.from ?? p.actor ?? 'anon'
+
+  // Opening a channel (or receiving a new post while it is open) marks it read for the actor,
+  // clearing its unread dot (task_1058 goal 3). Keyed on the latest post seq so a live post
+  // re-marks it; the server no-ops when the last-read is already current. Fire-and-forget: a
+  // failed mark just leaves the dot, which self-heals on the next open.
+  const latestSeq = posts.reduce((m, p) => Math.max(m, p.seq), 0)
+  useEffect(() => {
+    if (!id || Number.isNaN(id) || latestSeq <= 0) return
+    markChannelRead(id, { principal: actor, up_to_seq: latestSeq }).catch(() => {})
+  }, [id, latestSeq, actor])
 
   async function send() {
     const body = draft.trim()

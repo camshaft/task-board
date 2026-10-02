@@ -439,6 +439,12 @@ export interface Channel {
   members?: string[]
   member_count?: number
   created_at: string
+  // Viewer-relative unread (task_1067 backend, task_1058 unread-dots UI). Present only when the list
+  // was fetched for a viewer (listChannels({member}) / getChannel with a viewer): the count of posts
+  // newer than that viewer's last-read seq (own posts excluded), and a has-unread convenience bool.
+  // Omitted/undefined when no viewer was given (the public list), so treat undefined as "unknown".
+  unread_count?: number
+  has_unread?: boolean
 }
 
 // A post from get_channel_posts: a channel.post (named channel) or message.direct (DM) event.
@@ -828,7 +834,12 @@ export const api = {
       'GET',
       `/channels${member ? `?member=${encodeURIComponent(member)}` : ''}`,
     ),
-  getChannel: (id: number) => req<Channel>('GET', `/channels/${id}`),
+  // A `viewer` makes the returned channel carry that viewer's unread_count/has_unread (task_1067).
+  getChannel: (id: number, viewer?: string) =>
+    req<Channel>(
+      'GET',
+      `/channels/${id}${viewer ? `?viewer=${encodeURIComponent(viewer)}` : ''}`,
+    ),
   createChannel: (b: {
     name: string
     topic?: string
@@ -854,6 +865,15 @@ export const api = {
     req<{ seq: number }>('POST', `/channels/${id}/posts`, b),
   inviteToChannel: (id: number, b: { agent_id: string; principal?: string }) =>
     req<Channel>('POST', `/channels/${id}/invites`, b),
+  // Advance the viewer's last-read seq for a channel, clearing its unread dot (task_1067). Omit
+  // up_to_seq to mark everything currently in the channel read. Emits a silent channel.read event so
+  // the dot clears across the viewer's other tabs too.
+  markChannelRead: (id: number, b: { principal: string; up_to_seq?: number }) =>
+    req<{ channel_id: number; last_read_seq: number; unread_count: number }>(
+      'POST',
+      `/channels/${id}/read`,
+      b,
+    ),
   sendMessage: (b: { from_agent: string; to_agent: string; body: string }) =>
     req<{ seq: number }>('POST', '/messages', b),
   // Resolve-or-create the private 1:1 DM channel for a pair (idempotent, order-independent).

@@ -575,6 +575,17 @@ export async function inviteToChannel(id: number, b: Parameters<typeof api.invit
   return c
 }
 
+// Mark a channel read for the viewer, clearing its unread dot (task_1067 / task_1058). Refresh the
+// channel row + the channel lists (which carry the viewer's unread_count) but NOT the post pane —
+// marking read changes no posts, so re-fetching them would be wasted work. The server also emits a
+// channel.read event, which clears the dot in the viewer's other tabs via the SSE path.
+export async function markChannelRead(id: number, b: Parameters<typeof api.markChannelRead>[1]) {
+  const r = await api.markChannelRead(id, b)
+  invalidate(keys.channel(id))
+  invalidateMatching('channels')
+  return r
+}
+
 // Resolve-or-create the private DM channel for a pair. A new DM should surface in the channel
 // lists, so refresh them (resolving an existing one is a cheap no-op refresh).
 export async function openDm(b: Parameters<typeof api.openDm>[0]) {

@@ -4,7 +4,7 @@ import { useScrollRestoration } from './scrollRestore'
 import { type Channel } from './api'
 import { useBoardContext } from './Layout'
 import { createChannel, openDm, useAgents, useChannels } from './resources'
-import { AGENT_DOT, relTime } from './ui'
+import { AGENT_DOT, relTime, UnreadBadge } from './ui'
 
 // Display label for a channel: named channels use their name; DMs (private, no name) fall back
 // to a generic label (the other participant is shown in the channel view, which has members).
@@ -159,7 +159,12 @@ export default function Channels() {
                 className="flex items-center gap-3 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 hover:border-sky-500/40"
               >
                 <span className="text-[var(--color-muted)]">{c.private ? '🔒' : '#'}</span>
-                <span className="min-w-0 flex-1 truncate text-sm">{channelLabel(c)}</span>
+                <span
+                  className={`min-w-0 flex-1 truncate text-sm ${c.has_unread ? 'font-semibold' : ''}`}
+                >
+                  {channelLabel(c)}
+                </span>
+                <UnreadBadge count={c.unread_count} />
                 {c.topic && (
                   <span className="hidden truncate text-xs text-[var(--color-muted)] md:inline">
                     {c.topic}
