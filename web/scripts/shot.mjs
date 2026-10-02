@@ -180,8 +180,37 @@ if (contrastAudit) {
   // >=24px, or >=18.66px bold). This is the already-proven ratio snippet from the task_520 light-
   // contrast fix (camshaft/task-board#171), now reusable so a palette regression is caught here.
   const auditExpr = `(() => {
-    const parse = (s) => { const m = /rgba?\\(([^)]+)\\)/.exec(s || ''); if (!m) return null;
-      const p = m[1].split(',').map((x) => parseFloat(x)); return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 }; };
+    // Parse a computed color to {r,g,b,a} in 0-255 sRGB. Handles rgb()/rgba() (comma- OR
+    // space/slash-separated) AND oklch() -- Tailwind v4 emits oklch() in computed style, which the
+    // old rgba-only parser dropped to null, so every oklch background (e.g. a bg-sky-600 primary
+    // button) was treated as transparent and fell through to white -> a false white-on-white ratio
+    // of 1 on every primary button (task_1209). oklch() is converted OKLCH -> OKLab -> linear sRGB
+    // -> gamma sRGB so the audit measures the real rendered color.
+    const parse = (s) => {
+      s = (s || '').trim();
+      let m = /rgba?\\(([^)]+)\\)/.exec(s);
+      if (m) { const p = m[1].split(/[ ,/]+/).filter((x) => x.length).map(parseFloat);
+        return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 }; }
+      m = /oklch\\(([^)]+)\\)/i.exec(s);
+      if (m) {
+        const p = m[1].split(/[ ,/]+/).filter((x) => x.length);
+        const num = (t) => (/%$/.test(t) ? parseFloat(t) / 100 : parseFloat(t));
+        const L = num(p[0]); const C = parseFloat(p[1]) || 0; const H = parseFloat(p[2]) || 0;
+        const a = p.length > 3 ? num(p[3]) : 1;
+        const hr = (H * Math.PI) / 180, ca = C * Math.cos(hr), cb = C * Math.sin(hr);
+        const l_ = L + 0.3963377774 * ca + 0.2158037573 * cb;
+        const m_ = L - 0.1055613458 * ca - 0.0638541728 * cb;
+        const s_ = L - 0.0894841775 * ca - 1.291485548 * cb;
+        const l = l_ * l_ * l_, mm = m_ * m_ * m_, ss = s_ * s_ * s_;
+        const lr = 4.0767416621 * l - 3.3077115913 * mm + 0.2309699292 * ss;
+        const lg = -1.2684380046 * l + 2.6097574011 * mm - 0.3413193965 * ss;
+        const lb = -0.0041960863 * l - 0.7034186147 * mm + 1.707614701 * ss;
+        const g = (x) => { x = Math.max(0, Math.min(1, x));
+          return 255 * (x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055); };
+        return { r: g(lr), g: g(lg), b: g(lb), a };
+      }
+      return null;
+    };
     const over = (fg, bg) => ({ r: fg.r*fg.a + bg.r*(1-fg.a), g: fg.g*fg.a + bg.g*(1-fg.a), b: fg.b*fg.a + bg.b*(1-fg.a), a: 1 });
     const effBg = (el) => { const chain = []; for (let n = el; n; n = n.parentElement) chain.push(n);
       let acc = { r: 255, g: 255, b: 255, a: 1 };
@@ -193,8 +222,13 @@ if (contrastAudit) {
     const hasText = (el) => [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim());
     const visible = (el) => { const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     const out = [];
+    // WCAG 1.4.3 exempts text in an INACTIVE (disabled) UI component from the contrast minimum, so
+    // skip a disabled control + its descendants. Without this a disabled primary button (which the
+    // app dims with opacity-40) would report a sub-AA ratio that WCAG does not actually require.
+    const exempt = (el) =>
+      el.closest('button:disabled, input:disabled, select:disabled, textarea:disabled, fieldset:disabled, [aria-disabled="true"]')
     for (const el of document.querySelectorAll('body *')) {
-      if (!hasText(el) || !visible(el)) continue;
+      if (!hasText(el) || !visible(el) || exempt(el)) continue;
       const s = getComputedStyle(el); const fg = parse(s.color); if (!fg) continue;
       const bg = effBg(el); const text = fg.a < 1 ? over(fg, bg) : fg;
       const size = parseFloat(s.fontSize); const bold = (parseInt(s.fontWeight, 10) || 400) >= 700;
