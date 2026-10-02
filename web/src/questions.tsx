@@ -140,6 +140,9 @@ type FormSpec =
       step?: number
       placeholder?: string
       unit?: string
+      // 'slider' (doc_3371 A1 entry 4) renders the same bounded-number answer as a range input with
+      // a live value readout rather than a typed field; 'input' (default) is the numeric text field.
+      display?: 'input' | 'slider'
     }
   | { shape: 'age'; recipient: string }
 
@@ -229,6 +232,19 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
           step: asNumber(p.step),
           placeholder: asText(p.placeholder),
           unit: asText(p.unit),
+          display: 'input',
+        }
+      case 'slider':
+        // Same bounded-number answer as numeric (entry 3), rendered as a range input. A slider needs
+        // both bounds to draw its track; fall back to the typed input if either is missing.
+        return {
+          shape: 'number',
+          min: asNumber(p.minimum),
+          max: asNumber(p.maximum),
+          integer: p.integer === true,
+          step: asNumber(p.step),
+          unit: asText(p.unit),
+          display: asNumber(p.minimum) != null && asNumber(p.maximum) != null ? 'slider' : 'input',
         }
       case 'age-request': {
         const recipient = asText(p.recipient)
@@ -464,6 +480,13 @@ function AnswerForm({
     const kind = numSpec.integer ? 'whole number' : 'number'
     return range ? `Enter a ${kind} ${range}.` : numSpec.integer ? 'Enter a whole number.' : null
   })()
+  // A slider always has a value: start the thumb at the midpoint of the (required) bounds, rounded
+  // for an integer slider, so the operator can submit immediately or drag to adjust.
+  const numMid =
+    numSpec && numSpec.min != null && numSpec.max != null
+      ? (numSpec.min + numSpec.max) / 2
+      : (numSpec?.min ?? 0)
+  const sliderVal = num !== '' ? Number(num) : numSpec?.integer ? Math.round(numMid) : numMid
 
   return (
     <div className="mt-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-2.5">
@@ -724,7 +747,40 @@ function AnswerForm({
         </div>
       )}
 
-      {spec?.shape === 'number' && (
+      {spec?.shape === 'number' && spec.display === 'slider' && (
+        // Slider (doc_3371 A1 entry 4): a range input over the same bounded-number answer, with the
+        // min/max endpoints and a live value readout. One submit posts the current value, which the
+        // range input keeps within [min,max] at `step`, so it always satisfies the response_schema.
+        <div className="space-y-2">
+          {numHint && <p className="text-xs text-[var(--color-muted)]">{numHint}</p>}
+          <div className="flex items-center gap-3">
+            <span className="text-xs tabular-nums text-[var(--color-muted)]">{spec.min}</span>
+            <input
+              type="range"
+              min={spec.min}
+              max={spec.max}
+              step={spec.step ?? (spec.integer ? 1 : 'any')}
+              value={sliderVal}
+              disabled={busy}
+              onChange={(e) => setNum(e.target.value)}
+              aria-label="Value"
+              className="flex-1 accent-sky-700"
+            />
+            <span className="text-xs tabular-nums text-[var(--color-muted)]">{spec.max}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="rounded-md bg-[var(--color-panel-2)] px-2 py-0.5 text-sm font-medium tabular-nums">
+              {sliderVal}
+              {spec.unit ? ` ${spec.unit}` : ''}
+            </span>
+            <button disabled={busy} className={BTN} onClick={() => onSubmit('number', sliderVal)}>
+              Submit
+            </button>
+          </div>
+        </div>
+      )}
+
+      {spec?.shape === 'number' && spec.display !== 'slider' && (
         <div className="space-y-1.5">
           {numHint && <p className="text-xs text-[var(--color-muted)]">{numHint}</p>}
           <div className="flex items-center gap-2">
