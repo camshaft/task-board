@@ -28,6 +28,8 @@ let
     db_snapshot_user = cfg.dbSnapshotUser;
   } // lib.optionalAttrs (cfg.dbSnapshotPassword != null) {
     db_snapshot_password = cfg.dbSnapshotPassword;
+  } // lib.optionalAttrs (cfg.hosts != { }) {
+    hosts = cfg.hosts;
   };
   configFile = (pkgs.formats.toml { }).generate "task-board.toml" settings;
 in
@@ -121,6 +123,23 @@ in
       description = ''
         HTTP Basic-auth password for the DB-snapshot endpoint. Required when dbSnapshotEnabled.
         NOTE: store-rendered as plaintext (see dbSnapshotEnabled) -- use only a temporary credential.
+      '';
+    };
+
+    hosts = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf lib.types.str);
+      default = { };
+      example = {
+        "board.example.com".auth_header = "x-tunnel-user";
+        "127.0.0.1" = { };
+      };
+      description = ''
+        Per-host trusted-front-door auth, keyed by the inbound Host authority's hostname. A host
+        whose attrs set auth_header FORCES the acting user of a write to that request header's value
+        (the client cannot attribute the write to anyone else), and a write missing the header is
+        rejected 401. A host with no auth_header (e.g. "127.0.0.1" = { }) or any unlisted host stays
+        permissive -- the client sets its own actor. Lets a tunnel-fronted public hostname force the
+        username from the tunnel's authenticated-user header while localhost stays open for dev.
       '';
     };
 

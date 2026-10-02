@@ -3,8 +3,9 @@
 //! trust-on-first-use) but the router is structured so a middleware layer can be added
 //! cleanly later.
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
@@ -37,6 +38,12 @@ pub struct AppState {
     /// `enabled` false (the default) 404s the endpoint; when enabled, `user`/`password` gate it with
     /// HTTP Basic auth. See `config::Settings::db_snapshot_enabled`.
     pub db_snapshot: DbSnapshotCfg,
+    /// Per-host trusted-front-door auth, keyed by lowercased hostname (port stripped): hostname ->
+    /// optional header to force the acting user from. A host mapped to `Some(header)` forces the
+    /// identity from that header on writes; an unlisted host, or one mapped to `None`, is permissive
+    /// (the client sets its own actor). Empty (default) trusts the client everywhere. Arc so the
+    /// per-request `State` clone is cheap. See [`force_trusted_user`] and `config::Settings::hosts`.
+    pub host_auth: std::sync::Arc<std::collections::HashMap<String, Option<String>>>,
 }
 
 /// Config for the authenticated DB-snapshot download endpoint, carried on [`AppState`].
@@ -329,11 +336,144 @@ pub fn router(state: AppState) -> Router {
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
+        // Trusted-front-door identity: force the acting user from a configured header on
+        // non-loopback writes (task_1030). A no-op when `trusted_user_header` is unset.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            force_trusted_user,
+        ))
         .with_state(state)
 }
 
 async fn api_not_found() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response()
+}
+
+/// Acting-principal field names a write body may carry — the fields that attribute WHO is acting.
+/// When the trusted-user header forces the identity, these are overwritten; target fields
+/// (assignee, routed_to, to_agent, blocked_on_ref, agent_id, subscriber, ...) are deliberately NOT
+/// here, so forcing the actor never rewrites who a write is ABOUT.
+const ACTING_FIELDS: &[&str] = &[
+    "actor",
+    "author",
+    "sender",
+    "created_by",
+    "from_agent",
+    "invited_by",
+];
+
+/// The hostname of a `Host` header authority, lowercased, with the port stripped and an IPv6
+/// literal unwrapped from its brackets — the key used to look a request up in the per-host auth
+/// map. "board.example.com:8079" -> "board.example.com"; "[::1]:8079" -> "::1".
+fn host_authority_name(host: &str) -> String {
+    let host = host.trim();
+    let host = host.split('%').next().unwrap_or(host); // strip any IPv6 zone id
+    let host_part = if let Some(rest) = host.strip_prefix('[') {
+        // IPv6 literal: "[::1]" or "[::1]:8079".
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        // "name:port" or "name" — a bare name/IPv4 has at most one colon.
+        host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+    };
+    host_part.to_ascii_lowercase()
+}
+
+/// Overwrite every present [`ACTING_FIELDS`] key in a JSON object body with `user`. Only existing
+/// keys are changed (so `deny_unknown_fields` is never tripped by an injected key, and an endpoint
+/// without an acting field is untouched). Non-object / non-JSON bodies pass through unchanged.
+fn rewrite_acting_fields(bytes: &[u8], user: &str) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return bytes.to_vec();
+    };
+    let mut changed = false;
+    for f in ACTING_FIELDS {
+        if let Some(slot) = obj.get_mut(*f) {
+            *slot = Value::String(user.to_string());
+            changed = true;
+        }
+    }
+    if changed {
+        serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec())
+    } else {
+        bytes.to_vec()
+    }
+}
+
+/// Middleware: force the acting user from a per-host trusted header (task_1030, operator request).
+/// The behavior is driven entirely by the `[hosts.'<name>']` config matched on the request's `Host`:
+/// - no per-host config at all → pass through (client-set actor trusted everywhere, legacy).
+/// - request `Host` not listed, or listed with no `auth_header` (e.g. `[hosts.'127.0.0.1']`) →
+///   pass through (that host is permissive; the client sets its own actor — covers localhost/dev).
+/// - matched host WITH an `auth_header`, read (GET/HEAD/OPTIONS) → pass through (reads don't
+///   attribute an actor).
+/// - matched host WITH an `auth_header`, write MISSING the header → 401 (a request fronted by that
+///   host's tunnel must carry it; a missing header is a misconfig or a bypass attempt).
+/// - matched host WITH an `auth_header`, write WITH the header → the acting-principal fields in the
+///   JSON body are overwritten with the header value, so the client cannot attribute the write to
+///   anyone else.
+async fn force_trusted_user(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    if st.host_auth.is_empty() {
+        return next.run(req).await;
+    }
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // This host forces identity only if it is listed WITH an auth_header; otherwise permissive.
+    let Some(header_name) = st
+        .host_auth
+        .get(&host_authority_name(host))
+        .and_then(|h| h.as_deref())
+    else {
+        return next.run(req).await;
+    };
+    let is_write = matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if !is_write {
+        return next.run(req).await;
+    }
+    let forced = req
+        .headers()
+        .get(header_name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let Some(forced) = forced else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": format!("missing trusted user header `{header_name}` on a non-loopback write")
+            })),
+        )
+            .into_response();
+    };
+    let (parts, body) = req.into_parts();
+    // API JSON bodies are small; buffer to rewrite the acting fields. 16 MiB cap guards against a
+    // runaway body (a document `content` is well under this).
+    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "could not read request body" })),
+            )
+                .into_response()
+        }
+    };
+    let new_bytes = rewrite_acting_fields(&bytes, &forced);
+    let mut parts = parts;
+    // The body length changed; drop the stale Content-Length so the downstream extractor reads the
+    // rewritten body in full (axum/hyper will frame it correctly).
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    let req = Request::from_parts(parts, axum::body::Body::from(new_bytes));
+    next.run(req).await
 }
 
 /// Health beacon: a cheap liveness+readiness probe agents check before a full tick, instead of
@@ -3326,6 +3466,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
         });
         Ok(())
     }
@@ -3400,6 +3541,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
         };
 
         let get = |uri: String| {
@@ -3438,6 +3580,149 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn host_authority_name_strips_port_and_unwraps_v6() {
+        assert_eq!(
+            host_authority_name("board.example.com:8079"),
+            "board.example.com"
+        );
+        assert_eq!(
+            host_authority_name("Board.Example.COM"),
+            "board.example.com"
+        );
+        assert_eq!(host_authority_name("127.0.0.1:8079"), "127.0.0.1");
+        assert_eq!(host_authority_name("[::1]:8079"), "::1");
+        assert_eq!(host_authority_name("localhost"), "localhost");
+    }
+
+    #[test]
+    fn rewrite_acting_fields_overwrites_only_present_acting_keys() {
+        // Present acting fields are overwritten; a target field (assignee) and an unrelated field
+        // are left untouched; a missing acting field is NOT added (keeps deny_unknown_fields safe).
+        let out = rewrite_acting_fields(
+            br#"{"author":"evil","assignee":"bob","body":"hi"}"#,
+            "alice",
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["author"], json!("alice"));
+        assert_eq!(v["assignee"], json!("bob"), "target field untouched");
+        assert_eq!(v["body"], json!("hi"));
+        assert!(v.get("actor").is_none(), "absent acting field not injected");
+        // Non-JSON / non-object bodies pass through unchanged.
+        assert_eq!(rewrite_acting_fields(b"not json", "alice"), b"not json");
+        assert_eq!(rewrite_acting_fields(b"[1,2]", "alice"), b"[1,2]");
+    }
+
+    /// task_1030: a per-host `auth_header` forces the acting user from that header on writes to that
+    /// host (overriding a client-set author), a listed host without `auth_header` stays permissive,
+    /// and a forcing host missing the header is rejected 401.
+    #[tokio::test]
+    async fn force_trusted_user_overrides_actor_per_host() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = core::create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = core::create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let (events_tx, _rx) = broadcast::channel(16);
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "board.example.com".to_string(),
+            Some("x-tunnel-user".to_string()),
+        );
+        map.insert("127.0.0.1".to_string(), None); // listed but permissive (no auth_header)
+        let state = AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: std::sync::Arc::new(map),
+        };
+        let post = |host: &'static str, user: Option<&'static str>, author: &'static str| {
+            let app = router(state.clone());
+            let body = serde_json::to_vec(&json!({ "body": "hi", "author": author })).unwrap();
+            async move {
+                let mut b = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{tid}/comments"))
+                    .header("host", host)
+                    .header("content-type", "application/json");
+                if let Some(u) = user {
+                    b = b.header("x-tunnel-user", u);
+                }
+                app.oneshot(b.body(axum::body::Body::from(body)).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        // comment_task returns {comment_id,...}; read the stored comment back to see its author.
+        let author_of = |resp_body: &Value| {
+            let cid = resp_body["comment_id"].as_i64().unwrap();
+            let app = router(state.clone());
+            async move {
+                let resp = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(format!("/comments/{cid}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let v: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                v["author"].as_str().map(str::to_string)
+            }
+        };
+        // Forcing host WITH header: the author is forced to the header value, not the body's "evil".
+        let resp = post("board.example.com:8079", Some("alice"), "evil").await;
+        assert_eq!(resp.status(), StatusCode::OK, "forced write should succeed");
+        let v: Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await?)?;
+        assert_eq!(
+            author_of(&v).await.as_deref(),
+            Some("alice"),
+            "actor forced from header"
+        );
+        // Permissive host (listed, no auth_header): the client-set author is preserved.
+        let resp = post("127.0.0.1:8079", None, "evil").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await?)?;
+        assert_eq!(
+            author_of(&v).await.as_deref(),
+            Some("evil"),
+            "permissive host keeps the client actor"
+        );
+        // Forcing host MISSING the header: rejected 401.
+        let resp = post("board.example.com", None, "evil").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "missing trusted header is rejected"
+        );
+        Ok(())
+    }
+
     /// The approved-version read convenience (task_842): `?approved=true` on a document with no
     /// approved version returns a DISTINCT 404 `no approved version` (never a 503 and never a silent
     /// 200 fall-through to the current draft), and `approved=true` together with `version_no` is a
@@ -3470,6 +3755,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
         };
         let get = |uri: String| {
             let app = router(state.clone());
@@ -3531,6 +3817,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             db_path: String::new(),
             db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
         };
         let resp = health(State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3615,6 +3902,7 @@ mod tests {
                 user: Some("ops".into()),
                 password: Some("s3cret".into()),
             },
+            host_auth: Default::default(),
         };
         let disabled = AppState {
             pool: pool.clone(),
@@ -3623,6 +3911,7 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             db_path: db_path.clone(),
             db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
         };
         let good = format!(
             "Basic {}",

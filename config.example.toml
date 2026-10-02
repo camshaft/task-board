@@ -45,3 +45,15 @@ mcp_allowed_hosts = []
 #   db_snapshot_enabled = true
 #   db_snapshot_user = "ops"
 #   db_snapshot_password = "set-via-agenix"
+
+# Per-host trusted-front-door auth, keyed by the inbound `Host` authority's hostname (port stripped,
+# case-insensitive). A host whose section sets `auth_header` FORCES the acting user of a write to
+# that request header's value -- the client cannot attribute the write to anyone else (actor /
+# author / sender / created_by / from_agent / invited_by are overwritten), and a write missing the
+# header is rejected (401). A host with no `auth_header`, or any host not listed, stays permissive:
+# the client sets its own actor. So a tunnel-fronted public hostname can force the username from the
+# tunnel's authenticated-user header while localhost stays open for dev. (Named `hosts` plural
+# because `host` above is the bind address.)
+#   [hosts.'127.0.0.1']            # permissive -- no auth_header, client sets the actor
+#   [hosts.'board.example.com']
+#   auth_header = "x-tunnel-user"
