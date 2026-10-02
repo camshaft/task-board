@@ -1205,7 +1205,7 @@ export function QuestionComment({
             <button
               disabled={busy}
               onClick={onDecline}
-              className="text-amber-400 hover:text-amber-300 disabled:opacity-40"
+              className="text-amber-700 hover:text-amber-600 disabled:opacity-40 dark:text-amber-400 dark:hover:text-amber-300"
             >
               Decline
             </button>
@@ -1214,7 +1214,7 @@ export function QuestionComment({
             <button
               disabled={busy}
               onClick={onSupersede}
-              className="text-sky-400 hover:text-sky-300 disabled:opacity-40"
+              className="text-sky-700 hover:text-sky-600 disabled:opacity-40 dark:text-sky-400 dark:hover:text-sky-300"
             >
               Supersede
             </button>
@@ -1223,7 +1223,7 @@ export function QuestionComment({
             <button
               disabled={busy}
               onClick={onCancel}
-              className="text-rose-400 hover:text-rose-300 disabled:opacity-40"
+              className="text-rose-700 hover:text-rose-600 disabled:opacity-40 dark:text-rose-400 dark:hover:text-rose-300"
             >
               Cancel question
             </button>
