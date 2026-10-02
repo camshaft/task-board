@@ -6261,19 +6261,88 @@ pub async fn check_notifications(
 /// `message.direct` event (post_to_channel derives that type for DM channels) delivered to
 /// the recipient's inbox, and get_messages still reads it. The event now also carries the
 /// pair's channel_id, so the conversation has a durable home a client can page through.
+/// task_1164: a WARN-level advisory when a non-concierge sender DMs a human identity that sits in
+/// limbo -- a person record with no draining agent loop and no Slack bridge -- so the DM does not
+/// silently vanish into an unmonitored inbox (the review-bypass repro). Keyed on REACHABILITY, not
+/// personhood: concierge (the operator-liaison) is exempt, an agent recipient has a draining loop,
+/// and a bridged person (metadata.slack_dm / metadata.bridged set) is reachable; only an un-bridged,
+/// non-agent person triggers it. The recipient is alias-resolved first so DMing "operator" is caught
+/// as DMing its canonical person. WARN only for now -- the message is still delivered -- becoming a
+/// hard reject once operator-directed messages route through concierge (seed-before-flip, task_1100
+/// lesson). The exact bridge flag is coordinated with the slack_dm bridge work (option b).
+async fn dm_limbo_warning(
+    pool: &Pool,
+    from_agent: &str,
+    to_agent: &str,
+) -> anyhow::Result<Option<String>> {
+    if from_agent == "concierge" {
+        return Ok(None);
+    }
+    // Alias-resolve the recipient (e.g. "operator" -> "cameron") so an alias can't dodge the guard.
+    let canonical: String = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT canonical FROM identity_aliases WHERE alias=?), ?)",
+    )
+    .bind(to_agent)
+    .bind(to_agent)
+    .fetch_one(pool)
+    .await?;
+    // An agent recipient drains its own inbox -> reachable, never limbo.
+    if sqlx::query("SELECT 1 FROM agents WHERE id=?")
+        .bind(&canonical)
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    // Only a KNOWN person triggers the guard (an unknown id is a normal agent-style DM).
+    let Some(prow) = sqlx::query("SELECT metadata FROM people WHERE id=?")
+        .bind(&canonical)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    // Reachable if the person carries a Slack DM bridge (metadata.slack_dm / metadata.bridged).
+    let meta: Value = prow
+        .try_get::<String, _>("metadata")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    let bridged = ["slack_dm", "bridged"].iter().any(|k| match meta.get(*k) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => !s.is_empty(),
+        _ => false,
+    });
+    if bridged {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{canonical} is a human identity with no monitored inbox (no agent loop or Slack bridge), so \
+         this direct message may sit unseen. Route operator-directed messages through concierge, the \
+         operator-liaison. (task_1164 advisory; this becomes an error once routing is in place.)"
+    )))
+}
+
 pub async fn send_message(
     pool: &Pool,
     from_agent: &str,
     to_agent: &str,
     body: &str,
 ) -> anyhow::Result<Value> {
+    // task_1164: compute the limbo advisory before delivering (WARN mode -- still delivers).
+    let warning = dm_limbo_warning(pool, from_agent, to_agent).await?;
     let mut tx = pool.begin().await?;
     let cid = dm_channel(&mut tx, from_agent, to_agent).await?;
     tx.commit().await?;
     // post_to_channel opens its own transaction; the DM channel is committed above so it's
     // visible. Emits message.direct to the recipient (FromChannel minus the sender).
     post_to_channel(pool, cid, from_agent, body, None, None).await?;
-    Ok(json!({ "to": to_agent, "channel_id": cid, "delivered": true }))
+    let mut out = json!({ "to": to_agent, "channel_id": cid, "delivered": true });
+    if let (Value::Object(ref mut m), Some(w)) = (&mut out, warning) {
+        m.insert("warning".into(), json!(w));
+    }
+    Ok(out)
 }
 
 /// Get (or create) the private 1:1 DM channel for a pair of agents, returning the channel with
@@ -22501,5 +22570,43 @@ mod tests {
         assert_eq!(page_json_array(arr.clone(), 4, 10), json!([4]));
         assert_eq!(page_json_array(arr.clone(), 10, 5), json!([]));
         assert_eq!(page_json_array(json!({"a": 1}), 0, 2), json!({"a": 1}));
+    }
+
+    /// task_1164: a non-concierge DM to an un-bridged human (a person with no agent loop) carries a
+    /// limbo warning; concierge, an agent recipient, and a bridged person do not.
+    #[tokio::test]
+    async fn send_message_warns_on_human_limbo() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        register_agent(&pool, "alice", None, None, None, None, None).await?;
+        register_agent(&pool, "bob", None, None, None, None, None).await?;
+        create_person(&pool, "human1", Some("Human One"), None, None).await?;
+        create_person(
+            &pool,
+            "human2",
+            Some("Bridged"),
+            None,
+            Some(json!({ "slack_dm": "U123" })),
+        )
+        .await?;
+
+        // non-concierge -> un-bridged person: warned (but still delivered).
+        let r = send_message(&pool, "alice", "human1", "hi").await?;
+        assert_eq!(r["delivered"], json!(true));
+        assert!(
+            r.get("warning").and_then(Value::as_str).is_some(),
+            "a limbo DM warns: {r}"
+        );
+        // concierge (operator-liaison) is exempt.
+        let r = send_message(&pool, "concierge", "human1", "hi").await?;
+        assert!(r.get("warning").is_none(), "concierge is exempt: {r}");
+        // an agent recipient has a draining loop: no warning.
+        let r = send_message(&pool, "alice", "bob", "hi").await?;
+        assert!(r.get("warning").is_none(), "agent recipient not limbo: {r}");
+        // a bridged person is reachable: no warning.
+        let r = send_message(&pool, "alice", "human2", "hi").await?;
+        assert!(r.get("warning").is_none(), "bridged person not limbo: {r}");
+        Ok(())
     }
 }
