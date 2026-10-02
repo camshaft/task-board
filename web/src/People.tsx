@@ -9,6 +9,7 @@ import {
   deletePerson,
   deleteTeam,
   removeTeamMember,
+  useAgents,
   usePeople,
   useTeam,
   useTeams,
@@ -209,7 +210,8 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
   const { data: team, loading, error } = useTeam(teamId)
   const { data: people = [] } = usePeople()
   const { data: teams = [] } = useTeams()
-  const [memberKind, setMemberKind] = useState<'person' | 'team'>('person')
+  const { data: agents = [] } = useAgents()
+  const [memberKind, setMemberKind] = useState<'person' | 'team' | 'agent'>('person')
   const [memberId, setMemberId] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -239,8 +241,14 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
   if (error) return <p className="text-sm text-rose-300">{error.message}</p>
   if (!team) return null
 
-  // Suggest ids for the add control: people when adding a person, other teams when nesting a team.
-  const suggestions = memberKind === 'person' ? people.map((p) => p.id) : teams.filter((t) => t.id !== teamId).map((t) => t.id)
+  // Suggest ids for the add control, scoped to the chosen member kind: people, other teams (to
+  // nest), or registered agents.
+  const suggestions =
+    memberKind === 'person'
+      ? people.map((p) => p.id)
+      : memberKind === 'agent'
+        ? agents.map((a) => a.id)
+        : teams.filter((t) => t.id !== teamId).map((t) => t.id)
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-3">
@@ -265,7 +273,7 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
                 className="flex items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-panel-2)] py-0.5 pl-2 pr-1 text-xs"
               >
                 <span
-                  className={`font-mono ${m.member_kind === 'team' ? 'text-violet-300' : ''}`}
+                  className={`font-mono ${m.member_kind === 'team' ? 'text-violet-300' : m.member_kind === 'agent' ? 'text-sky-300' : ''}`}
                   title={m.member_kind}
                 >
                   {m.member_kind === 'team' ? `@${m.member_id}` : m.member_id}
@@ -305,6 +313,27 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
         )}
       </div>
 
+      <div>
+        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+          Resolved agents
+          <span className="ml-1 font-normal normal-case">(nested teams expanded)</span>
+        </div>
+        {team.resolved_agents.length === 0 ? (
+          <p className="text-xs text-[var(--color-muted)]">None.</p>
+        ) : (
+          <div className="flex flex-wrap gap-1.5">
+            {team.resolved_agents.map((aid) => (
+              <span
+                key={aid}
+                className="rounded-full bg-sky-500/15 px-2 py-0.5 font-mono text-xs text-sky-300"
+              >
+                {aid}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
       <form
         onSubmit={(e) => {
           e.preventDefault()
@@ -314,16 +343,23 @@ function TeamDetailPanel({ teamId, actor }: { teamId: string; actor: string }) {
       >
         <select
           value={memberKind}
-          onChange={(e) => setMemberKind(e.target.value as 'person' | 'team')}
+          onChange={(e) => setMemberKind(e.target.value as 'person' | 'team' | 'agent')}
           className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-xs"
         >
           <option value="person">person</option>
           <option value="team">team</option>
+          <option value="agent">agent</option>
         </select>
         <input
           value={memberId}
           onChange={(e) => setMemberId(e.target.value)}
-          placeholder={memberKind === 'person' ? 'person id to add' : 'team id to nest'}
+          placeholder={
+            memberKind === 'person'
+              ? 'person id to add'
+              : memberKind === 'agent'
+                ? 'agent id to add'
+                : 'team id to nest'
+          }
           list="people-teams-member-ids"
           className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 font-mono text-xs"
         />

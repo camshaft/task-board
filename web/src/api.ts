@@ -191,17 +191,19 @@ export interface Team {
   metadata?: unknown
 }
 
-// A team's direct membership edge: a person id or a nested team id.
+// A team's direct membership edge: a person id, a nested team id, or an agent id.
 export interface TeamMember {
   member_id: string
-  member_kind: 'person' | 'team'
+  member_kind: 'person' | 'team' | 'agent'
 }
 
-// GET /teams/{id}: the team row plus its direct members and the fully-resolved person set with
-// nested teams expanded (cycle-guarded server-side).
+// GET /teams/{id}: the team row plus its direct members and the fully-resolved principal sets with
+// nested teams expanded (cycle-guarded server-side). People and agents are kept separate (not a
+// unified principals blob), so resolved_people stays person-only.
 export interface TeamDetail extends Team {
   members: TeamMember[]
   resolved_people: string[]
+  resolved_agents: string[]
 }
 
 // A bridged human/actor (from listExternalIdentities), distinct from a fleet Agent.
@@ -899,9 +901,9 @@ export const api = {
   getTeam: (id: string) => req<TeamDetail>('GET', `/teams/${encodeURIComponent(id)}`),
   deleteTeam: (id: string) =>
     req<{ deleted: string }>('DELETE', `/teams/${encodeURIComponent(id)}`),
-  addTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team'; principal?: string }) =>
+  addTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team' | 'agent'; principal?: string }) =>
     req<TeamDetail>('POST', `/teams/${encodeURIComponent(teamId)}/members`, b),
-  removeTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team' }) =>
+  removeTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team' | 'agent' }) =>
     req<TeamDetail>('DELETE', `/teams/${encodeURIComponent(teamId)}/members`, b),
 
   getSecretRequest: (id: number) => req<SecretRequest>('GET', `/secret-requests/${id}`),
