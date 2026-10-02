@@ -4,6 +4,7 @@ import { type DocumentComment, type DocumentVersion, ipfsUrl } from './api'
 import { DocStatusChip } from './Documents'
 import { useBoardContext } from './Layout'
 import { Markdown, Mermaid, VegaLite } from './markdown'
+import { asQuote, captureSelectionQuote, findQuoteRange, type RegionQuote } from './annotations'
 import {
   approveDocument,
   commentDocument,
@@ -65,24 +66,17 @@ export default function DocumentView() {
   // prefix/suffix context, for disambiguation + highlight matching against the shown version).
   function captureSelection() {
     const el = contentRef.current
-    const sel = window.getSelection()
-    if (!el || !sel || sel.isCollapsed || !sel.anchorNode || !el.contains(sel.anchorNode)) return
-    const exact = sel.toString().trim()
-    if (exact.length < 2) return
-    const full = el.textContent ?? ''
-    const idx = full.indexOf(exact)
+    if (!el) return
+    const quote = captureSelectionQuote(el)
+    if (!quote) return
     // Anchor the inline compose popover to the selection's vertical position within the wrapper,
     // and close any open thread so the two popovers never stack.
+    const sel = window.getSelection()
     const wrap = wrapRef.current
-    const rng = sel.rangeCount > 0 ? sel.getRangeAt(0) : null
+    const rng = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null
     if (wrap && rng) setSelTop(rng.getBoundingClientRect().top - wrap.getBoundingClientRect().top)
     setOpenKey(null)
-    setRegion({
-      type: 'text-quote',
-      exact,
-      prefix: idx > 0 ? full.slice(Math.max(0, idx - 32), idx) : '',
-      suffix: idx >= 0 ? full.slice(idx + exact.length, idx + exact.length + 32) : '',
-    })
+    setRegion(quote)
   }
 
   // Run a mutation and surface its error. The wrappers invalidate the document + its comments
@@ -1025,69 +1019,6 @@ function CommentCard({
       <Markdown source={c.body} className="text-sm" />
     </div>
   )
-}
-
-// A client-defined text-quote region selector (the board stores comment.region as opaque JSON).
-export interface RegionQuote {
-  type: 'text-quote'
-  exact: string
-  prefix?: string
-  suffix?: string
-}
-
-// Narrow an opaque comment.region to a text-quote selector (with a usable `exact`), else null.
-function asQuote(region: unknown): RegionQuote | null {
-  if (region && typeof region === 'object') {
-    const r = region as Record<string, unknown>
-    if (r.type === 'text-quote' && typeof r.exact === 'string' && r.exact.length > 0) {
-      return {
-        type: 'text-quote',
-        exact: r.exact,
-        prefix: typeof r.prefix === 'string' ? r.prefix : undefined,
-        suffix: typeof r.suffix === 'string' ? r.suffix : undefined,
-      }
-    }
-  }
-  return null
-}
-
-// Locate a quote (optionally disambiguated by its preceding prefix) in a container's rendered
-// text and return a DOM Range spanning it — walking text nodes so a match that spans elements
-// still resolves. Returns null when the quote isn't present in the shown content.
-function findQuoteRange(container: HTMLElement, exact: string, prefix?: string): Range | null {
-  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
-  const nodes: Text[] = []
-  const starts: number[] = []
-  let full = ''
-  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-    starts.push(full.length)
-    nodes.push(n as Text)
-    full += (n as Text).data
-  }
-  if (nodes.length === 0) return null
-  let exactAt = -1
-  if (prefix) {
-    const withPrefix = full.indexOf(prefix + exact)
-    if (withPrefix >= 0) exactAt = withPrefix + prefix.length
-  }
-  if (exactAt < 0) exactAt = full.indexOf(exact)
-  if (exactAt < 0) return null
-  const locate = (pos: number) => {
-    for (let i = nodes.length - 1; i >= 0; i--) {
-      if (starts[i] <= pos) return { node: nodes[i], offset: Math.min(pos - starts[i], nodes[i].length) }
-    }
-    return { node: nodes[0], offset: 0 }
-  }
-  const s = locate(exactAt)
-  const e = locate(exactAt + exact.length)
-  const range = document.createRange()
-  try {
-    range.setStart(s.node, s.offset)
-    range.setEnd(e.node, e.offset)
-  } catch {
-    return null
-  }
-  return range
 }
 
 // The inline thread popover anchored beside a highlighted region: the region's comment(s) and

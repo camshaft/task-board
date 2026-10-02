@@ -9,6 +9,7 @@ import {
   type AwaitingItem,
   type Channel,
   type ChannelPost,
+  type CommentAnnotation,
   type Document,
   type DocumentComment,
   type DocumentContent,
@@ -47,6 +48,8 @@ const keys = {
   document: (documentId: number) => `document:${documentId}`,
   documentContent: (documentId: number) => `documentContent:${documentId}`,
   documentComments: (documentId: number) => `documentComments:${documentId}`,
+  // Anchored annotations on one comment (task_1033), keyed per comment.
+  commentAnnotations: (commentId: number) => `commentAnnotations:${commentId}`,
   agent: (id: string) => `agent:${id}`,
   // Keyed under the `tasks:` prefix so touched()'s task-list invalidation refreshes it too.
   agentTasks: (id: string) => `tasks:agent:${id}`,
@@ -246,6 +249,14 @@ export function useDocumentContent(documentId: number) {
 export function useDocumentComments(documentId: number) {
   return useResource<DocumentComment[]>(keys.documentComments(documentId), () =>
     api.getDocumentComments(documentId),
+  )
+}
+
+// Anchored annotations on a single comment (task_1033). Keyed per comment so a comment's
+// annotation thread loads and live-updates independently.
+export function useCommentAnnotations(commentId: number) {
+  return useResource<CommentAnnotation[]>(keys.commentAnnotations(commentId), () =>
+    api.getCommentAnnotations(commentId),
   )
 }
 
@@ -479,6 +490,27 @@ export async function resolveDocumentComment(
   return r
 }
 
+// Comment-annotation mutations (task_1033). Both refresh the owning comment's annotation list; the
+// server also emits comment.annotated / comment.annotation_resolved for other clients.
+export async function annotateComment(
+  commentId: number,
+  b: Parameters<typeof api.annotateComment>[1],
+) {
+  const r = await api.annotateComment(commentId, b)
+  invalidate(keys.commentAnnotations(commentId))
+  return r
+}
+
+export async function resolveCommentAnnotation(
+  annotationId: number,
+  commentId: number,
+  b: Parameters<typeof api.resolveCommentAnnotation>[1] = {},
+) {
+  const r = await api.resolveCommentAnnotation(annotationId, b)
+  invalidate(keys.commentAnnotations(commentId))
+  return r
+}
+
 export async function submitDocumentForReview(
   id: number,
   b: Parameters<typeof api.submitDocumentForReview>[1] = {},
@@ -645,5 +677,11 @@ export function applyStreamEvent(ev: StreamEvent) {
     invalidate(keys.review(ev.review_id))
     invalidate(keys.reviews)
     invalidate(keys.reviewTrend)
+  }
+  // comment.annotated / comment.annotation_resolved fan out on the parent task, so the compact SSE
+  // event carries no comment_id. Refresh every loaded comment-annotation list; only the mounted
+  // ones actually refetch, so a new or resolved annotation by another client shows live.
+  if (ev.type === 'comment.annotated' || ev.type === 'comment.annotation_resolved') {
+    invalidateMatching('commentAnnotations:')
   }
 }
