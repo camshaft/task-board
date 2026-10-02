@@ -30,6 +30,7 @@ const KIND_LABEL: Record<QuestionKind, string> = {
   select_all: 'Select all',
   fill_in_the_blank: 'Fill in the blank',
   rank_list: 'Rank list',
+  point_allocation: 'Point allocation',
 }
 
 const STATE_CHIP: Record<QuestionState, string> = {
@@ -244,6 +245,11 @@ type FormSpec =
   // `confidence` (schema-driven, doc_3371 A1 entry 6): a composite {choice, confidence} object -- one
   // decision plus how sure the operator is -- validated by the inline object response_schema.
   | { shape: 'confidence'; options: QuestionOption[]; levels: QuestionOption[]; confidenceLabel?: string }
+  // `allocation` (legacy point_allocation kind, doc_3371 A1 entry 8): spread a fixed `budget` of
+  // integer points across the options -- a constant-sum answer. The submitted value is an object
+  // {option_id: integer_points} whose values must total the budget exactly (enforced in-form before
+  // submit and re-validated by the backend).
+  | { shape: 'allocation'; options: QuestionOption[]; budget: number }
   | { shape: 'age'; recipient: string }
 
 // Does a response schema expect an array value (vs a scalar)? Used to decide a single-select's
@@ -390,6 +396,14 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
       return { shape: 'text' }
     case 'rank_list':
       return { shape: 'ranked', options: q.options ?? [] }
+    case 'point_allocation': {
+      // Constant-sum allocation (entry 8): the budget rides the question's per-kind config. Without a
+      // valid budget there is no usable form, so fall back to the free-text escape.
+      const budget = asNumber(q.config?.budget)
+      return budget != null && budget >= 1
+        ? { shape: 'allocation', options: q.options ?? [], budget }
+        : null
+    }
     default:
       return null
   }
@@ -398,7 +412,11 @@ function formSpecFor(q: QuestionPayload): FormSpec | null {
 // The options a question presents (choice / ranked shapes), for the read-only list and for resolving
 // an answer's option ids to their labels. Empty for bool / text / formless questions.
 function specOptions(spec: FormSpec | null): QuestionOption[] | undefined {
-  if (spec && (spec.shape === 'choice' || spec.shape === 'ranked') && spec.options.length > 0) {
+  if (
+    spec &&
+    (spec.shape === 'choice' || spec.shape === 'ranked' || spec.shape === 'allocation') &&
+    spec.options.length > 0
+  ) {
     return spec.options
   }
   return undefined
@@ -455,6 +473,26 @@ function AnswerValue({
           · confidence: {typeof rec.confidence === 'string' ? rec.confidence : JSON.stringify(rec.confidence)}
         </span>
       </span>
+    )
+  }
+  // Allocation answer {option_id: points} (doc_3371 A1 entry 8): resolve each id to its option label
+  // and list the points highest-first (mirrors the backend summary), rather than raw JSON.
+  if (
+    answer.shape === 'allocation' &&
+    v &&
+    typeof v === 'object' &&
+    !Array.isArray(v) &&
+    Object.values(v as Record<string, unknown>).every((n) => typeof n === 'number')
+  ) {
+    const entries = Object.entries(v as Record<string, number>).sort((a, b) => b[1] - a[1])
+    return (
+      <ul className="ml-5 list-disc text-sm marker:text-[var(--color-muted)]">
+        {entries.map(([id, pts]) => (
+          <li key={id}>
+            {labelFor(id)} <span className="text-[var(--color-muted)]">— {pts} pts</span>
+          </li>
+        ))}
+      </ul>
     )
   }
   return (
@@ -562,6 +600,8 @@ function AnswerForm({
   const [dt, setDt] = useState('')
   const [confChoice, setConfChoice] = useState('')
   const [confLevel, setConfLevel] = useState('')
+  // Allocation: points per option id (missing = 0). Kept as integers via the setter below.
+  const [alloc, setAlloc] = useState<Record<string, number>>({})
   const [order, setOrder] = useState<string[]>(options.map((o) => o.id))
   // string-list rows (start with one empty row the operator types into).
   const [items, setItems] = useState<string[]>([''])
@@ -628,6 +668,20 @@ function AnswerForm({
       ? (numSpec.min + numSpec.max) / 2
       : (numSpec?.min ?? 0)
   const sliderVal = num !== '' ? Number(num) : numSpec?.integer ? Math.round(numMid) : numMid
+
+  // allocation (constant-sum, entry 8): points per option, totalling exactly the budget. Submit is
+  // gated on total === budget; the value is {option_id: points} over every option (zeros included,
+  // all valid ids), which the backend re-validates. The setter clamps to a non-negative integer.
+  const allocSpec = spec?.shape === 'allocation' ? spec : null
+  const allocPts = (id: string) => alloc[id] ?? 0
+  const setAllocPts = (id: string, n: number) =>
+    setAlloc((a) => ({ ...a, [id]: Math.max(0, Math.floor(Number.isFinite(n) ? n : 0)) }))
+  const allocTotal = allocSpec ? allocSpec.options.reduce((s, o) => s + allocPts(o.id), 0) : 0
+  const allocRemaining = allocSpec ? allocSpec.budget - allocTotal : 0
+  const allocOk = !!allocSpec && allocRemaining === 0
+  const allocValue = allocSpec
+    ? Object.fromEntries(allocSpec.options.map((o) => [o.id, allocPts(o.id)]))
+    : {}
 
   return (
     <div className="mt-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] p-2.5">
@@ -1028,6 +1082,74 @@ function AnswerForm({
             onClick={() => onSubmit('confidence', { choice: confChoice, confidence: confLevel })}
           >
             Submit answer
+          </button>
+        </div>
+      )}
+
+      {spec?.shape === 'allocation' && (
+        // Constant-sum point allocation (doc_3371 A1 entry 8): spread exactly `budget` integer points
+        // across the options. A live total/remaining readout guides the operator to the budget, and
+        // submit stays disabled until it lands on it. The submitted {option_id: points} is re-checked
+        // by the backend.
+        <div className="space-y-2.5">
+          <p
+            className={`text-xs font-medium ${
+              allocRemaining === 0
+                ? 'text-emerald-700 dark:text-emerald-400'
+                : allocRemaining < 0
+                  ? 'text-rose-600 dark:text-rose-400'
+                  : 'text-[var(--color-muted)]'
+            }`}
+            aria-live="polite"
+          >
+            {allocRemaining === 0
+              ? `All ${allocSpec?.budget} points allocated.`
+              : allocRemaining > 0
+                ? `${allocRemaining} of ${allocSpec?.budget} points left to allocate.`
+                : `${-allocRemaining} over budget (budget is ${allocSpec?.budget}).`}
+          </p>
+          <div className="space-y-1.5">
+            {allocSpec?.options.map((o) => (
+              <div key={o.id} className="flex items-center gap-2 text-sm">
+                <span className="min-w-0 flex-1 break-words">{o.label}</span>
+                <button
+                  type="button"
+                  disabled={busy || allocPts(o.id) <= 0}
+                  aria-label={`Remove a point from ${o.label}`}
+                  onClick={() => setAllocPts(o.id, allocPts(o.id) - 1)}
+                  className="rounded-md px-2 py-0.5 text-sm leading-none ring-1 ring-inset ring-[var(--color-border)] hover:bg-[var(--color-panel-2)] disabled:opacity-40"
+                >
+                  −
+                </button>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  inputMode="numeric"
+                  disabled={busy}
+                  aria-label={`Points for ${o.label}`}
+                  value={allocPts(o.id)}
+                  onChange={(e) => setAllocPts(o.id, Math.trunc(Number(e.target.value)))}
+                  className="w-16 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-right text-sm tabular-nums outline-none focus:border-sky-500/50"
+                />
+                <button
+                  type="button"
+                  disabled={busy}
+                  aria-label={`Add a point to ${o.label}`}
+                  onClick={() => setAllocPts(o.id, allocPts(o.id) + 1)}
+                  className="rounded-md px-2 py-0.5 text-sm leading-none ring-1 ring-inset ring-[var(--color-border)] hover:bg-[var(--color-panel-2)] disabled:opacity-40"
+                >
+                  +
+                </button>
+              </div>
+            ))}
+          </div>
+          <button
+            disabled={busy || !allocOk}
+            className={BTN}
+            onClick={() => onSubmit('allocation', allocValue)}
+          >
+            Submit allocation
           </button>
         </div>
       )}

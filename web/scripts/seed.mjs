@@ -278,6 +278,8 @@ async function run() {
       wait_period_seconds: q.wait_period_seconds,
       response_schema: q.response_schema,
       ui: q.ui,
+      // Per-kind config, e.g. point_allocation's { budget } (doc_3371 entry 8).
+      config: q.config,
       actor: q.actor,
     })
     if (q.alias) ids.questions[q.alias] = r.id
