@@ -103,27 +103,38 @@ impl Board {
     /// the review-integrity model (doc_82 v3 states the rule; this makes it structural, closing the
     /// task_1099 vector that `me_opt`'s forced > CLIENT > session precedence left open).
     fn gate_author(&self, explicit: Option<&str>) -> Result<String, McpError> {
-        let who = self.authenticated_identity().ok_or_else(|| {
+        let explicit = explicit.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(auth) = self.authenticated_identity() {
+            // Authenticated (forced X-Fleet-Agent header or a persisted session): bind to it; a
+            // divergent client-supplied author is a forged reviewer identity -> reject.
+            if let Some(x) = explicit {
+                if x != auth {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "a gate-relevant review entry must be authored by your own identity \
+                             ({auth}); it cannot be recorded under another agent's name ({x})"
+                        ),
+                        None,
+                    ));
+                }
+            }
+            return Ok(auth);
+        }
+        // No authenticated identity: a fleet-native session opens a fresh Mcp-Session-Id per call, so
+        // register_agent cannot persist and (until the task_1092 bounce wires X-Fleet-Agent) no forced
+        // header arrives either. Fall back to the explicit author as a last resort rather than lock a
+        // legitimate reviewer out (the PR 326 regression). This leaves only the pre-326 self-asserted
+        // exposure for UNauthenticated sessions, with the doc_82 behavior rule as the honor backstop;
+        // it closes automatically as agents are bounced onto the header, at which point this tightens
+        // back to reject-if-none, gated on a task_1092 pool-carries-header preflight (task_1100).
+        explicit.map(|s| s.to_string()).ok_or_else(|| {
             McpError::invalid_params(
-                "this review action records a conformance-gate entry and requires an authenticated \
-                 identity: connect with your X-Fleet-Agent header or call register_agent first (a \
-                 client-supplied author is not accepted for a gate entry)"
+                "a gate-relevant review entry needs an author: pass your agent id, or connect with \
+                 your X-Fleet-Agent header"
                     .to_string(),
                 None,
             )
-        })?;
-        if let Some(x) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-            if x != who {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "a gate-relevant review entry must be authored by your own identity \
-                         ({who}); it cannot be recorded under another agent's name ({x})"
-                    ),
-                    None,
-                ));
-            }
-        }
-        Ok(who)
+        })
     }
 }
 
@@ -4538,12 +4549,19 @@ mod tests {
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         let board = Board::new(pool, None);
 
-        // No authenticated identity (unregistered, no header): a gate entry is rejected outright,
-        // even with a client-supplied author.
+        // No authenticated identity (a fleet-native session: fresh Mcp-Session-Id per call, not yet
+        // bounced onto the X-Fleet-Agent header): fall back to the explicit author so a legitimate
+        // reviewer is not locked out (the PR 326 regression) -- but an authorless gate entry is still
+        // rejected.
         assert!(board.authenticated_identity().is_none());
+        assert_eq!(
+            board.gate_author(Some("librarian"))?,
+            "librarian",
+            "an unauthenticated session falls back to the explicit author"
+        );
         assert!(
-            board.gate_author(Some("librarian")).is_err(),
-            "a gate entry with no authenticated identity is rejected"
+            board.gate_author(None).is_err(),
+            "a gate entry with neither an authenticated identity nor an explicit author is rejected"
         );
 
         // A registered session: the gate author is the SESSION identity; a divergent client author is
