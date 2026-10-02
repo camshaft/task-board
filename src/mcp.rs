@@ -72,6 +72,24 @@ impl Board {
         }
     }
 
+    /// Resolve the viewer for a READ-ONLY awaiting-queue inspection (`list_awaiting`). Unlike
+    /// `me_opt` (forced > explicit > session -- the right precedence for a WRITE's actor), an
+    /// explicitly-named viewer here is AUTHORITATIVE even for a forced-identity (X-Fleet-Agent)
+    /// session: the queue is a pure read that discloses nothing beyond
+    /// `list_tasks(blocked_on_kind=...)`, so a fleet caller must be able to inspect ANOTHER
+    /// principal's queue (e.g. `viewer=operator`). Routing it through `me_opt` silently pinned every
+    /// forced-identity caller to their OWN queue regardless of the viewer passed -- which is exactly
+    /// what made an operator-queue probe return the caller's items instead of the operator's set and
+    /// produced the misleading "MCP returns 1, HTTP returns 23" reading (task_1226; the HTTP endpoint
+    /// honors its `viewer`, so its count was the correct one). Falls back to the session/forced
+    /// identity only when no viewer is passed ("defaults to you").
+    fn awaiting_viewer(&self, explicit: Option<&str>) -> Option<String> {
+        match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(v) => Some(v.to_string()),
+            None => self.me_opt(None),
+        }
+    }
+
     /// Like `me_opt`, but required: a clear error when there's no explicit value and no session
     /// identity, rather than acting as nobody.
     fn me_req(&self, explicit: Option<&str>) -> Result<String, McpError> {
@@ -3619,7 +3637,7 @@ impl Board {
         &self,
         Parameters(a): Parameters<ListAwaitingArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(viewer) = self.me_opt(a.viewer.as_deref()) else {
+        let Some(viewer) = self.awaiting_viewer(a.viewer.as_deref()) else {
             return Err(err(anyhow::anyhow!(
                 "no viewer: pass `viewer` or call with a session identity"
             )));
@@ -4712,6 +4730,41 @@ mod tests {
             "forced beats an explicit value"
         );
         assert_eq!(board.me_opt(None).as_deref(), Some("forced"));
+        Ok(())
+    }
+
+    // task_1226: list_awaiting's `viewer` is a READ-ONLY queue SELECTOR, not a write actor, so an
+    // explicitly-passed viewer is authoritative even under a forced (X-Fleet-Agent) identity.
+    // Routing it through me_opt (forced wins) silently pinned every fleet caller to its OWN queue, so
+    // an operator-queue probe returned the caller's items -- the artifact behind the misleading
+    // "MCP returns 1, HTTP returns 23" reading. Contrast forced_identity_wins_in_me_opt: a WRITE's
+    // actor still binds to the forced identity.
+    #[tokio::test]
+    async fn awaiting_viewer_honors_explicit_over_forced() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let board = Board::new(pool, None);
+        // No identity at all: an explicit viewer is used; a blank/absent one resolves to nobody.
+        assert_eq!(
+            board.awaiting_viewer(Some("operator")).as_deref(),
+            Some("operator")
+        );
+        assert_eq!(board.awaiting_viewer(None), None);
+        assert_eq!(
+            board.awaiting_viewer(Some("   ")),
+            None,
+            "a blank viewer is treated as unset"
+        );
+        // A forced fleet identity: an explicit viewer STILL wins (unlike me_opt), so viewer=operator
+        // inspects the operator's queue rather than the caller's.
+        *board.forced_identity.lock().unwrap() = Some("v-task-board".to_string());
+        assert_eq!(
+            board.awaiting_viewer(Some("operator")).as_deref(),
+            Some("operator"),
+            "an explicit viewer is authoritative for a read-only queue inspection, even when forced"
+        );
+        // With no explicit viewer it falls back to the forced/session identity ("defaults to you").
+        assert_eq!(board.awaiting_viewer(None).as_deref(), Some("v-task-board"));
         Ok(())
     }
 
