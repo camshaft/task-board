@@ -100,6 +100,17 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at  TEXT NOT NULL,
     UNIQUE(subscriber, target_type, target_id)
 );
+-- Per-(subscriber, channel) last-read pointer for Slack-style unread tracking (task_1067). No row
+-- means last_read_seq 0 = everything unread. Unread = a channel's posts with seq > last_read_seq
+-- that the viewer did not author. Kept DISTINCT from the inbox read_at so draining notifications
+-- (check_notifications) never clears a channel's unread dot.
+CREATE TABLE IF NOT EXISTS channel_reads (
+    subscriber    TEXT NOT NULL,
+    channel_id    INTEGER NOT NULL,
+    last_read_seq INTEGER NOT NULL DEFAULT 0,
+    updated_at    TEXT NOT NULL,
+    UNIQUE(subscriber, channel_id)
+);
 -- Per-agent-per-task mute: an agent in a task's fan-out (creator/assignee/subscriber) can
 -- detach from that task's event notifications. Subtracted from the task recipient set so a
 -- stood-down owner stops getting FYI wakes on a task they opened (unsubscribe can't, since the

@@ -886,6 +886,28 @@ pub struct ListChannelsArgs {
 pub struct GetChannelArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub channel_id: i64,
+    /// If set, include this viewer's `unread_count` + `has_unread` for the channel (task_1067).
+    #[serde(default)]
+    pub viewer: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MarkChannelReadArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub channel_id: i64,
+    /// Who is marking the channel read. Defaults to the agent this session registered as.
+    #[serde(
+        rename = "principal",
+        alias = "agent_id",
+        alias = "subscriber",
+        default
+    )]
+    pub agent_id: Option<String>,
+    /// Advance the last-read pointer to this post seq. Omit to mark everything currently in the
+    /// channel read (defaults to the channel's current max post seq).
+    #[serde(default)]
+    pub up_to_seq: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2399,12 +2421,28 @@ impl Board {
             .and_then(ok)
     }
 
-    #[tool(description = "Get one channel with its member list.")]
+    #[tool(
+        description = "Get one channel with its member list. Pass `viewer` to also get that viewer's unread_count + has_unread (task_1067)."
+    )]
     async fn get_channel(
         &self,
         Parameters(a): Parameters<GetChannelArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::get_channel(&self.pool, a.channel_id)
+        core::get_channel(&self.pool, a.channel_id, s(&a.viewer))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Mark a channel read for you up to a post seq (default: everything currently in the channel), clearing its unread dot. Advances your per-channel last-read pointer and emits a silent channel.read event so your other tabs/devices clear the dot too. Returns {channel_id, last_read_seq, unread_count}."
+    )]
+    async fn mark_channel_read(
+        &self,
+        Parameters(a): Parameters<MarkChannelReadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let who = self.me_req(s(&a.agent_id))?;
+        core::mark_channel_read(&self.pool, a.channel_id, &who, a.up_to_seq)
             .await
             .map_err(err)
             .and_then(ok)

@@ -5260,8 +5260,33 @@ async fn join_channel(
     Ok(())
 }
 
+/// A viewer's unread post count in a channel (task_1067): channel.post / message.direct events with
+/// seq beyond the viewer's last_read_seq (no channel_reads row = 0 = all unread) that the viewer did
+/// NOT author. Own posts never count as unread.
+async fn channel_unread_count(pool: &Pool, channel_id: i64, viewer: &str) -> anyhow::Result<i64> {
+    let last_read: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT last_read_seq FROM channel_reads WHERE subscriber=? AND channel_id=?), 0)",
+    )
+    .bind(viewer)
+    .bind(channel_id)
+    .fetch_one(pool)
+    .await?;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE channel_id=? AND type IN ('channel.post','message.direct') \
+         AND seq > ? AND (actor IS NULL OR actor != ?)",
+    )
+    .bind(channel_id)
+    .bind(last_read)
+    .bind(viewer)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
 /// List channels. Private channels (incl. DMs) are shown only to their members; named public
 /// channels are always listed. `member` optionally scopes to channels a given agent belongs to.
+/// When `member` is given, each channel also carries that viewer's `unread_count` + `has_unread`
+/// (task_1067).
 pub async fn list_channels(pool: &Pool, member: Option<&str>) -> anyhow::Result<Value> {
     // A channel is visible if it's public (private=0) OR the viewer is a member. When `member`
     // is given we also restrict to that agent's channels regardless of visibility.
@@ -5294,20 +5319,100 @@ pub async fn list_channels(pool: &Pool, member: Option<&str>) -> anyhow::Result<
         let mut d = channel_json(r);
         if let Value::Object(ref mut m) = d {
             m.insert("member_count".into(), json!(n));
+            if let Some(viewer) = member {
+                let unread = channel_unread_count(pool, cid, viewer).await?;
+                m.insert("unread_count".into(), json!(unread));
+                m.insert("has_unread".into(), json!(unread > 0));
+            }
         }
         out.push(d);
     }
     Ok(Value::Array(out))
 }
 
-/// Fetch one channel with its member list.
-pub async fn get_channel(pool: &Pool, channel_id: i64) -> anyhow::Result<Value> {
+/// Fetch one channel with its member list. When `viewer` is given, also carries that viewer's
+/// `unread_count` + `has_unread` (task_1067).
+pub async fn get_channel(
+    pool: &Pool,
+    channel_id: i64,
+    viewer: Option<&str>,
+) -> anyhow::Result<Value> {
     let mut tx = pool.begin().await?;
-    let out = channel_row_json(&mut tx, channel_id)
+    let mut out = channel_row_json(&mut tx, channel_id)
         .await?
         .unwrap_or(Value::Null);
     tx.commit().await?;
+    if let (Value::Object(ref mut m), Some(v)) = (&mut out, viewer) {
+        if m.contains_key("id") {
+            let unread = channel_unread_count(pool, channel_id, v).await?;
+            m.insert("unread_count".into(), json!(unread));
+            m.insert("has_unread".into(), json!(unread > 0));
+        }
+    }
     Ok(out)
+}
+
+/// Advance a subscriber's last-read pointer for a channel (task_1067). `up_to_seq` defaults to the
+/// channel's current max post seq (mark everything read). Upserts channel_reads and emits a SILENT
+/// `channel.read` event (SSE tail only, no inbox fan-out) so the subscriber's other tabs/devices
+/// clear the unread dot without polling. Returns {channel_id, last_read_seq, unread_count}.
+pub async fn mark_channel_read(
+    pool: &Pool,
+    channel_id: i64,
+    subscriber: &str,
+    up_to_seq: Option<i64>,
+) -> anyhow::Result<Value> {
+    if sqlx::query("SELECT 1 FROM channels WHERE id=?")
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no channel {channel_id}");
+    }
+    let target: i64 = match up_to_seq {
+        Some(s) => s,
+        None => {
+            sqlx::query_scalar(
+                "SELECT COALESCE(MAX(seq),0) FROM events WHERE channel_id=? \
+             AND type IN ('channel.post','message.direct')",
+            )
+            .bind(channel_id)
+            .fetch_one(pool)
+            .await?
+        }
+    };
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    sqlx::query(
+        "INSERT INTO channel_reads(subscriber, channel_id, last_read_seq, updated_at) \
+         VALUES(?,?,?,?) ON CONFLICT(subscriber, channel_id) \
+         DO UPDATE SET last_read_seq=excluded.last_read_seq, updated_at=excluded.updated_at",
+    )
+    .bind(subscriber)
+    .bind(channel_id)
+    .bind(target)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    emit(
+        &mut tx,
+        &mut hooks,
+        "channel.read",
+        Some(subscriber),
+        None,
+        None,
+        Some(channel_id),
+        None,
+        json!({ "last_read_seq": target }),
+        Recipients::Explicit(BTreeSet::new()),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    let unread = channel_unread_count(pool, channel_id, subscriber).await?;
+    Ok(json!({ "channel_id": channel_id, "last_read_seq": target, "unread_count": unread }))
 }
 
 /// Post a message to a channel. The poster is auto-joined (so posting implies membership),
@@ -6172,7 +6277,7 @@ pub async fn get_or_create_dm(pool: &Pool, a: &str, b: &str) -> anyhow::Result<V
     let mut tx = pool.begin().await?;
     let cid = dm_channel(&mut tx, a, b).await?;
     tx.commit().await?;
-    get_channel(pool, cid).await
+    get_channel(pool, cid, None).await
 }
 
 pub async fn get_messages(
@@ -16900,11 +17005,11 @@ mod tests {
         };
 
         // Before enabling, a and b (registered before the channel existed) are not members.
-        assert!(!members(&get_channel(&pool, cid).await?).contains(&"a".to_string()));
+        assert!(!members(&get_channel(&pool, cid, None).await?).contains(&"a".to_string()));
 
         // Enable: backfill joins every registered agent.
         set_channel_auto_join(&pool, cid, true, Some("owner")).await?;
-        let m = members(&get_channel(&pool, cid).await?);
+        let m = members(&get_channel(&pool, cid, None).await?);
         assert!(
             m.contains(&"a".to_string()) && m.contains(&"b".to_string()),
             "backfilled: {m:?}"
@@ -16913,14 +17018,14 @@ mod tests {
         // A newly-registered agent auto-joins.
         register_agent(&pool, "c", None, None, None, None, None).await?;
         assert!(
-            members(&get_channel(&pool, cid).await?).contains(&"c".to_string()),
+            members(&get_channel(&pool, cid, None).await?).contains(&"c".to_string()),
             "c auto-joined"
         );
 
         // Disabling stops future auto-joins (existing members stay).
         set_channel_auto_join(&pool, cid, false, Some("owner")).await?;
         register_agent(&pool, "d", None, None, None, None, None).await?;
-        let m2 = members(&get_channel(&pool, cid).await?);
+        let m2 = members(&get_channel(&pool, cid, None).await?);
         assert!(
             !m2.contains(&"d".to_string()),
             "d did not auto-join after disable: {m2:?}"
@@ -17181,6 +17286,82 @@ mod tests {
         Ok(())
     }
 
+    /// Per-channel unread tracking (task_1067): unread counts a viewer's un-authored posts beyond
+    /// their last-read pointer; own posts never count; mark_channel_read advances the pointer and
+    /// clears the dot; a no-viewer list carries no unread fields.
+    #[tokio::test]
+    async fn channel_unread_tracking() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        let cid = create_channel(&pool, "General", None, Some("alice"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        subscribe(&pool, "bob", None, None, Some(cid), None, false).await?;
+
+        // No posts yet: bob has nothing unread.
+        let g = get_channel(&pool, cid, Some("bob")).await?;
+        assert_eq!(g["unread_count"], json!(0));
+        assert_eq!(g["has_unread"], json!(false));
+
+        // alice posts twice. bob (not the author) now has 2 unread; alice (author) has 0.
+        let seq1 = post_to_channel(&pool, cid, "alice", "one", None, None).await?["seq"]
+            .as_i64()
+            .unwrap();
+        let seq2 = post_to_channel(&pool, cid, "alice", "two", None, None).await?["seq"]
+            .as_i64()
+            .unwrap();
+
+        let g = get_channel(&pool, cid, Some("bob")).await?;
+        assert_eq!(g["unread_count"], json!(2), "bob has 2 unread: {g}");
+        assert_eq!(g["has_unread"], json!(true));
+        assert_eq!(
+            get_channel(&pool, cid, Some("alice")).await?["unread_count"],
+            json!(0),
+            "own posts never count as unread"
+        );
+
+        // list_channels(member) carries the same per-viewer unread; a no-viewer list omits it.
+        let list = list_channels(&pool, Some("bob")).await?;
+        let ch = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"].as_i64() == Some(cid))
+            .unwrap();
+        assert_eq!(ch["unread_count"], json!(2));
+        let anon = list_channels(&pool, None).await?;
+        let ch_anon = anon
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"].as_i64() == Some(cid));
+        if let Some(ca) = ch_anon {
+            assert!(
+                ca.get("unread_count").is_none(),
+                "no viewer => no unread field"
+            );
+        }
+
+        // bob marks read up to the first post: 1 remains unread (the second).
+        let r = mark_channel_read(&pool, cid, "bob", Some(seq1)).await?;
+        assert_eq!(r["last_read_seq"].as_i64(), Some(seq1));
+        assert_eq!(
+            get_channel(&pool, cid, Some("bob")).await?["unread_count"],
+            json!(1)
+        );
+        assert_eq!(seq2, seq1 + 1); // sanity: contiguous post seqs here
+
+        // Mark everything read (default up_to): 0 unread, dot cleared.
+        let r = mark_channel_read(&pool, cid, "bob", None).await?;
+        assert_eq!(r["unread_count"], json!(0));
+        assert_eq!(
+            get_channel(&pool, cid, Some("bob")).await?["has_unread"],
+            json!(false)
+        );
+        Ok(())
+    }
+
     /// get_channel_posts read modes (task #315, mirroring get_events #266): ascending is oldest-
     /// first (scrollback); desc is newest-first so since_seq=0 + a limit yields the LATEST N (a chat
     /// view); before_seq pages earlier; and the seq bounds compose with either order.
@@ -17301,7 +17482,7 @@ mod tests {
 
         // Leaving = unsubscribe from the channel.
         unsubscribe(&pool, "bob", None, None, Some(cid), None, false).await?;
-        let after = get_channel(&pool, cid).await?;
+        let after = get_channel(&pool, cid, None).await?;
         let members: Vec<&str> = after["members"]
             .as_array()
             .unwrap()

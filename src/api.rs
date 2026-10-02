@@ -239,6 +239,7 @@ pub fn router(state: AppState) -> Router {
         .route("/subscriptions", post(subscribe).delete(unsubscribe))
         .route("/channels", get(list_channels).post(create_channel))
         .route("/channels/{channel_id}", get(get_channel))
+        .route("/channels/{channel_id}/read", post(mark_channel_read))
         .route(
             "/channels/{channel_id}/posts",
             get(get_channel_posts).post(post_to_channel),
@@ -849,7 +850,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, channel, document, the whole board (board=true), or a thread (thread_root=the root post seq).", query: "", body: Some("SubscribeBody") },
     Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None },
     Endpoint { method: "POST", path: "/api/channels", summary: "Create (or get) a named channel.", query: "", body: Some("CreateChannelBody") },
-    Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members. Pass viewer to also get that viewer's unread_count + has_unread (task_1067).", query: "viewer=str", body: None },
+    Endpoint { method: "POST", path: "/api/channels/{channel_id}/read", summary: "Mark a channel read for the caller (principal) up to a post seq (default: everything currently in the channel), clearing its unread dot. Advances the per-(subscriber,channel) last-read pointer and emits a silent channel.read event for cross-tab dot-clearing. Returns {channel_id, last_read_seq, unread_count}.", query: "", body: Some("ChannelReadBody") },
     Endpoint { method: "GET", path: "/api/channels/{channel_id}/posts", summary: "Read a channel's post history. order=desc returns the latest N (newest-first) for a chat view; default asc is oldest-first for scrollback. before_seq pages earlier.", query: "since_seq=int&limit=int&before_seq=int&order=asc|desc", body: None },
     Endpoint { method: "POST", path: "/api/channels/{channel_id}/posts", summary: "Post a message to a channel.", query: "", body: Some("PostToChannelBody") },
     Endpoint { method: "PATCH", path: "/api/channels/{channel_id}/props", summary: "Merge props into a channel's metadata (e.g. the outbound reflect-back policy).", query: "", body: None },
@@ -986,6 +988,7 @@ fn body_schemas() -> Value {
         FulfillSecretBody,
         CancelSecretBody,
         SetChannelAutoJoinBody,
+        ChannelReadBody,
         CreateReviewBody,
         SetReviewStatusBody,
         SetReviewVettedBody,
@@ -2043,11 +2046,47 @@ async fn create_channel(State(st): State<AppState>, Json(b): Json<CreateChannelB
     ))
 }
 
+#[derive(Deserialize)]
+struct GetChannelQuery {
+    /// If set, include this viewer's unread_count + has_unread (task_1067).
+    viewer: Option<String>,
+}
+
 async fn get_channel(
     State(st): State<AppState>,
     Path(ChannelRef(channel_id)): Path<ChannelRef>,
+    Query(q): Query<GetChannelQuery>,
 ) -> ApiResult {
-    found(core::get_channel(&st.pool, channel_id).await?)
+    found(core::get_channel(&st.pool, channel_id, q.viewer.as_deref()).await?)
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ChannelReadBody {
+    #[serde(rename = "principal", alias = "agent_id", alias = "subscriber")]
+    principal: Option<String>,
+    /// Advance the last-read pointer to this post seq. Omit to mark everything currently in the
+    /// channel read.
+    up_to_seq: Option<i64>,
+}
+
+/// POST a channel's read marker: advance the caller's last-read pointer (task_1067).
+async fn mark_channel_read(
+    State(st): State<AppState>,
+    Path(ChannelRef(channel_id)): Path<ChannelRef>,
+    Json(b): Json<ChannelReadBody>,
+) -> ApiResult {
+    let who = b
+        .principal
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError(anyhow::anyhow!(
+                "a subscriber (principal) is required to mark a channel read"
+            ))
+        })?;
+    Ok(Json(
+        core::mark_channel_read(&st.pool, channel_id, who, b.up_to_seq).await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
