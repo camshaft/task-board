@@ -41,6 +41,32 @@ export interface Project {
   updated_at: string
   task_counts?: Record<string, number>
   tasks?: TaskSummary[]
+  // Visibility + roles (task 542 Phase 3, record-only): the team grants on this project. Present on
+  // get_project / list_projects.
+  teams?: ProjectTeamGrant[]
+}
+
+// A project role grant to a team (task 542 Phase 3). cascade extends the grant to nested sub-teams.
+export type ProjectRole = 'admin' | 'read-write' | 'read'
+export interface ProjectTeamGrant {
+  team_id: string
+  role: ProjectRole
+  cascade: boolean
+}
+
+// One principal's resolved access on a project: the strongest role that reaches them, the granting
+// team (or "(creator)" for the implicit creator-admin grant), and whether they are a person or agent.
+export interface ResolvedAccess {
+  role: string
+  kind: 'person' | 'agent'
+  via: string
+}
+
+// GET /projects/{id}/teams: the project row (incl. its raw `teams` grants) plus the fully-resolved
+// per-principal access map (strongest role wins; nested teams expanded on a cascade grant).
+export interface ProjectAccess extends Project {
+  teams: ProjectTeamGrant[]
+  access: Record<string, ResolvedAccess>
 }
 
 export interface TaskSummary {
@@ -905,6 +931,15 @@ export const api = {
     req<TeamDetail>('POST', `/teams/${encodeURIComponent(teamId)}/members`, b),
   removeTeamMember: (teamId: string, b: { member_id: string; member_kind: 'person' | 'team' | 'agent' }) =>
     req<TeamDetail>('DELETE', `/teams/${encodeURIComponent(teamId)}/members`, b),
+
+  // Project visibility + roles (task 542 Phase 3, record-only -- surfaced + edited, not enforced).
+  getProjectTeams: (projectId: number) => req<ProjectAccess>('GET', `/projects/${projectId}/teams`),
+  attachProjectTeam: (
+    projectId: number,
+    b: { team_id: string; role: ProjectRole; cascade?: boolean; principal?: string },
+  ) => req<ProjectAccess>('POST', `/projects/${projectId}/teams`, b),
+  detachProjectTeam: (projectId: number, b: { team_id: string; principal?: string }) =>
+    req<ProjectAccess>('DELETE', `/projects/${projectId}/teams`, b),
 
   getSecretRequest: (id: number) => req<SecretRequest>('GET', `/secret-requests/${id}`),
   submitSecret: (id: number, b: { token: string; ciphertext: string }) =>
