@@ -2100,6 +2100,46 @@ pub async fn list_projects_scoped(
     Ok(Value::Array(out))
 }
 
+/// Filter an already-fetched task array to those whose PROJECT `viewer` can read, when enforcement is
+/// enabled (task_542 Phase 3 Part B5b). Passthrough while enforcement is OFF. FAIL-CLOSED under
+/// enforcement: an unidentified viewer gets an empty array. Applied by the list_tasks handlers BEFORE
+/// pagination, so a page never surfaces a task the caller cannot see. Per-project decisions are
+/// cached, so the cost is M distinct-project checks, not N tasks.
+pub async fn filter_tasks_to_readable(
+    pool: &Pool,
+    tasks: Value,
+    viewer: Option<&str>,
+) -> anyhow::Result<Value> {
+    if !enforcement_enabled(pool).await? {
+        return Ok(tasks);
+    }
+    let Some(viewer) = viewer else {
+        return Ok(json!([])); // fail-closed: an unidentified caller sees no tasks
+    };
+    let Value::Array(items) = tasks else {
+        return Ok(tasks);
+    };
+    let mut decisions: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(items.len());
+    for t in items {
+        let Some(pid) = t.get("project_id").and_then(Value::as_i64) else {
+            continue; // a task row with no project_id is omitted under enforcement (fail-closed)
+        };
+        let allowed = match decisions.get(&pid) {
+            Some(&d) => d,
+            None => {
+                let d = principal_can_read_project(pool, viewer, pid).await?;
+                decisions.insert(pid, d);
+                d
+            }
+        };
+        if allowed {
+            out.push(t);
+        }
+    }
+    Ok(Value::Array(out))
+}
+
 /// Resolve an addressable principal id to the set of principal ids who can act on it (task 542): a
 /// team expands to its people AND its agents (cycle-guarded); anything else (a person id, or an
 /// agent id) resolves to itself. The read-time primitive for team-aware addressing + visibility in
@@ -23344,6 +23384,84 @@ mod tests {
             ids(&list_projects_scoped(&pool, None, Some("coord")).await?),
             BTreeSet::from([p1, p2])
         );
+        Ok(())
+    }
+
+    /// task_542 B5b: filter_tasks_to_readable is a passthrough while enforcement is OFF, and once
+    /// enabled drops tasks whose project the viewer cannot read (fail-closed for an unidentified
+    /// viewer), keyed per-project across a cross-project listing.
+    #[tokio::test]
+    async fn filter_tasks_to_readable_drops_unreadable_projects() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "boss", None, None, None, None, None).await?;
+        let p1 = create_project(&pool, "P1", None, Some("boss"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let p2 = create_project(&pool, "P2", None, Some("other"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let t1 = create_task(
+            &pool,
+            p1,
+            "T1",
+            None,
+            None,
+            None,
+            Some("boss"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let t2 = create_task(
+            &pool,
+            p2,
+            "T2",
+            None,
+            None,
+            None,
+            Some("other"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        // A cross-project listing (no project filter).
+        let all = list_tasks(
+            &pool, None, None, None, false, None, false, None, None, None, None, None, false,
+        )
+        .await?;
+        let ids = |v: &Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t.get("id").and_then(Value::as_i64))
+                .collect::<BTreeSet<_>>()
+        };
+
+        // Enforcement OFF: passthrough -- both tasks.
+        assert_eq!(
+            ids(&filter_tasks_to_readable(&pool, all.clone(), Some("boss")).await?),
+            BTreeSet::from([t1, t2])
+        );
+
+        set_enforcement_enabled(&pool, true, Some("boss")).await?;
+
+        // boss reads only P1's task; an unidentified caller reads none.
+        assert_eq!(
+            ids(&filter_tasks_to_readable(&pool, all.clone(), Some("boss")).await?),
+            BTreeSet::from([t1])
+        );
+        assert!(filter_tasks_to_readable(&pool, all, None)
+            .await?
+            .as_array()
+            .unwrap()
+            .is_empty());
         Ok(())
     }
 
