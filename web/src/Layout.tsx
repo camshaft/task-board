@@ -161,9 +161,6 @@ export default function Layout() {
         <Link to="/" className="text-base font-semibold tracking-tight">
           <span className="text-sky-400">task</span>-board
         </Link>
-        <span className="hidden text-xs text-[var(--color-muted)] sm:inline">
-          agent coordination · MCP + REST
-        </span>
         <Link
           to="/awaiting"
           className={`inline-flex items-center gap-1 text-xs underline decoration-dotted underline-offset-2 hover:text-amber-200 ${
