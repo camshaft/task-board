@@ -182,6 +182,18 @@ pub async fn resolve_cid(
     ipfs_api_url: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(cid) = cid.map(str::trim).filter(|s| !s.is_empty()) {
+        // task_1272: a bare content id is alphanumeric (base58/base32), never a path or phrase. A
+        // path-shaped `cid` (e.g. a wiki path "designs/foo" stuffed into `cid`) was the silent
+        // content-loss trap: create_document / publish_version called with a path in `cid` PLUS a
+        // `content` body stored the path verbatim as the version cid and never persisted the body
+        // (the doc then read empty). Reject a non-content-id `cid` loudly so a provided body is
+        // never silently dropped; the legitimate real-CID-plus-content case (cid for storage,
+        // content for link indexing) is unaffected since a real CID is alphanumeric.
+        if !is_probable_cid(cid) {
+            anyhow::bail!(
+                "`cid` must be a bare content id (alphanumeric base58/base32), not a path or phrase (got '{cid}'): to store a body pass `content` (no `cid`), and set a wiki path separately with set_document_path"
+            );
+        }
         return Ok(cid.to_string());
     }
     match content {
@@ -225,6 +237,33 @@ mod tests {
         // An explicit CID passes through verbatim, even with content + a backend present.
         let cid = resolve_cid(Some("  bafyexplicit "), Some("ignored"), Some("http://x")).await?;
         assert_eq!(cid, "bafyexplicit");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_cid_rejects_a_path_shaped_cid() -> anyhow::Result<()> {
+        // task_1272: a wiki path stuffed into `cid` (alongside a body) was silently stored as the
+        // version cid, dropping the body and yielding an empty doc. It is now a loud error, so the
+        // body is never lost; a real bare CID + content (content for link indexing) still passes.
+        let err = resolve_cid(
+            Some("designs/task-close"),
+            Some("the body"),
+            Some("http://x"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("bare content id") && err.contains("designs/task-close"),
+            "got: {err}"
+        );
+        let cid = resolve_cid(
+            Some("QmVnKtNdzF7NEr7wQVjy8oUjRs9co9DbURhB5y1Q6ByEve"),
+            Some("body for link indexing"),
+            Some("http://x"),
+        )
+        .await?;
+        assert_eq!(cid, "QmVnKtNdzF7NEr7wQVjy8oUjRs9co9DbURhB5y1Q6ByEve");
         Ok(())
     }
 
