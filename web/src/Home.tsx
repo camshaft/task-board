@@ -37,7 +37,11 @@ export default function Home() {
     )
   }
 
-  const active = projects.filter((p) => p.status !== 'archived')
+  // Stable, case-insensitive name order, matching the sidebar, so the dashboard project list is
+  // predictable rather than the server's creation-id order (task_1058 goal).
+  const active = projects
+    .filter((p) => p.status !== 'archived')
+    .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '', undefined, { sensitivity: 'base' }))
 
   // Fleet-wide task totals per status, summed from each project's counts.
   const totals: Record<string, number> = {}

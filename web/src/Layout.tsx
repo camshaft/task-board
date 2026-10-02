@@ -129,8 +129,13 @@ export default function Layout() {
   // static column on lg+. Navigating from a drawer link closes it so the content is visible.
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const closeSidebar = () => setSidebarOpen(false)
-  const activeProjects = projects.filter((p) => p.status !== 'archived')
-  const archivedProjects = projects.filter((p) => p.status === 'archived')
+  // Order the sidebar by project name (case-insensitive), not the server's creation-id order, so
+  // the list is stable and scannable (task_1058 goal: projects appeared in an arbitrary order).
+  // .filter() returns a copy, so sorting here does not mutate the shared store data.
+  const byName = (a: { name: string | null }, b: { name: string | null }) =>
+    (a.name ?? '').localeCompare(b.name ?? '', undefined, { sensitivity: 'base' })
+  const activeProjects = projects.filter((p) => p.status !== 'archived').sort(byName)
+  const archivedProjects = projects.filter((p) => p.status === 'archived').sort(byName)
 
   async function newProject() {
     const name = window.prompt('Project name:')
