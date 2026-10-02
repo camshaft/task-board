@@ -166,6 +166,40 @@
         },
         "additionalProperties": false
       }
+    },
+    "numeric": {
+      "title": "Number",
+      "description": "A single bounded number (a count, size, or threshold). The response schema is a number (or integer) with optional minimum / maximum / multipleOf, validated generically; this element renders a numeric input enforcing the same bounds. Optional step, placeholder, and a short unit label are props.",
+      "component": "NumericInput",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "minimum": {
+            "type": "number",
+            "description": "Inclusive lower bound for the entered value (mirror of the response schema's minimum)."
+          },
+          "maximum": {
+            "type": "number",
+            "description": "Inclusive upper bound for the entered value (mirror of the response schema's maximum)."
+          },
+          "integer": {
+            "type": "boolean",
+            "description": "Require a whole number (the response schema uses type integer rather than number)."
+          },
+          "step": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Granularity of the input stepper, e.g. 0.5; omit for the browser default of 1 / any."
+          },
+          "placeholder": { "type": "string" },
+          "unit": {
+            "type": "string",
+            "description": "A short unit label shown beside the input, e.g. \"ms\", \"%\", \"MB\"."
+          }
+        },
+        "additionalProperties": false
+      }
     }
   }
 }
