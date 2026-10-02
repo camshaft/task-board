@@ -38,7 +38,8 @@ export const REVIEW_STATUS_FLOW = ['open', 'in_review', 'changes_requested', 'ap
 // Render a review's source artifact as a link where we can construct a safe URL, else the raw
 // ref. `source` names the artifact kind; `target_ref` locates it.
 export function reviewSourceLink(source: string | null, targetRef: string | null): ReactNode {
-  const cls = 'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
+  const cls =
+    'text-sky-700 underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300'
   if (!targetRef) {
     return source ? <span className="text-[var(--color-muted)]">{source}</span> : null
   }

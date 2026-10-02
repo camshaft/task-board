@@ -104,9 +104,10 @@ const REF_ROUTE: Record<string, string> = {
 
 // Shared link styling (sky underline) — used by markdown links and the bare-URL / task-ref
 // autolinkers below.
-const LINK_CLS = 'text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300'
+const LINK_CLS =
+  'text-sky-700 underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300'
 const RED_LINK_CLS =
-  'text-rose-400/90 underline decoration-dotted underline-offset-2 hover:text-rose-300'
+  'text-rose-700/90 underline decoration-dotted underline-offset-2 hover:text-rose-800 dark:text-rose-400/90 dark:hover:text-rose-300'
 
 // remark plugin: recognizes a paragraph consisting of exactly one text node matching EMBED_RE and
 // replaces it with a block-level embed node, lowered to a hast <div boardKind="embed-block" ...>
@@ -427,7 +428,7 @@ function makeHeading(level: 1 | 2 | 3 | 4 | 5 | 6, anchors: boolean) {
         <a
           href={fragmentHref(id)}
           aria-label="Link to this section"
-          className="mr-2 select-none font-mono font-normal text-[var(--color-muted)] opacity-50 hover:text-sky-300 hover:opacity-100"
+          className="mr-2 select-none font-mono font-normal text-[var(--color-muted)] opacity-50 hover:text-sky-800 hover:opacity-100 dark:hover:text-sky-300"
         >
           {'#'.repeat(level)}
         </a>
@@ -802,7 +803,7 @@ export function Embed({
     return (
       <div className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-sm">
         <span className="text-[var(--color-muted)]">⧉ embed </span>
-        <Link to="/wiki" className="text-rose-400/90 hover:text-rose-300" title={`No page filed at "${path}"`}>
+        <Link to="/wiki" className="text-rose-700/90 hover:text-rose-800 dark:text-rose-400/90 dark:hover:text-rose-300" title={`No page filed at "${path}"`}>
           {title}
         </Link>
         <span className="text-[var(--color-muted)]"> — no page filed</span>
@@ -813,7 +814,7 @@ export function Embed({
   const header = (
     <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-muted)]">
       <span>⧉ embedded</span>
-      <Link to={`/documents/${hit.id}`} className="text-sky-400 hover:text-sky-300">
+      <Link to={`/documents/${hit.id}`} className="text-sky-700 hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300">
         {title}
       </Link>
       {versionNo != null && <span className="uppercase">· v{versionNo}</span>}
@@ -847,7 +848,7 @@ export function Embed({
       ) : (
         <a
           href={body.url}
-          className="text-xs text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300"
+          className="text-xs text-sky-700 underline decoration-dotted underline-offset-2 hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300"
         >
           open embedded content
         </a>
