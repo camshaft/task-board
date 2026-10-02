@@ -1351,18 +1351,6 @@ pub struct SupersedeQuestionArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ListTasksBlockingMeArgs {
-    /// The principal to view for (defaults to you). A team-routed question surfaces for its members.
-    #[serde(default)]
-    pub viewer: Option<String>,
-    #[serde(default)]
-    pub project_id: Option<i64>,
-    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
-    pub include_archived: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ListAwaitingArgs {
     /// The principal whose awaiting-decision queue to return (defaults to you). "operator" is the
     /// seeded operator team; a team-targeted block or team-routed question surfaces for members.
@@ -3080,30 +3068,7 @@ impl Board {
     }
 
     #[tool(
-        description = "List tasks with an open BLOCKING question routed to you (or to `viewer`) -- the question-based 'waiting on me' view (doc_33 A5). A question routed to a team you belong to surfaces here too. Complements the scalar blocked_on 'waiting on me' from list_tasks; union the two for a full picture."
-    )]
-    async fn list_tasks_blocking_me(
-        &self,
-        Parameters(a): Parameters<ListTasksBlockingMeArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let Some(viewer) = self.me_opt(a.viewer.as_deref()) else {
-            return Err(err(anyhow::anyhow!(
-                "no viewer: pass `viewer` or call with a session identity"
-            )));
-        };
-        core::list_tasks_blocking_me(
-            &self.pool,
-            &viewer,
-            a.project_id,
-            a.include_archived.unwrap_or(false),
-        )
-        .await
-        .map_err(err)
-        .and_then(ok)
-    }
-
-    #[tool(
-        description = "The unified 'awaiting you' queue (task_860 + task_873): everything awaiting a decision from `viewer` (defaults to you), keyed INDEPENDENT of assignee (owner-held tasks are deliberately not assigned to the principal), team-expanded, deduped, as a FLAT array of discriminated items. kind='task' rows {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]} cover tasks blocked_on the principal OR carrying an open blocking question routed to it (answer the questions inline). kind='document' rows {document_id, title, status, version_no, updated_at, path} cover docs awaiting the operator's approval (status operator_review) and appear only when the viewer resolves to the operator. Supersedes list_tasks_blocking_me (questions-only). Pass viewer=operator for the operator's queue."
+        description = "The unified 'awaiting you' queue (task_860 + task_873): everything awaiting a decision from `viewer` (defaults to you), keyed INDEPENDENT of assignee (owner-held tasks are deliberately not assigned to the principal), team-expanded, deduped, as a FLAT array of discriminated items. kind='task' rows {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]} cover tasks blocked_on the principal OR carrying an open blocking question routed to it (answer the questions inline). kind='document' rows {document_id, title, status, version_no, updated_at, path} cover docs awaiting the operator's approval (status operator_review) and appear only when the viewer resolves to the operator. Pass viewer=operator for the operator's queue."
     )]
     async fn list_awaiting(
         &self,
