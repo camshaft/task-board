@@ -4336,13 +4336,14 @@ async fn load_open_question(
 /// A short human-readable body for an answer comment, from its shape + value.
 fn answer_body_summary(shape: &str, value: &Value) -> String {
     match shape {
-        "bool" => {
-            if value.as_bool() == Some(true) {
-                "yes".into()
-            } else {
-                "no".into()
-            }
-        }
+        // A yes-no answer may arrive as a raw boolean OR, when the question's response_schema is a
+        // string enum, be coerced to that enum string (task_1093). Render the string as-is; a raw
+        // boolean renders yes/no -- so a coerced "yes" no longer displays inverted as "no".
+        "bool" => match value {
+            Value::String(s) => s.clone(),
+            _ if value.as_bool() == Some(true) => "yes".into(),
+            _ => "no".into(),
+        },
         "text" => value.as_str().unwrap_or("").to_string(),
         "choice" => value
             .as_array()
@@ -11692,6 +11693,11 @@ mod tests {
             json!("yes"),
             "true coerced to the enum string yes"
         );
+        assert_eq!(
+            a_yes["body"],
+            json!("yes"),
+            "the summary label matches the coerced answer, not inverted"
+        );
         assert_eq!(get_comment(&pool, q_yes).await?["state"], json!("answered"));
 
         let q_no = pose_question_full(
@@ -11717,6 +11723,11 @@ mod tests {
             json!("no"),
             "false coerced to the enum string no"
         );
+        assert_eq!(
+            a_no["body"],
+            json!("no"),
+            "false label renders no, not inverted"
+        );
 
         // A genuine boolean schema is untouched: the boolean validates directly, no coercion.
         let q_bool = pose_question_full(
@@ -11741,6 +11752,11 @@ mod tests {
             a_bool["payload"]["value"],
             json!(true),
             "a boolean schema keeps the raw boolean"
+        );
+        assert_eq!(
+            a_bool["body"],
+            json!("yes"),
+            "a raw boolean still renders yes/no"
         );
 
         // Coercion does NOT misfire on a non-yes/no enum: a boolean answer there still fails cleanly.
