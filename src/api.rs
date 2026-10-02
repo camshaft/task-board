@@ -211,6 +211,7 @@ pub fn router(state: AppState) -> Router {
                 .post(attach_project_team)
                 .delete(detach_project_team),
         )
+        .route("/enforcement/preflight", get(enforcement_preflight))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{task_id}", get(get_task).patch(update_task))
         .route("/tasks/{task_id}/comments", post(comment_task))
@@ -822,6 +823,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/projects/{project_id}/teams", summary: "Get a project's team grants (visibility + roles) + the resolved principal access map (strongest role wins; nested teams expanded for a cascade grant; implicit creator admin). Recording layer, task 542 Phase 3.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/projects/{project_id}/teams", summary: "Grant a team access to a project with a role (admin/read-write/read), idempotent. cascade (default true) extends to nested sub-teams.", query: "", body: Some("ProjectTeamBody") },
     Endpoint { method: "DELETE", path: "/api/projects/{project_id}/teams", summary: "Revoke a team's grant on a project (idempotent).", query: "", body: Some("ProjectTeamBody") },
+    Endpoint { method: "GET", path: "/api/enforcement/preflight", summary: "Fail-closed preflight for enabling per-operator access enforcement (doc_26 A5): enablable=true only when the fleet-coordination team exists and holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant, blockers. Read-only.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
@@ -1445,6 +1447,11 @@ async fn list_project_teams(
     Path(ProjectRef(project_id)): Path<ProjectRef>,
 ) -> ApiResult {
     Ok(Json(core::project_access(&st.pool, project_id).await?))
+}
+
+/// GET the fail-closed enforcement-enablement preflight (task 542 Phase 3 Part B, doc_26 A5).
+async fn enforcement_preflight(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::enforcement_preflight(&st.pool).await?))
 }
 
 /// Attach a team to a project with a role (admin / read-write / read), idempotent.

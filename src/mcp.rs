@@ -334,6 +334,11 @@ pub struct GetProjectArgs {
     pub project_id: i64,
 }
 
+/// No arguments: the enforcement preflight is a global read.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnforcementPreflightArgs {}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttachProjectTeamArgs {
@@ -2800,6 +2805,19 @@ impl Board {
         Parameters(a): Parameters<GetProjectArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::project_access(&self.pool, a.project_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Fail-closed preflight for enabling per-operator access enforcement (doc_26 A5 safe-enablement invariant). Returns whether enforcement can be safely turned on: enablable=true ONLY when the seeded fleet-coordination team exists AND holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant (ids), and blockers. Read-only; takes no arguments."
+    )]
+    async fn enforcement_preflight(
+        &self,
+        Parameters(_a): Parameters<EnforcementPreflightArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::enforcement_preflight(&self.pool)
             .await
             .map_err(err)
             .and_then(ok)
