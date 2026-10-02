@@ -5,6 +5,7 @@ import { useLiveUpdates } from './live'
 import {
   AgentMentionContext,
   type AgentResolver,
+  LinkRulesContext,
   WikiLinkContext,
   type WikiResolver,
 } from './markdown'
@@ -16,6 +17,7 @@ import {
   useChannels,
   useEvents,
   useIdentityAliases,
+  useLinkRules,
   usePeople,
   useProjects,
   useWiki,
@@ -115,6 +117,9 @@ export default function Layout() {
     return m
   }, [wikiDocs])
   const resolveWikiLink = useCallback<WikiResolver>((path) => wikiByPath.get(path) ?? null, [wikiByPath])
+  // Deployment-configured custom link-tag rules (task_1243), fetched once and shared via context so
+  // every rendered-markdown surface linkifies the same patterns. Empty (nothing extra) by default.
+  const { data: linkRules = [] } = useLinkRules()
   // Known agent + person ids, so an @mention in any rendered markdown auto-links to a real agent or
   // person (an unknown @word stays plain text). Live-updates as agents register / people are added.
   const { data: agents = [] } = useAgents()
@@ -488,7 +493,9 @@ export default function Layout() {
             [[wiki-links]] in any markdown below resolve against the live wiki. */}
         <WikiLinkContext.Provider value={resolveWikiLink}>
           <AgentMentionContext.Provider value={resolveMention}>
-            <Outlet context={{ actor, setActor, forcedUser, theme } satisfies BoardContext} />
+            <LinkRulesContext.Provider value={linkRules}>
+              <Outlet context={{ actor, setActor, forcedUser, theme } satisfies BoardContext} />
+            </LinkRulesContext.Provider>
           </AgentMentionContext.Provider>
         </WikiLinkContext.Provider>
 

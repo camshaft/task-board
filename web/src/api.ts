@@ -644,6 +644,14 @@ export interface CrashReport {
 // only for 5xx and network-level failures, never for an expected 4xx (those are surfaced to the user
 // inline), and never for the crash-report endpoint itself (that would loop). task_1201.
 export type ApiFailure = { method: string; path: string; status?: number; message: string }
+// One deployment-configured link-tag rule (task_1243): a regex `pattern` matched in rendered content
+// and a `url_template` whose $1.. (and $0 = the whole match) are substituted from the match's capture
+// groups to form the link target. Supplied by the deployment TOML; empty by default.
+export interface LinkRule {
+  pattern: string
+  url_template: string
+}
+
 let apiFailureReporter: ((f: ApiFailure) => void) | null = null
 export function setApiFailureReporter(fn: (f: ApiFailure) => void) {
   apiFailureReporter = fn
@@ -651,6 +659,12 @@ export function setApiFailureReporter(fn: (f: ApiFailure) => void) {
 
 export const api = {
   meta: () => req<Meta>('GET', '/meta'),
+
+  // Deployment-configured link-tag rules (task_1243): a read-only list the UI uses to linkify
+  // custom references (e.g. CR-NNNN) in rendered content, generalizing the built-in typed-ref
+  // linkification. Empty when the deployment TOML configures none. Unwrapped to the bare list.
+  listLinkRules: () =>
+    req<{ link_rules: LinkRule[] }>('GET', '/system/link-rules').then((r) => r.link_rules ?? []),
 
   // Fire-and-forget UI crash telemetry; the backend returns the task it filed/bumped. Callers
   // (the crash reporter) swallow failures so reporting a crash can never itself crash the app.

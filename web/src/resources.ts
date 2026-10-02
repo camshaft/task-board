@@ -18,6 +18,7 @@ import {
   type ExternalIdentity,
   type ExternalLink,
   type IdentityAlias,
+  type LinkRule,
   type Person,
   type Project,
   type ProjectAccess,
@@ -71,10 +72,18 @@ const keys = {
   reviews: 'reviews',
   review: (id: number) => `review:${id}`,
   reviewTrend: 'reviewTrend',
+  // Deployment-configured custom link-tag rules (task_1243); static, so one cache entry.
+  linkRules: 'system:linkRules',
 }
 
 export function useProjects() {
   return useResource<Project[]>(keys.projects, () => api.listProjects())
+}
+
+// Deployment-configured custom link-tag rules (task_1243). Fetched once and shared app-wide via the
+// LinkRulesContext so every rendered-markdown surface linkifies the same custom patterns.
+export function useLinkRules() {
+  return useResource<LinkRule[]>(keys.linkRules, () => api.listLinkRules())
 }
 
 export function useAgents() {
