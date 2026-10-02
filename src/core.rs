@@ -1523,6 +1523,89 @@ pub async fn list_people(pool: &Pool) -> anyhow::Result<Value> {
     Ok(Value::Array(rows.iter().map(row_to_json).collect()))
 }
 
+// --- Per-operator concierge bindings (task_1259): person X -> handling agent (concierge-X). ---
+// A durable board projection of each per-operator concierge's metadata.operator pin, WRITTEN at
+// mint (hiring-manager) and READ by the routed-to-person reachability path. Default-preserving: a
+// person with NO row behaves exactly as before (a question routed to that person pings nobody and
+// is surfaced via the Awaiting queue). cameron stays intentionally unbound = the existing default.
+
+/// Upsert the binding person -> handling_agent. Idempotent / reconcile-on-reclaim: a re-call with
+/// the same or a new handling_agent is safe and simply refreshes the row.
+pub async fn bind_operator(
+    pool: &Pool,
+    person: &str,
+    handling_agent: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let person = person.trim();
+    let handling_agent = handling_agent.trim();
+    if person.is_empty() || handling_agent.is_empty() {
+        anyhow::bail!("bind_operator needs a non-empty person and handling_agent");
+    }
+    sqlx::query(
+        "INSERT INTO operator_bindings(person, handling_agent, written_by, updated_at) \
+         VALUES(?,?,?,?) ON CONFLICT(person) DO UPDATE SET \
+           handling_agent=excluded.handling_agent, written_by=excluded.written_by, \
+           updated_at=excluded.updated_at",
+    )
+    .bind(person)
+    .bind(handling_agent)
+    .bind(actor)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    get_operator_binding(pool, person)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("operator binding vanished after write"))
+}
+
+/// Clear a binding (idempotent -- OK if the person has no row). The person then falls back to the
+/// existing default handling (surfaced via the queue / the operator-team fan-out).
+pub async fn unbind_operator(
+    pool: &Pool,
+    person: &str,
+    _actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let person = person.trim();
+    let res = sqlx::query("DELETE FROM operator_bindings WHERE person=?")
+        .bind(person)
+        .execute(pool)
+        .await?;
+    Ok(json!({ "person": person, "cleared": res.rows_affected() > 0 }))
+}
+
+/// Read one binding, or None.
+pub async fn get_operator_binding(pool: &Pool, person: &str) -> anyhow::Result<Option<Value>> {
+    let row = sqlx::query("SELECT * FROM operator_bindings WHERE person=?")
+        .bind(person.trim())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_json))
+}
+
+/// All bindings (inspection), person-ordered.
+pub async fn list_operator_bindings(pool: &Pool) -> anyhow::Result<Value> {
+    let rows = sqlx::query("SELECT * FROM operator_bindings ORDER BY person")
+        .fetch_all(pool)
+        .await?;
+    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+}
+
+/// The handling agent bound to `person`, or None -- the in-tx read the routed-to resolver uses.
+async fn operator_binding_agent_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    person: &str,
+) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query("SELECT handling_agent FROM operator_bindings WHERE person=?")
+        .bind(person.trim())
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(match row {
+        Some(r) => Some(r.try_get("handling_agent")?),
+        None => None,
+    })
+}
+
 /// Create (or idempotently upsert) a team. `id` is a stable string handle (e.g. "operator").
 pub async fn create_team(
     pool: &Pool,
@@ -5253,7 +5336,14 @@ async fn resolve_routed_to_agents(
     Ok(match kind {
         "team" => resolve_team_principals_tx(tx, routed_to).await?.1,
         "agent" => BTreeSet::from([routed_to.to_string()]),
-        _ => BTreeSet::new(),
+        // A person normally has no board inbox and is surfaced via the Awaiting queue, not pinged.
+        // EXCEPTION (task_1259): if the person has a per-operator concierge binding, that handling
+        // agent IS pinged, so a question routed to a bound operator wakes their concierge. An
+        // UNBOUND person stays queue-only (empty set) -- the pre-binding behavior, unchanged.
+        _ => match operator_binding_agent_tx(tx, routed_to).await? {
+            Some(agent) => BTreeSet::from([agent]),
+            None => BTreeSet::new(),
+        },
     })
 }
 
@@ -12845,6 +12935,83 @@ mod tests {
         let again = check_notifications(&pool, "planner", true, 50, None).await?;
         assert_eq!(again["count"].as_i64(), Some(0), "should be drained");
 
+        Ok(())
+    }
+
+    /// Per-operator concierge binding (task_1259): bind/get/reconcile/unbind/list, and the
+    /// default-preserving routed-to-person override -- an UNBOUND person resolves to nobody
+    /// (the pre-binding behavior), a BOUND person resolves to its handling agent, and the
+    /// agent/team arms are untouched.
+    #[tokio::test]
+    async fn operator_binding_overrides_routed_to_person_default_preserving() -> anyhow::Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("board.db");
+        let pool = crate::db::init(db_path.to_str().unwrap()).await?;
+
+        // No binding yet: get is None, and a routed-to-person resolves to NOBODY (regression guard:
+        // the pre-task_1259 behavior -- a person is surfaced via the queue, not pinged).
+        assert!(get_operator_binding(&pool, "zyork").await?.is_none());
+        {
+            let mut tx = pool.begin().await?;
+            let r = resolve_routed_to_agents(&mut tx, "zyork", "person").await?;
+            assert!(r.is_empty(), "an unbound person must resolve to no agents");
+        }
+
+        // Bind, then get returns the row, and the routed-to-person override now pings the agent.
+        let bound =
+            bind_operator(&pool, "zyork", "concierge-zyork", Some("hiring-manager")).await?;
+        assert_eq!(bound["handling_agent"], json!("concierge-zyork"));
+        assert_eq!(bound["written_by"], json!("hiring-manager"));
+        assert_eq!(
+            get_operator_binding(&pool, "zyork").await?.unwrap()["handling_agent"],
+            json!("concierge-zyork")
+        );
+        {
+            let mut tx = pool.begin().await?;
+            let r = resolve_routed_to_agents(&mut tx, "zyork", "person").await?;
+            assert_eq!(r, BTreeSet::from(["concierge-zyork".to_string()]));
+        }
+
+        // Reconcile-on-reclaim: a re-bind to a different agent updates in place (idempotent upsert).
+        bind_operator(&pool, "zyork", "concierge-zyork-2", Some("hiring-manager")).await?;
+        assert_eq!(
+            get_operator_binding(&pool, "zyork").await?.unwrap()["handling_agent"],
+            json!("concierge-zyork-2")
+        );
+
+        // The agent + team arms are unaffected by the binding override.
+        {
+            let mut tx = pool.begin().await?;
+            assert_eq!(
+                resolve_routed_to_agents(&mut tx, "some-agent", "agent").await?,
+                BTreeSet::from(["some-agent".to_string()])
+            );
+        }
+
+        // list shows the binding; unbind clears it and the person reverts to the default (nobody).
+        assert_eq!(
+            list_operator_bindings(&pool)
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let cleared = unbind_operator(&pool, "zyork", None).await?;
+        assert_eq!(cleared["cleared"], json!(true));
+        assert!(get_operator_binding(&pool, "zyork").await?.is_none());
+        {
+            let mut tx = pool.begin().await?;
+            assert!(resolve_routed_to_agents(&mut tx, "zyork", "person")
+                .await?
+                .is_empty());
+        }
+        // Unbind is idempotent: clearing an absent row is a no-op, not an error.
+        assert_eq!(
+            unbind_operator(&pool, "zyork", None).await?["cleared"],
+            json!(false)
+        );
         Ok(())
     }
 

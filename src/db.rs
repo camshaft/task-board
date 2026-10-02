@@ -497,6 +497,18 @@ CREATE TABLE IF NOT EXISTS board_settings (
     updated_at TEXT NOT NULL,
     updated_by TEXT
 );
+-- Per-operator concierge binding (task_1259): person X -> the agent that handles X (concierge-X).
+-- Additive + default-preserving: a question routed to a PERSON resolves to the bound handling agent
+-- when a row exists, else the existing default (no row => unchanged behavior). The metadata.operator
+-- pin on each per-operator concierge instance is the SOURCE that drives the write (hiring-manager at
+-- mint); this row is the durable board projection the reachability path reads, so an operator stays
+-- reachable even when its concierge instance is bounced. One handling agent per person.
+CREATE TABLE IF NOT EXISTS operator_bindings (
+    person         TEXT PRIMARY KEY,
+    handling_agent TEXT NOT NULL,
+    written_by     TEXT,
+    updated_at     TEXT NOT NULL
+);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
