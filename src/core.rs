@@ -15,6 +15,79 @@ use std::time::Duration;
 
 use regex::Regex;
 
+/// A typed board error carrying an HTTP-agnostic status class alongside its message (task_751).
+/// The operator flagged the old pattern -- anyhow+bail everywhere, then STRING-MATCHING the message
+/// at the HTTP boundary to pick a status code -- as fragile ("janky af"). A `BoardError` lets a core
+/// bail carry its intended status explicitly, so the api layer maps the status directly instead of
+/// matching on text. It stays HTTP-agnostic (an [`ErrorStatus`] class, not an axum StatusCode) to
+/// keep core free of the web layer; api maps the class to a concrete code. It is a normal
+/// `std::error::Error`, so it rides inside `anyhow::Error` (bail!/`?`), and the boundary recovers it
+/// with `downcast_ref`. Migration is incremental (strangler): a bail that has been converted keys on
+/// the typed status; the string classifier remains the fallback for not-yet-converted sites.
+// NotFound/Forbidden/Unavailable are matched exhaustively at the api boundary but only BadRequest is
+// *constructed* so far; the rest are the strangler's complete status vocabulary and get constructed as
+// more bail sites migrate off the string classifier.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorStatus {
+    /// Client input is invalid/rejected -> 400.
+    BadRequest,
+    /// The named resource does not exist -> 404.
+    NotFound,
+    /// Not authorized for this action (e.g. a bad capability token) -> 403.
+    Forbidden,
+    /// A dependency is configured-absent or transiently unavailable, retryable -> 503.
+    Unavailable,
+}
+
+/// See [`ErrorStatus`]. Construct with the helpers ([`BoardError::bad_request`] etc.) and return it
+/// through `anyhow` (e.g. `anyhow::bail!(BoardError::bad_request(msg))`).
+#[derive(Debug, Clone)]
+pub struct BoardError {
+    pub status: ErrorStatus,
+    pub message: String,
+}
+
+impl BoardError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: ErrorStatus::BadRequest,
+            message: message.into(),
+        }
+    }
+    #[allow(dead_code)]
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: ErrorStatus::NotFound,
+            message: message.into(),
+        }
+    }
+    #[allow(dead_code)]
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: ErrorStatus::Forbidden,
+            message: message.into(),
+        }
+    }
+    #[allow(dead_code)]
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: ErrorStatus::Unavailable,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BoardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The message alone, so an un-downcast path (string classifier / logging) sees the same text
+        // it always did -- the typed status is additive, never changes the rendered message.
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BoardError {}
+
 /// Convert a dynamically-typed SQLite row into a JSON object, matching how the Python
 /// `sqlite3.Row` -> dict conversion behaves (ints, floats, text, null).
 pub fn row_to_json(row: &SqliteRow) -> Value {
@@ -847,13 +920,15 @@ pub async fn resolve_agent(pool: &Pool, name: &str) -> anyhow::Result<Value> {
             .filter_map(|r| r.try_get::<String, _>("id").ok())
             .collect();
     match ids.len() {
-        0 => anyhow::bail!("no agent matches '{name}' (no exact id and no substring match)"),
+        0 => anyhow::bail!(BoardError::bad_request(format!(
+            "no agent matches '{name}' (no exact id and no substring match)"
+        ))),
         1 => Ok(json!({ "name": name, "id": ids[0], "match": "unique-substring" })),
-        _ => anyhow::bail!(
+        _ => anyhow::bail!(BoardError::bad_request(format!(
             "'{name}' is ambiguous: it matches {} agents by substring ({}). Pass the exact agent id.",
             ids.len(),
             ids.join(", ")
-        ),
+        ))),
     }
 }
 
@@ -2825,13 +2900,13 @@ pub async fn update_task(
                 .await?
                 .is_some();
                 if !has_operator_question {
-                    anyhow::bail!(
+                    anyhow::bail!(BoardError::bad_request(
                         "blocked_on=operator requires an actual ask: this task carries no open \
                          blocking question routed to the operator. Pose the decision you need first \
                          (pose_question routed_to=operator, blocking=true), then set the \
                          operator-block (task_1150: you can't just block the operator -- you must \
                          have a question the operator can act on)."
-                    );
+                    ));
                 }
             }
         }
@@ -7022,7 +7097,7 @@ pub async fn send_message(
     // The route-via-concierge norm is now seeded fleet-wide (seed-before-flip gate met), so this is a
     // mistake to stop, not merely flag.
     if let Some(reason) = dm_limbo_block_reason(pool, from_agent, to_agent).await? {
-        anyhow::bail!(reason);
+        anyhow::bail!(BoardError::bad_request(reason));
     }
     let mut tx = pool.begin().await?;
     let cid = dm_channel(&mut tx, from_agent, to_agent).await?;
@@ -25312,5 +25387,25 @@ mod tests {
             "only the two active dupes count, not done/iceboxed: {res:#?}"
         );
         Ok(())
+    }
+
+    /// task_751: a BoardError carries its status class through anyhow (so the HTTP boundary can map
+    /// it directly instead of string-matching) while its Display stays the bare message (so the
+    /// not-yet-migrated string classifier + logs are unaffected).
+    #[test]
+    fn board_error_carries_status_through_anyhow() {
+        let e: anyhow::Error = BoardError::bad_request("bad input").into();
+        assert_eq!(e.to_string(), "bad input", "Display is the bare message");
+        let be = e
+            .downcast_ref::<BoardError>()
+            .expect("recovers the typed BoardError");
+        assert_eq!(be.status, ErrorStatus::BadRequest);
+        assert_eq!(be.message, "bad input");
+        assert_eq!(BoardError::not_found("x").status, ErrorStatus::NotFound);
+        assert_eq!(BoardError::forbidden("x").status, ErrorStatus::Forbidden);
+        assert_eq!(
+            BoardError::unavailable("x").status,
+            ErrorStatus::Unavailable
+        );
     }
 }

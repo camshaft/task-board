@@ -71,7 +71,17 @@ struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let msg = self.0.to_string();
-        let code = if msg.starts_with("no project")
+        // task_751: a typed core::BoardError carries its intended status explicitly -- map it
+        // directly, no string-matching. The string classifier below stays as the fallback for bails
+        // not yet converted to BoardError (incremental strangler migration).
+        let code = if let Some(be) = self.0.downcast_ref::<core::BoardError>() {
+            match be.status {
+                core::ErrorStatus::BadRequest => StatusCode::BAD_REQUEST,
+                core::ErrorStatus::NotFound => StatusCode::NOT_FOUND,
+                core::ErrorStatus::Forbidden => StatusCode::FORBIDDEN,
+                core::ErrorStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            }
+        } else if msg.starts_with("no project")
             || msg.starts_with("no task")
             || msg.starts_with("no agent")
             || msg.starts_with("no document")
@@ -108,13 +118,6 @@ impl IntoResponse for ApiError {
             || msg.starts_with("answer shape")
             || msg.starts_with("invalid `response_schema`")
             || msg.starts_with("invalid `default`")
-            // task_1164: a DM to a limbo human is refused -- a bad recipient, a client error.
-            || msg.starts_with("cannot DM ")
-            // task_1150: an operator-block with no routed question is refused -- client input error.
-            || msg.contains("requires an actual ask")
-            // task_1251: resolve_agent on an ambiguous or unknown name -- a client input error.
-            || msg.contains("is ambiguous:")
-            || msg.starts_with("no agent matches ")
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
@@ -4091,6 +4094,44 @@ mod tests {
         // a resource -> a 4xx client error (a path-deserialize rejection), never a 200.
         let resp = get(format!("/tasks/doc_{tid}")).await;
         assert!(resp.status().is_client_error(), "got {}", resp.status());
+        Ok(())
+    }
+
+    /// task_751: an ambiguous resolve_agent returns 400 via the typed core::BoardError downcast at
+    /// the boundary (its string-classifier arm was removed in the same change), proving the typed
+    /// path maps the status without string-matching.
+    #[tokio::test]
+    async fn resolve_agent_ambiguous_is_400_via_board_error() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        core::register_agent(&pool, "v-foo", None, None, None, None, None).await?;
+        core::register_agent(&pool, "v-foo-helper", None, None, None, None, None).await?;
+        let (events_tx, _rx) = broadcast::channel(16);
+        let state = AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
+        };
+        // "foo" substring-matches BOTH v-foo and v-foo-helper and is not an exact id -> ambiguous.
+        let resp = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/resolve-agent?name=foo")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "ambiguous resolve_agent must be a 400 via BoardError"
+        );
         Ok(())
     }
 
