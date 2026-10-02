@@ -1921,6 +1921,10 @@ async fn set_task_props(
 #[derive(Deserialize, JsonSchema)]
 struct MoveTaskBody {
     to_project_id: i64,
+    /// Move the task's whole subtree with it (epic + descendants, links preserved). Required for a
+    /// task that has children or a parent; default false.
+    #[serde(default)]
+    cascade: Option<bool>,
     #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
 }
@@ -1931,7 +1935,14 @@ async fn move_task(
     Json(b): Json<MoveTaskBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::move_task(&st.pool, task_id, b.to_project_id, b.actor.as_deref()).await?,
+        core::move_task(
+            &st.pool,
+            task_id,
+            b.to_project_id,
+            b.cascade.unwrap_or(false),
+            b.actor.as_deref(),
+        )
+        .await?,
     ))
 }
 

@@ -3011,11 +3011,16 @@ pub async fn update_task(
 /// Reparent a task onto a different project. Emits `task.moved` (carrying both the old and
 /// new project ids in its data) so subscribers on either project — and the live UI — learn
 /// the task left one board column set and joined another. No-op-safe: moving a task onto its
-/// current project just returns it unchanged.
+/// current project just returns it unchanged. With `cascade=true`, a task that has children
+/// (an epic) or a parent moves its WHOLE subtree atomically — every descendant moves with it,
+/// preserving the internal parent/child links, and the moved root is detached from any parent
+/// that stays behind — so relocating an epic is one call, not a manual detach/move/reattach
+/// dance (task_1235). Without cascade, a parented or child-bearing task is rejected as before.
 pub async fn move_task(
     pool: &Pool,
     task_id: i64,
     to_project_id: i64,
+    cascade: bool,
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
     let ts = now_iso();
@@ -3030,7 +3035,6 @@ pub async fn move_task(
         anyhow::bail!("no task {task_id}");
     };
     let from_project_id: i64 = old.try_get("project_id")?;
-    let title: Option<String> = old.try_get("title")?;
 
     if sqlx::query("SELECT 1 FROM projects WHERE id=?")
         .bind(to_project_id)
@@ -3049,44 +3053,78 @@ pub async fn move_task(
         return Ok(out);
     }
 
-    // Nesting is per-project, so a task tangled in a parent/child relationship can't cross
-    // projects — reject with guidance to unlink first (clear the parent / move children).
+    // Nesting is per-project: a subtree always lives in one project. Without cascade, a task tangled
+    // in a parent/child relationship can't cross projects alone -- reject with guidance. With
+    // cascade=true the whole subtree moves together (preserving internal parent/child links) in one
+    // call, so relocating an epic is atomic rather than a detach/move/reattach dance (task_1235).
     let parent: Option<i64> = old.try_get("parent_id")?;
-    if parent.is_some() {
-        anyhow::bail!(
-            "cannot move task {task_id} to another project while it has a parent — clear its parent (parent_id=0) first"
-        );
-    }
     let child_count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM tasks WHERE parent_id=?")
         .bind(task_id)
         .fetch_one(&mut *tx)
         .await?
         .try_get("n")?;
-    if child_count > 0 {
-        anyhow::bail!(
-            "cannot move task {task_id} to another project while it has {child_count} child task(s) — reparent them first"
-        );
+    if !cascade {
+        if parent.is_some() {
+            anyhow::bail!(
+                "cannot move task {task_id} to another project while it has a parent — clear its parent (parent_id=0) first, or pass cascade=true to move its subtree with it"
+            );
+        }
+        if child_count > 0 {
+            anyhow::bail!(
+                "cannot move task {task_id} to another project while it has {child_count} child task(s) — reparent them first, or pass cascade=true to move the whole subtree atomically"
+            );
+        }
     }
 
-    sqlx::query("UPDATE tasks SET project_id=?, updated_at=? WHERE id=?")
-        .bind(to_project_id)
-        .bind(&ts)
-        .bind(task_id)
-        .execute(&mut *tx)
-        .await?;
-    emit(
-        &mut tx,
-        &mut hooks,
-        "task.moved",
-        actor,
-        Some(task_id),
-        Some(to_project_id),
-        None,
-        None,
-        json!({ "from_project_id": from_project_id, "to_project_id": to_project_id, "title": title }),
-        Recipients::FromTask,
+    // The subtree rooted at this task (the task + all descendants). Non-cascade reaches here only as
+    // a lone task (no parent, no children, guarded above), so this is just [task_id].
+    let subtree_rows = sqlx::query(
+        "WITH RECURSIVE subtree(id) AS ( \
+            SELECT ? UNION ALL SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id \
+         ) \
+         SELECT tk.id AS id, tk.title AS title, tk.project_id AS old_project \
+         FROM subtree s JOIN tasks tk ON tk.id = s.id",
     )
+    .bind(task_id)
+    .fetch_all(&mut *tx)
     .await?;
+
+    // The moved root can no longer sit under a parent that stays in the old project, so cascade
+    // detaches it (it becomes top-level in the destination); descendants keep their parent links.
+    if cascade && parent.is_some() {
+        sqlx::query("UPDATE tasks SET parent_id=NULL, updated_at=? WHERE id=?")
+            .bind(&ts)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Relocate every node in the subtree, emitting task.moved per node so per-project routers and
+    // subscribers (via the `moved` event class) see each task entering its new project.
+    for row in &subtree_rows {
+        let node_id: i64 = row.try_get("id")?;
+        let node_title: Option<String> = row.try_get("title")?;
+        let node_from: i64 = row.try_get("old_project")?;
+        sqlx::query("UPDATE tasks SET project_id=?, updated_at=? WHERE id=?")
+            .bind(to_project_id)
+            .bind(&ts)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.moved",
+            actor,
+            Some(node_id),
+            Some(to_project_id),
+            None,
+            None,
+            json!({ "from_project_id": node_from, "to_project_id": to_project_id, "title": node_title }),
+            Recipients::FromTask,
+        )
+        .await?;
+    }
     let out = fetch_one_json(&mut tx, "SELECT * FROM tasks WHERE id=?", task_id)
         .await?
         .unwrap_or(Value::Null);
@@ -16193,11 +16231,129 @@ mod tests {
             .any(|e| e["type"] == json!("task.reparented")));
 
         // move_task guard: the epic still has a child -> cannot cross projects.
-        assert!(move_task(&pool, eid, pid2, Some("u")).await.is_err());
+        assert!(move_task(&pool, eid, pid2, false, Some("u")).await.is_err());
         // c2 is now top-level with no children -> it can move.
         assert_eq!(
-            move_task(&pool, c2id, pid2, Some("u")).await?["project_id"],
+            move_task(&pool, c2id, pid2, false, Some("u")).await?["project_id"],
             json!(pid2)
+        );
+        Ok(())
+    }
+
+    /// task_1235: move_task(cascade=true) relocates a WHOLE epic subtree in one call -- every
+    /// descendant moves to the new project, the internal parent/child links are preserved, and the
+    /// moved root is detached from any parent left behind -- instead of a manual detach/move/reattach
+    /// dance. Without cascade, a parented or child-bearing task is still rejected.
+    #[tokio::test]
+    async fn move_task_cascade_moves_the_whole_subtree() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let a = create_project(&pool, "A", None, Some("u"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let b = create_project(&pool, "B", None, Some("u"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        // Epic E in A: children C1, C2; grandchild G under C1.
+        let e = create_task(
+            &pool,
+            a,
+            "epic",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let c1 = create_task(
+            &pool,
+            a,
+            "c1",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(e),
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let c2 = create_task(
+            &pool,
+            a,
+            "c2",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(e),
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let g = create_task(
+            &pool,
+            a,
+            "g",
+            None,
+            None,
+            None,
+            Some("u"),
+            None,
+            Some(c1),
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // Non-cascade: the epic has children -> rejected (the task_1235 friction).
+        assert!(move_task(&pool, e, b, false, Some("u")).await.is_err());
+
+        // Cascade: one call relocates the whole subtree to B.
+        let moved = move_task(&pool, e, b, true, Some("u")).await?;
+        assert_eq!(moved["project_id"], json!(b));
+        for id in [e, c1, c2, g] {
+            let proj: i64 = sqlx::query("SELECT project_id FROM tasks WHERE id=?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await?
+                .try_get("project_id")?;
+            assert_eq!(proj, b, "subtree task {id} moved to B");
+        }
+        // Internal parent/child links preserved; the root carries no parent.
+        let parent_of = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("SELECT parent_id FROM tasks WHERE id=?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await?
+                    .try_get::<Option<i64>, _>("parent_id")
+                    .map_err(anyhow::Error::from)
+            }
+        };
+        assert_eq!(parent_of(c1).await?, Some(e), "c1 still under the epic");
+        assert_eq!(parent_of(c2).await?, Some(e), "c2 still under the epic");
+        assert_eq!(parent_of(g).await?, Some(c1), "grandchild still under c1");
+        assert_eq!(parent_of(e).await?, None, "epic root has no parent");
+
+        // A CHILD moved with cascade detaches from its (cross-project) parent and becomes top-level.
+        let moved_c2 = move_task(&pool, c2, a, true, Some("u")).await?;
+        assert_eq!(moved_c2["project_id"], json!(a));
+        assert_eq!(
+            parent_of(c2).await?,
+            None,
+            "a cascade-moved child detaches from its cross-project parent"
         );
         Ok(())
     }
@@ -16980,7 +17136,7 @@ mod tests {
         .await?;
         let tid = t["id"].as_i64().unwrap();
 
-        let moved = move_task(&pool, tid, bid, Some("u")).await?;
+        let moved = move_task(&pool, tid, bid, false, Some("u")).await?;
         assert_eq!(moved["project_id"], json!(bid));
         // It now lists under B, not A.
         assert_eq!(
@@ -17045,7 +17201,7 @@ mod tests {
             .as_array()
             .unwrap()
             .len();
-        move_task(&pool, tid, bid, Some("u")).await?;
+        move_task(&pool, tid, bid, false, Some("u")).await?;
         let after = get_events(&pool, 0, 100, None, false)
             .await?
             .as_array()
@@ -17096,7 +17252,7 @@ mod tests {
         let tid = t["id"].as_i64().unwrap();
 
         // Triage moves it to its real project.
-        let moved = move_task(&pool, tid, real, Some("triage")).await?;
+        let moved = move_task(&pool, tid, real, false, Some("triage")).await?;
         assert_eq!(moved["project_id"], json!(real));
 
         // The external_link survives the move: still exactly one link, same (source, external_id,
@@ -18139,7 +18295,7 @@ mod tests {
         )
         .await?;
         let tid = t["id"].as_i64().unwrap();
-        assert!(move_task(&pool, tid, 9999, Some("u")).await.is_err());
+        assert!(move_task(&pool, tid, 9999, false, Some("u")).await.is_err());
         Ok(())
     }
 
