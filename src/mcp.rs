@@ -1404,6 +1404,56 @@ pub struct GetCommentArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct AnnotateCommentArgs {
+    /// The task comment this annotation anchors to.
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub comment_id: i64,
+    pub body: String,
+    /// Who is annotating (your agent id). `agent_id`/`actor` are accepted as aliases.
+    #[serde(
+        rename = "principal",
+        alias = "author",
+        default,
+        alias = "agent_id",
+        alias = "actor"
+    )]
+    pub author: Option<String>,
+    /// Free-form JSON anchor selecting a span of the comment (e.g. W3C/Hypothesis TextQuote +
+    /// TextPosition). Stored verbatim; omit for an annotation on the whole comment.
+    #[serde(default)]
+    pub region: Option<JsonObject>,
+    /// Thread this annotation under another (one-level).
+    #[serde(default)]
+    pub reply_to: Option<i64>,
+    /// Optional external identity id (e.g. "slack:U123") to attribute this annotation to — for an
+    /// ingested human. `author` stays the fleet agent (you) that performed the write.
+    #[serde(default)]
+    pub external_author: Option<String>,
+    /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub acknowledge_banned: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveCommentAnnotationArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub annotation_id: i64,
+    #[serde(rename = "principal", alias = "actor", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetCommentAnnotationsArgs {
+    #[serde(deserialize_with = "de_i64_lenient")]
+    pub comment_id: i64,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PoseQuestionArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub task_id: i64,
@@ -3109,6 +3159,56 @@ impl Board {
         Parameters(a): Parameters<GetDocumentCommentsArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_document_comments(&self.pool, a.document_id, a.version_id, s(&a.status))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Annotate a task comment, optionally anchored to a highlighted span of it (doc-comment style). `region` is a free-form JSON selector object (e.g. W3C/Hypothesis TextQuote + TextPosition) stored verbatim — omit it to annotate the whole comment. `reply_to` threads under another annotation. Auto-subscribes you to the parent task and notifies its watchers."
+    )]
+    async fn annotate_comment(
+        &self,
+        Parameters(a): Parameters<AnnotateCommentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::check_content(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
+            .await
+            .map_err(err)?;
+        core::annotate_comment(
+            &self.pool,
+            a.comment_id,
+            s(&a.author),
+            &a.body,
+            a.region.map(Value::Object),
+            a.reply_to,
+            s(&a.external_author),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Mark a comment annotation resolved (open -> resolved). Notifies the parent task's watchers."
+    )]
+    async fn resolve_comment_annotation(
+        &self,
+        Parameters(a): Parameters<ResolveCommentAnnotationArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::resolve_comment_annotation(&self.pool, a.annotation_id, s(&a.actor))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "List a task comment's annotations (oldest first), optionally filtered by status (open / resolved)."
+    )]
+    async fn get_comment_annotations(
+        &self,
+        Parameters(a): Parameters<GetCommentAnnotationsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_comment_annotations(&self.pool, a.comment_id, s(&a.status))
             .await
             .map_err(err)
             .and_then(ok)

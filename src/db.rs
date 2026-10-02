@@ -185,6 +185,23 @@ CREATE TABLE IF NOT EXISTS document_comments (
     created_at  TEXT NOT NULL,
     external_author TEXT
 );
+-- Anchored annotations on a TASK comment (task_1033): the doc-comment pattern applied to a
+-- comment thread, so a user can highlight a span of a comment and attach a note to it. `region`
+-- is a JSON string of W3C/Hypothesis-style selectors (NULL = an annotation on the whole comment).
+-- The anchor pins to the immutable comment id (task comment bodies are never edited in place --
+-- an edit is a superseding comment), so a span selector into that frozen body stays valid.
+-- `reply_to` gives one-level threading; `status` (open/resolved) drives the resolve affordance.
+CREATE TABLE IF NOT EXISTS comment_annotations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    comment_id  INTEGER NOT NULL REFERENCES comments(id),
+    author      TEXT,
+    body        TEXT NOT NULL,
+    region      TEXT,
+    status      TEXT NOT NULL DEFAULT 'open',
+    reply_to    INTEGER REFERENCES comment_annotations(id),
+    created_at  TEXT NOT NULL,
+    external_author TEXT
+);
 -- Many-to-many links between documents and tasks (a design doc can back several tasks).
 CREATE TABLE IF NOT EXISTS document_attachments (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
