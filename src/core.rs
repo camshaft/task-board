@@ -6723,16 +6723,18 @@ pub async fn check_notifications(
 /// `message.direct` event (post_to_channel derives that type for DM channels) delivered to
 /// the recipient's inbox, and get_messages still reads it. The event now also carries the
 /// pair's channel_id, so the conversation has a durable home a client can page through.
-/// task_1164: a WARN-level advisory when a non-concierge sender DMs a human identity that sits in
-/// limbo -- a person record with no draining agent loop and no Slack bridge -- so the DM does not
+/// task_1164 (REJECT flip): the reason a non-concierge DM to a human identity in limbo -- a person
+/// record with no draining agent loop and no Slack bridge -- must be REFUSED, so the DM cannot
 /// silently vanish into an unmonitored inbox (the review-bypass repro). Keyed on REACHABILITY, not
 /// personhood: concierge (the operator-liaison) is exempt, an agent recipient has a draining loop,
 /// and a bridged person (metadata.slack_dm / metadata.bridged set) is reachable; only an un-bridged,
 /// non-agent person triggers it. The recipient is alias-resolved first so DMing "operator" is caught
-/// as DMing its canonical person. WARN only for now -- the message is still delivered -- becoming a
-/// hard reject once operator-directed messages route through concierge (seed-before-flip, task_1100
-/// lesson). The exact bridge flag is coordinated with the slack_dm bridge work (option b).
-async fn dm_limbo_warning(
+/// as DMing its canonical person. Returns Some(reason) when the DM must be rejected, None when it is
+/// allowed. This is the hard-reject flip of the former WARN (camshaft/task-board#339): the
+/// seed-before-flip gate is met -- every looping agent's kickoff now carries the route-via-concierge
+/// norm (task_1164/task_1178), so operator-directed comms go through concierge and a direct limbo DM
+/// is a mistake to stop, not merely flag. The bridge flag is coordinated with the slack_dm work.
+async fn dm_limbo_block_reason(
     pool: &Pool,
     from_agent: &str,
     to_agent: &str,
@@ -6780,9 +6782,9 @@ async fn dm_limbo_warning(
         return Ok(None);
     }
     Ok(Some(format!(
-        "{canonical} is a human identity with no monitored inbox (no agent loop or Slack bridge), so \
-         this direct message may sit unseen. Route operator-directed messages through concierge, the \
-         operator-liaison. (task_1164 advisory; this becomes an error once routing is in place.)"
+        "cannot DM {canonical}: it is a human identity with no monitored inbox (no agent loop or \
+         Slack bridge), so the message would sit unseen. Route operator-directed messages through \
+         concierge, the operator-liaison, or pose a question routed_to=operator. (task_1164)"
     )))
 }
 
@@ -6792,19 +6794,20 @@ pub async fn send_message(
     to_agent: &str,
     body: &str,
 ) -> anyhow::Result<Value> {
-    // task_1164: compute the limbo advisory before delivering (WARN mode -- still delivers).
-    let warning = dm_limbo_warning(pool, from_agent, to_agent).await?;
+    // task_1164 (REJECT flip): refuse a non-concierge DM to a limbo human (no agent loop, no Slack
+    // bridge) BEFORE creating the channel or delivering -- it would vanish into an unmonitored inbox.
+    // The route-via-concierge norm is now seeded fleet-wide (seed-before-flip gate met), so this is a
+    // mistake to stop, not merely flag.
+    if let Some(reason) = dm_limbo_block_reason(pool, from_agent, to_agent).await? {
+        anyhow::bail!(reason);
+    }
     let mut tx = pool.begin().await?;
     let cid = dm_channel(&mut tx, from_agent, to_agent).await?;
     tx.commit().await?;
     // post_to_channel opens its own transaction; the DM channel is committed above so it's
     // visible. Emits message.direct to the recipient (FromChannel minus the sender).
     post_to_channel(pool, cid, from_agent, body, None, None).await?;
-    let mut out = json!({ "to": to_agent, "channel_id": cid, "delivered": true });
-    if let (Value::Object(ref mut m), Some(w)) = (&mut out, warning) {
-        m.insert("warning".into(), json!(w));
-    }
-    Ok(out)
+    Ok(json!({ "to": to_agent, "channel_id": cid, "delivered": true }))
 }
 
 /// Get (or create) the private 1:1 DM channel for a pair of agents, returning the channel with
@@ -24484,10 +24487,10 @@ mod tests {
         assert_eq!(page_json_array(json!({"a": 1}), 0, 2), json!({"a": 1}));
     }
 
-    /// task_1164: a non-concierge DM to an un-bridged human (a person with no agent loop) carries a
-    /// limbo warning; concierge, an agent recipient, and a bridged person do not.
+    /// task_1164 (REJECT flip): a non-concierge DM to an un-bridged human (a person with no agent
+    /// loop) is REJECTED; concierge, an agent recipient, and a bridged person are allowed through.
     #[tokio::test]
-    async fn send_message_warns_on_human_limbo() -> anyhow::Result<()> {
+    async fn send_message_rejects_human_limbo() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
@@ -24503,22 +24506,23 @@ mod tests {
         )
         .await?;
 
-        // non-concierge -> un-bridged person: warned (but still delivered).
-        let r = send_message(&pool, "alice", "human1", "hi").await?;
-        assert_eq!(r["delivered"], json!(true));
+        // non-concierge -> un-bridged person: REJECTED (never delivered).
+        let e = send_message(&pool, "alice", "human1", "hi")
+            .await
+            .expect_err("a limbo DM must be rejected");
         assert!(
-            r.get("warning").and_then(Value::as_str).is_some(),
-            "a limbo DM warns: {r}"
+            e.to_string().starts_with("cannot DM "),
+            "unexpected error: {e}"
         );
-        // concierge (operator-liaison) is exempt.
+        // concierge (operator-liaison) is exempt: delivered.
         let r = send_message(&pool, "concierge", "human1", "hi").await?;
-        assert!(r.get("warning").is_none(), "concierge is exempt: {r}");
-        // an agent recipient has a draining loop: no warning.
+        assert_eq!(r["delivered"], json!(true), "concierge is exempt: {r}");
+        // an agent recipient has a draining loop: delivered.
         let r = send_message(&pool, "alice", "bob", "hi").await?;
-        assert!(r.get("warning").is_none(), "agent recipient not limbo: {r}");
-        // a bridged person is reachable: no warning.
+        assert_eq!(r["delivered"], json!(true), "agent recipient allowed: {r}");
+        // a bridged person is reachable: delivered.
         let r = send_message(&pool, "alice", "human2", "hi").await?;
-        assert!(r.get("warning").is_none(), "bridged person not limbo: {r}");
+        assert_eq!(r["delivered"], json!(true), "bridged person allowed: {r}");
         Ok(())
     }
 }

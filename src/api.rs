@@ -108,6 +108,10 @@ impl IntoResponse for ApiError {
             || msg.starts_with("answer shape")
             || msg.starts_with("invalid `response_schema`")
             || msg.starts_with("invalid `default`")
+            // task_1164: a DM to a limbo human is refused -- a bad recipient, a client error.
+            || msg.starts_with("cannot DM ")
+            // task_1150: an operator-block with no routed question is refused -- client input error.
+            || msg.contains("requires an actual ask")
         {
             // Client-input validation errors (bad request), not server faults.
             StatusCode::BAD_REQUEST
