@@ -614,22 +614,10 @@ export const api = {
     const qs = p.toString()
     return req<TaskSummary[]>('GET', `/tasks${qs ? `?${qs}` : ''}`)
   },
-  // Tasks with an OPEN BLOCKING question routed to `viewer` (team-expanded) — the question-based
-  // "waiting on you" view (task_629 slice 3). Each is a task summary; open it to see/answer the
-  // question. CID-independent (routing-based), so safe regardless of the type-keying rework.
-  listTasksBlockingMe: (
-    viewer: string,
-    q: { project_id?: number; include_archived?: boolean } = {},
-  ) => {
-    const p = new URLSearchParams({ viewer })
-    if (q.project_id != null) p.set('project_id', String(q.project_id))
-    if (q.include_archived) p.set('include_archived', 'true')
-    return req<TaskSummary[]>('GET', `/tasks/blocking-me?${p.toString()}`)
-  },
   // The unified "awaiting you" queue (task_860): tasks blocked_on `viewer` UNION tasks with an open
   // blocking question routed to it, keyed independent of assignee + team-expanded + deduped. Each row
   // is task-centric with its open questions nested as full comment objects (so they render + answer
-  // inline). Supersedes listTasksBlockingMe.
+  // inline).
   listAwaiting: (viewer: string, q: { project_id?: number; include_archived?: boolean } = {}) => {
     const p = new URLSearchParams({ viewer })
     if (q.project_id != null) p.set('project_id', String(q.project_id))

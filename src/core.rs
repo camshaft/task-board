@@ -3120,66 +3120,6 @@ async fn principals_routing_to(pool: &Pool, viewer: &str) -> anyhow::Result<BTre
     Ok(out)
 }
 
-/// The "waiting on me" view for derived question-blocks (task_628 slice 3, doc_33 A5): tasks with an
-/// open blocking question routed (doc_26-expanded) to `viewer`. The analogue of the scalar
-/// `list_tasks(blocked_on_kind='agent', blocked_on_ref=viewer)` view -- a question routed to a TEAM
-/// surfaces for every (transitive) member, one routed directly to the viewer matches as-is, and it
-/// works for any principal (agent-to-agent included), not just the operator. Honors `project_id` +
-/// `include_archived` and returns the same row shape (+ monitor_exempt / assignee reachability) as
-/// `list_tasks`, so a caller can union this array with a scalar-blocked `list_tasks` result directly.
-pub async fn list_tasks_blocking_me(
-    pool: &Pool,
-    viewer: &str,
-    project_id: Option<i64>,
-    include_archived: bool,
-) -> anyhow::Result<Value> {
-    // Precompute (in Rust, since team expansion is not expressible in SQL) the principals whose
-    // routed_to would surface for this viewer, then match them with a plain IN (...) in the EXISTS.
-    let routed = principals_routing_to(pool, viewer).await?;
-    let placeholders = std::iter::repeat_n("?", routed.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut conds: Vec<String> = Vec::new();
-    if !include_archived {
-        conds.push("archived_at IS NULL".into());
-    }
-    if project_id.is_some() {
-        conds.push("project_id=?".into());
-    }
-    conds.push(format!(
-        "EXISTS (SELECT 1 FROM comments c WHERE c.task_id = tasks.id AND c.{OPEN_BLOCKING_QUESTION} \
-         AND json_extract(c.payload,'$.routed_to') IN ({placeholders}))"
-    ));
-    let q = format!(
-        "SELECT id, project_id, title, status, assignee, priority, parent_id, updated_at, \
-         blocked_on_kind, blocked_on_ref, json_extract(metadata, '$.monitor_exempt') AS monitor_exempt \
-         FROM tasks WHERE {} ORDER BY id",
-        conds.join(" AND "),
-    );
-    // Bind order mirrors the cond order: project_id (if any), then the routed principals.
-    let mut query = sqlx::query(&q);
-    if let Some(pid) = project_id {
-        query = query.bind(pid);
-    }
-    for p in &routed {
-        query = query.bind(p);
-    }
-    let rows = query.fetch_all(pool).await?;
-    let mut out: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            let mut v = row_to_json_ref(r, "task");
-            if let Value::Object(ref mut m) = v {
-                let exempt = matches!(m.get("monitor_exempt"), Some(x) if x.as_i64() == Some(1) || x.as_bool() == Some(true));
-                m.insert("monitor_exempt".into(), Value::Bool(exempt));
-            }
-            v
-        })
-        .collect();
-    annotate_assignee_reachability(pool, &mut out).await?;
-    Ok(Value::Array(out))
-}
-
 /// The open blocking questions on `task_id` routed to one of `routed`, as full comment objects
 /// (parsed payload + ref), so a caller can render and answer them inline (task_860).
 async fn open_routed_questions(
@@ -3210,12 +3150,12 @@ async fn open_routed_questions(
 /// shortcut) misses them. A task qualifies if EITHER it is blocked_on the principal
 /// (blocked_on_kind='operator' when the principal resolves to the operator, or kind agent/team with
 /// blocked_on_ref in the doc_26 team-expanded principal set) OR it carries an open blocking question
-/// routed to the principal (as `list_tasks_blocking_me`). Returns a flat array of discriminated
+/// routed to the principal (doc_26 team-expanded). Returns a flat array of discriminated
 /// items (task_873): a `kind:"task"` row per qualifying task (blocked_on_principal, blocked_on_note,
 /// and questions[] carrying the FULL question comment objects so a client renders and answers them
 /// inline), and, when the principal resolves to the operator, a `kind:"document"` row per document
-/// awaiting the operator's approval (status `operator_review`). Supersedes the questions-only
-/// `list_tasks_blocking_me`.
+/// awaiting the operator's approval (status `operator_review`). This is the unified replacement for
+/// the retired questions-only "waiting on me" view (task_871).
 pub async fn list_awaiting(
     pool: &Pool,
     viewer: &str,
@@ -11270,11 +11210,10 @@ mod tests {
     }
 
     /// task_628 slice 3: get_task's DERIVED question-block (effectively_blocked / question_blocked /
-    /// blocking_questions sorted by comment id / question_blocked_on raw ids) and the principal-
-    /// general "waiting on me" view (list_tasks_blocking_me), including team-routed questions
-    /// surfacing for members and answered questions dropping out of the block.
+    /// blocking_questions sorted by comment id / question_blocked_on raw ids), including team-routed
+    /// questions surfacing for members and answered questions dropping out of the block.
     #[tokio::test]
-    async fn derived_question_block_and_waiting_on_me() -> anyhow::Result<()> {
+    async fn derived_question_block() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
         register_agent(&pool, "asker", None, None, None, None, None).await?;
@@ -11310,14 +11249,6 @@ mod tests {
                 .await?;
             Ok(cid)
         }
-        fn ids(v: &Value) -> Vec<i64> {
-            v.as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["id"].as_i64().unwrap())
-                .collect()
-        }
-
         // No questions yet -> not effectively blocked, empty derived fields.
         let before = get_task(&pool, tid).await?;
         assert_eq!(before["effectively_blocked"], json!(false));
@@ -11354,19 +11285,8 @@ mod tests {
         assert_eq!(bq[0]["prompt"], json!("ship it?"));
         assert_eq!(got["question_blocked_on"], json!(["bob"]));
 
-        // "waiting on me": bob sees it; carol (uninvolved) does not.
-        assert_eq!(
-            ids(&list_tasks_blocking_me(&pool, "bob", None, false).await?),
-            vec![tid]
-        );
-        assert!(list_tasks_blocking_me(&pool, "carol", None, false)
-            .await?
-            .as_array()
-            .unwrap()
-            .is_empty());
-
         // A second blocking question routed to a TEAM carol belongs to: union sorted by raw id,
-        // ordering by comment id holds, and carol now surfaces (team expansion).
+        // and ordering by comment id holds.
         create_team(&pool, "qa", Some("QA"), Some("asker"), None).await?;
         add_team_member(&pool, "qa", "carol", "agent", Some("asker")).await?;
         let c_team = pose(
@@ -11383,23 +11303,9 @@ mod tests {
         assert_eq!(bq2[0]["comment_id"], json!(c_bob), "sorted by comment id");
         assert_eq!(bq2[1]["comment_id"], json!(c_team));
         assert_eq!(got2["question_blocked_on"], json!(["bob", "qa"]));
-        assert_eq!(
-            ids(&list_tasks_blocking_me(&pool, "carol", None, false).await?),
-            vec![tid]
-        );
-        assert_eq!(
-            ids(&list_tasks_blocking_me(&pool, "bob", None, false).await?),
-            vec![tid]
-        );
-        // An unrelated principal sees nothing.
-        assert!(list_tasks_blocking_me(&pool, "dave", None, false)
-            .await?
-            .as_array()
-            .unwrap()
-            .is_empty());
 
-        // Answering bob's question drops it from the derived block + bob's view; the task stays
-        // effectively blocked on the still-open qa question.
+        // Answering bob's question drops it from the derived block; the task stays effectively
+        // blocked on the still-open qa question.
         sqlx::query("UPDATE comments SET state='answered' WHERE id=?")
             .bind(c_bob)
             .execute(&pool)
@@ -11408,11 +11314,6 @@ mod tests {
         assert_eq!(got3["blocking_questions"].as_array().unwrap().len(), 1);
         assert_eq!(got3["question_blocked_on"], json!(["qa"]));
         assert_eq!(got3["effectively_blocked"], json!(true));
-        assert!(list_tasks_blocking_me(&pool, "bob", None, false)
-            .await?
-            .as_array()
-            .unwrap()
-            .is_empty());
         Ok(())
     }
 

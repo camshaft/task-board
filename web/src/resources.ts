@@ -48,9 +48,6 @@ const keys = {
   agent: (id: string) => `agent:${id}`,
   // Keyed under the `tasks:` prefix so touched()'s task-list invalidation refreshes it too.
   agentTasks: (id: string) => `tasks:agent:${id}`,
-  // The question-based "waiting on you" view, same `tasks:` prefix so answering/declining a
-  // question (which touches the task) refreshes it.
-  tasksBlockingMe: (id: string) => `tasks:blocking-me:${id}`,
   // The unified "awaiting you" queue (task_860), same `tasks:` prefix so answering/declining a
   // question (which touches the task) refreshes it live.
   awaiting: (viewer: string) => `tasks:awaiting:${viewer}`,
@@ -85,16 +82,9 @@ export function useAgentTasks(id: string) {
   return useResource<TaskSummary[]>(keys.agentTasks(id), () => api.listTasks({ assignee: id }))
 }
 
-// Tasks with an open blocking question routed to the viewer (team-expanded) — "waiting on you".
-export function useTasksBlockingMe(viewer: string) {
-  return useResource<TaskSummary[]>(keys.tasksBlockingMe(viewer), () =>
-    api.listTasksBlockingMe(viewer),
-  )
-}
-
 // The unified "awaiting you" queue (task_860): everything awaiting the viewer's decision —
 // blocked_on=viewer tasks UNION tasks with an open routed blocking question, team-expanded,
-// assignee-independent. Supersedes useTasksBlockingMe.
+// assignee-independent.
 export function useAwaiting(viewer: string) {
   return useResource<AwaitingItem[]>(keys.awaiting(viewer), () => api.listAwaiting(viewer))
 }
