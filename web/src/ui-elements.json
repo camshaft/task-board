@@ -200,6 +200,40 @@
         },
         "additionalProperties": false
       }
+    },
+    "slider": {
+      "title": "Slider",
+      "description": "A bounded continuous estimate (a percentage, budget, or any approximate number) rendered as a range slider with a live value readout -- the same number answer as the numeric element, validated against the question's inline response_schema. Both bounds are required so the slider can draw its track; step sets the granularity, integer snaps to whole numbers, and unit is a short label.",
+      "component": "SliderInput",
+      "props_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "minimum": {
+            "type": "number",
+            "description": "Inclusive lower bound (slider track start; mirror of the response schema's minimum)."
+          },
+          "maximum": {
+            "type": "number",
+            "description": "Inclusive upper bound (slider track end; mirror of the response schema's maximum)."
+          },
+          "integer": {
+            "type": "boolean",
+            "description": "Snap to whole numbers (the response schema uses type integer rather than number)."
+          },
+          "step": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Slider granularity, e.g. 5; omit for 1 (integer) or continuous (number)."
+          },
+          "unit": {
+            "type": "string",
+            "description": "A short unit label shown with the value readout, e.g. \"%\", \"ms\", \"MB\"."
+          }
+        },
+        "required": ["minimum", "maximum"],
+        "additionalProperties": false
+      }
     }
   }
 }
