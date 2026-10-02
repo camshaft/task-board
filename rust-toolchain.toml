@@ -1,0 +1,9 @@
+# Pins the Rust toolchain for EVERY cargo invocation in this tree -- nix or not. A bare
+# `cargo`/`cargo clippy` run through a host rustup now honors this channel instead of floating to
+# rustup's default stable (which was 0.1.98 and fired upstream lints the pinned toolchain never
+# would). The channel matches the flake devShell pin (flake.nix: rust-bin.stable."1.90.0"), so the
+# rustup path and the nix path agree. scripts/gate.sh also self-pins by re-execing into the devShell.
+[toolchain]
+channel = "1.90.0"
+components = ["clippy", "rustfmt", "rust-src"]
+profile = "minimal"
