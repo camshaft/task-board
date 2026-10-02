@@ -18,7 +18,6 @@ import ProjectAccess from './ProjectAccess.tsx'
 import ReviewView from './ReviewView.tsx'
 import Reviews from './Reviews.tsx'
 import Search from './Search.tsx'
-import SecretSubmit from './SecretSubmit.tsx'
 import Settings from './Settings.tsx'
 import Wiki from './Wiki.tsx'
 import { TaskDrawer, TaskRedirect } from './TaskDrawer.tsx'
@@ -68,8 +67,6 @@ createRoot(document.getElementById('root')!).render(
     <ErrorBoundary>
       <BrowserRouter basename={basename}>
         <Routes>
-          {/* Standalone secret-submission page — no board chrome; reached via a capability link. */}
-          <Route path="secret-requests/:id" element={<SecretSubmit />} />
           <Route element={<Layout />}>
             <Route index element={<Home />} />
             <Route path="awaiting" element={<Awaiting />} />

@@ -2,9 +2,9 @@
 // recipients IN THE BROWSER and returns the armored ciphertext -- the board/API only ever receives
 // this, the plaintext never leaves the tab. Uses age-encryption (the official age TS implementation
 // by FiloSottile; pure-JS @noble crypto), loaded lazily via dynamic import so the crypto bundle is
-// fetched only when an encryption actually happens, not on every page. Shared by the operator-
-// question age-request answer (age-answer.tsx) and the standalone secret-submit page
-// (SecretSubmit.tsx).
+// fetched only when an encryption actually happens, not on every page. Used by the operator-
+// question age-request answer (age-answer.tsx) -- the client-side encrypt for a secret-bearing
+// question whose response_schema is a string holding the age ciphertext.
 export async function encryptToRecipients(
   plaintext: string,
   recipients: string[],

@@ -91,16 +91,10 @@ impl IntoResponse for ApiError {
             || msg.starts_with("no document")
             || msg.starts_with("no comment")
             || msg.starts_with("no parent task")
-            || msg.starts_with("no secret request")
             || msg.starts_with("no review")
             || msg == "not found"
         {
             StatusCode::NOT_FOUND
-        } else if msg.starts_with("invalid submit token")
-            || msg.starts_with("invalid fulfiller token")
-        {
-            // A capability token that doesn't match — not authorized for this action.
-            StatusCode::FORBIDDEN
         } else if msg.starts_with("give ")
             || msg.starts_with("cannot move task")
             || msg.starts_with("a task cannot be its own parent")
@@ -109,9 +103,6 @@ impl IntoResponse for ApiError {
             || msg.starts_with("banned phrase")
             || msg.starts_with("non-ASCII")
             || msg.starts_with("ambiguous bare reference")
-            || msg.starts_with("submit link already used")
-            || msg.contains("is not awaiting submission")
-            || msg.contains("has no ciphertext to pull")
             || msg.starts_with("unknown review status")
             || msg.starts_with("unknown review log type")
             // Structured-question answer / schema validation (task_1093): a bad answer is a client
@@ -325,18 +316,6 @@ pub fn router(state: AppState) -> Router {
             "/teams/{team_id}/members",
             post(add_team_member).delete(remove_team_member),
         )
-        .route(
-            "/secret-requests",
-            get(list_secret_requests).post(create_secret_request),
-        )
-        .route("/secret-requests/{id}", get(get_secret_request))
-        .route("/secret-requests/{id}/submit", post(submit_secret))
-        .route(
-            "/secret-requests/{id}/ciphertext",
-            get(get_secret_ciphertext),
-        )
-        .route("/secret-requests/{id}/fulfill", post(fulfill_secret))
-        .route("/secret-requests/{id}/cancel", post(cancel_secret_request))
         .route("/reviews", get(list_reviews).post(create_review))
         .route("/reviews/trend", get(review_trend))
         .route("/reviews/{review_id}", get(get_review))
@@ -941,13 +920,6 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/teams/{team_id}/members", summary: "Add a person or team as a member (idempotent). Rejects a sub-team add that would create a membership cycle.", query: "", body: Some("TeamMemberBody") },
     Endpoint { method: "DELETE", path: "/api/teams/{team_id}/members", summary: "Remove a member (person or team) from a team (idempotent).", query: "", body: Some("TeamMemberBody") },
     Endpoint { method: "POST", path: "/api/identity-aliases", summary: "Upsert an identity alias (alias -> canonical). Idempotent on the alias (repoints an existing one); alias is stored lowercased.", query: "", body: Some("SetIdentityAliasBody") },
-    Endpoint { method: "GET", path: "/api/secret-requests", summary: "List secret requests (metadata only — never the ciphertext or tokens). The board is an ephemeral request broker, not a secret store.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/secret-requests", summary: "File a named secret request (carries the age recipient pubkeys + instructions). Returns a single-use submit_url the operator opens to submit the value encrypted in-browser, plus the fulfiller_token.", query: "", body: Some("CreateSecretRequestBody") },
-    Endpoint { method: "GET", path: "/api/secret-requests/{id}", summary: "Fetch one secret request as metadata (name, instructions, recipients, status) — drives the submit page. Never returns ciphertext or tokens.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/secret-requests/{id}/submit", summary: "Submit the browser-encrypted ciphertext for a request (single-use submit token). Flips it to submitted with a TTL and directly notifies the fulfiller.", query: "", body: Some("SubmitSecretBody") },
-    Endpoint { method: "GET", path: "/api/secret-requests/{id}/ciphertext", summary: "Fulfiller pulls the ciphertext once to relocate it into durable storage (fulfiller token via ?token=). The one place ciphertext leaves the board.", query: "token=str", body: None },
-    Endpoint { method: "POST", path: "/api/secret-requests/{id}/fulfill", summary: "Fulfill a request: the secret is relocated, so the board deletes the row + its transient ciphertext. Idempotent; fulfiller-token-gated while the row exists.", query: "", body: Some("FulfillSecretBody") },
-    Endpoint { method: "POST", path: "/api/secret-requests/{id}/cancel", summary: "Cancel (delete) a pending secret request. Idempotent.", query: "", body: Some("CancelSecretBody") },
     Endpoint { method: "GET", path: "/api/reviews", summary: "List reviews (newest-touched first), optionally filtered by status/kind/assignee. Without logs.", query: "status=str&kind=str&assignee=str", body: None },
     Endpoint { method: "POST", path: "/api/reviews", summary: "Create a review over an artifact (document|code|design|agent-session|task). Starts in `open` unless a status is seeded; records a `submitted` log entry. Pass external_link for idempotent ingest (a review already linked on (source, external_id) is returned created:false).", query: "", body: Some("CreateReviewBody") },
     Endpoint { method: "GET", path: "/api/reviews/trend", summary: "Improvement trend derived from review logs (no stored counter): findings-per-review with an earlier-vs-later trend, overall + sliced by kind and by producing area, counterbalanced by an escaped-defect signal (post-approval findings, re-opens, lineage follow-ups). A slice where findings fell while escaped defects rose is flagged.", query: "kind=str&area=str", body: None },
@@ -1041,10 +1013,6 @@ fn body_schemas() -> Value {
         LintTextBody,
         GradeDocumentBody,
         UpdateDocumentBody,
-        CreateSecretRequestBody,
-        SubmitSecretBody,
-        FulfillSecretBody,
-        CancelSecretBody,
         SetChannelAutoJoinBody,
         ChannelReadBody,
         CreateReviewBody,
@@ -2837,117 +2805,6 @@ async fn remove_banned_phrase(State(st): State<AppState>, Path(phrase): Path<Str
     Ok(Json(core::remove_banned_phrase(&st.pool, &phrase).await?))
 }
 
-// --- Secret requests (ephemeral secret-request broker, task 272) ---
-
-#[derive(Deserialize, JsonSchema)]
-struct CreateSecretRequestBody {
-    /// The secret's name (e.g. the durable filename it will land as).
-    name: String,
-    /// Age recipient public keys (non-secret) the browser encrypts the value to. For a
-    /// host-bound secret, include the recovery/user keys too, not just the host key.
-    #[serde(default)]
-    recipients: Vec<String>,
-    /// Human instructions shown on the submit page (what the value is, where to obtain it).
-    instructions: Option<String>,
-    /// Advisory placement hint for the fulfiller (the durable path + any wiring note).
-    target: Option<String>,
-    /// The agent to directly notify on submit + whose token gates the ciphertext pull.
-    fulfiller: Option<String>,
-    /// The requesting agent (for the audit event).
-    #[serde(rename = "principal", alias = "requested_by")]
-    requested_by: Option<String>,
-}
-
-async fn create_secret_request(
-    State(st): State<AppState>,
-    Json(b): Json<CreateSecretRequestBody>,
-) -> ApiResult {
-    Ok(Json(
-        core::create_secret_request(
-            &st.pool,
-            &b.name,
-            &b.recipients,
-            b.instructions.as_deref(),
-            b.target.as_deref(),
-            b.fulfiller.as_deref(),
-            b.requested_by.as_deref(),
-        )
-        .await?,
-    ))
-}
-
-async fn list_secret_requests(State(st): State<AppState>) -> ApiResult {
-    Ok(Json(core::list_secret_requests(&st.pool).await?))
-}
-
-async fn get_secret_request(State(st): State<AppState>, Path(id): Path<i64>) -> ApiResult {
-    Ok(Json(core::get_secret_request(&st.pool, id).await?))
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct SubmitSecretBody {
-    /// The single-use submit capability token from the submit link.
-    token: String,
-    /// The browser-encrypted ciphertext (the board never receives plaintext).
-    ciphertext: String,
-}
-
-async fn submit_secret(
-    State(st): State<AppState>,
-    Path(id): Path<i64>,
-    Json(b): Json<SubmitSecretBody>,
-) -> ApiResult {
-    Ok(Json(
-        core::submit_secret(&st.pool, id, &b.token, &b.ciphertext).await?,
-    ))
-}
-
-#[derive(Deserialize)]
-struct FulfillerTokenQuery {
-    token: String,
-}
-
-async fn get_secret_ciphertext(
-    State(st): State<AppState>,
-    Path(id): Path<i64>,
-    Query(q): Query<FulfillerTokenQuery>,
-) -> ApiResult {
-    Ok(Json(
-        core::get_secret_ciphertext(&st.pool, id, &q.token).await?,
-    ))
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct FulfillSecretBody {
-    /// The fulfiller capability token.
-    token: String,
-}
-
-async fn fulfill_secret(
-    State(st): State<AppState>,
-    Path(id): Path<i64>,
-    Json(b): Json<FulfillSecretBody>,
-) -> ApiResult {
-    Ok(Json(core::fulfill_secret(&st.pool, id, &b.token).await?))
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct CancelSecretBody {
-    /// The agent cancelling the request (for the audit event).
-    #[serde(rename = "principal", alias = "actor")]
-    actor: Option<String>,
-}
-
-async fn cancel_secret_request(
-    State(st): State<AppState>,
-    Path(id): Path<i64>,
-    Json(b): Json<CancelSecretBody>,
-) -> ApiResult {
-    Ok(Json(
-        core::cancel_secret_request(&st.pool, id, b.actor.as_deref()).await?,
-    ))
-}
-
 // --- Reviews (Document #5, increment 1: a typed review over an artifact, A2 lifecycle + log) ---
 
 #[derive(Deserialize, JsonSchema)]
@@ -4284,7 +4141,7 @@ mod tests {
         assert_eq!(
             v["requested_by"],
             json!("alice"),
-            "secret-request actor forced"
+            "requested_by acting field forced"
         );
         assert_eq!(v["assignee"], json!("bob"), "target field untouched");
         assert_eq!(
