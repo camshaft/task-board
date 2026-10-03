@@ -8630,10 +8630,88 @@ fn hydrate_workspace_kind(r: &SqliteRow) -> Value {
     v
 }
 
+// --- Shared fleet policy: watchable versions + the policy.changed hot-reload event (task_1460,
+// doc_3426 ask 5) ---
+//
+// A fleet-SHARED analog of the per-agent agent_config_versions / agent.config_changed pair
+// (task_1477): one monotonic counter per policy_kind ('banned_phrases', 'admission'), bumped on every
+// edit, surfaced on the read so the harness compares versions, and each bump emits policy.changed
+// {policy_kind, version} in the 'policy' event class so a board + ["policy"] subscriber wakes and
+// re-reads with no restart. Shared (keyed by policy_kind alone) because the banned-phrase list + the
+// per-role admission rules apply fleet-wide, not per-agent.
+
+/// Policy kinds that carry a watchable version (the keys of `policy_versions`). The per-role
+/// admission policy kind arrives with the role_admission_rules store (ask 5 piece 2).
+pub const POLICY_BANNED_PHRASES: &str = "banned_phrases";
+
+/// Bump the monotonic version for `policy_kind` inside a tx and return the new value. Each bump
+/// pairs with an [`emit_policy_changed`] so a subscribed harness hot-reloads.
+async fn bump_policy_version(
+    tx: &mut Transaction<'_, Sqlite>,
+    policy_kind: &str,
+    ts: &str,
+) -> anyhow::Result<i64> {
+    sqlx::query(
+        "INSERT INTO policy_versions(policy_kind, version, updated_at) VALUES(?,1,?) \
+         ON CONFLICT(policy_kind) DO UPDATE SET version=version+1, updated_at=excluded.updated_at",
+    )
+    .bind(policy_kind)
+    .bind(ts)
+    .execute(&mut **tx)
+    .await?;
+    let v: i64 = sqlx::query("SELECT version FROM policy_versions WHERE policy_kind=?")
+        .bind(policy_kind)
+        .fetch_one(&mut **tx)
+        .await?
+        .try_get("version")?;
+    Ok(v)
+}
+
+/// Read the current watchable version for `policy_kind` (0 if it has never been bumped). The read
+/// surfaces return this so the harness can compare it against the version it last loaded.
+pub async fn policy_version(pool: &Pool, policy_kind: &str) -> anyhow::Result<i64> {
+    Ok(
+        sqlx::query("SELECT version FROM policy_versions WHERE policy_kind=?")
+            .bind(policy_kind)
+            .fetch_optional(pool)
+            .await?
+            .and_then(|r| r.try_get::<i64, _>("version").ok())
+            .unwrap_or(0),
+    )
+}
+
+/// Emit policy.changed {policy_kind, version} in the shared 'policy' event class so a board +
+/// ["policy"] subscriber (the harness) hot-reloads the shared runtime policy with no restart. A
+/// fleet-wide broadcast: no explicit recipient, picked up by the classed board-firehose subscribers
+/// in `emit` (the same path that unions the "agent" class for agent.config_changed).
+async fn emit_policy_changed(
+    tx: &mut Transaction<'_, Sqlite>,
+    hooks: &mut Vec<WebhookDelivery>,
+    policy_kind: &str,
+    version: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<()> {
+    emit(
+        tx,
+        hooks,
+        "policy.changed",
+        actor,
+        None,
+        None,
+        None,
+        None,
+        json!({ "policy_kind": policy_kind, "version": version }),
+        Recipients::Explicit(BTreeSet::new()),
+    )
+    .await?;
+    Ok(())
+}
+
 // --- Banned phrases (data-driven pre-submit content lint for docs + comments) ---
 
 /// Add (or update the note on) a banned phrase. Stored trimmed + lowercased so matching is
-/// case-insensitive. Idempotent on the phrase. Returns the stored record.
+/// case-insensitive. Idempotent on the phrase. Bumps the 'banned_phrases' policy version + emits
+/// policy.changed so a subscribed harness hot-reloads the list (task_1460). Returns the stored record.
 pub async fn add_banned_phrase(
     pool: &Pool,
     phrase: &str,
@@ -8644,6 +8722,9 @@ pub async fn add_banned_phrase(
     if p.is_empty() {
         anyhow::bail!("give a non-empty phrase to ban");
     }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
     sqlx::query(
         "INSERT INTO banned_phrases(phrase, note, created_by, created_at) VALUES(?,?,?,?) \
          ON CONFLICT(phrase) DO UPDATE SET note=excluded.note",
@@ -8651,28 +8732,78 @@ pub async fn add_banned_phrase(
     .bind(&p)
     .bind(note)
     .bind(created_by)
-    .bind(now_iso())
-    .execute(pool)
+    .bind(&ts)
+    .execute(&mut *tx)
     .await?;
-    Ok(json!({ "phrase": p, "note": note, "created_by": created_by }))
+    let version = bump_policy_version(&mut tx, POLICY_BANNED_PHRASES, &ts).await?;
+    emit_policy_changed(
+        &mut tx,
+        &mut hooks,
+        POLICY_BANNED_PHRASES,
+        version,
+        created_by,
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "phrase": p, "note": note, "created_by": created_by, "version": version }))
 }
 
-/// The maintained banned-phrases list, alphabetical.
+/// The maintained banned-phrases list with its watchable version (task_1460): `{policy_kind,
+/// version, count, phrases:[..]}`. The harness reads this as the authoritative runtime source and
+/// re-reads on a policy.changed wake, comparing `version`.
 pub async fn list_banned_phrases(pool: &Pool) -> anyhow::Result<Value> {
     let rows = sqlx::query("SELECT * FROM banned_phrases ORDER BY phrase")
         .fetch_all(pool)
         .await?;
-    Ok(Value::Array(rows.iter().map(row_to_json).collect()))
+    let phrases: Vec<Value> = rows.iter().map(row_to_json).collect();
+    Ok(json!({
+        "policy_kind": POLICY_BANNED_PHRASES,
+        "version": policy_version(pool, POLICY_BANNED_PHRASES).await?,
+        "count": phrases.len(),
+        "phrases": phrases,
+    }))
 }
 
-/// Remove a banned phrase. Returns `{phrase, deleted}` (deleted=false if it wasn't listed).
+/// Remove a banned phrase. Returns `{phrase, deleted, version}` (deleted=false if it wasn't listed).
+/// Only an actual deletion bumps the version + emits policy.changed, so removing a non-listed phrase
+/// is a no-op signal-wise (task_1460).
 pub async fn remove_banned_phrase(pool: &Pool, phrase: &str) -> anyhow::Result<Value> {
     let p = phrase.trim().to_lowercase();
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let res = sqlx::query("DELETE FROM banned_phrases WHERE phrase=?")
         .bind(&p)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(json!({ "phrase": p, "deleted": res.rows_affected() > 0 }))
+    let deleted = res.rows_affected() > 0;
+    let version = if deleted {
+        let v = bump_policy_version(&mut tx, POLICY_BANNED_PHRASES, &ts).await?;
+        emit_policy_changed(&mut tx, &mut hooks, POLICY_BANNED_PHRASES, v, None).await?;
+        v
+    } else {
+        policy_version_tx(&mut tx, POLICY_BANNED_PHRASES).await?
+    };
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "phrase": p, "deleted": deleted, "version": version }))
+}
+
+/// Read the current version for `policy_kind` inside a tx (0 if never bumped) -- the in-tx twin of
+/// [`policy_version`], so a no-op remove can report the unchanged version without a second pool read.
+async fn policy_version_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    policy_kind: &str,
+) -> anyhow::Result<i64> {
+    Ok(
+        sqlx::query("SELECT version FROM policy_versions WHERE policy_kind=?")
+            .bind(policy_kind)
+            .fetch_optional(&mut **tx)
+            .await?
+            .and_then(|r| r.try_get::<i64, _>("version").ok())
+            .unwrap_or(0),
+    )
 }
 
 /// Whether `needle` occurs in `haystack` as a whole phrase — bounded by a non-alphanumeric
@@ -23412,10 +23543,15 @@ mod tests {
         add_banned_phrase(&pool, "the floor", Some("still jargon"), Some("librarian")).await?; // dup -> update
         let list = list_banned_phrases(&pool).await?;
         assert_eq!(
-            list.as_array().unwrap().len(),
+            list["phrases"].as_array().unwrap().len(),
             2,
             "dup add did not grow the list: {list}"
         );
+        assert_eq!(list["count"], json!(2));
+        assert_eq!(list["policy_kind"], json!("banned_phrases"));
+        // Each edit (3 adds here) bumps the watchable 'banned_phrases' version (task_1460).
+        let v_after_adds = list["version"].as_i64().unwrap();
+        assert_eq!(v_after_adds, 3, "three adds bumped the version three times");
 
         // Case-insensitive, whole-phrase match; the term inside a larger word does NOT match.
         assert_eq!(
@@ -23445,21 +23581,80 @@ mod tests {
         assert!(err.contains("the floor"), "names the phrase: {err}");
         check_banned_phrases(&pool, "down to the floor", true).await?; // acknowledged -> passes
 
-        // Remove one; it stops matching and the list shrinks.
+        // Remove one; it stops matching and the list shrinks. An actual delete bumps the version.
         let r = remove_banned_phrase(&pool, "THE FLOOR").await?;
         assert_eq!(r["deleted"], json!(true));
+        assert_eq!(r["version"], json!(4), "a real delete bumped the version");
         assert!(scan_banned_phrases(&pool, "we hit the floor")
             .await?
             .is_empty());
+        let after = list_banned_phrases(&pool).await?;
+        assert_eq!(after["phrases"].as_array().unwrap().len(), 1);
+        assert_eq!(after["version"], json!(4));
+        // A no-op remove (already gone) does NOT bump the version -- no spurious hot-reload.
+        let noop = remove_banned_phrase(&pool, "the floor").await?;
+        assert_eq!(noop["deleted"], json!(false), "already gone");
+        assert_eq!(noop["version"], json!(4), "no-op remove did not bump");
+        assert_eq!(policy_version(&pool, "banned_phrases").await?, 4);
+        Ok(())
+    }
+
+    /// task_1460 (doc_3426 ask 5): a banned-phrase edit emits policy.changed in the shared 'policy'
+    /// event class, so a harness subscribed board + ["policy"] is woken with the new version to
+    /// hot-reload the list -- the shared analog of the per-agent agent.config_changed wake.
+    #[tokio::test]
+    async fn policy_changed_wakes_a_board_policy_subscriber() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        // The harness subscribes the fleet-shared policy class once.
+        subscribe_classed(
+            &pool,
+            "harness",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &["policy".to_string()],
+        )
+        .await?;
+        // An unrelated task-class board subscriber must NOT be woken by a policy edit.
+        subscribe_classed(
+            &pool,
+            "watcher",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &["created".to_string()],
+        )
+        .await?;
+
+        add_banned_phrase(&pool, "robust", None, Some("op")).await?;
+
+        let notes = check_notifications(&pool, "harness", true, 50, None).await?;
         assert_eq!(
-            list_banned_phrases(&pool).await?.as_array().unwrap().len(),
-            1
+            notes["count"].as_i64(),
+            Some(1),
+            "policy subscriber woken: {notes}"
         );
+        let n = &notes["notifications"][0];
+        assert_eq!(n["type"], json!("policy.changed"));
+        assert_eq!(n["data"]["policy_kind"], json!("banned_phrases"));
+        assert_eq!(n["data"]["version"], json!(1));
+
+        let other = check_notifications(&pool, "watcher", true, 50, None).await?;
         assert_eq!(
-            remove_banned_phrase(&pool, "the floor").await?["deleted"],
-            json!(false),
-            "already gone"
+            other["count"].as_i64(),
+            Some(0),
+            "a task-class subscriber is not woken by a policy edit"
         );
+
+        // A no-op remove emits nothing (no spurious wake).
+        remove_banned_phrase(&pool, "not-listed").await?;
+        let after = check_notifications(&pool, "harness", true, 50, None).await?;
+        assert_eq!(after["count"].as_i64(), Some(0), "no-op edit did not wake");
         Ok(())
     }
 
