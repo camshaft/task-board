@@ -528,6 +528,30 @@ CREATE TABLE IF NOT EXISTS operator_bindings (
     written_by     TEXT,
     updated_at     TEXT NOT NULL
 );
+-- Durable per-session transcript-chunk pointer log (task_1463, doc_3426 ask 8). The harness
+-- checkpoints each context window to IPFS and APPENDS a pointer here; the board stores the CID +
+-- metadata only, NEVER the transcript bytes (the content-addressing posture of documents: the
+-- identifier is location-independent, the bytes are resolved by the client). The log is
+-- APPEND-ONLY and HISTORY-PRESERVING: compaction appends a 'compaction-boundary' marker plus the
+-- post-boundary windows WITHOUT deleting any pre-boundary chunk, so a session's full transcript is
+-- always recoverable. `position` is the per-session order index, monotonic ACROSS generations
+-- (generation is recorded per entry, but one session's history spans generations when a session is
+-- respawned/migrated, so rehydration walks the whole session). UNIQUE(session_id, position) makes
+-- the append race-safe under the single writer AND backs the ordered + since-position list query.
+CREATE TABLE IF NOT EXISTS transcript_chunks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    generation  INTEGER NOT NULL,
+    position    INTEGER NOT NULL,
+    content_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'window',
+    turn_start  INTEGER,
+    turn_end    INTEGER,
+    size_bytes  INTEGER,
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    UNIQUE(session_id, position)
+);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no

@@ -218,6 +218,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
+        .route(
+            "/sessions/{session_id}/transcript-chunks",
+            get(list_transcript_chunks).post(append_transcript_chunk),
+        )
         .route("/projects", get(list_projects).post(create_project))
         .route(
             "/projects/{project_id}",
@@ -888,7 +892,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
     Endpoint { method: "GET", path: "/api/metrics", summary: "Request metrics for optimizing board/fleet performance (task_1380): per-endpoint latency p50/p90/p99 in ms (approximate, from coarse log-spaced buckets), request count + process start (a throughput basis), the in-flight / max-in-flight concurrency gauge (a hang shows as a stuck-high in_flight), and 2xx/4xx/5xx status-class counts, plus an overall rollup. Keys are METHOD + route template relative to the /api mount. Aggregate numbers only, mutates nothing.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/admin/db-snapshot", summary: "Download a point-in-time-consistent copy of the SQLite database (VACUUM INTO, integrity-checked), behind HTTP Basic auth. Disabled by default (404 when off); the deployment keeps it loopback/LAN-bound and off the public tunnel. The extraction primitive for host migration + DR.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata, retired} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match), retired (true=only terminally-gone agents, false=only live). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&retired=bool&limit=int&offset=int", body: None },
+    Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata, retired, lifecycle_intent, priority} by default (the small metadata bag is kept for filtering, e.g. metadata.native; lifecycle_intent + priority are the declared-config fields the reconciler reads; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match), retired (true=only terminally-gone agents, false=only live). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&retired=bool&limit=int&offset=int", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
     Endpoint { method: "GET", path: "/api/resolve-agent", summary: "Resolve an agent name to one exact agent id (task_1251): an exact id wins (never ambiguous even when it is a prefix of a longer id), a unique case-insensitive substring resolves, an ambiguous substring is refused (400) with the sorted candidate ids. The safe recipient-resolver vs picking the first row of a q= search. Returns {name, id, match}.", query: "name=str", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
@@ -900,6 +904,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/lifecycle-intent", summary: "Set an agent's DECLARED lifecycle intent (task_1455): run or paused — the desired state the reconciler drives on, distinct from live presence. 'retired' is set via /retire (guarded auto-disposition sweep) and reversed via /restore, not here. Emits agent.intent_changed so a subscribed reconciler acts without a re-fetch.", query: "", body: Some("SetLifecycleIntentBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
+    Endpoint { method: "POST", path: "/api/sessions/{session_id}/transcript-chunks", summary: "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). position is assigned server-side (per-session, monotonic across generations) and returned. kind is window | compaction-boundary; append-only + history-preserving.", query: "", body: Some("AppendTranscriptChunkBody") },
+    Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None },
     Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
@@ -1036,6 +1042,7 @@ fn body_schemas() -> Value {
         RetireAgentBody,
         RestoreAgentBody,
         SetLifecycleIntentBody,
+        AppendTranscriptChunkBody,
         CreateProjectBody,
         UpdateProjectBody,
         CreateTaskBody,
@@ -1385,6 +1392,62 @@ async fn set_lifecycle_intent(
             b.reason.as_deref(),
         )
         .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AppendTranscriptChunkBody {
+    /// The session generation this chunk belongs to (one session's history spans generations).
+    generation: i64,
+    /// The IPFS CID the checkpointed context window was published to (pointer only, never bytes).
+    #[serde(rename = "content_id", alias = "cid")]
+    content_id: String,
+    /// window (default) or compaction-boundary (an in-order marker; pre-boundary chunks retained).
+    kind: Option<String>,
+    /// Optional first turn index covered by this window.
+    turn_start: Option<i64>,
+    /// Optional last turn index covered by this window.
+    turn_end: Option<i64>,
+    /// Optional byte size of the checkpointed window.
+    size_bytes: Option<i64>,
+    /// Optional arbitrary metadata recorded with the entry.
+    metadata: Option<serde_json::Value>,
+}
+
+async fn append_transcript_chunk(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(b): Json<AppendTranscriptChunkBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::append_transcript_chunk(
+            &st.pool,
+            &session_id,
+            b.generation,
+            &b.content_id,
+            b.kind.as_deref(),
+            b.turn_start,
+            b.turn_end,
+            b.size_bytes,
+            b.metadata,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ListTranscriptChunksQuery {
+    /// Incremental cursor: return only entries strictly after this position (omit/0 = from start).
+    since_position: Option<i64>,
+}
+
+async fn list_transcript_chunks(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(q): Query<ListTranscriptChunksQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_transcript_chunks(&st.pool, &session_id, q.since_position).await?,
     ))
 }
 

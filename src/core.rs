@@ -10314,6 +10314,143 @@ pub async fn publish_version(
     Ok(out)
 }
 
+/// The transcript-chunk kinds (task_1463, doc_3426 ask 8). A `window` is a checkpointed context
+/// window; a `compaction-boundary` is an in-order marker recording where history was compacted --
+/// the pre-boundary chunks are RETAINED (the log is append-only; nothing before the boundary is
+/// deleted) and the post-boundary windows follow, so a session's full transcript stays recoverable.
+pub const TRANSCRIPT_CHUNK_KINDS: &[&str] = &["window", "compaction-boundary"];
+
+/// Serialize one `transcript_chunks` row, parsing the stored `metadata` JSON string back to a value
+/// (default `{}`), mirroring [`agent_json`].
+fn transcript_chunk_json(row: &SqliteRow) -> Value {
+    let mut obj = match row_to_json(row) {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let meta = obj
+        .get("metadata")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| json!({}));
+    obj.insert("metadata".into(), meta);
+    Value::Object(obj)
+}
+
+/// Append a transcript-window pointer to a session's durable chunk log (task_1463, doc_3426 ask 8).
+/// The board stores the IPFS CID + metadata only, NEVER the transcript bytes (the content-addressing
+/// posture of documents -- the identifier is location-independent, the bytes are resolved by the
+/// client). `position` is assigned server-side as the next per-session order index, monotonic ACROSS
+/// generations, under the single writer -- a caller never races to pick one, and UNIQUE(session_id,
+/// position) is the backstop. `kind` is window | compaction-boundary; a compaction-boundary is just
+/// an in-order marker, so appending it (plus the post-boundary windows) retains everything before it
+/// -- the log is append-only + history-preserving, with no delete path. This is a pointer append,
+/// distinct from the task stream (no task + no event). Returns the stored entry incl its position.
+#[allow(clippy::too_many_arguments)]
+pub async fn append_transcript_chunk(
+    pool: &Pool,
+    session_id: &str,
+    generation: i64,
+    content_id: &str,
+    kind: Option<&str>,
+    turn_start: Option<i64>,
+    turn_end: Option<i64>,
+    size_bytes: Option<i64>,
+    metadata: Option<Value>,
+) -> anyhow::Result<Value> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request("session_id is required"));
+    }
+    let content_id = content_id.trim();
+    if content_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "content_id (the IPFS CID) is required"
+        ));
+    }
+    let kind = kind
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .unwrap_or("window");
+    if !TRANSCRIPT_CHUNK_KINDS.contains(&kind) {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "kind must be one of {} (got '{kind}')",
+            TRANSCRIPT_CHUNK_KINDS.join("|")
+        )));
+    }
+    let meta_str = metadata
+        .filter(|m| !m.is_null())
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    // Next per-session position, assigned under the single writer so the ordered log never gaps or
+    // duplicates; UNIQUE(session_id, position) backs it. Spans generations by keying on session only.
+    let next_pos: i64 = sqlx::query(
+        "SELECT COALESCE(MAX(position),0)+1 AS n FROM transcript_chunks WHERE session_id=?",
+    )
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("n")?;
+    let row = sqlx::query(
+        "INSERT INTO transcript_chunks(session_id, generation, position, content_id, kind, turn_start, turn_end, size_bytes, metadata, created_at) \
+         VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING *",
+    )
+    .bind(session_id)
+    .bind(generation)
+    .bind(next_pos)
+    .bind(content_id)
+    .bind(kind)
+    .bind(turn_start)
+    .bind(turn_end)
+    .bind(size_bytes)
+    .bind(&meta_str)
+    .bind(&ts)
+    .fetch_one(&mut *tx)
+    .await?;
+    let out = transcript_chunk_json(&row);
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// List a session's transcript-chunk pointers in order (task_1463, doc_3426 ask 8). Returns the
+/// ordered entries ACROSS generations -- one session's history spans generations after a respawn or
+/// migration, so rehydration replays the whole session, not just the current generation.
+/// `since_position` gives the incremental form: only entries strictly after that position (None/0 =
+/// from the start). `last_position` in the response is the cursor to pass as the next `since_position`
+/// for a tail-follow. The board returns CIDs + metadata; the caller resolves the bytes from IPFS.
+pub async fn list_transcript_chunks(
+    pool: &Pool,
+    session_id: &str,
+    since_position: Option<i64>,
+) -> anyhow::Result<Value> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request("session_id is required"));
+    }
+    let since = since_position.unwrap_or(0);
+    let rows = sqlx::query(
+        "SELECT * FROM transcript_chunks WHERE session_id=? AND position>? ORDER BY position ASC",
+    )
+    .bind(session_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    let chunks: Vec<Value> = rows.iter().map(transcript_chunk_json).collect();
+    let last_position = chunks
+        .last()
+        .and_then(|c| c.get("position"))
+        .and_then(Value::as_i64)
+        .unwrap_or(since);
+    Ok(json!({
+        "session_id": session_id,
+        "since_position": since,
+        "count": chunks.len(),
+        "last_position": last_position,
+        "chunks": chunks,
+    }))
+}
+
 /// Fetch one document with its current version + version list.
 /// Resolve a document reference -- a numeric id OR a wiki path/slug -- to a document id. Agents cite
 /// docs by their wiki path (e.g. charters/v-nix, designs/...), so get_document / read_document accept
@@ -19152,6 +19289,142 @@ mod tests {
         let restored = get_agent(&pool, "v-a").await?;
         assert_eq!(restored["lifecycle_intent"], json!("run"));
         assert_eq!(restored["retired"], json!(false));
+        Ok(())
+    }
+
+    /// task_1463 (doc_3426 ask 8): the durable per-session transcript-chunk pointer log. Append
+    /// assigns an in-order per-session position + returns the entry; list returns the ordered chunks
+    /// with a since-position incremental form; compaction is history-preserving (a boundary marker +
+    /// post-boundary windows RETAIN every pre-boundary chunk); and a session's history spans
+    /// generations so rehydration replays the whole session across a respawn.
+    #[tokio::test]
+    async fn transcript_chunk_log_append_list_compaction_cross_generation() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // (1) append in order -> returns the assigned position; CID + metadata stored, no bytes.
+        let e1 = append_transcript_chunk(
+            &pool,
+            "sess-1",
+            0,
+            "bafyA",
+            None,
+            Some(0),
+            Some(9),
+            Some(1234),
+            Some(json!({"model": "opus"})),
+        )
+        .await?;
+        assert_eq!(e1["position"], json!(1));
+        assert_eq!(e1["kind"], json!("window"), "kind defaults to window");
+        assert_eq!(e1["content_id"], json!("bafyA"));
+        assert_eq!(e1["generation"], json!(0));
+        assert_eq!(e1["metadata"]["model"], json!("opus"));
+        let e2 = append_transcript_chunk(
+            &pool,
+            "sess-1",
+            0,
+            "bafyB",
+            None,
+            Some(10),
+            Some(19),
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            e2["position"],
+            json!(2),
+            "position is monotonic per session"
+        );
+
+        // A different session has its own independent position sequence.
+        let other =
+            append_transcript_chunk(&pool, "sess-2", 0, "bafyZ", None, None, None, None, None)
+                .await?;
+        assert_eq!(other["position"], json!(1));
+
+        // (2) list the ordered pointers for a session in one query.
+        let all = list_transcript_chunks(&pool, "sess-1", None).await?;
+        assert_eq!(all["count"], json!(2));
+        assert_eq!(all["last_position"], json!(2));
+        let chunks = all["chunks"].as_array().unwrap();
+        assert_eq!(chunks[0]["content_id"], json!("bafyA"));
+        assert_eq!(chunks[1]["content_id"], json!("bafyB"));
+
+        // (2) since-position incremental form: only entries strictly after the cursor.
+        let incr = list_transcript_chunks(&pool, "sess-1", Some(1)).await?;
+        assert_eq!(incr["count"], json!(1));
+        assert_eq!(incr["chunks"][0]["content_id"], json!("bafyB"));
+
+        // (3) history-preserving compaction: a boundary marker + the post-boundary window are
+        // appended; nothing before the boundary is deleted.
+        let boundary = append_transcript_chunk(
+            &pool,
+            "sess-1",
+            0,
+            "bafyC",
+            Some("compaction-boundary"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(boundary["position"], json!(3));
+        assert_eq!(boundary["kind"], json!("compaction-boundary"));
+        let post = list_transcript_chunks(&pool, "sess-1", None).await?;
+        assert_eq!(
+            post["count"],
+            json!(3),
+            "pre-boundary chunks are retained across compaction"
+        );
+        assert_eq!(post["chunks"][0]["content_id"], json!("bafyA"));
+
+        // (5) a session's history spans generations: a respawned generation keeps appending to the
+        // same per-session position sequence, and list replays the whole session across generations.
+        let g1 = append_transcript_chunk(&pool, "sess-1", 1, "bafyD", None, None, None, None, None)
+            .await?;
+        assert_eq!(
+            g1["position"],
+            json!(4),
+            "position continues across generations"
+        );
+        assert_eq!(g1["generation"], json!(1));
+        let full = list_transcript_chunks(&pool, "sess-1", None).await?;
+        assert_eq!(full["count"], json!(4), "rehydration spans generations");
+        let gens: Vec<i64> = full["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["generation"].as_i64().unwrap())
+            .collect();
+        assert_eq!(gens, vec![0, 0, 0, 1]);
+
+        // Validation: empty session_id / empty content_id / an unknown kind are rejected.
+        assert!(
+            append_transcript_chunk(&pool, "  ", 0, "bafyX", None, None, None, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            append_transcript_chunk(&pool, "sess-3", 0, "  ", None, None, None, None, None)
+                .await
+                .is_err()
+        );
+        assert!(append_transcript_chunk(
+            &pool,
+            "sess-3",
+            0,
+            "bafyX",
+            Some("bogus"),
+            None,
+            None,
+            None,
+            None
+        )
+        .await
+        .is_err());
         Ok(())
     }
 
