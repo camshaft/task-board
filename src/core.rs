@@ -10197,14 +10197,17 @@ pub fn scan_non_ascii(text: &str) -> Vec<(char, usize, usize)> {
 /// origin/main f9f73b8 and v-fleet-tooling parity-checked) so the board gate matches the fleet
 /// lint-prose rule rather than inventing a parallel heuristic. Kept conservative; a token carrying a
 /// digit or underscore is an identifier and is never flagged, so it does not belong here. The board
-/// set is the fleet caps_allow verbatim plus one board addition, CID (board-ubiquitous);
-/// v-fleet-tooling owns the upstream list, so re-sync this on a fleet edit.
+/// set is the fleet caps_allow plus board-local additions - CID (board-ubiquitous) and the genuine
+/// technical acronyms AWS, CAS, CIDR, IP, KV, SDK, SSRF (operator-tenet-exempt per task_1528, added
+/// board-side ahead of the upstream re-sync requested of v-fleet-tooling). v-fleet-tooling owns the
+/// upstream list, so re-sync this on a fleet edit.
 const CAPS_ALLOW: &[&str] = &[
-    "ABI", "AKIA", "API", "ASCII", "AST", "CD", "CI", "CID", "CLI", "CPU", "DNS", "ETA", "ETAG",
-    "FIXME", "GB", "GHA", "HEAD", "HOME", "HTTP", "HTTPS", "ID", "IO", "JSON", "JSONL", "KB",
-    "LAN", "MB", "MCP", "MIDI", "ML", "NOTE", "OK", "OS", "PID", "PR", "RAM", "REST", "RPC",
-    "SAFETY", "SHA", "SQL", "SRI", "SSH", "STT", "TCP", "TODO", "TOML", "TTS", "UA", "UDP", "URI",
-    "URL", "USB", "UTC", "UUID", "VPN", "WASI", "WIT", "YAML",
+    "ABI", "AKIA", "API", "ASCII", "AST", "AWS", "CAS", "CD", "CI", "CID", "CIDR", "CLI", "CPU",
+    "DNS", "ETA", "ETAG", "FIXME", "GB", "GHA", "HEAD", "HOME", "HTTP", "HTTPS", "ID", "IO", "IP",
+    "JSON", "JSONL", "KB", "KV", "LAN", "MB", "MCP", "MIDI", "ML", "NOTE", "OK", "OS", "PID", "PR",
+    "RAM", "REST", "RPC", "SAFETY", "SDK", "SHA", "SQL", "SRI", "SSH", "SSRF", "STT", "TCP",
+    "TODO", "TOML", "TTS", "UA", "UDP", "URI", "URL", "USB", "UTC", "UUID", "VPN", "WASI", "WIT",
+    "YAML",
 ];
 
 /// Is `word` an all-caps emphasis token under the allow-list? Mirrors the fleet rule
@@ -30545,6 +30548,14 @@ mod tests {
         assert!(
             scan_caps_emphasis("the API returns a CID over HTTP via REST and JSON").is_empty(),
             "allow-listed acronyms pass"
+        );
+        // task_1528 board-local technical acronyms are allow-listed, not caps-emphasis.
+        assert!(
+            scan_caps_emphasis(
+                "deploy to AWS with the SDK, store in CAS over IP, allow a CIDR, guard SSRF, cache in KV"
+            )
+            .is_empty(),
+            "task_1528 technical acronyms are allow-listed, not caps-emphasis"
         );
         // Identifiers (underscore or digit) are one word and skipped; single letters never flag.
         assert!(
