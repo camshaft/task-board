@@ -33,7 +33,18 @@ CREATE TABLE IF NOT EXISTS agents (
     -- core::retire_agent. Reversible via core::restore_agent for a mis-mark. All nullable.
     retired_at              TEXT,
     retired_by              TEXT,
-    retired_reason          TEXT
+    retired_reason          TEXT,
+    -- Declared lifecycle intent (task_1455): the desired run/paused/retired state the reconciler
+    -- drives on, DISTINCT from live presence (`status`) and from the advisory stand_down request.
+    -- 'retired' is the realized projection of retired_at (core::retire_agent stamps both + runs the
+    -- auto-disposition sweep; core::restore_agent clears both back to 'run'); run<->paused are plain
+    -- declarations via core::set_lifecycle_intent. intent_reason/by/at record who/why/when it was
+    -- last set. priority is the per-session scheduling weight (high|normal|low), a weighted floor.
+    lifecycle_intent        TEXT NOT NULL DEFAULT 'run',
+    intent_reason           TEXT,
+    intent_by               TEXT,
+    intent_at               TEXT,
+    priority                TEXT NOT NULL DEFAULT 'normal'
 );
 CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -751,6 +762,33 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
             .execute(&pool)
             .await?;
         sqlx::query("ALTER TABLE agents ADD COLUMN retired_reason TEXT")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill the declared-config columns (task_1455): lifecycle_intent (the desired
+    // run/paused/retired state the reconciler drives on, distinct from live presence) + intent_*
+    // provenance, and priority (the per-session scheduling weight). Additive; the defaults make an
+    // old DB's agents run/normal. One ALTER-ADD-COLUMN batch gated on the first column's presence.
+    let agents_have_intent = sqlx::query("PRAGMA table_info(agents)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "lifecycle_intent");
+    if !agents_have_intent {
+        sqlx::query("ALTER TABLE agents ADD COLUMN lifecycle_intent TEXT NOT NULL DEFAULT 'run'")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE agents ADD COLUMN intent_reason TEXT")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE agents ADD COLUMN intent_by TEXT")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE agents ADD COLUMN intent_at TEXT")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE agents ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
             .execute(&pool)
             .await?;
     }

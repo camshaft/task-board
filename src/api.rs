@@ -212,6 +212,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/agents/{agent_id}/retire", post(retire_agent))
         .route("/agents/{agent_id}/restore", post(restore_agent))
+        .route(
+            "/agents/{agent_id}/lifecycle-intent",
+            post(set_lifecycle_intent),
+        )
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/projects", get(list_projects).post(create_project))
@@ -893,6 +897,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/request-stand-down", summary: "Request that an agent gracefully wind down: records the request (who/why/when, shown on the agent's page) and notifies the agent so it stands down on its own terms. A SIGNAL — never changes the agent's status and never kills a live agent. Cleared when the agent goes offline.", query: "", body: Some("RequestStandDownBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/retire", summary: "Terminally retire an agent (task_1363): mark it permanently gone (distinct from offline/stand-down, which are resumable) and run the auto-disposition sweep — every task blocked on it is cleared back to todo (keeping the assignee) and task.blocker_retired is emitted to board-pm for re-homing, so no dependent silently strands. Operator or board-pm only; reversible via /restore.", query: "", body: Some("RetireAgentBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/restore", summary: "Reverse a terminal retirement (task_1363): clear the gone marker so a mis-marked agent is live again. Does not un-sweep already-disposed tasks. Operator or board-pm only.", query: "", body: Some("RestoreAgentBody") },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/lifecycle-intent", summary: "Set an agent's DECLARED lifecycle intent (task_1455): run or paused — the desired state the reconciler drives on, distinct from live presence. 'retired' is set via /retire (guarded auto-disposition sweep) and reversed via /restore, not here. Emits agent.intent_changed so a subscribed reconciler acts without a re-fetch.", query: "", body: Some("SetLifecycleIntentBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
@@ -1030,6 +1035,7 @@ fn body_schemas() -> Value {
         RequestStandDownBody,
         RetireAgentBody,
         RestoreAgentBody,
+        SetLifecycleIntentBody,
         CreateProjectBody,
         UpdateProjectBody,
         CreateTaskBody,
@@ -1355,6 +1361,34 @@ async fn restore_agent(
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct SetLifecycleIntentBody {
+    /// The desired intent: run or paused (retired is set via /retire, run-from-retired via /restore).
+    intent: String,
+    /// Who is setting it (recorded on the agent + the agent.intent_changed event).
+    #[serde(rename = "principal", alias = "intent_by", alias = "actor")]
+    intent_by: Option<String>,
+    /// Optional reason.
+    reason: Option<String>,
+}
+
+async fn set_lifecycle_intent(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<SetLifecycleIntentBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_lifecycle_intent(
+            &st.pool,
+            &agent_id,
+            &b.intent,
+            b.intent_by.as_deref(),
+            b.reason.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct RegisterAgentBody {
     agent_id: String,
     display_name: Option<String>,
@@ -1417,6 +1451,8 @@ struct UpdateAgentBody {
     /// kind, charter, status_message, webhook_url. An explicit value for a field wins over clearing.
     #[serde(default)]
     clear: Option<Vec<String>>,
+    /// Per-session scheduling priority/tier (task_1455): high | normal | low (a weighted floor).
+    priority: Option<String>,
     /// Return the full agent (including `charter`) in the response. Default false — the response
     /// omits the charter to keep a looping caller's context light; fetch it via GET /api/agents/{id}.
     #[serde(default)]
@@ -1439,6 +1475,7 @@ async fn update_agent(
         b.webhook_url.as_deref(),
         b.metadata,
         b.clear.as_deref(),
+        b.priority.as_deref(),
     )
     .await?;
     Ok(Json(if b.verbose.unwrap_or(false) {

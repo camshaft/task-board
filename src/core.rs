@@ -681,8 +681,19 @@ pub async fn update_agent(
     webhook_url: Option<&str>,
     metadata: Option<Value>,
     clear: Option<&[String]>,
+    priority: Option<&str>,
 ) -> anyhow::Result<Value> {
+    // task_1455: priority is the per-session scheduling weight the reconciler reads; validate the
+    // enum up front so a typo can't land as config.
+    if let Some(p) = priority {
+        if !["high", "normal", "low"].contains(&p) {
+            anyhow::bail!(BoardError::bad_request(format!(
+                "priority must be one of high|normal|low (got '{p}')"
+            )));
+        }
+    }
     let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
     let old = sqlx::query("SELECT metadata FROM agents WHERE id=?")
         .bind(agent_id)
         .fetch_optional(&mut *tx)
@@ -692,13 +703,14 @@ pub async fn update_agent(
     };
 
     let mut set_clauses: Vec<String> = Vec::new();
-    let fields: [(&str, Option<&str>); 6] = [
+    let fields: [(&str, Option<&str>); 7] = [
         ("display_name", display_name),
         ("kind", kind),
         ("charter", charter),
         ("status", status),
         ("status_message", status_message),
         ("webhook_url", webhook_url),
+        ("priority", priority),
     ];
     for (col, val) in fields.iter() {
         if val.is_some() {
@@ -754,12 +766,49 @@ pub async fn update_agent(
         q.execute(&mut *tx).await?;
     }
 
+    // task_1455: a config change emits agent.updated naming the changed field(s), delivered to the
+    // agent (which hot-reloads role/model/charter/priority without a restart) and visible on the
+    // board firehose for a subscribed reconciler. Emitted only when something actually changed.
+    let mut changed: Vec<String> = Vec::new();
+    for (col, val) in fields.iter() {
+        if val.is_some() {
+            changed.push((*col).to_string());
+        }
+    }
+    if merged_meta.is_some() {
+        changed.push("metadata".to_string());
+    }
+    if let Some(clear) = clear {
+        for name in clear {
+            if !changed.iter().any(|c| c == name) {
+                changed.push(name.clone());
+            }
+        }
+    }
+    if !changed.is_empty() {
+        let mut recips = BTreeSet::new();
+        recips.insert(agent_id.to_string());
+        emit(
+            &mut tx,
+            &mut hooks,
+            "agent.updated",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json!({ "agent_id": agent_id, "changed": changed }),
+            Recipients::Explicit(recips),
+        )
+        .await?;
+    }
     let row = sqlx::query("SELECT * FROM agents WHERE id=?")
         .bind(agent_id)
         .fetch_one(&mut *tx)
         .await?;
     let out = agent_json(&row);
     tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
 }
 
@@ -882,13 +931,24 @@ pub async fn set_status(
 /// metadata every agent read native=false and the WHOLE self-improve observer cadence went dark
 /// (task 477 fixed the acute drop). Add a field here only when a fleet consumer genuinely depends on
 /// it in the compact roster -- it is a standing promise the gate enforces.
-pub const FLEET_CONSUMED_ROSTER_FIELDS: &[&str] = &["metadata"];
+pub const FLEET_CONSUMED_ROSTER_FIELDS: &[&str] = &["metadata", "lifecycle_intent"];
 
 /// The default compact `list_agents` projection (task 418): the human-facing id/name/status plus the
 /// load-bearing [`FLEET_CONSUMED_ROSTER_FIELDS`], minus the heavy `charter` (the one field whose size
 /// overflowed the caller token cap, so the one dropped). `get_agent` / verbose still return the full
 /// object. Keep every [`FLEET_CONSUMED_ROSTER_FIELDS`] entry in this list or the contract test reds.
-const COMPACT_ROSTER_FIELDS: &[&str] = &["id", "display_name", "status", "metadata", "retired"];
+const COMPACT_ROSTER_FIELDS: &[&str] = &[
+    "id",
+    "display_name",
+    "status",
+    "metadata",
+    "retired",
+    // task_1455: the reconciler reads the declared lifecycle intent off the compact roster in one
+    // round trip (the task_1456 desired-fleet-state query), so it is a fleet-consumed projection
+    // field. `priority` rides along as the scheduling weight the reconciler also consumes.
+    "lifecycle_intent",
+    "priority",
+];
 
 /// Safely resolve an agent name to a single exact agent id (task_1251): the board-side guard against
 /// the prefix/substring-collision misroute (e.g. a caller resolving "v-fleet-tooling" via a
@@ -1151,19 +1211,33 @@ pub async fn retire_agent(
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
-    // Mark terminally gone. Idempotent re-retire refreshes the stamp/reason.
-    let n =
-        sqlx::query("UPDATE agents SET retired_at=?, retired_by=?, retired_reason=? WHERE id=?")
-            .bind(&ts)
-            .bind(retired_by)
-            .bind(reason)
-            .bind(agent_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-    if n == 0 {
+    // Read the prior declared intent (for the change event) and confirm the agent exists.
+    let Some(old_row) = sqlx::query("SELECT lifecycle_intent FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
         anyhow::bail!("no agent {agent_id}");
-    }
+    };
+    let old_intent: String = old_row
+        .try_get("lifecycle_intent")
+        .unwrap_or_else(|_| "run".to_string());
+    // Mark terminally gone AND stamp the declared lifecycle intent (task_1455): 'retired' is the
+    // realized projection of retired_at, and retire_agent is the sole guarded+swept writer of
+    // intent='retired'. Idempotent re-retire refreshes the stamp/reason.
+    sqlx::query(
+        "UPDATE agents SET retired_at=?, retired_by=?, retired_reason=?, \
+         lifecycle_intent='retired', intent_reason=?, intent_by=?, intent_at=? WHERE id=?",
+    )
+    .bind(&ts)
+    .bind(retired_by)
+    .bind(reason)
+    .bind(reason)
+    .bind(retired_by)
+    .bind(&ts)
+    .bind(agent_id)
+    .execute(&mut *tx)
+    .await?;
     // SWEEP: re-disposition every task currently blocked on this now-gone agent.
     let blocked: Vec<i64> = sqlx::query(
         "SELECT id FROM tasks WHERE blocked_on_kind='agent' AND blocked_on_ref=? AND status='blocked' ORDER BY id",
@@ -1231,6 +1305,20 @@ pub async fn retire_agent(
         )
         .await?;
     }
+    // Reconciler feed: a lifecycle-intent change (task_1455) so a subscribed reconciler sees the
+    // terminal transition on the same event shape as a run<->paused change, without a re-fetch.
+    if old_intent != "retired" {
+        emit_intent_changed(
+            &mut tx,
+            &mut hooks,
+            agent_id,
+            &old_intent,
+            "retired",
+            Some(retired_by),
+            reason,
+        )
+        .await?;
+    }
     let row = sqlx::query("SELECT * FROM agents WHERE id=?")
         .bind(agent_id)
         .fetch_one(&mut *tx)
@@ -1255,17 +1343,165 @@ pub async fn restore_agent(pool: &Pool, agent_id: &str, actor: &str) -> anyhow::
              board-pm."
         )));
     }
-    let n = sqlx::query(
-        "UPDATE agents SET retired_at=NULL, retired_by=NULL, retired_reason=NULL WHERE id=?",
-    )
-    .bind(agent_id)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    if n == 0 {
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(old_row) = sqlx::query("SELECT lifecycle_intent FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
         anyhow::bail!("no agent {agent_id}");
+    };
+    let old_intent: String = old_row
+        .try_get("lifecycle_intent")
+        .unwrap_or_else(|_| "retired".to_string());
+    // Clear the terminal marker AND reset the declared intent to 'run' (task_1455). Does NOT
+    // un-sweep tasks already re-dispositioned by the retire.
+    sqlx::query(
+        "UPDATE agents SET retired_at=NULL, retired_by=NULL, retired_reason=NULL, \
+         lifecycle_intent='run', intent_reason=NULL, intent_by=?, intent_at=? WHERE id=?",
+    )
+    .bind(actor)
+    .bind(&ts)
+    .bind(agent_id)
+    .execute(&mut *tx)
+    .await?;
+    if old_intent != "run" {
+        emit_intent_changed(
+            &mut tx,
+            &mut hooks,
+            agent_id,
+            &old_intent,
+            "run",
+            Some(actor),
+            None,
+        )
+        .await?;
     }
-    get_agent(pool, agent_id).await
+    let row = sqlx::query("SELECT * FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let out = agent_json(&row);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// task_1455: emit `agent.intent_changed` so a subscribed reconciler acts on a lifecycle-intent
+/// change (run/paused/retired) without a re-fetch. Delivered to the agent itself (it pauses/resumes
+/// or hot-reloads) and visible on the board firehose for a central reconciler. The payload carries
+/// the new value, so the reconciler need not re-read. Modeled on retire_agent's task.blocker_retired.
+async fn emit_intent_changed(
+    tx: &mut Transaction<'_, Sqlite>,
+    hooks: &mut Vec<WebhookDelivery>,
+    agent_id: &str,
+    old_intent: &str,
+    new_intent: &str,
+    intent_by: Option<&str>,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut recips = BTreeSet::new();
+    recips.insert(agent_id.to_string());
+    emit(
+        tx,
+        hooks,
+        "agent.intent_changed",
+        intent_by,
+        None,
+        None,
+        None,
+        None,
+        json!({
+            "agent_id": agent_id,
+            "old_intent": old_intent,
+            "new_intent": new_intent,
+            "intent_by": intent_by,
+            "intent_reason": reason,
+        }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Set an agent's declared lifecycle intent (task_1455) for the run<->paused transitions -- the
+/// desired state the reconciler drives on, distinct from live presence (`status`). The terminal
+/// 'retired' transition is NOT settable here: it stays behind retire_agent (operator/board-pm guard
+/// plus the auto-disposition sweep) and restore_agent, so there is exactly one guarded+swept
+/// retired-writer. Rejects a direct 'retired' (points to retire_agent) and a run/paused change while
+/// the agent is retired (points to restore_agent). Emits agent.intent_changed.
+pub async fn set_lifecycle_intent(
+    pool: &Pool,
+    agent_id: &str,
+    intent: &str,
+    intent_by: Option<&str>,
+    reason: Option<&str>,
+) -> anyhow::Result<Value> {
+    let intent = intent.trim();
+    match intent {
+        "run" | "paused" => {}
+        "retired" => anyhow::bail!(BoardError::bad_request(
+            "set lifecycle_intent='retired' via retire_agent (it runs the guarded auto-disposition \
+             sweep), not set_lifecycle_intent"
+                .to_string()
+        )),
+        other => anyhow::bail!(BoardError::bad_request(format!(
+            "lifecycle_intent must be one of run|paused|retired (got '{other}')"
+        ))),
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let Some(old_row) = sqlx::query("SELECT lifecycle_intent, retired_at FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        anyhow::bail!("no agent {agent_id}");
+    };
+    let old_intent: String = old_row
+        .try_get("lifecycle_intent")
+        .unwrap_or_else(|_| "run".to_string());
+    let retired_at: Option<String> = old_row.try_get("retired_at").ok().flatten();
+    if retired_at.is_some() || old_intent == "retired" {
+        anyhow::bail!(BoardError::bad_request(
+            "agent is retired (terminal); use restore_agent to bring it back to run, not \
+             set_lifecycle_intent"
+                .to_string()
+        ));
+    }
+    sqlx::query(
+        "UPDATE agents SET lifecycle_intent=?, intent_reason=?, intent_by=?, intent_at=? WHERE id=?",
+    )
+    .bind(intent)
+    .bind(reason)
+    .bind(intent_by)
+    .bind(&ts)
+    .bind(agent_id)
+    .execute(&mut *tx)
+    .await?;
+    if old_intent != intent {
+        emit_intent_changed(
+            &mut tx,
+            &mut hooks,
+            agent_id,
+            &old_intent,
+            intent,
+            intent_by,
+            reason,
+        )
+        .await?;
+    }
+    let row = sqlx::query("SELECT * FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let out = agent_json(&row);
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
 }
 
 /// Filter a `list_agents` result array by the derived `retired` bool (task_1363): keep only retired
@@ -18689,6 +18925,7 @@ mod tests {
             None,
             Some(json!({"branch": "main"})),
             None,
+            None,
         )
         .await?;
         let got = get_agent(&pool, "v-x").await?;
@@ -18711,6 +18948,7 @@ mod tests {
             Some("http://x/wake"),
             None,
             None,
+            None,
         )
         .await?;
         assert_eq!(
@@ -18728,6 +18966,7 @@ mod tests {
             None,
             None,
             Some(&["webhook_url".to_string()]),
+            None,
         )
         .await?;
         assert!(
@@ -18746,6 +18985,7 @@ mod tests {
             Some("http://y/wake"),
             None,
             Some(&["webhook_url".to_string()]),
+            None,
         )
         .await?;
         assert_eq!(
@@ -18764,14 +19004,15 @@ mod tests {
             None,
             None,
             None,
-            Some(&["status".to_string()])
+            Some(&["status".to_string()]),
+            None
         )
         .await
         .is_err());
 
         // update_agent on an unknown agent errors (it's a mutate, not an upsert).
         assert!(
-            update_agent(&pool, "nope", None, None, None, None, None, None, None, None)
+            update_agent(&pool, "nope", None, None, None, None, None, None, None, None, None)
                 .await
                 .is_err()
         );
@@ -18779,6 +19020,138 @@ mod tests {
         // A fresh agent gets an empty bag by default, not null.
         register_agent(&pool, "v-y", None, None, None, None, None).await?;
         assert_eq!(get_agent(&pool, "v-y").await?["metadata"], json!({}));
+        Ok(())
+    }
+
+    /// task_1455: agent config as board data. The declared-config fields default (lifecycle_intent
+    /// 'run', priority 'normal') and surface on get_agent + the compact roster; set_lifecycle_intent
+    /// moves run<->paused and emits agent.intent_changed to the agent; 'retired' is NOT settable
+    /// there (points to retire_agent) and a run/paused change while retired is rejected (points to
+    /// restore_agent); retire_agent stamps intent='retired' (retired bool is its projection) and
+    /// restore_agent clears it to 'run'; update_agent sets a validated priority and emits
+    /// agent.updated naming the changed field.
+    #[tokio::test]
+    async fn lifecycle_intent_and_priority_config_as_data() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "v-a", None, None, None, None, None).await?;
+        set_identity_alias(&pool, "operator", "cameron", Some("v-a")).await?;
+
+        // Defaults on a fresh agent, surfaced on get_agent AND the compact roster.
+        let a = get_agent(&pool, "v-a").await?;
+        assert_eq!(a["lifecycle_intent"], json!("run"));
+        assert_eq!(a["priority"], json!("normal"));
+        assert_eq!(a["retired"], json!(false));
+        let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
+        let entry = roster
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == json!("v-a"))
+            .unwrap();
+        assert_eq!(
+            entry["lifecycle_intent"],
+            json!("run"),
+            "compact roster carries lifecycle_intent"
+        );
+        assert_eq!(
+            entry["priority"],
+            json!("normal"),
+            "compact roster carries priority"
+        );
+
+        // run -> paused persists + emits agent.intent_changed to the agent (new value in payload).
+        set_lifecycle_intent(&pool, "v-a", "paused", Some("cameron"), Some("rebalancing")).await?;
+        assert_eq!(
+            get_agent(&pool, "v-a").await?["lifecycle_intent"],
+            json!("paused")
+        );
+        let ev = check_notifications(&pool, "v-a", false, 50, Some("agent.intent_changed")).await?;
+        let n = ev["notifications"].as_array().unwrap();
+        assert_eq!(n.len(), 1, "intent change delivered to the agent: {ev}");
+        assert_eq!(n[0]["data"]["old_intent"], json!("run"));
+        assert_eq!(n[0]["data"]["new_intent"], json!("paused"));
+
+        // 'retired' not settable here (-> retire_agent); an unknown token rejected.
+        assert!(
+            set_lifecycle_intent(&pool, "v-a", "retired", Some("cameron"), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            set_lifecycle_intent(&pool, "v-a", "bogus", Some("cameron"), None)
+                .await
+                .is_err()
+        );
+
+        // priority via update_agent: a valid set sticks + emits agent.updated(changed=[priority]);
+        // an invalid enum is rejected.
+        update_agent(
+            &pool,
+            "v-a",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("high"),
+        )
+        .await?;
+        assert_eq!(get_agent(&pool, "v-a").await?["priority"], json!("high"));
+        assert!(
+            update_agent(
+                &pool,
+                "v-a",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("urgent"),
+            )
+            .await
+            .is_err(),
+            "a bad priority enum is rejected"
+        );
+        let upd = check_notifications(&pool, "v-a", false, 50, Some("agent.updated")).await?;
+        assert!(
+            upd["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["data"]["changed"]
+                    .as_array()
+                    .map(|c| c.contains(&json!("priority")))
+                    .unwrap_or(false)),
+            "agent.updated names the changed priority field: {upd}"
+        );
+
+        // retire stamps intent='retired' (projection), then a run set is rejected (-> restore);
+        // restore clears intent back to 'run'.
+        retire_agent(&pool, "v-a", "cameron", Some("gone")).await?;
+        let retired = get_agent(&pool, "v-a").await?;
+        assert_eq!(retired["lifecycle_intent"], json!("retired"));
+        assert_eq!(
+            retired["retired"],
+            json!(true),
+            "retired bool is the projection of intent=retired"
+        );
+        assert!(
+            set_lifecycle_intent(&pool, "v-a", "run", Some("cameron"), None)
+                .await
+                .is_err(),
+            "run while retired must point to restore_agent"
+        );
+        restore_agent(&pool, "v-a", "cameron").await?;
+        let restored = get_agent(&pool, "v-a").await?;
+        assert_eq!(restored["lifecycle_intent"], json!("run"));
+        assert_eq!(restored["retired"], json!(false));
         Ok(())
     }
 

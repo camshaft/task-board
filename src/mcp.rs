@@ -285,6 +285,10 @@ pub struct UpdateAgentArgs {
     /// for the same field wins over clearing it.
     #[serde(default)]
     pub clear: Option<Vec<String>>,
+    /// Per-session scheduling priority / tier (task_1455): high | normal | low (a weighted floor the
+    /// reconciler reads, not strict preemption). Operator-facing agents are typically high.
+    #[serde(default)]
+    pub priority: Option<String>,
     /// Return the full agent (including the `charter`) in the response. Default false — the response
     /// omits the charter to keep a looping caller's context light; fetch it with get_agent.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
@@ -303,6 +307,22 @@ pub struct SetStatusArgs {
     pub status: String,
     #[serde(default)]
     pub status_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetLifecycleIntentArgs {
+    /// The agent whose declared lifecycle intent to set.
+    pub agent_id: String,
+    /// The desired intent: run or paused. (retired is set via retire_agent, which runs the guarded
+    /// auto-disposition sweep; use restore_agent to bring a retired agent back to run.)
+    pub intent: String,
+    /// Who is setting it (defaults to this session's identity).
+    #[serde(rename = "principal", alias = "intent_by", alias = "actor", default)]
+    pub intent_by: Option<String>,
+    /// Optional reason recorded on the agent + the agent.intent_changed event.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2268,6 +2288,7 @@ impl Board {
             s(&a.webhook_url),
             a.metadata.map(Value::Object),
             a.clear.as_deref(),
+            s(&a.priority),
         )
         .await
         .map(|v| {
@@ -2277,6 +2298,26 @@ impl Board {
                 core::strip_field(v, "charter")
             }
         })
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Set an agent's DECLARED lifecycle intent (task_1455): run or paused -- the desired state the reconciler drives on, DISTINCT from live presence (status). 'retired' is NOT set here: use retire_agent (which runs the guarded auto-disposition sweep) and restore_agent to bring a retired agent back to run. Emits agent.intent_changed so a subscribed reconciler acts without a re-fetch."
+    )]
+    async fn set_lifecycle_intent(
+        &self,
+        Parameters(a): Parameters<SetLifecycleIntentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let intent_by = self.me_opt(s(&a.intent_by));
+        core::set_lifecycle_intent(
+            &self.pool,
+            &a.agent_id,
+            &a.intent,
+            intent_by.as_deref(),
+            s(&a.reason),
+        )
+        .await
         .map_err(err)
         .and_then(ok)
     }
