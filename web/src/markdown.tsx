@@ -81,7 +81,7 @@ const GITHUB_REF_RE = /(?<![\w./@-])([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*)#(
 // lookbehind rejects a leading word char / hyphen so "subtask_5" / "todoc_3" don't match (and a '#'
 // is neither, so "#task_5" matches with the '#' captured as group 1); \b after the digits rejects
 // "task_12ab".
-const TYPED_REF_RE = /(?<![\w-])(#?)(task|doc|project|channel)_(\d+)\b/g
+const TYPED_REF_RE = /(?<![\w-])(#?)(task|doc|project|channel|comment)_(\d+)\b/g
 
 // NOTE (task_869): a BARE "#N" (e.g. "#123") is NO LONGER linkified. cameron hard-rejected the bare
 // form at write time (it is ambiguous versus a GitHub owner/repo#N and the canonical #task_N), so
@@ -100,6 +100,9 @@ const REF_ROUTE: Record<string, string> = {
   doc: 'documents',
   project: 'projects',
   channel: 'channels',
+  // A comment is a CHILD of a task, so /comments/:id is a resolver route (CommentRedirect) that
+  // looks up the parent task and forwards to /tasks/:task_id#comment-:id (task_1431).
+  comment: 'comments',
 }
 
 // Shared link styling (sky underline) — used by markdown links and the bare-URL / task-ref

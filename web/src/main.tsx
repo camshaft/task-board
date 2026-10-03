@@ -20,7 +20,7 @@ import Reviews from './Reviews.tsx'
 import Search from './Search.tsx'
 import Settings from './Settings.tsx'
 import Wiki from './Wiki.tsx'
-import { TaskDrawer, TaskRedirect } from './TaskDrawer.tsx'
+import { CommentRedirect, TaskDrawer, TaskRedirect } from './TaskDrawer.tsx'
 import { installCrashReporting } from './crash-report'
 
 // Install global uncaught-error / unhandled-rejection telemetry before anything renders (task_879),
@@ -84,6 +84,7 @@ createRoot(document.getElementById('root')!).render(
             <Route path="channels/:channelId" element={<ChannelView />} />
             {/* Bare task deep-link: resolves the task's project and redirects to the nested URL. */}
             <Route path="tasks/:taskId" element={<TaskRedirect />} />
+            <Route path="comments/:commentId" element={<CommentRedirect />} />
             <Route path="projects/:projectId/access" element={<ProjectAccess />} />
             <Route path="projects/:projectId" element={<Board />}>
               <Route path="tasks/:taskId" element={<TaskDrawer />} />
