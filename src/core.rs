@@ -10867,12 +10867,25 @@ pub async fn recall_bundle(
         None => Value::Null,
     };
 
+    // Live attach-state (task_1501, doc_3426 ask 7 follow-on): the current reference count of
+    // attachers streaming this agent's live session. Push on/off is edge-triggered by the
+    // session.attach_active / session.detach events, so a harness recovering on restart (while an
+    // attacher is still connected) would not re-see the earlier attach_active via forward-replay.
+    // Surfacing the point-in-time count here lets the harness set its initial push state on startup,
+    // then follow the edges. Read-only.
+    let attachers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM session_attachments WHERE agent_id=?")
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await?;
+
     Ok(json!({
         "agent": agent,
         "open_tasks": open_tasks,
         "open_task_count": open_task_count,
         "inbox": inbox,
         "transcript": transcript,
+        "attach": { "active": attachers > 0, "attachers": attachers },
     }))
 }
 
@@ -14725,6 +14738,32 @@ mod tests {
             let n = check_notifications(&pool, "a1", false, 100, Some(kind)).await?;
             assert_eq!(n["count"], json!(want), "wrong count for {kind}");
         }
+        Ok(())
+    }
+
+    /// task_1501 (doc_3426 ask 7 follow-on): the recall bundle surfaces the live attach-state so a
+    /// restarting harness recovers its push on/off state, since push is edge-triggered.
+    #[tokio::test]
+    async fn recall_bundle_surfaces_live_attach_state() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "a1", Some("Agent 1"), None, None, None, None).await?;
+
+        // No attacher: recall reports attach inactive.
+        let b = recall_bundle(&pool, "a1", None, 50, 50).await?;
+        assert_eq!(b["attach"]["active"], json!(false));
+        assert_eq!(b["attach"]["attachers"], json!(0));
+
+        // With an attacher, recall reports it active with the live count.
+        attach_session(&pool, "a1", "op").await?;
+        let b = recall_bundle(&pool, "a1", None, 50, 50).await?;
+        assert_eq!(b["attach"]["active"], json!(true));
+        assert_eq!(b["attach"]["attachers"], json!(1));
+
+        // After the last detach, inactive again.
+        detach_session(&pool, "a1", "op").await?;
+        let b = recall_bundle(&pool, "a1", None, 50, 50).await?;
+        assert_eq!(b["attach"]["active"], json!(false));
         Ok(())
     }
 
