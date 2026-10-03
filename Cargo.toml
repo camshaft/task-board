@@ -34,6 +34,11 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 anyhow = "1"
 thiserror = "2"
+# Compile-time self-registration (task_1497): the REST discovery catalog + the body-schema set
+# collect their entries from linker-section statics (`inventory::submit!` at each definition site)
+# instead of a central hand-maintained append list, so new endpoints/schemas stop colliding on a
+# shared line. Collected under both the native binary and `cargo test` (verified by v-fleet-tooling).
+inventory = "0.3"
 base64 = "0.22"
 # Pattern matching for the design-doc structural submit gate (task_1038 placeholder/attestation
 # checks). Already in the tree transitively; promoted to a direct dep.

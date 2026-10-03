@@ -924,267 +924,310 @@ struct Endpoint {
     /// Key into the `schemas` object for the request-body JSON Schema, if any.
     body: Option<&'static str>,
 }
+inventory::collect!(Endpoint);
 
-/// The hand-curated map of every REST endpoint. Kept next to `router()` so the two stay
-/// in sync. `body` names a struct whose JSON Schema is generated below.
-const ENDPOINTS: &[Endpoint] = &[
-    Endpoint { method: "GET", path: "/api", summary: "This discovery index: every endpoint with its request schema.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/tunnels", summary: "Diagnostic: which agents currently have a live reverse tunnel (so the board can push a wake rather than the agent polling). An agent absent here has no live tunnel — its wakes fall back to the inbox + poll.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/health", summary: "Health beacon: cheap liveness+readiness probe. 200 {ok:true,db:true} when the process is up and the database is reachable; 503 {ok:false} when the database is not ready. Check before a full tick and treat any non-200 (incl a 502 from the origin when it is down) as back-off-and-retry.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/metrics", summary: "Request metrics for optimizing board/fleet performance (task_1380): per-endpoint latency p50/p90/p99 in ms (approximate, from coarse log-spaced buckets), request count + process start (a throughput basis), the in-flight / max-in-flight concurrency gauge (a hang shows as a stuck-high in_flight), and 2xx/4xx/5xx status-class counts, plus an overall rollup. Keys are METHOD + route template relative to the /api mount. Aggregate numbers only, mutates nothing.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/admin/db-snapshot", summary: "Download a point-in-time-consistent copy of the SQLite database (VACUUM INTO, integrity-checked), behind HTTP Basic auth. Disabled by default (404 when off); the deployment keeps it loopback/LAN-bound and off the public tunnel. The extraction primitive for host migration + DR.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata, retired, lifecycle_intent, priority} by default (the small metadata bag is kept for filtering, e.g. metadata.native; lifecycle_intent + priority are the declared-config fields the reconciler reads; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match), lifecycle_intent (run|paused|retired declared desired-fleet-state, independent of live presence; lifecycle_intent=run is the desired-live set), retired (true=only terminally-gone agents, false=only live). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&lifecycle_intent=str&verbose=bool&retired=bool&limit=int&offset=int", body: None },
-    Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
-    Endpoint { method: "GET", path: "/api/resolve-agent", summary: "Resolve an agent name to one exact agent id (task_1251): an exact id wins (never ambiguous even when it is a prefix of a longer id), a unique case-insensitive substring resolves, an ambiguous substring is refused (400) with the sorted candidate ids. The safe recipient-resolver vs picking the first row of a q= search. Returns {name, id, match}.", query: "name=str", body: None },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
-    Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry). Merge-PATCH: an omitted/null field is left unchanged; to reset a nullable field to null, name it in `clear` (e.g. [\"webhook_url\"]).", query: "", body: Some("UpdateAgentBody") },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}/mandate", summary: "Assemble an agent's session-start mandate from board data in one read (task_1457, doc_3426 ask 3): charter, role prompt, applicable standing directives (tenets/*), and applicable recipes (recipes/*), in the deterministic order charter, role, directives, recipes. Applicability is matched server-side; a version_fingerprint + component_document_ids drive the harness's subscribe-and-recompare hot-reload.", query: "contexts=csv&include_content=bool", body: None },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/request-stand-down", summary: "Request that an agent gracefully wind down: records the request (who/why/when, shown on the agent's page) and notifies the agent so it stands down on its own terms. A SIGNAL — never changes the agent's status and never kills a live agent. Cleared when the agent goes offline.", query: "", body: Some("RequestStandDownBody") },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/retire", summary: "Terminally retire an agent (task_1363): mark it permanently gone (distinct from offline/stand-down, which are resumable) and run the auto-disposition sweep — every task blocked on it is cleared back to todo (keeping the assignee) and task.blocker_retired is emitted to board-pm for re-homing, so no dependent silently strands. Operator or board-pm only; reversible via /restore.", query: "", body: Some("RetireAgentBody") },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/restore", summary: "Reverse a terminal retirement (task_1363): clear the gone marker so a mis-marked agent is live again. Does not un-sweep already-disposed tasks. Operator or board-pm only.", query: "", body: Some("RestoreAgentBody") },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/lifecycle-intent", summary: "Set an agent's DECLARED lifecycle intent (task_1455): run or paused — the desired state the reconciler drives on, distinct from live presence. 'retired' is set via /retire (guarded auto-disposition sweep) and reversed via /restore, not here. Emits agent.intent_changed so a subscribed reconciler acts without a re-fetch.", query: "", body: Some("SetLifecycleIntentBody") },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}/inbox", summary: "Recipient-filtered since-seq inbox read (task_1490): returns the agent's own events with seq strictly greater than since_seq, in seq order, bounded by limit, with NO ack side-effect (fetching never marks read, unlike /notifications). The clean no-lost-wake primitive -- the harness persists its last durably-processed seq and replays from it after a crash without the fetch-ack coupling. last_seq in the response is the next cursor; independent of read_at, so it is at-least-once by the client cursor. Pair with the inbox/ack endpoint for pruning.", query: "since_seq=int&limit=int", body: None },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/inbox/ack", summary: "Seq-scoped ack (task_1490): mark the agent's inbox rows read up to and including a durably-processed seq, so at-least-once delivery does not depend on drain discipline and acked rows become prunable. Idempotent; advances read_at only on unread rows at or below through_seq. Does not change the /notifications default semantics.", query: "", body: Some("AckInboxBody") },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}/recall", summary: "Board-state-recall bundle (task_1464, doc_3426 ask 9): ONE round trip that rebuilds an agent's working context at session (re)start -- its desired config + lifecycle_intent (task_1455/1456), its open assigned tasks with status + blocked_on, its bounded unread inbox (NOT marked read), and, when session_id is given, a handle to that session's transcript-chunk log (task_1463). The board is the recovery authority: recall first, transcript rehydration second. Bounded + efficient per start.", query: "session_id=str&task_limit=int&activity_limit=int", body: None },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Read an agent's per-config_kind editable-config set (task_1477, doc_3426 ask 11): one read returns {agent_id, config_kind, version, count, entries} in dispatch order (position then id). config_kind namespaces the shared per-agent editable-config surface -- 'decider' (ask 11: payload = {kind, criteria, bands}, scope = applies_to_call_types) and 'tool' (ask 4: payload = authz/argument policy). Each entry is the {id, enabled, scope, payload} envelope + position. The harness reads at session start and re-reads on an agent.config_changed wake (subscribe board + [\"agent\"]); version is the watchable key. Pass effective=true for the merged per-agent set = role-level grants + agent overrides (task_1459 ask 4; adds role, role_version, agent_version, and a per-entry source).", query: "effective=bool", body: None },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Upsert one entry in an agent's config set (task_1477): add a new entry or edit/toggle an existing one by entry_id. An omitted field keeps the existing value (edit) or the default (add: enabled=true, scope=null=all-call-types, payload={}, position appended). scope=null clears to all call types. Bumps the version + emits agent.config_changed so a subscribed harness hot-reloads. Returns the full updated set.", query: "", body: Some("SetAgentConfigEntryBody") },
-    Endpoint { method: "DELETE", path: "/api/agents/{agent_id}/config/{config_kind}/{entry_id}", summary: "Remove one entry from an agent's config set (task_1477). Bumps the version + emits agent.config_changed like an edit. Returns the shrunk set.", query: "actor=str", body: None },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/check-stop", summary: "Board-authoritative stop-condition check (task_1479, doc_3426 ask 13): the harness calls this before letting an agent stop. Returns {decision: accept} only when the agent's lifecycle_intent is paused/retired (meant offline); a run-intent agent is never hard-accepted -- {decision: reject, reason, directive} with directive {kind: take, task_ref} if it holds an open actionable (todo/in_progress, non-blocked, non-monitor-exempt) task, else {kind: park} (stay online, idle, wait for a wake). A pure idempotent read on board state (desired-fleet-state + open work), not the agent self-report; the reason is fed to the model verbatim. stop_context is advisory.", query: "", body: Some("CheckStopBody") },
-    Endpoint { method: "GET", path: "/api/roles/{role}/config/{config_kind}", summary: "Read a ROLE's own config set for one config_kind (task_1459, doc_3426 ask 4) -- the role-level base inherited by every agent in the role, before per-agent overrides. For the merged per-agent view call GET /api/agents/{id}/config/{kind}?effective=true. Same shape as the agent read; the subject is role:{role}.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/roles/{role}/config/{config_kind}", summary: "Upsert a ROLE-level config entry (task_1459, ask 4): a grant inherited by every agent in the role unless an agent overrides the same entry_id. enabled=false withholds the entry for the whole role (the N8 unattended-window guarantee), overridable per agent. For config_kind=tool, payload is the optional per-tool authz/argument policy (M3). Bumps the role version + emits agent.config_changed so agents in the role hot-reload.", query: "", body: Some("SetAgentConfigEntryBody") },
-    Endpoint { method: "DELETE", path: "/api/roles/{role}/config/{config_kind}/{entry_id}", summary: "Remove a ROLE-level config entry (task_1459). Bumps the role version + emits agent.config_changed. Returns the shrunk role set.", query: "actor=str", body: None },
-    Endpoint { method: "POST", path: "/api/sessions/{session_id}/transcript-chunks", summary: "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). position is assigned server-side (per-session, monotonic across generations) and returned. kind is window | compaction-boundary; append-only + history-preserving.", query: "", body: Some("AppendTranscriptChunkBody") },
-    Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None },
-    Endpoint { method: "POST", path: "/api/decider-episodes", summary: "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. Lightweight no-event append — fire it async off the agent hot path. Downstream consumer: the decider corpus (task_1471).", query: "", body: Some("SubmitDeciderEpisodeBody") },
-    Endpoint { method: "GET", path: "/api/decider-episodes", summary: "Aggregate decider episodes for the corpus relabel/retrain work (task_1478): filter by decider_id, call_type, and a [since, until) created_at window (all optional), ordered by append order, bounded by limit (default 200, max 1000). Returns each episode's inline structured relabel record + CID.", query: "decider_id=str&call_type=str&since=iso&until=iso&limit=int", body: None },
-    Endpoint { method: "POST", path: "/api/budgets", summary: "Set (upsert) an editable budget cap (task_1461, doc_3426 ask 6) scoped to an agent or role over a rolling window (hour|day|week|month|total). Bumps a version and emits budget.updated so affected agents hot-reload. Config data; the admit/defer decision stays harness-side.", query: "", body: Some("SetBudgetBody") },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}/budget", summary: "One-read budget admission surface (task_1461): an agent's effective cap (role base merged with agent override), current spend over the window, session priority, and a would_admit convenience, so the harness admits or defers a turn in one round trip. Deterministic.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/spend", summary: "Report one turn's realized cost to the spend ledger (task_1461): append-only, lightweight, fire off the hot path. The board accumulates current spend over the rolling window. Returns current spend after the append.", query: "", body: Some("ReportSpendBody") },
-    Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
-    Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
-    Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
-    Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") },
-    Endpoint { method: "GET", path: "/api/projects/{project_id}/teams", summary: "Get a project's team grants (visibility + roles) + the resolved principal access map (strongest role wins; nested teams expanded for a cascade grant; implicit creator admin). Recording layer, task 542 Phase 3.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/projects/{project_id}/teams", summary: "Grant a team access to a project with a role (admin/read-write/read), idempotent. cascade (default true) extends to nested sub-teams.", query: "", body: Some("ProjectTeamBody") },
-    Endpoint { method: "DELETE", path: "/api/projects/{project_id}/teams", summary: "Revoke a team's grant on a project (idempotent).", query: "", body: Some("ProjectTeamBody") },
-    Endpoint { method: "POST", path: "/api/projects/{project_id}/archive-done", summary: "Retention sweep (task_1228): soft-archive every task in the project that has been done AND untouched for at least older_than_days days (default 7; 0 = no retention window). Reversible (restore), idempotent, iceboxed tasks exempt. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveDoneProposalsBody") },
-    Endpoint { method: "POST", path: "/api/projects/{project_id}/age-out-todos", summary: "Age-out sweep (task_1215 sibling): soft-archive stale untriaged todos (status=todo, untouched for at least older_than_days days; default 14; 0 = no window). Scoped to status=todo, so blocked/in_progress/done/iceboxed are exempt. Reversible, idempotent. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveStaleTodosBody") },
-    Endpoint { method: "GET", path: "/api/projects/{project_id}/duplicates", summary: "Report-only duplicate detector (task_1215 dedup sibling): active tasks (todo/in_progress/blocked, non-archived) clustered by normalized title (case/whitespace-insensitive), returning clusters of 2+. Mutates nothing. Done/cancelled/iceboxed excluded. Returns {project_id, groups:[{title_key, count, tasks:[...]}]}.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/projects/{project_id}/metrics", summary: "Read-only queue-time metrics (task_1265): derived entirely from the events stream, no new tables. pickup_latency_secs (task creation -> first assignment), time_in_todo_secs (summed dwell in status todo), time_blocked_secs (summed dwell in status blocked, sampled over actually-blocked tasks only). Each is {count, p50, p90, max, mean} in whole seconds (nearest-rank percentiles). Mutates nothing. Returns {project_id, task_count, pickup_latency_secs, time_in_todo_secs, time_blocked_secs}.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/system/link-rules", summary: "The deployment-configured link-tag rules (task_1243): a read-only list of {pattern, url_template} the UI uses to linkify custom references (e.g. CR-NNNN) in rendered content, generalizing the built-in typed-ref linkification. Patterns live in the deployment TOML (never in source), so each deployment customizes its own tags; empty when none are configured. Returns {link_rules:[{pattern, url_template}]}. Mutates nothing.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/enforcement/preflight", summary: "Fail-closed preflight for enabling per-operator ACCESS enforcement -- checks WORKSPACE/PROJECT GRANTS, NOT document conformance (use grade_document, the doc_7 A8 rubric, for a doc's conformance). doc_26 A5: enablable=true only when the fleet-coordination team exists and holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant, blockers. Read-only.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true. monitor_exempt=bool filters by the derived monitor-exempt flag (audit the no-hiding-behind-exempt invariant).", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool&monitor_exempt=bool", body: None },
-    Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
-    Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
-    Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") },
-    Endpoint { method: "GET", path: "/api/comments/{comment_id}", summary: "Read one comment by id, with its type (plain/question/answer), parsed payload, lifecycle state, and reply_to/supersedes links.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task, routed to a principal; blocking by default. Give EITHER a legacy kind (yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list/point_allocation) OR omit kind for a CID-keyed question carrying an inline response_schema + ui.element_schema_cid (its canonical type id). Answers validated against the response_schema generically. point_allocation (doc_3371 entry 8) needs options + config={budget:N}; its answer is an object {option_id: integer_points} summing to the budget. quiz (doc_3371 entry 10) needs options + config={answer:[option_id,...], explanation?}; its answer is a choice scored server-side against the stored key (redacted from the question on read, revealed with the score on the answer). Returns the question comment.", query: "", body: Some("PoseQuestionBody") },
-    Endpoint { method: "POST", path: "/api/comments/{comment_id}/answer", summary: "Answer an open question. For a kind-based question a framed answer (shape matching the kind) marks it answered and a text answer to a non-text kind is the out-of-frame escape; for a schema-driven question the value is validated against its response_schema generically. Returns the answer comment.", query: "", body: Some("AnswerQuestionBody") },
-    Endpoint { method: "POST", path: "/api/comments/{comment_id}/decline", summary: "Decline an open question with feedback (an explicit refusal, distinct from an out-of-frame answer).", query: "", body: Some("DeclineQuestionBody") },
-    Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") },
-    Endpoint { method: "POST", path: "/api/comments/{comment_id}/supersede", summary: "Supersede an open question with a replacement (doc_33 A6): the old is kept immutable + linked, the new copies its payload with a new prompt. Asker-only.", query: "", body: Some("SupersedeQuestionBody") },
-    Endpoint { method: "GET", path: "/api/comments/{comment_id}/annotations", summary: "List a task comment's annotations (oldest first), optionally filtered by status (open/resolved).", query: "status=str", body: None },
-    Endpoint { method: "POST", path: "/api/comments/{comment_id}/annotations", summary: "Annotate a task comment, optionally anchored to a highlighted span (region = free-form JSON selector, e.g. W3C/Hypothesis TextQuote+TextPosition; omit to annotate the whole comment). reply_to threads one level. Notifies the parent task's watchers.", query: "", body: Some("AnnotateCommentBody") },
-    Endpoint { method: "POST", path: "/api/comment-annotations/{annotation_id}/resolve", summary: "Mark a comment annotation resolved (open -> resolved).", query: "", body: Some("ResolveCommentBody") },
-    Endpoint { method: "GET", path: "/api/tasks/awaiting", summary: "The unified 'awaiting you' queue (task_860 + task_873): everything awaiting a decision from `viewer`, keyed INDEPENDENT of assignee, team-expanded, deduped, as a FLAT array of discriminated items. kind='task' {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]} for a task blocked_on the principal OR carrying an open blocking question routed to it. kind='document' {document_id, title, status, version_no, updated_at, path} for a doc awaiting the operator's approval (status operator_review) -- emitted only when the viewer resolves to the operator.", query: "viewer=str&project_id=int&include_archived=bool", body: None },
-    Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/archive", summary: "Soft-archive a task: hide it from the default list_tasks view (still fetchable by id and with include_archived). Orthogonal to status; reversible with restore.", query: "", body: Some("ArchiveTaskBody") },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/restore", summary: "Restore an archived task so it reappears in the default list_tasks view.", query: "", body: Some("ArchiveTaskBody") },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/mute", summary: "Mute a task for an agent: detach them from its event fan-out (stop FYI notifications).", query: "", body: Some("MuteTaskBody") },
-    Endpoint { method: "POST", path: "/api/tasks/{task_id}/unmute", summary: "Unmute a task for an agent (rejoin its fan-out).", query: "", body: Some("MuteTaskBody") },
-    Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, document, or the whole board (board=true). Optional event_classes (e.g. [\"created\"]) makes it a delivery-gated filtered subscription (only those classes reach the inbox and wake you); omit for every event. Idempotent (re-subscribe updates the class set). Pass thread_root (a channel post's event seq) to subscribe to a THREAD and be delivered+woken on in-thread follow-ups (reply_to=that root) without a re-mention.", query: "", body: Some("SubscribeBody") },
-    Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, channel, document, the whole board (board=true), or a thread (thread_root=the root post seq).", query: "", body: Some("SubscribeBody") },
-    Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None },
-    Endpoint { method: "POST", path: "/api/channels", summary: "Create (or get) a named channel.", query: "", body: Some("CreateChannelBody") },
-    Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members. Pass viewer to also get that viewer's unread_count + has_unread (task_1067).", query: "viewer=str", body: None },
-    Endpoint { method: "POST", path: "/api/channels/{channel_id}/read", summary: "Mark a channel read for the caller (principal) up to a post seq (default: everything currently in the channel), clearing its unread dot. Advances the per-(subscriber,channel) last-read pointer and emits a silent channel.read event for cross-tab dot-clearing. Returns {channel_id, last_read_seq, unread_count}.", query: "", body: Some("ChannelReadBody") },
-    Endpoint { method: "GET", path: "/api/channels/{channel_id}/posts", summary: "Read a channel's post history. order=desc returns the latest N (newest-first) for a chat view; default asc is oldest-first for scrollback. before_seq pages earlier.", query: "since_seq=int&limit=int&before_seq=int&order=asc|desc", body: None },
-    Endpoint { method: "POST", path: "/api/channels/{channel_id}/posts", summary: "Post a message to a channel.", query: "", body: Some("PostToChannelBody") },
-    Endpoint { method: "PATCH", path: "/api/channels/{channel_id}/props", summary: "Merge props into a channel's metadata (e.g. the outbound reflect-back policy).", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/channels/{channel_id}/auto-join", summary: "Set/clear a channel's auto_join flag — a fleet-wide broadcast channel every agent belongs to (enabling joins all current agents + auto-joins future ones on register).", query: "", body: Some("SetChannelAutoJoinBody") },
-    Endpoint { method: "POST", path: "/api/channels/{channel_id}/promote-thread", summary: "Promote a channel thread into a task (root→description, replies→comments); idempotent.", query: "", body: Some("PromoteThreadBody") },
-    Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") },
-    Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") },
-    Endpoint { method: "POST", path: "/api/dms", summary: "Get (or create) the private 1:1 DM channel for a pair of agents, returning the channel + members. Idempotent and order-independent — lets a client open/link a DM before any message is sent.", query: "", body: Some("OpenDmBody") },
-    Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log (optionally filtered to one actor). order=desc returns the latest N (newest-first) for a live feed; default asc is oldest-first for incremental pollers.", query: "since_seq=int&limit=int&actor=str&order=asc|desc", body: None },
-    Endpoint { method: "GET", path: "/api/external-identities", summary: "List external (bridged) identities, optionally filtered by source.", query: "source=str", body: None },
-    Endpoint { method: "POST", path: "/api/external-identities", summary: "Register/update an external identity (a bridged human/actor, e.g. slack:U123).", query: "", body: Some("UpsertExternalIdentityBody") },
-    Endpoint { method: "GET", path: "/api/external-links", summary: "List bridged links (channel-map / issue↔task / thread↔task), filter by source/board_kind/board_id. Task-kind rows carry the linked task's board_status, so a sync can enumerate the live external-entity-task set and filter to non-terminal.", query: "source=str&board_kind=str&board_id=int", body: None },
-    Endpoint { method: "POST", path: "/api/external-links", summary: "Map a board entity (channel|task|thread) to an external one; idempotent on (source, external_id).", query: "", body: Some("UpsertExternalLinkBody") },
-    Endpoint { method: "POST", path: "/api/external-entity-tasks", summary: "Create-or-reuse an external-entity-task for an external wait on a CR/PR (idempotent on source + lowercased owner/repo#number). State lives in metadata.external_entity; the bridge syncs it and sets it done on resolution, which auto-unblocks waiters.", query: "", body: Some("EnsureExternalEntityTaskBody") },
-    Endpoint { method: "POST", path: "/api/external-entity-tasks/block", summary: "Make a task wait on an external CR/PR: ensure the shared entity-task E and set the waiter's blocked_on={kind:task,target:E}. Collapses into blocked-on-task and auto-unblocks when the bridge resolves E.", query: "", body: Some("BlockOnExternalBody") },
-    Endpoint { method: "GET", path: "/api/workspace-kinds", summary: "List custom workspace kinds (named env setup definitions fleet spin-up materializes from board data).", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/workspace-kinds", summary: "Define/update a workspace kind (setup_script + config an agent is configured with); idempotent on name, config merges.", query: "", body: Some("SetWorkspaceKindBody") },
-    Endpoint { method: "GET", path: "/api/workspace-kinds/{name}", summary: "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize a workspace.", query: "", body: None },
-    Endpoint { method: "DELETE", path: "/api/workspace-kinds/{name}", summary: "Retire a workspace kind by name.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/lint", summary: "Dry-run the pre-submit content lint on arbitrary text without writing: returns {clean, banned_phrases, non_ascii, bare_refs} against the authoritative live banned-phrases list, the ASCII-only rule, and the ambiguous bare-#N typed-ref rule. Use this to pre-check content (incl. before a CID publish, which the write-path gate does not cover) instead of a drift-prone local copy.", query: "", body: Some("LintTextBody") },
-    Endpoint { method: "POST", path: "/api/crash-reports", summary: "Ingest a UI crash report (task_879): auto-file (or bump) an investigation task for an uncaught browser exception. Body {message, kind?, stack?, component_stack?, url?, build?, user_agent?, occurred_at?}. Deduped by build + stack signature -- a recurring crash bumps one open task's occurrence count rather than spawning duplicates; a new signature files an unassigned task in intake (project 29) for board-triage to route. Returns {task_id, created, occurrences}.", query: "", body: Some("CrashReportBody") },
-    Endpoint { method: "POST", path: "/api/grade-document", summary: "Grade a design document against the mechanical doc_7 A8 conformance rubric (ascii, required-sections-in-order, banned-phrases, title/heading rules, body-hygiene, status/provenance, caps-emphasis, body-length). Returns {clean, has_hard_fail, findings:[{check, severity, line, message}]} with actionable-remedy messages. The single grading source of truth: the board submit path and any client (fleet check-doc, the reviewer) call this one endpoint.", query: "", body: Some("GradeDocumentBody") },
-    Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list -- the authoritative runtime source the pre-submit content lint checks docs and comments against (doc_3426 ask 5). Returns {policy_kind, version, count, phrases}. version is the watchable key: a harness re-reads on a policy.changed wake (board + [\"policy\"]) comparing version to hot-reload the list.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
-    Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/admission-rules", summary: "List per-role admission rules with the watchable version (task_1460, doc_3426 ask 5): {policy_kind, version, count, rules, role}. With ?role= set, returns that role's own rules UNION the \"*\" class-defaults (the set that applies to the role); without it, every rule. The harness reads this to admit/decline by role and re-reads on a policy.changed wake (board + [\"policy\"]) comparing version.", query: "role=str", body: None },
-    Endpoint { method: "POST", path: "/api/admission-rules", summary: "Set a per-role admission rule: (role, action_class) -> effect allow|deny. role=\"*\" sets the per-action-class default (applies to every role) so a sensitive action_class can be made default-deny without flipping the global default-allow. action_class is an opaque harness-owned string (doc_3428 admission vocabulary). Bumps the 'admission' policy version + emits policy.changed.", query: "", body: Some("SetAdmissionRuleBody") },
-    Endpoint { method: "DELETE", path: "/api/admission-rules/{role}/{action_class}", summary: "Remove a per-role admission rule. Only a real delete bumps the 'admission' policy version + emits policy.changed.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/admission-check", summary: "Evaluate the admission decision for a (role, action_class) server-side: precedence exact rule > per-class default (role=\"*\") > global default-allow. Returns {role, action_class, effect, source (rule|class_default|global_default)}.", query: "role=str&action_class=str", body: None },
-    Endpoint { method: "GET", path: "/api/identity-aliases", summary: "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). A small config table consumers/UI use to resolve or display a floating name as the canonical identity across assignee, blocked_on, and @-mentions.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/people", summary: "List people (first-class human identities, multi-operator model doc_26). A separate registry from agents; resolved together with agents at read time.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/people", summary: "Create or upsert a person by stable string id (e.g. cameron).", query: "", body: Some("CreatePersonBody") },
-    Endpoint { method: "DELETE", path: "/api/people/{id}", summary: "Delete a person and drop their team memberships.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/operators/bindings", summary: "List all per-operator concierge bindings (person -> handling agent, task_1259) -- the operator routing map.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/operators/{person}/binding", summary: "Read an operator's per-operator-concierge binding (person -> handling agent, task_1259), or null if unbound (default handling).", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/operators/{person}/binding", summary: "Bind an operator (person) to the agent that handles them (e.g. zyork -> concierge-zyork). Idempotent upsert; a question routed to a bound person wakes that agent, an unbound person is unchanged.", query: "", body: Some("BindOperatorBody") },
-    Endpoint { method: "DELETE", path: "/api/operators/{person}/binding", summary: "Clear an operator's handling-agent binding (idempotent); the person falls back to default handling.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/teams", summary: "List teams (addressable groups whose members are people OR other teams).", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/teams", summary: "Create or upsert a team by stable string id (e.g. operator).", query: "", body: Some("CreateTeamBody") },
-    Endpoint { method: "GET", path: "/api/teams/{team_id}", summary: "Get a team with its direct members and its fully-resolved person AND agent sets (resolved_people + resolved_agents, kept separate; nested teams expanded, cycle-guarded).", query: "", body: None },
-    Endpoint { method: "DELETE", path: "/api/teams/{team_id}", summary: "Delete a team and drop its memberships (its members and its membership in parent teams).", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/teams/{team_id}/members", summary: "Add a person or team as a member (idempotent). Rejects a sub-team add that would create a membership cycle.", query: "", body: Some("TeamMemberBody") },
-    Endpoint { method: "DELETE", path: "/api/teams/{team_id}/members", summary: "Remove a member (person or team) from a team (idempotent).", query: "", body: Some("TeamMemberBody") },
-    Endpoint { method: "POST", path: "/api/identity-aliases", summary: "Upsert an identity alias (alias -> canonical). Idempotent on the alias (repoints an existing one); alias is stored lowercased.", query: "", body: Some("SetIdentityAliasBody") },
-    Endpoint { method: "GET", path: "/api/reviews", summary: "List reviews (newest-touched first), optionally filtered by status/kind/assignee. Without logs.", query: "status=str&kind=str&assignee=str", body: None },
-    Endpoint { method: "POST", path: "/api/reviews", summary: "Create a review over an artifact (document|code|design|agent-session|task). Starts in `open` unless a status is seeded; records a `submitted` log entry. Pass external_link for idempotent ingest (a review already linked on (source, external_id) is returned created:false).", query: "", body: Some("CreateReviewBody") },
-    Endpoint { method: "GET", path: "/api/reviews/trend", summary: "Improvement trend derived from review logs (no stored counter): findings-per-review with an earlier-vs-later trend, overall + sliced by kind and by producing area, counterbalanced by an escaped-defect signal (post-approval findings, re-opens, lineage follow-ups). A slice where findings fell while escaped defects rose is flagged.", query: "kind=str&area=str", body: None },
-    Endpoint { method: "GET", path: "/api/reviews/{review_id}", summary: "Fetch one review with its full append-only log (findings are the entries of type `finding`).", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/reviews/{review_id}/status", summary: "Transition a review's A2 status (open/in_review/changes_requested/approved/closed). Same status = idempotent no-op. Emits review.status_changed (+ opened_for_review / terminal).", query: "", body: Some("SetReviewStatusBody") },
-    Endpoint { method: "POST", path: "/api/reviews/{review_id}/vetted", summary: "Set/clear a review's vetted gate (adversarial review run + addressed). Audit-only per D17: records the actor + logs the change (a decision entry), emits review.vetted_changed. Same value = idempotent no-op.", query: "", body: Some("SetReviewVettedBody") },
-    Endpoint { method: "POST", path: "/api/reviews/{review_id}/metadata", summary: "Post-hoc setter for a review's metadata bag (recovery path for a review created with empty/incomplete metadata). MERGES the given properties (incoming keys overwrite), logs a decision entry naming the keys set, emits review.metadata_changed. Most important use: set reviewed_version on a conformance review that lacks it (the key the operator-submit gate reads). Empty object = idempotent no-op.", query: "", body: Some("SetReviewMetadataBody") },
-    Endpoint { method: "POST", path: "/api/reviews/{review_id}/log", summary: "Append a log entry (comment / finding / decision / ...). Pass external_id for idempotent ingest (a bridge replaying an upstream item returns appended:false).", query: "", body: Some("AppendReviewLogBody") },
-    Endpoint { method: "POST", path: "/api/reviews/{review_id}/assignees", summary: "Assign an ADDITIONAL reviewer (task_1323 multi-reviewer). The reviewer set is the primary assignee UNION the added reviewers; all are woken on review events. Logs assignee_added, emits review.assignee_added. Idempotent. Returns the review with its assignees + derived approval_state.", query: "", body: Some("ReviewAssigneeBody") },
-    Endpoint { method: "POST", path: "/api/reviews/{review_id}/assignees/remove", summary: "Remove an added reviewer (task_1323). The single primary assignee set at create time is not removed by this. Logs assignee_removed, emits review.assignee_removed to the pre-removal reviewer set. Idempotent.", query: "", body: Some("ReviewAssigneeBody") },
-    Endpoint { method: "POST", path: "/api/reviews/{review_id}/approve", summary: "Record a reviewer's approval (task_1323). Appends an approval log entry; approval_state is derived from all assignees' approvals against metadata.approval_policy (all [default] / any / k_of_n via metadata.approval_k). Emits review.approved_by.", query: "", body: Some("ApproveReviewBody") },
-    Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") },
-    Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None },
-    Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/exclude_tag/task_id/author; archived hidden unless include_archived=true). status accepts a comma-separated set + the operator vocabulary (pending-review/published); exclude_tag hides a tag (default-hide primitive). Agent-memory docs (the reserved agent-memory tag, or the repos/ and agents/ path prefixes) are hidden unless include_memory=true.", query: "project_id=int&status=str&tag=str&exclude_tag=str&task_id=int&author=str&include_archived=bool&include_memory=bool", body: None },
-    Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") },
-    Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None },
-    Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list. Pass ?include_body=true to also inline the current version's markdown (resolved server-side from its CID; body:null + body_error on fetch failure).", query: "include_body=bool", body: None },
-    Endpoint { method: "PATCH", path: "/api/documents/{document_id}", summary: "Rename a document (set its title; metadata-only — versions/content/path/status untouched). Emits document.updated.", query: "", body: Some("UpdateDocumentBody") },
-    Endpoint { method: "PATCH", path: "/api/documents/{document_id}/props", summary: "Merge a JSON object into a document's metadata (description, type, tags, provenance) without cutting a content version. The list + wiki index project metadata.description. Emits document.updated.", query: "", body: Some("SetDocumentPropsBody") },
-    Endpoint { method: "DELETE", path: "/api/documents/{document_id}", summary: "HARD-DELETE a document + all dependents (versions/comments/attachments/links/embeds). IRREVERSIBLE; requires the doc be archived first. Use only for true garbage; prefer archive otherwise. Emits document.deleted.", query: "", body: Some("DocumentActorBody") },
-    Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version, or ?approved=true for the operator-approved version (404 'no approved version' when there is none -- never a silent fallback to the current draft). The response carries an ETag of the served version's CID; a matching If-None-Match returns 304. Requires ipfs_api_url.", query: "version_no=int&approved=bool", body: None },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") },
-    Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/versions", summary: "Publish a new immutable version (bare CID).", query: "", body: Some("PublishVersionBody") },
-    Endpoint { method: "GET", path: "/api/documents/{document_id}/comments", summary: "List a document's comments (filter by version_id/status).", query: "version_id=int&status=str", body: None },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/comments", summary: "Comment on a document, optionally region-anchored to a version.", query: "", body: Some("CommentDocumentBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/comments/{comment_id}/resolve", summary: "Mark a document comment resolved. task_1418 soft-gate: a text-quote-anchored comment whose exact anchored text is still present verbatim in the current version is rejected with a warning (likely a premature 'addressed' claim); pass acknowledge=true to resolve a legitimately-rephrased-in-place anchor. Best-effort: skipped when there is no anchor or the body cannot be fetched.", query: "", body: Some("ResolveCommentBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-review", summary: "Submit a document for review (status -> in_review).", query: "", body: Some("DocumentActorBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-to-operator-review", summary: "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator sees it. Rejected unless a template attestation (template_followed or template_waiver_reason) is given AND a design-conformance review has run against the current version with zero open findings. A design-doc submission also requires the read-the-guide attestation (the read_guide_attested field, or the legacy in-body marker).", query: "", body: Some("SubmitToOperatorReviewBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/request-changes", summary: "Request changes on a document (status -> changes_requested).", query: "", body: Some("RequestChangesBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/approve", summary: "Approve a document (stamps the current version, status -> approved).", query: "", body: Some("DocumentActorBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/attach", summary: "Attach a document to a task (notifies both sides).", query: "", body: Some("AttachDocumentBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/detach", summary: "Detach a document from a task.", query: "", body: Some("AttachDocumentBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/archive", summary: "Soft-archive (retire) a document: hidden from listings by default, reversible, history preserved.", query: "", body: Some("DocumentActorBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/restore", summary: "Restore a previously archived document (clears the archive stamp).", query: "", body: Some("DocumentActorBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/deprecate", summary: "Mark a document deprecated (optionally superseded_by a replacing document id), or deprecated=false to clear it. Orthogonal to archive: a deprecated doc stays VISIBLE (clients show a banner) rather than hidden. deprecated defaults to true.", query: "", body: Some("DeprecateDocumentBody") },
-    Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
-    Endpoint { method: "GET", path: "/api/agents/{agent_id}/attach", summary: "Server-Sent Events stream of an agent's live transcript + thought-process frames (doc_3426 ask 7). Reference-counts the attach (the first attacher wakes the headless harness to start pushing frames) and detaches on disconnect. Frames are ephemeral and best-effort: a lagging attacher gets a gap marker (the dropped count) and re-pulls the durable transcript-chunk log, never backpressuring the agent. Authz: the operator, the agent's lead, or a same-team teammate.", query: "caller=str", body: None },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/frames", summary: "The headless harness pushes one live frame {session_id, turn_id?, frame_seq, kind: transcript-delta|thought-process, payload}, fanned out to the agent's current attachers (a no-op if none). Ephemeral and best-effort; never blocks on a slow or gone attacher.", query: "", body: None },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/steer", summary: "Deliver a steer message as the agent's next input (a durable session.steer control item the harness consumes at its next input boundary). Authz: the operator or the agent's lead.", query: "", body: Some("SteerBody") },
-    Endpoint { method: "POST", path: "/api/agents/{agent_id}/abort", summary: "Deliver a non-destructive abort (the M4 abort verb): the harness cancels the current turn at its next checkpoint and preserves session state (a durable session.abort control item). Authz: the operator or the agent's lead.", query: "", body: Some("AbortBody") },
-];
+// Every REST endpoint self-registers into the discovery catalog via `inventory::submit!`
+// (task_1497) rather than being appended to a central `ENDPOINTS` array, so adding an
+// endpoint no longer collides on one shared list -- a new `inventory::submit! { Endpoint
+// { .. } }` item can live anywhere in the crate. `discovery_doc()` and the catalog tests
+// collect these with `inventory::iter` and sort deterministically (link/iteration order is
+// unspecified). `body` names the struct whose JSON Schema `body_schemas()` generates.
+inventory::submit! { Endpoint { method: "GET", path: "/api", summary: "This discovery index: every endpoint with its request schema.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/tunnels", summary: "Diagnostic: which agents currently have a live reverse tunnel (so the board can push a wake rather than the agent polling). An agent absent here has no live tunnel — its wakes fall back to the inbox + poll.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/health", summary: "Health beacon: cheap liveness+readiness probe. 200 {ok:true,db:true} when the process is up and the database is reachable; 503 {ok:false} when the database is not ready. Check before a full tick and treat any non-200 (incl a 502 from the origin when it is down) as back-off-and-retry.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/metrics", summary: "Request metrics for optimizing board/fleet performance (task_1380): per-endpoint latency p50/p90/p99 in ms (approximate, from coarse log-spaced buckets), request count + process start (a throughput basis), the in-flight / max-in-flight concurrency gauge (a hang shows as a stuck-high in_flight), and 2xx/4xx/5xx status-class counts, plus an overall rollup. Keys are METHOD + route template relative to the /api mount. Aggregate numbers only, mutates nothing.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/admin/db-snapshot", summary: "Download a point-in-time-consistent copy of the SQLite database (VACUUM INTO, integrity-checked), behind HTTP Basic auth. Disabled by default (404 when off); the deployment keeps it loopback/LAN-bound and off the public tunnel. The extraction primitive for host migration + DR.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata, retired, lifecycle_intent, priority} by default (the small metadata bag is kept for filtering, e.g. metadata.native; lifecycle_intent + priority are the declared-config fields the reconciler reads; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match), lifecycle_intent (run|paused|retired declared desired-fleet-state, independent of live presence; lifecycle_intent=run is the desired-live set), retired (true=only terminally-gone agents, false=only live). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&lifecycle_intent=str&verbose=bool&retired=bool&limit=int&offset=int", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/resolve-agent", summary: "Resolve an agent name to one exact agent id (task_1251): an exact id wins (never ambiguous even when it is a prefix of a longer id), a unique case-insensitive substring resolves, an ambiguous substring is refused (400) with the sorted candidate ids. The safe recipient-resolver vs picking the first row of a q= search. Returns {name, id, match}.", query: "name=str", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry). Merge-PATCH: an omitted/null field is left unchanged; to reset a nullable field to null, name it in `clear` (e.g. [\"webhook_url\"]).", query: "", body: Some("UpdateAgentBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/mandate", summary: "Assemble an agent's session-start mandate from board data in one read (task_1457, doc_3426 ask 3): charter, role prompt, applicable standing directives (tenets/*), and applicable recipes (recipes/*), in the deterministic order charter, role, directives, recipes. Applicability is matched server-side; a version_fingerprint + component_document_ids drive the harness's subscribe-and-recompare hot-reload.", query: "contexts=csv&include_content=bool", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/request-stand-down", summary: "Request that an agent gracefully wind down: records the request (who/why/when, shown on the agent's page) and notifies the agent so it stands down on its own terms. A SIGNAL — never changes the agent's status and never kills a live agent. Cleared when the agent goes offline.", query: "", body: Some("RequestStandDownBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/retire", summary: "Terminally retire an agent (task_1363): mark it permanently gone (distinct from offline/stand-down, which are resumable) and run the auto-disposition sweep — every task blocked on it is cleared back to todo (keeping the assignee) and task.blocker_retired is emitted to board-pm for re-homing, so no dependent silently strands. Operator or board-pm only; reversible via /restore.", query: "", body: Some("RetireAgentBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/restore", summary: "Reverse a terminal retirement (task_1363): clear the gone marker so a mis-marked agent is live again. Does not un-sweep already-disposed tasks. Operator or board-pm only.", query: "", body: Some("RestoreAgentBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/lifecycle-intent", summary: "Set an agent's DECLARED lifecycle intent (task_1455): run or paused — the desired state the reconciler drives on, distinct from live presence. 'retired' is set via /retire (guarded auto-disposition sweep) and reversed via /restore, not here. Emits agent.intent_changed so a subscribed reconciler acts without a re-fetch.", query: "", body: Some("SetLifecycleIntentBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/inbox", summary: "Recipient-filtered since-seq inbox read (task_1490): returns the agent's own events with seq strictly greater than since_seq, in seq order, bounded by limit, with NO ack side-effect (fetching never marks read, unlike /notifications). The clean no-lost-wake primitive -- the harness persists its last durably-processed seq and replays from it after a crash without the fetch-ack coupling. last_seq in the response is the next cursor; independent of read_at, so it is at-least-once by the client cursor. Pair with the inbox/ack endpoint for pruning.", query: "since_seq=int&limit=int", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/inbox/ack", summary: "Seq-scoped ack (task_1490): mark the agent's inbox rows read up to and including a durably-processed seq, so at-least-once delivery does not depend on drain discipline and acked rows become prunable. Idempotent; advances read_at only on unread rows at or below through_seq. Does not change the /notifications default semantics.", query: "", body: Some("AckInboxBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/recall", summary: "Board-state-recall bundle (task_1464, doc_3426 ask 9): ONE round trip that rebuilds an agent's working context at session (re)start -- its desired config + lifecycle_intent (task_1455/1456), its open assigned tasks with status + blocked_on, its bounded unread inbox (NOT marked read), and, when session_id is given, a handle to that session's transcript-chunk log (task_1463). The board is the recovery authority: recall first, transcript rehydration second. Bounded + efficient per start.", query: "session_id=str&task_limit=int&activity_limit=int", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Read an agent's per-config_kind editable-config set (task_1477, doc_3426 ask 11): one read returns {agent_id, config_kind, version, count, entries} in dispatch order (position then id). config_kind namespaces the shared per-agent editable-config surface -- 'decider' (ask 11: payload = {kind, criteria, bands}, scope = applies_to_call_types) and 'tool' (ask 4: payload = authz/argument policy). Each entry is the {id, enabled, scope, payload} envelope + position. The harness reads at session start and re-reads on an agent.config_changed wake (subscribe board + [\"agent\"]); version is the watchable key. Pass effective=true for the merged per-agent set = role-level grants + agent overrides (task_1459 ask 4; adds role, role_version, agent_version, and a per-entry source).", query: "effective=bool", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Upsert one entry in an agent's config set (task_1477): add a new entry or edit/toggle an existing one by entry_id. An omitted field keeps the existing value (edit) or the default (add: enabled=true, scope=null=all-call-types, payload={}, position appended). scope=null clears to all call types. Bumps the version + emits agent.config_changed so a subscribed harness hot-reloads. Returns the full updated set.", query: "", body: Some("SetAgentConfigEntryBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/agents/{agent_id}/config/{config_kind}/{entry_id}", summary: "Remove one entry from an agent's config set (task_1477). Bumps the version + emits agent.config_changed like an edit. Returns the shrunk set.", query: "actor=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/check-stop", summary: "Board-authoritative stop-condition check (task_1479, doc_3426 ask 13): the harness calls this before letting an agent stop. Returns {decision: accept} only when the agent's lifecycle_intent is paused/retired (meant offline); a run-intent agent is never hard-accepted -- {decision: reject, reason, directive} with directive {kind: take, task_ref} if it holds an open actionable (todo/in_progress, non-blocked, non-monitor-exempt) task, else {kind: park} (stay online, idle, wait for a wake). A pure idempotent read on board state (desired-fleet-state + open work), not the agent self-report; the reason is fed to the model verbatim. stop_context is advisory.", query: "", body: Some("CheckStopBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/roles/{role}/config/{config_kind}", summary: "Read a ROLE's own config set for one config_kind (task_1459, doc_3426 ask 4) -- the role-level base inherited by every agent in the role, before per-agent overrides. For the merged per-agent view call GET /api/agents/{id}/config/{kind}?effective=true. Same shape as the agent read; the subject is role:{role}.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/roles/{role}/config/{config_kind}", summary: "Upsert a ROLE-level config entry (task_1459, ask 4): a grant inherited by every agent in the role unless an agent overrides the same entry_id. enabled=false withholds the entry for the whole role (the N8 unattended-window guarantee), overridable per agent. For config_kind=tool, payload is the optional per-tool authz/argument policy (M3). Bumps the role version + emits agent.config_changed so agents in the role hot-reload.", query: "", body: Some("SetAgentConfigEntryBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/roles/{role}/config/{config_kind}/{entry_id}", summary: "Remove a ROLE-level config entry (task_1459). Bumps the role version + emits agent.config_changed. Returns the shrunk role set.", query: "actor=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/sessions/{session_id}/transcript-chunks", summary: "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). position is assigned server-side (per-session, monotonic across generations) and returned. kind is window | compaction-boundary; append-only + history-preserving.", query: "", body: Some("AppendTranscriptChunkBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/decider-episodes", summary: "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. Lightweight no-event append — fire it async off the agent hot path. Downstream consumer: the decider corpus (task_1471).", query: "", body: Some("SubmitDeciderEpisodeBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/decider-episodes", summary: "Aggregate decider episodes for the corpus relabel/retrain work (task_1478): filter by decider_id, call_type, and a [since, until) created_at window (all optional), ordered by append order, bounded by limit (default 200, max 1000). Returns each episode's inline structured relabel record + CID.", query: "decider_id=str&call_type=str&since=iso&until=iso&limit=int", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/budgets", summary: "Set (upsert) an editable budget cap (task_1461, doc_3426 ask 6) scoped to an agent or role over a rolling window (hour|day|week|month|total). Bumps a version and emits budget.updated so affected agents hot-reload. Config data; the admit/defer decision stays harness-side.", query: "", body: Some("SetBudgetBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/budget", summary: "One-read budget admission surface (task_1461): an agent's effective cap (role base merged with agent override), current spend over the window, session priority, and a would_admit convenience, so the harness admits or defers a turn in one round trip. Deterministic.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/spend", summary: "Report one turn's realized cost to the spend ledger (task_1461): append-only, lightweight, fire off the hot path. The board accumulates current spend over the rolling window. Returns current spend after the append.", query: "", body: Some("ReportSpendBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/projects/{project_id}", summary: "Update a project (rename, archive, description, metadata).", query: "", body: Some("UpdateProjectBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/projects/{project_id}/teams", summary: "Get a project's team grants (visibility + roles) + the resolved principal access map (strongest role wins; nested teams expanded for a cascade grant; implicit creator admin). Recording layer, task 542 Phase 3.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/projects/{project_id}/teams", summary: "Grant a team access to a project with a role (admin/read-write/read), idempotent. cascade (default true) extends to nested sub-teams.", query: "", body: Some("ProjectTeamBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/projects/{project_id}/teams", summary: "Revoke a team's grant on a project (idempotent).", query: "", body: Some("ProjectTeamBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/projects/{project_id}/archive-done", summary: "Retention sweep (task_1228): soft-archive every task in the project that has been done AND untouched for at least older_than_days days (default 7; 0 = no retention window). Reversible (restore), idempotent, iceboxed tasks exempt. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveDoneProposalsBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/projects/{project_id}/age-out-todos", summary: "Age-out sweep (task_1215 sibling): soft-archive stale untriaged todos (status=todo, untouched for at least older_than_days days; default 14; 0 = no window). Scoped to status=todo, so blocked/in_progress/done/iceboxed are exempt. Reversible, idempotent. Returns {project_id, older_than_days, archived, task_ids}.", query: "", body: Some("ArchiveStaleTodosBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/projects/{project_id}/duplicates", summary: "Report-only duplicate detector (task_1215 dedup sibling): active tasks (todo/in_progress/blocked, non-archived) clustered by normalized title (case/whitespace-insensitive), returning clusters of 2+. Mutates nothing. Done/cancelled/iceboxed excluded. Returns {project_id, groups:[{title_key, count, tasks:[...]}]}.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/projects/{project_id}/metrics", summary: "Read-only queue-time metrics (task_1265): derived entirely from the events stream, no new tables. pickup_latency_secs (task creation -> first assignment), time_in_todo_secs (summed dwell in status todo), time_blocked_secs (summed dwell in status blocked, sampled over actually-blocked tasks only). Each is {count, p50, p90, max, mean} in whole seconds (nearest-rank percentiles). Mutates nothing. Returns {project_id, task_count, pickup_latency_secs, time_in_todo_secs, time_blocked_secs}.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/system/link-rules", summary: "The deployment-configured link-tag rules (task_1243): a read-only list of {pattern, url_template} the UI uses to linkify custom references (e.g. CR-NNNN) in rendered content, generalizing the built-in typed-ref linkification. Patterns live in the deployment TOML (never in source), so each deployment customizes its own tags; empty when none are configured. Returns {link_rules:[{pattern, url_template}]}. Mutates nothing.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/enforcement/preflight", summary: "Fail-closed preflight for enabling per-operator ACCESS enforcement -- checks WORKSPACE/PROJECT GRANTS, NOT document conformance (use grade_document, the doc_7 A8 rubric, for a doc's conformance). doc_26 A5: enablable=true only when the fleet-coordination team exists and holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant, blockers. Read-only.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true. monitor_exempt=bool filters by the derived monitor-exempt flag (audit the no-hiding-behind-exempt invariant).", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool&monitor_exempt=bool", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/tasks/{task_id}/comments", summary: "Add a comment to a task.", query: "", body: Some("CommentBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/comments/{comment_id}", summary: "Read one comment by id, with its type (plain/question/answer), parsed payload, lifecycle state, and reply_to/supersedes links.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/tasks/{task_id}/questions", summary: "Pose a structured question on a task, routed to a principal; blocking by default. Give EITHER a legacy kind (yes_no/multiple_choice/select_all/fill_in_the_blank/rank_list/point_allocation) OR omit kind for a CID-keyed question carrying an inline response_schema + ui.element_schema_cid (its canonical type id). Answers validated against the response_schema generically. point_allocation (doc_3371 entry 8) needs options + config={budget:N}; its answer is an object {option_id: integer_points} summing to the budget. quiz (doc_3371 entry 10) needs options + config={answer:[option_id,...], explanation?}; its answer is a choice scored server-side against the stored key (redacted from the question on read, revealed with the score on the answer). Returns the question comment.", query: "", body: Some("PoseQuestionBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/comments/{comment_id}/answer", summary: "Answer an open question. For a kind-based question a framed answer (shape matching the kind) marks it answered and a text answer to a non-text kind is the out-of-frame escape; for a schema-driven question the value is validated against its response_schema generically. Returns the answer comment.", query: "", body: Some("AnswerQuestionBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/comments/{comment_id}/decline", summary: "Decline an open question with feedback (an explicit refusal, distinct from an out-of-frame answer).", query: "", body: Some("DeclineQuestionBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/comments/{comment_id}/cancel", summary: "Cancel an open question you posed (the asker withdraws it).", query: "", body: Some("CancelQuestionBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/comments/{comment_id}/supersede", summary: "Supersede an open question with a replacement (doc_33 A6): the old is kept immutable + linked, the new copies its payload with a new prompt. Asker-only.", query: "", body: Some("SupersedeQuestionBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/comments/{comment_id}/annotations", summary: "List a task comment's annotations (oldest first), optionally filtered by status (open/resolved).", query: "status=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/comments/{comment_id}/annotations", summary: "Annotate a task comment, optionally anchored to a highlighted span (region = free-form JSON selector, e.g. W3C/Hypothesis TextQuote+TextPosition; omit to annotate the whole comment). reply_to threads one level. Notifies the parent task's watchers.", query: "", body: Some("AnnotateCommentBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/comment-annotations/{annotation_id}/resolve", summary: "Mark a comment annotation resolved (open -> resolved).", query: "", body: Some("ResolveCommentBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/tasks/awaiting", summary: "The unified 'awaiting you' queue (task_860 + task_873): everything awaiting a decision from `viewer`, keyed INDEPENDENT of assignee, team-expanded, deduped, as a FLAT array of discriminated items. kind='task' {task_id, task_title, project_id, status, updated_at, blocked_on_principal, blocked_on_note, questions:[full question comment objects]} for a task blocked_on the principal OR carrying an open blocking question routed to it. kind='document' {document_id, title, status, version_no, updated_at, path} for a doc awaiting the operator's approval (status operator_review) -- emitted only when the viewer resolves to the operator.", query: "viewer=str&project_id=int&include_archived=bool", body: None } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/tasks/{task_id}/props", summary: "Merge a JSON object into a task's metadata.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/tasks/{task_id}/move", summary: "Move a task to a different project.", query: "", body: Some("MoveTaskBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/tasks/{task_id}/archive", summary: "Soft-archive a task: hide it from the default list_tasks view (still fetchable by id and with include_archived). Orthogonal to status; reversible with restore.", query: "", body: Some("ArchiveTaskBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/tasks/{task_id}/restore", summary: "Restore an archived task so it reappears in the default list_tasks view.", query: "", body: Some("ArchiveTaskBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/tasks/{task_id}/mute", summary: "Mute a task for an agent: detach them from its event fan-out (stop FYI notifications).", query: "", body: Some("MuteTaskBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/tasks/{task_id}/unmute", summary: "Unmute a task for an agent (rejoin its fan-out).", query: "", body: Some("MuteTaskBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/subscriptions", summary: "Subscribe to a task, project, channel, document, or the whole board (board=true). Optional event_classes (e.g. [\"created\"]) makes it a delivery-gated filtered subscription (only those classes reach the inbox and wake you); omit for every event. Idempotent (re-subscribe updates the class set). Pass thread_root (a channel post's event seq) to subscribe to a THREAD and be delivered+woken on in-thread follow-ups (reply_to=that root) without a re-mention.", query: "", body: Some("SubscribeBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/subscriptions", summary: "Unsubscribe from a task, project, channel, document, the whole board (board=true), or a thread (thread_root=the root post seq).", query: "", body: Some("SubscribeBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/channels", summary: "List channels (public, or a member's incl. private/DM).", query: "member=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/channels", summary: "Create (or get) a named channel.", query: "", body: Some("CreateChannelBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/channels/{channel_id}", summary: "Fetch one channel with its members. Pass viewer to also get that viewer's unread_count + has_unread (task_1067).", query: "viewer=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/channels/{channel_id}/read", summary: "Mark a channel read for the caller (principal) up to a post seq (default: everything currently in the channel), clearing its unread dot. Advances the per-(subscriber,channel) last-read pointer and emits a silent channel.read event for cross-tab dot-clearing. Returns {channel_id, last_read_seq, unread_count}.", query: "", body: Some("ChannelReadBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/channels/{channel_id}/posts", summary: "Read a channel's post history. order=desc returns the latest N (newest-first) for a chat view; default asc is oldest-first for scrollback. before_seq pages earlier.", query: "since_seq=int&limit=int&before_seq=int&order=asc|desc", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/channels/{channel_id}/posts", summary: "Post a message to a channel.", query: "", body: Some("PostToChannelBody") } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/channels/{channel_id}/props", summary: "Merge props into a channel's metadata (e.g. the outbound reflect-back policy).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/channels/{channel_id}/auto-join", summary: "Set/clear a channel's auto_join flag — a fleet-wide broadcast channel every agent belongs to (enabling joins all current agents + auto-joins future ones on register).", query: "", body: Some("SetChannelAutoJoinBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/channels/{channel_id}/promote-thread", summary: "Promote a channel thread into a task (root→description, replies→comments); idempotent.", query: "", body: Some("PromoteThreadBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/channels/{channel_id}/invites", summary: "Invite an agent into a channel (auto-join + notify).", query: "", body: Some("InviteChannelBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/messages", summary: "Send a direct message between agents.", query: "", body: Some("SendMessageBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/dms", summary: "Get (or create) the private 1:1 DM channel for a pair of agents, returning the channel + members. Idempotent and order-independent — lets a client open/link a DM before any message is sent.", query: "", body: Some("OpenDmBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/events", summary: "Read the append-only event log (optionally filtered to one actor). order=desc returns the latest N (newest-first) for a live feed; default asc is oldest-first for incremental pollers.", query: "since_seq=int&limit=int&actor=str&order=asc|desc", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/external-identities", summary: "List external (bridged) identities, optionally filtered by source.", query: "source=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/external-identities", summary: "Register/update an external identity (a bridged human/actor, e.g. slack:U123).", query: "", body: Some("UpsertExternalIdentityBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/external-links", summary: "List bridged links (channel-map / issue↔task / thread↔task), filter by source/board_kind/board_id. Task-kind rows carry the linked task's board_status, so a sync can enumerate the live external-entity-task set and filter to non-terminal.", query: "source=str&board_kind=str&board_id=int", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/external-links", summary: "Map a board entity (channel|task|thread) to an external one; idempotent on (source, external_id).", query: "", body: Some("UpsertExternalLinkBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/external-entity-tasks", summary: "Create-or-reuse an external-entity-task for an external wait on a CR/PR (idempotent on source + lowercased owner/repo#number). State lives in metadata.external_entity; the bridge syncs it and sets it done on resolution, which auto-unblocks waiters.", query: "", body: Some("EnsureExternalEntityTaskBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/external-entity-tasks/block", summary: "Make a task wait on an external CR/PR: ensure the shared entity-task E and set the waiter's blocked_on={kind:task,target:E}. Collapses into blocked-on-task and auto-unblocks when the bridge resolves E.", query: "", body: Some("BlockOnExternalBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/workspace-kinds", summary: "List custom workspace kinds (named env setup definitions fleet spin-up materializes from board data).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/workspace-kinds", summary: "Define/update a workspace kind (setup_script + config an agent is configured with); idempotent on name, config merges.", query: "", body: Some("SetWorkspaceKindBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/workspace-kinds/{name}", summary: "Fetch one workspace kind (setup_script + config) by name — what fleet spin-up reads to materialize a workspace.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/workspace-kinds/{name}", summary: "Retire a workspace kind by name.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/lint", summary: "Dry-run the pre-submit content lint on arbitrary text without writing: returns {clean, banned_phrases, non_ascii, bare_refs} against the authoritative live banned-phrases list, the ASCII-only rule, and the ambiguous bare-#N typed-ref rule. Use this to pre-check content (incl. before a CID publish, which the write-path gate does not cover) instead of a drift-prone local copy.", query: "", body: Some("LintTextBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/crash-reports", summary: "Ingest a UI crash report (task_879): auto-file (or bump) an investigation task for an uncaught browser exception. Body {message, kind?, stack?, component_stack?, url?, build?, user_agent?, occurred_at?}. Deduped by build + stack signature -- a recurring crash bumps one open task's occurrence count rather than spawning duplicates; a new signature files an unassigned task in intake (project 29) for board-triage to route. Returns {task_id, created, occurrences}.", query: "", body: Some("CrashReportBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/grade-document", summary: "Grade a design document against the mechanical doc_7 A8 conformance rubric (ascii, required-sections-in-order, banned-phrases, title/heading rules, body-hygiene, status/provenance, caps-emphasis, body-length). Returns {clean, has_hard_fail, findings:[{check, severity, line, message}]} with actionable-remedy messages. The single grading source of truth: the board submit path and any client (fleet check-doc, the reviewer) call this one endpoint.", query: "", body: Some("GradeDocumentBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list -- the authoritative runtime source the pre-submit content lint checks docs and comments against (doc_3426 ask 5). Returns {policy_kind, version, count, phrases}. version is the watchable key: a harness re-reads on a policy.changed wake (board + [\"policy\"]) comparing version to hot-reload the list.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/admission-rules", summary: "List per-role admission rules with the watchable version (task_1460, doc_3426 ask 5): {policy_kind, version, count, rules, role}. With ?role= set, returns that role's own rules UNION the \"*\" class-defaults (the set that applies to the role); without it, every rule. The harness reads this to admit/decline by role and re-reads on a policy.changed wake (board + [\"policy\"]) comparing version.", query: "role=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/admission-rules", summary: "Set a per-role admission rule: (role, action_class) -> effect allow|deny. role=\"*\" sets the per-action-class default (applies to every role) so a sensitive action_class can be made default-deny without flipping the global default-allow. action_class is an opaque harness-owned string (doc_3428 admission vocabulary). Bumps the 'admission' policy version + emits policy.changed.", query: "", body: Some("SetAdmissionRuleBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/admission-rules/{role}/{action_class}", summary: "Remove a per-role admission rule. Only a real delete bumps the 'admission' policy version + emits policy.changed.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/admission-check", summary: "Evaluate the admission decision for a (role, action_class) server-side: precedence exact rule > per-class default (role=\"*\") > global default-allow. Returns {role, action_class, effect, source (rule|class_default|global_default)}.", query: "role=str&action_class=str", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/identity-aliases", summary: "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). A small config table consumers/UI use to resolve or display a floating name as the canonical identity across assignee, blocked_on, and @-mentions.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/people", summary: "List people (first-class human identities, multi-operator model doc_26). A separate registry from agents; resolved together with agents at read time.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/people", summary: "Create or upsert a person by stable string id (e.g. cameron).", query: "", body: Some("CreatePersonBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/people/{id}", summary: "Delete a person and drop their team memberships.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/operators/bindings", summary: "List all per-operator concierge bindings (person -> handling agent, task_1259) -- the operator routing map.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/operators/{person}/binding", summary: "Read an operator's per-operator-concierge binding (person -> handling agent, task_1259), or null if unbound (default handling).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/operators/{person}/binding", summary: "Bind an operator (person) to the agent that handles them (e.g. zyork -> concierge-zyork). Idempotent upsert; a question routed to a bound person wakes that agent, an unbound person is unchanged.", query: "", body: Some("BindOperatorBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/operators/{person}/binding", summary: "Clear an operator's handling-agent binding (idempotent); the person falls back to default handling.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/teams", summary: "List teams (addressable groups whose members are people OR other teams).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/teams", summary: "Create or upsert a team by stable string id (e.g. operator).", query: "", body: Some("CreateTeamBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/teams/{team_id}", summary: "Get a team with its direct members and its fully-resolved person AND agent sets (resolved_people + resolved_agents, kept separate; nested teams expanded, cycle-guarded).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/teams/{team_id}", summary: "Delete a team and drop its memberships (its members and its membership in parent teams).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/teams/{team_id}/members", summary: "Add a person or team as a member (idempotent). Rejects a sub-team add that would create a membership cycle.", query: "", body: Some("TeamMemberBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/teams/{team_id}/members", summary: "Remove a member (person or team) from a team (idempotent).", query: "", body: Some("TeamMemberBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/identity-aliases", summary: "Upsert an identity alias (alias -> canonical). Idempotent on the alias (repoints an existing one); alias is stored lowercased.", query: "", body: Some("SetIdentityAliasBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/reviews", summary: "List reviews (newest-touched first), optionally filtered by status/kind/assignee. Without logs.", query: "status=str&kind=str&assignee=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/reviews", summary: "Create a review over an artifact (document|code|design|agent-session|task). Starts in `open` unless a status is seeded; records a `submitted` log entry. Pass external_link for idempotent ingest (a review already linked on (source, external_id) is returned created:false).", query: "", body: Some("CreateReviewBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/reviews/trend", summary: "Improvement trend derived from review logs (no stored counter): findings-per-review with an earlier-vs-later trend, overall + sliced by kind and by producing area, counterbalanced by an escaped-defect signal (post-approval findings, re-opens, lineage follow-ups). A slice where findings fell while escaped defects rose is flagged.", query: "kind=str&area=str", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/reviews/{review_id}", summary: "Fetch one review with its full append-only log (findings are the entries of type `finding`).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/reviews/{review_id}/status", summary: "Transition a review's A2 status (open/in_review/changes_requested/approved/closed). Same status = idempotent no-op. Emits review.status_changed (+ opened_for_review / terminal).", query: "", body: Some("SetReviewStatusBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/reviews/{review_id}/vetted", summary: "Set/clear a review's vetted gate (adversarial review run + addressed). Audit-only per D17: records the actor + logs the change (a decision entry), emits review.vetted_changed. Same value = idempotent no-op.", query: "", body: Some("SetReviewVettedBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/reviews/{review_id}/metadata", summary: "Post-hoc setter for a review's metadata bag (recovery path for a review created with empty/incomplete metadata). MERGES the given properties (incoming keys overwrite), logs a decision entry naming the keys set, emits review.metadata_changed. Most important use: set reviewed_version on a conformance review that lacks it (the key the operator-submit gate reads). Empty object = idempotent no-op.", query: "", body: Some("SetReviewMetadataBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/reviews/{review_id}/log", summary: "Append a log entry (comment / finding / decision / ...). Pass external_id for idempotent ingest (a bridge replaying an upstream item returns appended:false).", query: "", body: Some("AppendReviewLogBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/reviews/{review_id}/assignees", summary: "Assign an ADDITIONAL reviewer (task_1323 multi-reviewer). The reviewer set is the primary assignee UNION the added reviewers; all are woken on review events. Logs assignee_added, emits review.assignee_added. Idempotent. Returns the review with its assignees + derived approval_state.", query: "", body: Some("ReviewAssigneeBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/reviews/{review_id}/assignees/remove", summary: "Remove an added reviewer (task_1323). The single primary assignee set at create time is not removed by this. Logs assignee_removed, emits review.assignee_removed to the pre-removal reviewer set. Idempotent.", query: "", body: Some("ReviewAssigneeBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/reviews/{review_id}/approve", summary: "Record a reviewer's approval (task_1323). Appends an approval log entry; approval_state is derived from all assignees' approvals against metadata.approval_policy (all [default] / any / k_of_n via metadata.approval_k). Emits review.approved_by.", query: "", body: Some("ApproveReviewBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/ipfs/add", summary: "Content-address raw `content` server-side (add-only) and return its CID. Requires ipfs_api_url.", query: "", body: Some("IpfsAddBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/ipfs/{cid}", summary: "Read content by CID through the IPFS backend (scoped, read-only). Pass ?content_type= to label the response. Requires ipfs_api_url.", query: "content_type=str", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/documents", summary: "List documents for discovery (filter by project/status/tag/exclude_tag/task_id/author; archived hidden unless include_archived=true). status accepts a comma-separated set + the operator vocabulary (pending-review/published); exclude_tag hides a tag (default-hide primitive). Agent-memory docs (the reserved agent-memory tag, or the repos/ and agents/ path prefixes) are hidden unless include_memory=true.", query: "project_id=int&status=str&tag=str&exclude_tag=str&task_id=int&author=str&include_archived=bool&include_memory=bool", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents", summary: "Create a versioned document (content is a bare IPFS CID; the board never resolves it).", query: "", body: Some("CreateDocumentBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/wiki", summary: "List path-filed documents as a wiki tree (optionally under a path prefix), ordered by path; archived hidden unless include_archived=true.", query: "prefix=str&include_archived=bool", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/documents/{document_id}", summary: "Fetch one document with its current version + version list. Pass ?include_body=true to also inline the current version's markdown (resolved server-side from its CID; body:null + body_error on fetch failure).", query: "include_body=bool", body: None } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/documents/{document_id}", summary: "Rename a document (set its title; metadata-only — versions/content/path/status untouched). Emits document.updated.", query: "", body: Some("UpdateDocumentBody") } }
+inventory::submit! { Endpoint { method: "PATCH", path: "/api/documents/{document_id}/props", summary: "Merge a JSON object into a document's metadata (description, type, tags, provenance) without cutting a content version. The list + wiki index project metadata.description. Emits document.updated.", query: "", body: Some("SetDocumentPropsBody") } }
+inventory::submit! { Endpoint { method: "DELETE", path: "/api/documents/{document_id}", summary: "HARD-DELETE a document + all dependents (versions/comments/attachments/links/embeds). IRREVERSIBLE; requires the doc be archived first. Use only for true garbage; prefer archive otherwise. Emits document.deleted.", query: "", body: Some("DocumentActorBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/documents/{document_id}/content", summary: "Read a document's body inline (resolves the version CID through the IPFS backend). Pass ?version_no= for a specific version, or ?approved=true for the operator-approved version (404 'no approved version' when there is none -- never a silent fallback to the current draft). The response carries an ETag of the served version's CID; a matching If-None-Match returns 304. Requires ipfs_api_url.", query: "version_no=int&approved=bool", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/path", summary: "Set (or clear, with an empty path) a document's wiki path; unique among filed docs.", query: "", body: Some("SetDocumentPathBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/documents/{document_id}/versions", summary: "List a document's immutable versions (newest first).", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/versions", summary: "Publish a new immutable version (bare CID).", query: "", body: Some("PublishVersionBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/documents/{document_id}/comments", summary: "List a document's comments (filter by version_id/status).", query: "version_id=int&status=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/comments", summary: "Comment on a document, optionally region-anchored to a version.", query: "", body: Some("CommentDocumentBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/comments/{comment_id}/resolve", summary: "Mark a document comment resolved. task_1418 soft-gate: a text-quote-anchored comment whose exact anchored text is still present verbatim in the current version is rejected with a warning (likely a premature 'addressed' claim); pass acknowledge=true to resolve a legitimately-rephrased-in-place anchor. Best-effort: skipped when there is no anchor or the body cannot be fetched.", query: "", body: Some("ResolveCommentBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-review", summary: "Submit a document for review (status -> in_review).", query: "", body: Some("DocumentActorBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-to-operator-review", summary: "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator sees it. Rejected unless a template attestation (template_followed or template_waiver_reason) is given AND a design-conformance review has run against the current version with zero open findings. A design-doc submission also requires the read-the-guide attestation (the read_guide_attested field, or the legacy in-body marker).", query: "", body: Some("SubmitToOperatorReviewBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/request-changes", summary: "Request changes on a document (status -> changes_requested).", query: "", body: Some("RequestChangesBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/approve", summary: "Approve a document (stamps the current version, status -> approved).", query: "", body: Some("DocumentActorBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/attach", summary: "Attach a document to a task (notifies both sides).", query: "", body: Some("AttachDocumentBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/detach", summary: "Detach a document from a task.", query: "", body: Some("AttachDocumentBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/archive", summary: "Soft-archive (retire) a document: hidden from listings by default, reversible, history preserved.", query: "", body: Some("DocumentActorBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/restore", summary: "Restore a previously archived document (clears the archive stamp).", query: "", body: Some("DocumentActorBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/documents/{document_id}/deprecate", summary: "Mark a document deprecated (optionally superseded_by a replacing document id), or deprecated=false to clear it. Orthogonal to archive: a deprecated doc stays VISIBLE (clients show a banner) rather than hidden. deprecated defaults to true.", query: "", body: Some("DeprecateDocumentBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/attach", summary: "Server-Sent Events stream of an agent's live transcript + thought-process frames (doc_3426 ask 7). Reference-counts the attach (the first attacher wakes the headless harness to start pushing frames) and detaches on disconnect. Frames are ephemeral and best-effort: a lagging attacher gets a gap marker (the dropped count) and re-pulls the durable transcript-chunk log, never backpressuring the agent. Authz: the operator, the agent's lead, or a same-team teammate.", query: "caller=str", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/frames", summary: "The headless harness pushes one live frame {session_id, turn_id?, frame_seq, kind: transcript-delta|thought-process, payload}, fanned out to the agent's current attachers (a no-op if none). Ephemeral and best-effort; never blocks on a slow or gone attacher.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/steer", summary: "Deliver a steer message as the agent's next input (a durable session.steer control item the harness consumes at its next input boundary). Authz: the operator or the agent's lead.", query: "", body: Some("SteerBody") } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/abort", summary: "Deliver a non-destructive abort (the M4 abort verb): the harness cancels the current turn at its next checkpoint and preserves session state (a durable session.abort control item). Authz: the operator or the agent's lead.", query: "", body: Some("AbortBody") } }
 
-/// Build the JSON Schemas for every referenced request body, keyed by struct name.
+/// One request-body JSON Schema registration (task_1497). Each body-schema struct
+/// self-registers via the `body_schema!` helper instead of being appended to a central
+/// `schemas!(...)` list, so new schemas stop colliding on a shared line. `build` defers the
+/// `schema_for!` call (schemars runs at runtime) so the value is a plain `const` static.
+///
+/// Follow-on (deferred, task_1497): a `#[board_endpoint(..)]` attribute proc-macro could emit
+/// an endpoint's registrations from one annotation. It is NOT applicable as a single
+/// "triple" here -- the REST handler (this file, `*Body` args) and the MCP tool
+/// (`src/mcp.rs`, `*Args` args, already self-registered by rmcp's `#[tool_router]`) are
+/// separate functions in separate files with distinct arg types, so there is no shared
+/// handler to annotate and no inventory MCP registry to submit into. The collision-
+/// elimination goal is fully met by the `inventory::iter` conversion of the two genuine
+/// append-anchors (this set + the endpoint catalog) alone.
+pub struct BodySchema {
+    name: &'static str,
+    build: fn() -> Value,
+}
+inventory::collect!(BodySchema);
+
+/// Register one request-body struct's JSON Schema into the discovery registry. Place the
+/// invocation anywhere (ideally next to the struct) -- it no longer touches a shared list.
+macro_rules! body_schema {
+    ($t:ty) => {
+        inventory::submit! {
+            BodySchema {
+                name: stringify!($t),
+                build: || serde_json::to_value(schema_for!($t)).unwrap(),
+            }
+        }
+    };
+}
+
+body_schema!(RegisterAgentBody);
+body_schema!(UpdateAgentBody);
+body_schema!(SetStatusBody);
+body_schema!(RequestStandDownBody);
+body_schema!(RetireAgentBody);
+body_schema!(RestoreAgentBody);
+body_schema!(SetLifecycleIntentBody);
+body_schema!(AppendTranscriptChunkBody);
+body_schema!(AckInboxBody);
+body_schema!(CheckStopBody);
+body_schema!(SubmitDeciderEpisodeBody);
+body_schema!(SetAgentConfigEntryBody);
+body_schema!(SetBudgetBody);
+body_schema!(ReportSpendBody);
+body_schema!(SteerBody);
+body_schema!(AbortBody);
+body_schema!(CreateProjectBody);
+body_schema!(UpdateProjectBody);
+body_schema!(CreateTaskBody);
+body_schema!(UpdateTaskBody);
+body_schema!(CrashReportBody);
+body_schema!(MoveTaskBody);
+body_schema!(ArchiveTaskBody);
+body_schema!(ArchiveDoneProposalsBody);
+body_schema!(ArchiveStaleTodosBody);
+body_schema!(MuteTaskBody);
+body_schema!(CommentBody);
+body_schema!(SubscribeBody);
+body_schema!(CreateChannelBody);
+body_schema!(PostToChannelBody);
+body_schema!(InviteChannelBody);
+body_schema!(SendMessageBody);
+body_schema!(OpenDmBody);
+body_schema!(CreateDocumentBody);
+body_schema!(PublishVersionBody);
+body_schema!(SetDocumentPathBody);
+body_schema!(SetDocumentPropsBody);
+body_schema!(CommentDocumentBody);
+body_schema!(ResolveCommentBody);
+body_schema!(AnnotateCommentBody);
+body_schema!(DocumentActorBody);
+body_schema!(DeprecateDocumentBody);
+body_schema!(SubmitToOperatorReviewBody);
+body_schema!(PoseQuestionBody);
+body_schema!(AnswerQuestionBody);
+body_schema!(DeclineQuestionBody);
+body_schema!(CancelQuestionBody);
+body_schema!(SupersedeQuestionBody);
+body_schema!(RequestChangesBody);
+body_schema!(AttachDocumentBody);
+body_schema!(IpfsAddBody);
+body_schema!(UpsertExternalIdentityBody);
+body_schema!(UpsertExternalLinkBody);
+body_schema!(EnsureExternalEntityTaskBody);
+body_schema!(BlockOnExternalBody);
+body_schema!(PromoteThreadBody);
+body_schema!(SetWorkspaceKindBody);
+body_schema!(AddBannedPhraseBody);
+body_schema!(SetAdmissionRuleBody);
+body_schema!(LintTextBody);
+body_schema!(GradeDocumentBody);
+body_schema!(UpdateDocumentBody);
+body_schema!(SetChannelAutoJoinBody);
+body_schema!(ChannelReadBody);
+body_schema!(CreateReviewBody);
+body_schema!(SetReviewStatusBody);
+body_schema!(SetReviewVettedBody);
+body_schema!(SetReviewMetadataBody);
+body_schema!(AppendReviewLogBody);
+body_schema!(ReviewAssigneeBody);
+body_schema!(ApproveReviewBody);
+body_schema!(SetIdentityAliasBody);
+body_schema!(CreatePersonBody);
+body_schema!(BindOperatorBody);
+body_schema!(CreateTeamBody);
+body_schema!(TeamMemberBody);
+body_schema!(ProjectTeamBody);
+
+/// Build the JSON Schemas for every registered request body, keyed by struct name.
+/// Collected from the inventory registry; `serde_json::Map` (BTreeMap) keeps the keys
+/// sorted, so the discovery output is identical regardless of inventory's iteration order.
 fn body_schemas() -> Value {
-    macro_rules! schemas {
-        ($($t:ty),* $(,)?) => {{
-            let mut m = serde_json::Map::new();
-            $( m.insert(stringify!($t).into(), serde_json::to_value(schema_for!($t)).unwrap()); )*
-            Value::Object(m)
-        }};
+    let mut m = serde_json::Map::new();
+    for bs in inventory::iter::<BodySchema> {
+        m.insert(bs.name.to_string(), (bs.build)());
     }
-    schemas!(
-        RegisterAgentBody,
-        UpdateAgentBody,
-        SetStatusBody,
-        RequestStandDownBody,
-        RetireAgentBody,
-        RestoreAgentBody,
-        SetLifecycleIntentBody,
-        AppendTranscriptChunkBody,
-        AckInboxBody,
-        CheckStopBody,
-        SubmitDeciderEpisodeBody,
-        SetAgentConfigEntryBody,
-        SetBudgetBody,
-        ReportSpendBody,
-        SteerBody,
-        AbortBody,
-        CreateProjectBody,
-        UpdateProjectBody,
-        CreateTaskBody,
-        UpdateTaskBody,
-        CrashReportBody,
-        MoveTaskBody,
-        ArchiveTaskBody,
-        ArchiveDoneProposalsBody,
-        ArchiveStaleTodosBody,
-        MuteTaskBody,
-        CommentBody,
-        SubscribeBody,
-        CreateChannelBody,
-        PostToChannelBody,
-        InviteChannelBody,
-        SendMessageBody,
-        OpenDmBody,
-        CreateDocumentBody,
-        PublishVersionBody,
-        SetDocumentPathBody,
-        SetDocumentPropsBody,
-        CommentDocumentBody,
-        ResolveCommentBody,
-        AnnotateCommentBody,
-        DocumentActorBody,
-        DeprecateDocumentBody,
-        SubmitToOperatorReviewBody,
-        PoseQuestionBody,
-        AnswerQuestionBody,
-        DeclineQuestionBody,
-        CancelQuestionBody,
-        SupersedeQuestionBody,
-        RequestChangesBody,
-        AttachDocumentBody,
-        IpfsAddBody,
-        UpsertExternalIdentityBody,
-        UpsertExternalLinkBody,
-        EnsureExternalEntityTaskBody,
-        BlockOnExternalBody,
-        PromoteThreadBody,
-        SetWorkspaceKindBody,
-        AddBannedPhraseBody,
-        SetAdmissionRuleBody,
-        LintTextBody,
-        GradeDocumentBody,
-        UpdateDocumentBody,
-        SetChannelAutoJoinBody,
-        ChannelReadBody,
-        CreateReviewBody,
-        SetReviewStatusBody,
-        SetReviewVettedBody,
-        SetReviewMetadataBody,
-        AppendReviewLogBody,
-        ReviewAssigneeBody,
-        ApproveReviewBody,
-        SetIdentityAliasBody,
-        CreatePersonBody,
-        BindOperatorBody,
-        CreateTeamBody,
-        TeamMemberBody,
-        ProjectTeamBody,
-    )
+    Value::Object(m)
+}
+
+/// Every registered [`Endpoint`], in a deterministic order. `inventory` collects in an
+/// unspecified link order, so sort by `(path, method)` to keep the discovery document and the
+/// rendered HTML page byte-stable across builds (task_1497). `(path, method)` is a unique key.
+fn endpoints_sorted() -> Vec<&'static Endpoint> {
+    let mut eps: Vec<&'static Endpoint> = inventory::iter::<Endpoint>.into_iter().collect();
+    eps.sort_by(|a, b| (a.path, a.method).cmp(&(b.path, b.method)));
+    eps
 }
 
 /// The machine-readable discovery document (also drives the HTML page).
 fn discovery_doc() -> Value {
-    let endpoints: Vec<Value> = ENDPOINTS
-        .iter()
+    let endpoints: Vec<Value> = endpoints_sorted()
+        .into_iter()
         .map(|e| {
             json!({
                 "method": e.method,
@@ -4963,16 +5006,169 @@ mod tests {
         Ok(())
     }
 
-    /// Every request-body struct named in `ENDPOINTS` must have a generated schema.
+    /// Every request-body struct named by a registered endpoint must have a generated schema.
     #[test]
     fn every_body_ref_has_a_schema() {
         let schemas = body_schemas();
         let schemas = schemas.as_object().unwrap();
-        for e in ENDPOINTS {
+        for e in inventory::iter::<Endpoint> {
             if let Some(name) = e.body {
                 assert!(
                     schemas.contains_key(name),
                     "endpoint {} {} references body schema `{name}`, but body_schemas() has none",
+                    e.method,
+                    e.path,
+                );
+            }
+        }
+    }
+
+    /// task_1497 migration + drop guard (v-ft's `inventory_collects_under_cargo_test` canary):
+    /// prove the `inventory` linker-section collection is populated under `cargo test` (the gate
+    /// path, not just the native binary) AND that the collected set still matches the set that was
+    /// previously hand-maintained in the `ENDPOINTS` array and the `schemas!(...)` list — same
+    /// counts, same body-schema names, no duplicates. A silently-dropped `inventory::submit!`
+    /// (e.g. a lost registration during a refactor or a feature-gated-out handler) shows up here as
+    /// a count/name mismatch instead of a route or schema vanishing unnoticed at runtime.
+    #[test]
+    fn inventory_collects_under_cargo_test() {
+        // Previously-registered counts (frozen; bump intentionally when adding an endpoint/schema).
+        const EXPECTED_ENDPOINTS: usize = 161;
+        const EXPECTED_SCHEMAS: usize = 77;
+
+        let endpoints: Vec<&Endpoint> = inventory::iter::<Endpoint>.into_iter().collect();
+        let schemas: Vec<&BodySchema> = inventory::iter::<BodySchema>.into_iter().collect();
+
+        // Non-empty: a dead linker section (inventory not collecting under the test binary) would
+        // make both of these zero — the exact failure this canary exists to catch.
+        assert!(
+            !endpoints.is_empty() && !schemas.is_empty(),
+            "inventory collected nothing under cargo test (endpoints={}, schemas={})",
+            endpoints.len(),
+            schemas.len(),
+        );
+
+        // Counts match the previously-registered set.
+        assert_eq!(
+            endpoints.len(),
+            EXPECTED_ENDPOINTS,
+            "endpoint registration count changed; a submit was dropped or added without updating the guard",
+        );
+        assert_eq!(
+            schemas.len(),
+            EXPECTED_SCHEMAS,
+            "body-schema registration count changed; a submit was dropped or added without updating the guard",
+        );
+
+        // No duplicate registrations (two submits of the same (method, path) or schema name).
+        let ep_keys: BTreeSet<(&str, &str)> =
+            endpoints.iter().map(|e| (e.method, e.path)).collect();
+        assert_eq!(
+            ep_keys.len(),
+            endpoints.len(),
+            "duplicate endpoint (method, path) registration",
+        );
+        let schema_names: BTreeSet<&str> = schemas.iter().map(|s| s.name).collect();
+        assert_eq!(
+            schema_names.len(),
+            schemas.len(),
+            "duplicate body-schema name registration",
+        );
+
+        // Names match the previously-registered body-schema set exactly.
+        let expected_schema_names: BTreeSet<&str> = [
+            "AbortBody",
+            "AckInboxBody",
+            "AddBannedPhraseBody",
+            "AnnotateCommentBody",
+            "AnswerQuestionBody",
+            "AppendReviewLogBody",
+            "AppendTranscriptChunkBody",
+            "ApproveReviewBody",
+            "ArchiveDoneProposalsBody",
+            "ArchiveStaleTodosBody",
+            "ArchiveTaskBody",
+            "AttachDocumentBody",
+            "BindOperatorBody",
+            "BlockOnExternalBody",
+            "CancelQuestionBody",
+            "ChannelReadBody",
+            "CheckStopBody",
+            "CommentBody",
+            "CommentDocumentBody",
+            "CrashReportBody",
+            "CreateChannelBody",
+            "CreateDocumentBody",
+            "CreatePersonBody",
+            "CreateProjectBody",
+            "CreateReviewBody",
+            "CreateTaskBody",
+            "CreateTeamBody",
+            "DeclineQuestionBody",
+            "DeprecateDocumentBody",
+            "DocumentActorBody",
+            "EnsureExternalEntityTaskBody",
+            "GradeDocumentBody",
+            "InviteChannelBody",
+            "IpfsAddBody",
+            "LintTextBody",
+            "MoveTaskBody",
+            "MuteTaskBody",
+            "OpenDmBody",
+            "PoseQuestionBody",
+            "PostToChannelBody",
+            "ProjectTeamBody",
+            "PromoteThreadBody",
+            "PublishVersionBody",
+            "RegisterAgentBody",
+            "ReportSpendBody",
+            "RequestChangesBody",
+            "RequestStandDownBody",
+            "ResolveCommentBody",
+            "RestoreAgentBody",
+            "RetireAgentBody",
+            "ReviewAssigneeBody",
+            "SendMessageBody",
+            "SetAdmissionRuleBody",
+            "SetAgentConfigEntryBody",
+            "SetBudgetBody",
+            "SetChannelAutoJoinBody",
+            "SetDocumentPathBody",
+            "SetDocumentPropsBody",
+            "SetIdentityAliasBody",
+            "SetLifecycleIntentBody",
+            "SetReviewMetadataBody",
+            "SetReviewStatusBody",
+            "SetReviewVettedBody",
+            "SetStatusBody",
+            "SetWorkspaceKindBody",
+            "SteerBody",
+            "SubmitDeciderEpisodeBody",
+            "SubmitToOperatorReviewBody",
+            "SubscribeBody",
+            "SupersedeQuestionBody",
+            "TeamMemberBody",
+            "UpdateAgentBody",
+            "UpdateDocumentBody",
+            "UpdateProjectBody",
+            "UpdateTaskBody",
+            "UpsertExternalIdentityBody",
+            "UpsertExternalLinkBody",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            schema_names, expected_schema_names,
+            "body-schema name set drifted from the previously-registered schemas!(...) list",
+        );
+
+        // Cross-consistency: every endpoint body ref resolves to a registered schema (also covered
+        // standalone by `every_body_ref_has_a_schema`, re-checked here against the raw sets).
+        for e in &endpoints {
+            if let Some(name) = e.body {
+                assert!(
+                    schema_names.contains(name),
+                    "endpoint {} {} references body schema `{name}` that is not registered",
                     e.method,
                     e.path,
                 );
@@ -5723,10 +5919,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// The discovery catalog (`ENDPOINTS`) must match the actual axum router exactly.
-    /// axum doesn't expose its route table, so we parse the `.route(...)` lines out of
-    /// this file's own source. A new route with no catalog entry — or a stale catalog
-    /// entry for a route that's gone — fails the test.
+    /// The discovery catalog (the inventory-collected `Endpoint` set) must match the actual
+    /// axum router exactly. axum doesn't expose its route table, so we parse the `.route(...)`
+    /// lines out of this file's own source. A new route with no catalog entry — or a stale
+    /// catalog entry for a route that's gone — fails the test.
     #[test]
     fn catalog_matches_router() {
         let src = include_str!("api.rs");
@@ -5764,8 +5960,8 @@ mod tests {
             }
         }
 
-        let from_catalog: BTreeSet<(String, String)> = ENDPOINTS
-            .iter()
+        let from_catalog: BTreeSet<(String, String)> = inventory::iter::<Endpoint>
+            .into_iter()
             .map(|e| (e.method.to_string(), e.path.to_string()))
             .collect();
 
