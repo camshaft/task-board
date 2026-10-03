@@ -8640,9 +8640,9 @@ fn hydrate_workspace_kind(r: &SqliteRow) -> Value {
 // re-reads with no restart. Shared (keyed by policy_kind alone) because the banned-phrase list + the
 // per-role admission rules apply fleet-wide, not per-agent.
 
-/// Policy kinds that carry a watchable version (the keys of `policy_versions`). The per-role
-/// admission policy kind arrives with the role_admission_rules store (ask 5 piece 2).
+/// Policy kinds that carry a watchable version (the keys of `policy_versions`).
 pub const POLICY_BANNED_PHRASES: &str = "banned_phrases";
+pub const POLICY_ADMISSION: &str = "admission";
 
 /// Bump the monotonic version for `policy_kind` inside a tx and return the new value. Each bump
 /// pairs with an [`emit_policy_changed`] so a subscribed harness hot-reloads.
@@ -8803,6 +8803,230 @@ async fn policy_version_tx(
             .await?
             .and_then(|r| r.try_get::<i64, _>("version").ok())
             .unwrap_or(0),
+    )
+}
+
+// --- Per-role admission rules (task_1460, doc_3426 ask 5 piece 2) ---
+//
+// Shared board data the harness reads to admit or decline a class of action by role. A rule is
+// (role, action_class) -> effect allow|deny. role="*" is the per-action-class DEFAULT row (applies to
+// every role) so a sensitive action_class can be made default-deny (an allowlist) without flipping
+// the global default. action_class is an opaque harness-owned string (the doc_3428 v2 vocabulary; the
+// board stores it verbatim, like the decider call-type tags). Evaluation precedence: an exact
+// (role, action_class) rule > the (role="*", action_class) class-default > the global default-allow.
+// Every edit bumps policy_versions['admission'] + emits policy.changed, the same watchable-version
+// hot-reload path as the banned-phrase list.
+
+/// The sentinel `role` of a per-action-class default rule (applies to every role).
+pub const ADMISSION_DEFAULT_ROLE: &str = "*";
+
+/// Normalize + validate an admission effect to the stored lowercase literal.
+fn normalize_admission_effect(effect: &str) -> anyhow::Result<&'static str> {
+    match effect.trim().to_lowercase().as_str() {
+        "allow" => Ok("allow"),
+        "deny" => Ok("deny"),
+        other => anyhow::bail!(BoardError::bad_request(format!(
+            "admission effect must be 'allow' or 'deny' (got '{other}')"
+        ))),
+    }
+}
+
+/// Shape one admission-rule row as JSON (payload parsed back to a value).
+fn admission_rule_json(
+    role: &str,
+    action_class: &str,
+    effect: &str,
+    payload: &str,
+    note: Option<String>,
+    updated_at: &str,
+) -> Value {
+    json!({
+        "role": role,
+        "action_class": action_class,
+        "effect": effect,
+        "payload": serde_json::from_str::<Value>(payload).unwrap_or_else(|_| json!({})),
+        "note": note,
+        "updated_at": updated_at,
+    })
+}
+
+/// Upsert one per-role admission rule, keyed by (role, action_class). Validates effect in
+/// {allow, deny}; role="*" sets the per-action-class default. Bumps the 'admission' policy version +
+/// emits policy.changed so a subscribed harness hot-reloads. Returns the stored rule + version.
+pub async fn set_admission_rule(
+    pool: &Pool,
+    role: &str,
+    action_class: &str,
+    effect: &str,
+    payload: Option<Value>,
+    note: Option<&str>,
+    created_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let role = role.trim();
+    let action_class = action_class.trim();
+    if role.is_empty() || action_class.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "role and action_class are required".to_string()
+        ));
+    }
+    let eff = normalize_admission_effect(effect)?;
+    let payload_s = payload.unwrap_or_else(|| json!({})).to_string();
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    sqlx::query(
+        "INSERT INTO role_admission_rules(role, action_class, effect, payload, note, created_by, created_at, updated_at) \
+         VALUES(?,?,?,?,?,?,?,?) \
+         ON CONFLICT(role, action_class) DO UPDATE SET \
+           effect=excluded.effect, payload=excluded.payload, note=excluded.note, updated_at=excluded.updated_at",
+    )
+    .bind(role)
+    .bind(action_class)
+    .bind(eff)
+    .bind(&payload_s)
+    .bind(note)
+    .bind(created_by)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let version = bump_policy_version(&mut tx, POLICY_ADMISSION, &ts).await?;
+    emit_policy_changed(&mut tx, &mut hooks, POLICY_ADMISSION, version, created_by).await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    let mut rule = admission_rule_json(
+        role,
+        action_class,
+        eff,
+        &payload_s,
+        note.map(str::to_string),
+        &ts,
+    );
+    rule["version"] = json!(version);
+    Ok(rule)
+}
+
+/// Remove one admission rule. Returns `{role, action_class, deleted, version}`. Only an actual delete
+/// bumps the version + emits policy.changed (removing a non-existent rule is a no-op, no spurious wake).
+pub async fn remove_admission_rule(
+    pool: &Pool,
+    role: &str,
+    action_class: &str,
+) -> anyhow::Result<Value> {
+    let role = role.trim();
+    let action_class = action_class.trim();
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let res = sqlx::query("DELETE FROM role_admission_rules WHERE role=? AND action_class=?")
+        .bind(role)
+        .bind(action_class)
+        .execute(&mut *tx)
+        .await?;
+    let deleted = res.rows_affected() > 0;
+    let version = if deleted {
+        let v = bump_policy_version(&mut tx, POLICY_ADMISSION, &ts).await?;
+        emit_policy_changed(&mut tx, &mut hooks, POLICY_ADMISSION, v, None).await?;
+        v
+    } else {
+        policy_version_tx(&mut tx, POLICY_ADMISSION).await?
+    };
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(
+        json!({ "role": role, "action_class": action_class, "deleted": deleted, "version": version }),
+    )
+}
+
+/// List admission rules with the watchable version: `{policy_kind, version, count, rules:[..], role}`.
+/// With `role` set, returns that role's own rules UNION the role="*" class-defaults (the set that
+/// applies to the role, in one read); without it, every rule. Rules are ordered deterministically.
+pub async fn list_admission_rules(pool: &Pool, role: Option<&str>) -> anyhow::Result<Value> {
+    let rows = match role.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => {
+            sqlx::query(
+                "SELECT role, action_class, effect, payload, note, updated_at FROM role_admission_rules \
+                 WHERE role=? OR role=? ORDER BY action_class, role",
+            )
+            .bind(r)
+            .bind(ADMISSION_DEFAULT_ROLE)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "SELECT role, action_class, effect, payload, note, updated_at FROM role_admission_rules \
+                 ORDER BY role, action_class",
+            )
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    let mut rules = Vec::with_capacity(rows.len());
+    for r in &rows {
+        rules.push(admission_rule_json(
+            &r.try_get::<String, _>("role")?,
+            &r.try_get::<String, _>("action_class")?,
+            &r.try_get::<String, _>("effect")?,
+            &r.try_get::<String, _>("payload").unwrap_or_default(),
+            r.try_get::<Option<String>, _>("note").ok().flatten(),
+            &r.try_get::<String, _>("updated_at").unwrap_or_default(),
+        ));
+    }
+    Ok(json!({
+        "policy_kind": POLICY_ADMISSION,
+        "version": policy_version(pool, POLICY_ADMISSION).await?,
+        "count": rules.len(),
+        "rules": rules,
+        "role": role,
+    }))
+}
+
+/// Server-side admission decision for a (role, action_class), applying the precedence exact rule >
+/// class-default (role="*") > global default-allow. Returns `{role, action_class, effect, source}`
+/// where source is "rule" | "class_default" | "global_default" -- so the harness can admit/decline by
+/// role in one call, or read the full set with [`list_admission_rules`] and decide client-side.
+pub async fn admission_decision(
+    pool: &Pool,
+    role: &str,
+    action_class: &str,
+) -> anyhow::Result<Value> {
+    let role = role.trim();
+    let action_class = action_class.trim();
+    if action_class.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "action_class is required".to_string()
+        ));
+    }
+    // Exact (role, action_class) rule wins.
+    let exact: Option<String> =
+        sqlx::query("SELECT effect FROM role_admission_rules WHERE role=? AND action_class=?")
+            .bind(role)
+            .bind(action_class)
+            .fetch_optional(pool)
+            .await?
+            .and_then(|r| r.try_get::<String, _>("effect").ok());
+    if let Some(effect) = exact {
+        return Ok(
+            json!({ "role": role, "action_class": action_class, "effect": effect, "source": "rule" }),
+        );
+    }
+    // Else the per-action-class default (role="*").
+    let class_default: Option<String> =
+        sqlx::query("SELECT effect FROM role_admission_rules WHERE role=? AND action_class=?")
+            .bind(ADMISSION_DEFAULT_ROLE)
+            .bind(action_class)
+            .fetch_optional(pool)
+            .await?
+            .and_then(|r| r.try_get::<String, _>("effect").ok());
+    if let Some(effect) = class_default {
+        return Ok(
+            json!({ "role": role, "action_class": action_class, "effect": effect, "source": "class_default" }),
+        );
+    }
+    // Else the global default-allow.
+    Ok(
+        json!({ "role": role, "action_class": action_class, "effect": "allow", "source": "global_default" }),
     )
 }
 
@@ -23655,6 +23879,103 @@ mod tests {
         remove_banned_phrase(&pool, "not-listed").await?;
         let after = check_notifications(&pool, "harness", true, 50, None).await?;
         assert_eq!(after["count"].as_i64(), Some(0), "no-op edit did not wake");
+        Ok(())
+    }
+
+    /// task_1460 (doc_3426 ask 5 piece 2): per-role admission rules -- global default-allow, an
+    /// explicit deny, a per-action-class default-deny (role="*") allowlist with an exact-rule override,
+    /// the role-filtered list, and version bumps on real edits only (reusing the policy.changed path).
+    #[tokio::test]
+    async fn admission_rules_precedence_and_versioning() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Empty store: every action is admitted (global default-allow).
+        let d = admission_decision(&pool, "v-x", "shell-command").await?;
+        assert_eq!(d["effect"], json!("allow"));
+        assert_eq!(d["source"], json!("global_default"));
+        assert_eq!(policy_version(&pool, "admission").await?, 0);
+
+        // An explicit deny for one (role, class) denies that role; another role stays default-allow.
+        let r = set_admission_rule(
+            &pool,
+            "v-x",
+            "shell-command",
+            "deny",
+            None,
+            Some("no shell"),
+            Some("op"),
+        )
+        .await?;
+        assert_eq!(r["effect"], json!("deny"));
+        assert_eq!(r["version"], json!(1));
+        assert_eq!(
+            admission_decision(&pool, "v-x", "shell-command").await?["effect"],
+            json!("deny")
+        );
+        let other = admission_decision(&pool, "v-y", "shell-command").await?;
+        assert_eq!(other["effect"], json!("allow"));
+        assert_eq!(other["source"], json!("global_default"));
+
+        // A per-action-class default-deny (role="*") turns the class into an allowlist...
+        set_admission_rule(&pool, "*", "merge-or-land", "deny", None, None, Some("op")).await?;
+        let cd = admission_decision(&pool, "v-y", "merge-or-land").await?;
+        assert_eq!(cd["effect"], json!("deny"));
+        assert_eq!(cd["source"], json!("class_default"));
+        // ...and an exact allow for a role overrides the class-default (exact beats class-default).
+        set_admission_rule(
+            &pool,
+            "v-z",
+            "merge-or-land",
+            "allow",
+            None,
+            None,
+            Some("op"),
+        )
+        .await?;
+        let ex = admission_decision(&pool, "v-z", "merge-or-land").await?;
+        assert_eq!(ex["effect"], json!("allow"));
+        assert_eq!(ex["source"], json!("rule"));
+
+        // Role-filtered list = the role's own rules UNION the role="*" class-defaults, with version.
+        let listed = list_admission_rules(&pool, Some("v-z")).await?;
+        assert_eq!(listed["policy_kind"], json!("admission"));
+        assert_eq!(listed["version"], json!(3));
+        let rules = listed["rules"].as_array().unwrap();
+        assert_eq!(
+            rules.len(),
+            2,
+            "v-z merge-or-land + the * merge-or-land default: {listed}"
+        );
+        assert!(rules
+            .iter()
+            .all(|r| r["action_class"] == json!("merge-or-land")));
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r["action_class"] == json!("shell-command")),
+            "v-x's shell-command deny is neither v-z's nor a class-default"
+        );
+
+        // Effect validation; a bad effect errors before the tx, so the version does not move.
+        assert!(
+            set_admission_rule(&pool, "v-x", "x", "maybe", None, None, Some("op"))
+                .await
+                .is_err()
+        );
+        assert_eq!(policy_version(&pool, "admission").await?, 3);
+
+        // Remove: a real delete bumps + reverts the role to default-allow; a no-op does not bump.
+        let del = remove_admission_rule(&pool, "v-x", "shell-command").await?;
+        assert_eq!(del["deleted"], json!(true));
+        assert_eq!(del["version"], json!(4));
+        assert_eq!(
+            admission_decision(&pool, "v-x", "shell-command").await?["effect"],
+            json!("allow")
+        );
+        let noop = remove_admission_rule(&pool, "v-x", "nope").await?;
+        assert_eq!(noop["deleted"], json!(false));
+        assert_eq!(noop["version"], json!(4), "no-op delete did not bump");
         Ok(())
     }
 

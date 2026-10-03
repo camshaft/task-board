@@ -1432,6 +1432,55 @@ pub struct BannedPhraseArgs {
     pub phrase: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetAdmissionRuleArgs {
+    /// The role the rule governs, e.g. "v-task-board-team". Use "*" for the per-action-class default
+    /// (applies to every role) so a sensitive action_class can be made default-deny without flipping
+    /// the global default-allow.
+    pub role: String,
+    /// The action class -- an opaque harness-owned string (the doc_3428 admission vocabulary, e.g.
+    /// shell-command, code-change, merge-or-land, spawn-subagent, external-network-call, secret-request).
+    pub action_class: String,
+    /// Whether the role may perform the action: "allow" or "deny".
+    pub effect: String,
+    /// Optional structured payload the harness interprets (opaque to the board).
+    #[serde(default)]
+    pub payload: Option<Value>,
+    /// Optional note: why the rule exists.
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(rename = "principal", alias = "created_by", default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveAdmissionRuleArgs {
+    /// The role of the rule to remove ("*" for a per-action-class default).
+    pub role: String,
+    /// The action class of the rule to remove.
+    pub action_class: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListAdmissionRulesArgs {
+    /// Optional role filter: returns that role's own rules UNION the "*" class-defaults (the set that
+    /// applies to the role). Omit for every rule.
+    #[serde(default, deserialize_with = "de_opt_string_scalar")]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionCheckArgs {
+    /// The role performing the action.
+    pub role: String,
+    /// The action class being attempted.
+    pub action_class: String,
+}
+
 // --- People / teams (multi-operator model, task 542 Phase 1b) ---
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3616,6 +3665,67 @@ impl Board {
         Parameters(a): Parameters<BannedPhraseArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::remove_banned_phrase(&self.pool, &a.phrase)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Set a per-role admission rule (doc_3426 ask 5): whether a role may perform or emit a class of action -- (role, action_class) -> effect allow|deny. role=\"*\" sets the per-action-class default (applies to every role), so a sensitive action_class can be made default-deny (an allowlist) without flipping the global default-allow. action_class is an opaque harness-owned string (the doc_3428 admission vocabulary). Editable as data; bumps the shared 'admission' policy version + emits policy.changed so a board + [\"policy\"] subscriber hot-reloads. Returns the stored rule + version."
+    )]
+    async fn set_admission_rule(
+        &self,
+        Parameters(a): Parameters<SetAdmissionRuleArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let creator = self.me_opt(s(&a.created_by));
+        core::set_admission_rule(
+            &self.pool,
+            &a.role,
+            &a.action_class,
+            &a.effect,
+            a.payload,
+            s(&a.note),
+            creator.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Remove a per-role admission rule by (role, action_class). Only a real delete bumps the 'admission' policy version + emits policy.changed. Returns {role, action_class, deleted, version}."
+    )]
+    async fn remove_admission_rule(
+        &self,
+        Parameters(a): Parameters<RemoveAdmissionRuleArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::remove_admission_rule(&self.pool, &a.role, &a.action_class)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "List per-role admission rules with the watchable version: {policy_kind, version, count, rules, role}. With role set, returns that role's own rules UNION the \"*\" class-defaults (the set that applies to the role) in one read; without it, every rule. The harness reads this to admit/decline by role and re-reads on a policy.changed wake (board + [\"policy\"]) comparing version."
+    )]
+    async fn list_admission_rules(
+        &self,
+        Parameters(a): Parameters<ListAdmissionRulesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_admission_rules(&self.pool, a.role.as_deref())
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Evaluate the admission decision for a (role, action_class) server-side, applying the precedence exact rule > per-class default (role=\"*\") > global default-allow. Returns {role, action_class, effect (allow|deny), source (rule|class_default|global_default)} so the harness can admit/decline in one call."
+    )]
+    async fn check_admission(
+        &self,
+        Parameters(a): Parameters<AdmissionCheckArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::admission_decision(&self.pool, &a.role, &a.action_class)
             .await
             .map_err(err)
             .and_then(ok)

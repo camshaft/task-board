@@ -652,6 +652,26 @@ CREATE TABLE IF NOT EXISTS policy_versions (
     version     INTEGER NOT NULL DEFAULT 0,
     updated_at  TEXT NOT NULL
 );
+-- Per-role admission rules (task_1460, doc_3426 ask 5 piece 2): shared board data the harness reads
+-- to admit or decline a class of action by role. (role, action_class) -> effect 'allow' | 'deny'.
+-- role='*' is the per-action-class DEFAULT row (applies to every role) so a sensitive action_class
+-- can be made default-deny (an allowlist) without flipping the global default. action_class is an
+-- opaque harness-owned string (the doc_3428 vocabulary; the board stores it verbatim). Evaluation
+-- precedence: an exact (role, action_class) rule wins over the (role='*', action_class) class-default,
+-- which wins over the global default-allow (an action is admitted unless a matching deny applies).
+-- Editable as data; every edit bumps policy_versions['admission'] + emits policy.changed so the
+-- harness hot-reloads, the same watchable-version path as the banned-phrase list.
+CREATE TABLE IF NOT EXISTS role_admission_rules (
+    role         TEXT NOT NULL,
+    action_class TEXT NOT NULL,
+    effect       TEXT NOT NULL,
+    payload      TEXT NOT NULL DEFAULT '{}',
+    note         TEXT,
+    created_by   TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (role, action_class)
+);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
