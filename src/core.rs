@@ -10939,23 +10939,99 @@ pub async fn set_agent_config_entry(
     position: Option<i64>,
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
-    let agent_id = agent_id.trim();
+    // A per-agent subject must be an EXISTING agent (the registry row), so a typo is a clean error.
+    set_config_entry(
+        pool,
+        agent_id,
+        true,
+        config_kind,
+        entry_id,
+        enabled,
+        scope,
+        payload,
+        position,
+        actor,
+    )
+    .await
+}
+
+/// task_1459 (doc_3426 ask 4): normalize a role name into its config-subject key. Role-level grants
+/// live in the SAME agent_config_entries table under a reserved "role:" subject so there is ONE
+/// editable-config surface (v-ft comment_8137: no second surface); an agent id can never collide
+/// since agent ids are not "role:"-prefixed.
+fn role_subject(role: &str) -> String {
+    format!("role:{}", role.trim())
+}
+
+/// Upsert a ROLE-level config entry (task_1459, ask 4): a grant inherited by every agent in the role
+/// unless an agent overrides the same entry_id. Stored under the "role:" subject in the shared table.
+/// A role entry with enabled=false withholds that entry for the whole role (the N8 unattended-window
+/// guarantee), overridable per agent. Bumps the role subject's version + emits agent.config_changed
+/// (so every agent in the role, subscribed board + ["agent"], re-reads its effective set).
+#[allow(clippy::too_many_arguments)]
+pub async fn set_role_config_entry(
+    pool: &Pool,
+    role: &str,
+    config_kind: &str,
+    entry_id: &str,
+    enabled: Option<bool>,
+    scope: Option<Value>,
+    payload: Option<Value>,
+    position: Option<i64>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let role = role.trim();
+    if role.is_empty() {
+        anyhow::bail!(BoardError::bad_request("role is required".to_string()));
+    }
+    set_config_entry(
+        pool,
+        &role_subject(role),
+        false,
+        config_kind,
+        entry_id,
+        enabled,
+        scope,
+        payload,
+        position,
+        actor,
+    )
+    .await
+}
+
+/// Shared upsert for an editable-config entry under a SUBJECT -- an agent id, or a "role:" subject
+/// for role-level grants (task_1459). `require_agent` gates the registry-row check: true for a
+/// per-agent subject (a typo'd agent is a clean error), false for a role subject (a role is not an
+/// agents row). Each edit bumps the subject's version and emits agent.config_changed.
+#[allow(clippy::too_many_arguments)]
+async fn set_config_entry(
+    pool: &Pool,
+    subject: &str,
+    require_agent: bool,
+    config_kind: &str,
+    entry_id: &str,
+    enabled: Option<bool>,
+    scope: Option<Value>,
+    payload: Option<Value>,
+    position: Option<i64>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let subject = subject.trim();
     let config_kind = config_kind.trim();
     let entry_id = entry_id.trim();
-    if agent_id.is_empty() || config_kind.is_empty() || entry_id.is_empty() {
+    if subject.is_empty() || config_kind.is_empty() || entry_id.is_empty() {
         anyhow::bail!(BoardError::bad_request(
-            "agent_id, config_kind, and entry_id are required".to_string()
+            "subject, config_kind, and entry_id are required".to_string()
         ));
     }
-    // The config is per EXISTING agent (the registry row), so a typo'd agent id is a clean error
-    // rather than an orphan config set.
-    if sqlx::query("SELECT 1 FROM agents WHERE id=?")
-        .bind(agent_id)
-        .fetch_optional(pool)
-        .await?
-        .is_none()
+    if require_agent
+        && sqlx::query("SELECT 1 FROM agents WHERE id=?")
+            .bind(subject)
+            .fetch_optional(pool)
+            .await?
+            .is_none()
     {
-        anyhow::bail!("no agent {agent_id}");
+        anyhow::bail!("no agent {subject}");
     }
     let ts = now_iso();
     let mut tx = pool.begin().await?;
@@ -10964,7 +11040,7 @@ pub async fn set_agent_config_entry(
         "SELECT enabled, scope, payload, position FROM agent_config_entries \
          WHERE agent_id=? AND config_kind=? AND entry_id=?",
     )
-    .bind(agent_id)
+    .bind(subject)
     .bind(config_kind)
     .bind(entry_id)
     .fetch_optional(&mut *tx)
@@ -11002,7 +11078,7 @@ pub async fn set_agent_config_entry(
                 "SELECT COALESCE(MAX(position),0)+1 AS n FROM agent_config_entries \
                  WHERE agent_id=? AND config_kind=?",
             )
-            .bind(agent_id)
+            .bind(subject)
             .bind(config_kind)
             .fetch_one(&mut *tx)
             .await?
@@ -11017,7 +11093,7 @@ pub async fn set_agent_config_entry(
            enabled=excluded.enabled, scope=excluded.scope, payload=excluded.payload, \
            position=excluded.position, updated_at=excluded.updated_at",
     )
-    .bind(agent_id)
+    .bind(subject)
     .bind(config_kind)
     .bind(entry_id)
     .bind(enabled_v)
@@ -11029,12 +11105,12 @@ pub async fn set_agent_config_entry(
     .execute(&mut *tx)
     .await?;
 
-    let version = bump_config_version(&mut tx, agent_id, config_kind, &ts).await?;
-    emit_config_changed(&mut tx, &mut hooks, agent_id, config_kind, version, actor).await?;
+    let version = bump_config_version(&mut tx, subject, config_kind, &ts).await?;
+    emit_config_changed(&mut tx, &mut hooks, subject, config_kind, version, actor).await?;
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
 
-    list_agent_config_entries(pool, agent_id, config_kind).await
+    list_agent_config_entries(pool, subject, config_kind).await
 }
 
 /// Remove one entry from an agent's config set (task_1477). Bumps the version + emits
@@ -11046,12 +11122,39 @@ pub async fn remove_agent_config_entry(
     entry_id: &str,
     actor: Option<&str>,
 ) -> anyhow::Result<Value> {
-    let agent_id = agent_id.trim();
+    remove_config_entry(pool, agent_id, config_kind, entry_id, actor).await
+}
+
+/// Remove a ROLE-level config entry (task_1459, ask 4). Bumps the role subject's version + emits
+/// agent.config_changed, so every agent in the role re-reads its effective set.
+pub async fn remove_role_config_entry(
+    pool: &Pool,
+    role: &str,
+    config_kind: &str,
+    entry_id: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let role = role.trim();
+    if role.is_empty() {
+        anyhow::bail!(BoardError::bad_request("role is required".to_string()));
+    }
+    remove_config_entry(pool, &role_subject(role), config_kind, entry_id, actor).await
+}
+
+/// Shared delete for a config entry under a subject (an agent id or a "role:" subject).
+async fn remove_config_entry(
+    pool: &Pool,
+    subject: &str,
+    config_kind: &str,
+    entry_id: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let subject = subject.trim();
     let config_kind = config_kind.trim();
     let entry_id = entry_id.trim();
-    if agent_id.is_empty() || config_kind.is_empty() || entry_id.is_empty() {
+    if subject.is_empty() || config_kind.is_empty() || entry_id.is_empty() {
         anyhow::bail!(BoardError::bad_request(
-            "agent_id, config_kind, and entry_id are required".to_string()
+            "subject, config_kind, and entry_id are required".to_string()
         ));
     }
     let ts = now_iso();
@@ -11060,22 +11163,22 @@ pub async fn remove_agent_config_entry(
     let res = sqlx::query(
         "DELETE FROM agent_config_entries WHERE agent_id=? AND config_kind=? AND entry_id=?",
     )
-    .bind(agent_id)
+    .bind(subject)
     .bind(config_kind)
     .bind(entry_id)
     .execute(&mut *tx)
     .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!(BoardError::bad_request(format!(
-            "no config entry '{entry_id}' for agent '{agent_id}' kind '{config_kind}'"
+            "no config entry '{entry_id}' for subject '{subject}' kind '{config_kind}'"
         )));
     }
-    let version = bump_config_version(&mut tx, agent_id, config_kind, &ts).await?;
-    emit_config_changed(&mut tx, &mut hooks, agent_id, config_kind, version, actor).await?;
+    let version = bump_config_version(&mut tx, subject, config_kind, &ts).await?;
+    emit_config_changed(&mut tx, &mut hooks, subject, config_kind, version, actor).await?;
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
 
-    list_agent_config_entries(pool, agent_id, config_kind).await
+    list_agent_config_entries(pool, subject, config_kind).await
 }
 
 /// Read an agent's full editable-config set for one config_kind in dispatch order, with the current
@@ -11118,6 +11221,107 @@ pub async fn list_agent_config_entries(
         "count": entries.len(),
         "entries": entries,
     }))
+}
+
+/// task_1459 (doc_3426 ask 4): the EFFECTIVE per-agent config set for one config_kind, merged from
+/// role-level grants (inherited) and the agent's own entries (overrides), in ONE read -- so the
+/// harness does not resolve roles itself (acceptance 1). An agent entry overrides a role entry with
+/// the same id (agent wins); a role entry with no agent override is inherited; a role entry with
+/// enabled=false withholds that id for the whole role (the N8 unattended-window guarantee) unless the
+/// agent overrides it. Each effective entry carries a `source` of "agent" or "role". Deterministic:
+/// ordered by position then id (acceptance 6). Returns both role_version and agent_version so the
+/// harness detects a change to either (both arrive as agent.config_changed in the task_1456 "agent"
+/// class). For config_kind=tool this is the granted-tool-set read: a grant is an enabled entry, and
+/// the harness applies the per-tool authz/argument policy carried in payload (M3).
+pub async fn effective_config_entries(
+    pool: &Pool,
+    agent_id: &str,
+    config_kind: &str,
+) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    let config_kind = config_kind.trim();
+    if agent_id.is_empty() || config_kind.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "agent_id and config_kind are required".to_string()
+        ));
+    }
+    // Validates the agent + gives its declared role (metadata.role).
+    let agent = get_agent(pool, agent_id).await?;
+    let role = agent
+        .get("metadata")
+        .and_then(|m| m.get("role"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // Merge role base (inherited) then agent overrides, keyed by entry id, tagging the source.
+    let mut merged: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut role_version = 0_i64;
+    if let Some(ref r) = role {
+        let role_set = list_agent_config_entries(pool, &role_subject(r), config_kind).await?;
+        role_version = role_set["version"].as_i64().unwrap_or(0);
+        if let Some(arr) = role_set["entries"].as_array() {
+            for e in arr {
+                if let Some(id) = e["id"].as_str() {
+                    let mut e = e.clone();
+                    if let Value::Object(ref mut m) = e {
+                        m.insert("source".into(), json!("role"));
+                    }
+                    merged.insert(id.to_string(), e);
+                }
+            }
+        }
+    }
+    let agent_set = list_agent_config_entries(pool, agent_id, config_kind).await?;
+    let agent_version = agent_set["version"].as_i64().unwrap_or(0);
+    if let Some(arr) = agent_set["entries"].as_array() {
+        for e in arr {
+            if let Some(id) = e["id"].as_str() {
+                let mut e = e.clone();
+                if let Value::Object(ref mut m) = e {
+                    m.insert("source".into(), json!("agent"));
+                }
+                merged.insert(id.to_string(), e); // agent overrides a same-id role entry
+            }
+        }
+    }
+
+    // Deterministic effective order: position then id.
+    let mut entries: Vec<Value> = merged.into_values().collect();
+    entries.sort_by(|a, b| {
+        let pa = a["position"].as_i64().unwrap_or(0);
+        let pb = b["position"].as_i64().unwrap_or(0);
+        pa.cmp(&pb).then_with(|| {
+            a["id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["id"].as_str().unwrap_or(""))
+        })
+    });
+
+    Ok(json!({
+        "agent_id": agent_id,
+        "config_kind": config_kind,
+        "role": role,
+        "role_version": role_version,
+        "agent_version": agent_version,
+        "count": entries.len(),
+        "entries": entries,
+    }))
+}
+
+/// Read a ROLE's own config set for one config_kind (task_1459, ask 4) -- the role-level base before
+/// per-agent overrides. The response's `agent_id` is the "role:" subject. For the merged per-agent
+/// view use effective_config_entries.
+pub async fn list_role_config_entries(
+    pool: &Pool,
+    role: &str,
+    config_kind: &str,
+) -> anyhow::Result<Value> {
+    let role = role.trim();
+    if role.is_empty() {
+        anyhow::bail!(BoardError::bad_request("role is required".to_string()));
+    }
+    list_agent_config_entries(pool, &role_subject(role), config_kind).await
 }
 
 /// Fetch one document with its current version + version list.
@@ -20520,6 +20724,157 @@ mod tests {
 
         // Unknown agent -> clean error.
         assert!(check_stop(&pool, "nobody", None).await.is_err());
+        Ok(())
+    }
+
+    /// task_1459 (doc_3426 ask 4): role-level tool grants + per-agent overrides merge to an effective
+    /// per-agent set in one read. A role entry is inherited; an agent entry with the same id overrides
+    /// it (agent wins); a role entry enabled=false withholds for the whole role (N8) unless an agent
+    /// overrides it. Deterministic order; reuses the shared agent_config_entries shell, config_kind=tool.
+    #[tokio::test]
+    async fn effective_tool_grants_role_base_plus_agent_override() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(
+            &pool,
+            "v-a",
+            None,
+            None,
+            None,
+            Some(json!({"role": "backend"})),
+            None,
+        )
+        .await?;
+        register_agent(
+            &pool,
+            "v-b",
+            None,
+            None,
+            None,
+            Some(json!({"role": "backend"})),
+            None,
+        )
+        .await?;
+
+        // Role base: grant `fetch` to all of backend; WITHHOLD `shell` for the whole role (N8).
+        set_role_config_entry(
+            &pool,
+            "backend",
+            "tool",
+            "fetch",
+            Some(true),
+            None,
+            Some(json!({"authz": "readonly"})),
+            Some(1),
+            Some("cameron"),
+        )
+        .await?;
+        set_role_config_entry(
+            &pool,
+            "backend",
+            "tool",
+            "shell",
+            Some(false),
+            None,
+            None,
+            Some(2),
+            Some("cameron"),
+        )
+        .await?;
+
+        // v-a overrides: grant `shell` (overriding the role withhold) + an agent-only `notes`.
+        set_agent_config_entry(
+            &pool,
+            "v-a",
+            "tool",
+            "shell",
+            Some(true),
+            None,
+            None,
+            Some(3),
+            Some("cameron"),
+        )
+        .await?;
+        set_agent_config_entry(
+            &pool,
+            "v-a",
+            "tool",
+            "notes",
+            Some(true),
+            None,
+            None,
+            Some(4),
+            Some("cameron"),
+        )
+        .await?;
+
+        // v-a effective: fetch (role, on), shell (agent override, on), notes (agent, on).
+        let eff = effective_config_entries(&pool, "v-a", "tool").await?;
+        assert_eq!(eff["role"], json!("backend"));
+        let by: std::collections::BTreeMap<String, Value> = eff["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["id"].as_str().unwrap().to_string(), e.clone()))
+            .collect();
+        assert_eq!(by.len(), 3);
+        assert_eq!(by["fetch"]["source"], json!("role"));
+        assert_eq!(by["fetch"]["enabled"], json!(true));
+        assert_eq!(
+            by["fetch"]["payload"]["authz"],
+            json!("readonly"),
+            "role-level per-tool payload (M3) is carried through"
+        );
+        assert_eq!(
+            by["shell"]["source"],
+            json!("agent"),
+            "agent override wins the merge"
+        );
+        assert_eq!(
+            by["shell"]["enabled"],
+            json!(true),
+            "an agent override grants a role-withheld tool"
+        );
+        assert_eq!(by["notes"]["source"], json!("agent"));
+        assert!(eff["role_version"].as_i64().unwrap() >= 2);
+        assert!(eff["agent_version"].as_i64().unwrap() >= 2);
+
+        // Deterministic order by position then id: fetch(1), shell(override pos 3), notes(4).
+        let ids: Vec<&str> = eff["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["fetch", "shell", "notes"]);
+
+        // v-b (same role, NO overrides): inherits fetch granted + shell WITHHELD (enabled=false).
+        let effb = effective_config_entries(&pool, "v-b", "tool").await?;
+        let byb: std::collections::BTreeMap<String, Value> = effb["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["id"].as_str().unwrap().to_string(), e.clone()))
+            .collect();
+        assert_eq!(byb["fetch"]["enabled"], json!(true));
+        assert_eq!(byb["shell"]["source"], json!("role"));
+        assert_eq!(
+            byb["shell"]["enabled"],
+            json!(false),
+            "shell withheld for the whole role, no agent override"
+        );
+
+        // Withhold is one role edit affecting every agent in the role.
+        remove_role_config_entry(&pool, "backend", "tool", "shell", Some("cameron")).await?;
+        let effb2 = effective_config_entries(&pool, "v-b", "tool").await?;
+        assert!(
+            !effb2["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == json!("shell")),
+            "role entry removed -> gone from every agent's effective set"
+        );
         Ok(())
     }
 
