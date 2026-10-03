@@ -11442,9 +11442,13 @@ pub async fn submit_to_operator_review(
     let archived_at: Option<String> = row.try_get("archived_at")?;
     let current_version_id: Option<i64> = row.try_get("current_version_id")?;
     let meta_str: String = row.try_get("metadata")?;
-    // The doc's own author -- used by check 2a to reject a self-authored conformance review
-    // (task_1065 Part A): review independence must be structural, not honor-system.
-    let doc_author: Option<String> = row.try_get("created_by")?;
+    // The doc RECORD's original creator (documents.created_by) -- NOT necessarily the author of the
+    // content under review. For a doc whose stewardship moved, this is a stale identity (task_1412:
+    // doc_20 was created by librarian at v1 but every version since is authored by charter-steward,
+    // so keying the self-review guard off this wrongly rejected librarian's independent conformance
+    // review). Used only as a fallback below; the self-review guard keys off the CURRENT version's
+    // author.
+    let doc_record_creator: Option<String> = row.try_get("created_by")?;
     if archived_at.is_some() {
         anyhow::bail!(
             "document {document_id} is archived; restore it before submitting for operator review"
@@ -11453,12 +11457,22 @@ pub async fn submit_to_operator_review(
     let Some(cvid) = current_version_id else {
         anyhow::bail!("document {document_id} has no published version to review");
     };
-    let current_version_no: i64 =
-        sqlx::query("SELECT version_no FROM document_versions WHERE id=?")
-            .bind(cvid)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get("version_no")?;
+    let cv_row = sqlx::query("SELECT version_no, created_by FROM document_versions WHERE id=?")
+        .bind(cvid)
+        .fetch_one(&mut *tx)
+        .await?;
+    let current_version_no: i64 = cv_row.try_get("version_no")?;
+    // The author of the content under review is whoever PUBLISHED the current version, not the doc
+    // record's original creator (task_1412). Review independence (task_1065 Part A) must exclude the
+    // agent who wrote THIS version -- a steward who inherited a doc and publishes its versions is the
+    // self-review identity -- while the long-ago record creator, now acting as an independent
+    // reviewer, must NOT be falsely rejected. Falls back to the record creator for a legacy version
+    // row that carries no author.
+    let version_author: Option<String> = cv_row
+        .try_get::<Option<String>, _>("created_by")
+        .ok()
+        .flatten();
+    let doc_author: Option<String> = version_author.or(doc_record_creator);
 
     // Conformance-exempt doc types (tenet / canon) skip checks 2a + 2b entirely (task_944,
     // librarian's sign-off): a tenet is approved by the operator via plain approve_document, not
@@ -22905,6 +22919,146 @@ mod tests {
         assert!(request_stand_down(&pool, "ghost", Some("x"), None)
             .await
             .is_err());
+        Ok(())
+    }
+
+    /// task_1412 regression: the self-review guard keys off the CURRENT version's author, not the
+    /// doc record's original creator. A doc created by one agent (librarian, at v1) whose current
+    /// version is authored by another (charter-steward) must accept a conformance review by the
+    /// record creator -- librarian did not write the version under review -- and metadata.author on
+    /// the review is free-form attribution that must not affect the gate. The guard still bites a
+    /// genuine self-review (the version author clearing their own version).
+    #[tokio::test]
+    async fn conformance_gate_uses_version_author_not_record_creator() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Docs", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        // Record created by librarian (v1); stewardship then moves to charter-steward, who publishes
+        // the current version (v2) -- the content actually under review.
+        let d = create_document(
+            &pool,
+            "Agent Charter Template",
+            Some(pid),
+            "bafyv1",
+            Some("v1"),
+            Some("librarian"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        publish_version(
+            &pool,
+            did,
+            "bafyv2",
+            Some("v2 steward edit"),
+            Some("charter-steward"),
+            None,
+            None,
+        )
+        .await?;
+
+        // A non-author conformance review by librarian (the record creator, NOT the v2 author), with
+        // metadata.author set to the doc author as free-form attribution (the task_1412 trap).
+        let r = create_review(
+            &pool,
+            "design_conformance",
+            Some("board-document"),
+            Some(&format!("doc_{did}")),
+            Some("conformance"),
+            None,
+            Some("librarian"),
+            Some("librarian"),
+            Some(json!({ "author": "charter-steward", "non_author": true })),
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 2 }).to_string()),
+            Some("librarian"),
+            None,
+            None,
+        )
+        .await?;
+        // Gate must PASS: librarian is not the author of v2 (charter-steward is). A template waiver
+        // skips the structural A8 gate; ipfs_api_url=None skips the body fetch.
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("charter-steward"),
+            None,
+            Some("charter template, not a design doc"),
+            None,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            out["status"],
+            json!("operator_review"),
+            "a review by the record creator (not the version author) must satisfy the gate: {out}"
+        );
+
+        // The guard still bites a true self-review: on a separate doc authored by charter-steward,
+        // a conformance entry by charter-steward (the version author) does NOT clear the gate.
+        let d2 = create_document(
+            &pool,
+            "Self authored",
+            Some(pid),
+            "bafys1",
+            Some("v1"),
+            Some("charter-steward"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did2 = d2["id"].as_i64().unwrap();
+        let r2 = create_review(
+            &pool,
+            "design_conformance",
+            Some("board-document"),
+            Some(&format!("doc_{did2}")),
+            Some("conformance"),
+            None,
+            Some("charter-steward"),
+            Some("charter-steward"),
+            None,
+            None,
+        )
+        .await?;
+        let rid2 = r2["id"].as_i64().unwrap();
+        append_review_log(
+            &pool,
+            rid2,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 1 }).to_string()),
+            Some("charter-steward"),
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            submit_to_operator_review(
+                &pool,
+                did2,
+                Some("charter-steward"),
+                None,
+                Some("charter template, not a design doc"),
+                None,
+                false,
+                None,
+            )
+            .await
+            .is_err(),
+            "the version author's own conformance entry must not clear the gate (self-review)"
+        );
         Ok(())
     }
 
