@@ -210,6 +210,8 @@ pub fn router(state: AppState) -> Router {
             "/agents/{agent_id}/request-stand-down",
             post(request_stand_down),
         )
+        .route("/agents/{agent_id}/retire", post(retire_agent))
+        .route("/agents/{agent_id}/restore", post(restore_agent))
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/projects", get(list_projects).post(create_project))
@@ -882,13 +884,15 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
     Endpoint { method: "GET", path: "/api/metrics", summary: "Request metrics for optimizing board/fleet performance (task_1380): per-endpoint latency p50/p90/p99 in ms (approximate, from coarse log-spaced buckets), request count + process start (a throughput basis), the in-flight / max-in-flight concurrency gauge (a hang shows as a stuck-high in_flight), and 2xx/4xx/5xx status-class counts, plus an overall rollup. Keys are METHOD + route template relative to the /api mount. Aggregate numbers only, mutates nothing.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/admin/db-snapshot", summary: "Download a point-in-time-consistent copy of the SQLite database (VACUUM INTO, integrity-checked), behind HTTP Basic auth. Disabled by default (404 when off); the deployment keeps it loopback/LAN-bound and off the public tunnel. The extraction primitive for host migration + DR.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&limit=int&offset=int", body: None },
+    Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata, retired} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match), retired (true=only terminally-gone agents, false=only live). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&retired=bool&limit=int&offset=int", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
     Endpoint { method: "GET", path: "/api/resolve-agent", summary: "Resolve an agent name to one exact agent id (task_1251): an exact id wins (never ambiguous even when it is a prefix of a longer id), a unique case-insensitive substring resolves, an ambiguous substring is refused (400) with the sorted candidate ids. The safe recipient-resolver vs picking the first row of a q= search. Returns {name, id, match}.", query: "name=str", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry). Merge-PATCH: an omitted/null field is left unchanged; to reset a nullable field to null, name it in `clear` (e.g. [\"webhook_url\"]).", query: "", body: Some("UpdateAgentBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/request-stand-down", summary: "Request that an agent gracefully wind down: records the request (who/why/when, shown on the agent's page) and notifies the agent so it stands down on its own terms. A SIGNAL — never changes the agent's status and never kills a live agent. Cleared when the agent goes offline.", query: "", body: Some("RequestStandDownBody") },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/retire", summary: "Terminally retire an agent (task_1363): mark it permanently gone (distinct from offline/stand-down, which are resumable) and run the auto-disposition sweep — every task blocked on it is cleared back to todo (keeping the assignee) and task.blocker_retired is emitted to board-pm for re-homing, so no dependent silently strands. Operator or board-pm only; reversible via /restore.", query: "", body: Some("RetireAgentBody") },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/restore", summary: "Reverse a terminal retirement (task_1363): clear the gone marker so a mis-marked agent is live again. Does not un-sweep already-disposed tasks. Operator or board-pm only.", query: "", body: Some("RestoreAgentBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
@@ -1024,6 +1028,8 @@ fn body_schemas() -> Value {
         UpdateAgentBody,
         SetStatusBody,
         RequestStandDownBody,
+        RetireAgentBody,
+        RestoreAgentBody,
         CreateProjectBody,
         UpdateProjectBody,
         CreateTaskBody,
@@ -1287,6 +1293,8 @@ struct ListAgentsQuery {
     meta_value: Option<String>,
     #[serde(default)]
     verbose: bool,
+    /// task_1363: true = only retired/gone agents, false = only live. Omit for all.
+    retired: Option<bool>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -1295,19 +1303,55 @@ async fn list_agents(
     State(st): State<AppState>,
     Query(query): Query<ListAgentsQuery>,
 ) -> ApiResult {
+    let agents = core::list_agents(
+        &st.pool,
+        query.status.as_deref(),
+        query.q.as_deref(),
+        query.meta_key.as_deref(),
+        query.meta_value.as_deref(),
+        query.verbose,
+        query.limit,
+        query.offset,
+    )
+    .await?;
+    // Audit filter on the derived retired flag (task_1363); a no-op when omitted.
+    Ok(Json(core::filter_agents_retired(agents, query.retired)))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RetireAgentBody {
+    /// Who is retiring the agent (must be an operator or board-pm).
+    #[serde(rename = "principal", alias = "retired_by", alias = "actor")]
+    retired_by: Option<String>,
+    /// Optional reason recorded on the agent + each swept task's note.
+    reason: Option<String>,
+}
+
+async fn retire_agent(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<RetireAgentBody>,
+) -> ApiResult {
+    let retired_by = b.retired_by.as_deref().unwrap_or_default();
     Ok(Json(
-        core::list_agents(
-            &st.pool,
-            query.status.as_deref(),
-            query.q.as_deref(),
-            query.meta_key.as_deref(),
-            query.meta_value.as_deref(),
-            query.verbose,
-            query.limit,
-            query.offset,
-        )
-        .await?,
+        core::retire_agent(&st.pool, &agent_id, retired_by, b.reason.as_deref()).await?,
     ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RestoreAgentBody {
+    /// Who is restoring the agent (must be an operator or board-pm).
+    #[serde(rename = "principal", alias = "actor", alias = "restored_by")]
+    actor: Option<String>,
+}
+
+async fn restore_agent(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<RestoreAgentBody>,
+) -> ApiResult {
+    let actor = b.actor.as_deref().unwrap_or_default();
+    Ok(Json(core::restore_agent(&st.pool, &agent_id, actor).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]
