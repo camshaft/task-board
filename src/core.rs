@@ -10124,30 +10124,71 @@ pub async fn scan_banned_phrases(pool: &Pool, text: &str) -> anyhow::Result<Vec<
     Ok(hits)
 }
 
-/// Pre-submit lint: bail with a clear, author-facing message if `text` contains any banned phrase
-/// and the author has not acknowledged. `acknowledge=true` is the soft-block escape hatch (submit
-/// anyway) — for intentional uses, e.g. content that quotes a banned phrase to discuss it. The
-/// error message starts with "banned phrase" so the REST layer maps it to 400.
-pub async fn check_banned_phrases(
-    pool: &Pool,
-    text: &str,
-    acknowledge: bool,
-) -> anyhow::Result<()> {
-    if acknowledge {
-        return Ok(());
-    }
-    let hits = scan_banned_phrases(pool, text).await?;
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let list = hits
+/// Quote-and-join a phrase list for an author-facing message: `"a", "b"`.
+fn quote_join(items: &[String]) -> String {
+    items
         .iter()
         .map(|p| format!("\"{p}\""))
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(", ")
+}
+
+/// Pre-submit lint: reject `text` if it contains a banned phrase the author has not acknowledged,
+/// and otherwise return the phrases that WERE acknowledged (suppressed) so the surface layer can
+/// name them -- an acknowledge is never silent (task_1534).
+///
+/// Acknowledgement is scoped, not all-or-nothing. `acknowledged_phrases` is the explicit list the
+/// author is carrying forward (case-insensitive, whole-phrase):
+/// - A non-empty list is authoritative -- only those phrases pass; ANY other banned hit is
+///   rejected, naming it. `blanket` does NOT widen a scoped list, so a phrase newly introduced by
+///   the same edit (not in the list) is still rejected rather than silently suppressed. This is the
+///   fix for the all-or-nothing override that let a new banned word publish silently.
+/// - With no list, `blanket` (the legacy `acknowledge_banned=true`) suppresses every hit for
+///   backward compatibility, but the hits are returned so the caller surfaces what it let through.
+/// - With neither, any hit is rejected (the original behavior).
+///
+/// The error message starts with "banned phrase" so the REST layer maps it to 400.
+pub async fn check_banned_phrases(
+    pool: &Pool,
+    text: &str,
+    acknowledged_phrases: &[String],
+    blanket: bool,
+) -> anyhow::Result<Vec<String>> {
+    let hits = scan_banned_phrases(pool, text).await?;
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Stored banned phrases (and therefore `hits`) are lowercase; normalize the acknowledged list
+    // the same way so the match is case-insensitive and blank entries are ignored.
+    let acked: BTreeSet<String> = acknowledged_phrases
+        .iter()
+        .map(|p| p.trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if !acked.is_empty() {
+        let un_acked: Vec<String> = hits
+            .iter()
+            .filter(|p| !acked.contains(*p))
+            .cloned()
+            .collect();
+        if !un_acked.is_empty() {
+            let list = quote_join(&un_acked);
+            anyhow::bail!(
+                "banned phrase(s) found that you did not acknowledge: {list}. These are on the \
+                 fleet banned-phrases list -- that is not how we write here. Rewrite to remove \
+                 them, or add them to acknowledged_phrases to submit anyway."
+            );
+        }
+        return Ok(hits);
+    }
+    if blanket {
+        return Ok(hits);
+    }
+    let list = quote_join(&hits);
     anyhow::bail!(
-        "banned phrase(s) found: {list}. These are on the fleet banned-phrases list — that is not \
-         how we write here. Rewrite to remove them, or pass acknowledge_banned=true to submit anyway."
+        "banned phrase(s) found: {list}. These are on the fleet banned-phrases list -- that is not \
+         how we write here. Rewrite to remove them, or list them in acknowledged_phrases (or pass \
+         acknowledge_banned=true) to submit anyway."
     );
 }
 
@@ -10273,14 +10314,36 @@ pub fn check_caps_emphasis(text: &str, acknowledge: bool) -> anyhow::Result<()> 
 }
 
 /// Combined pre-submit content lint for authored free text (task/document comments + document
-/// versions): the ASCII-format check, the caps-for-emphasis check, then the banned-phrase check, all
-/// honoring the same `acknowledge` escape hatch. One funnel so every authored surface runs the same
-/// checks and a new check only has to be added here.
-pub async fn check_content(pool: &Pool, text: &str, acknowledge: bool) -> anyhow::Result<()> {
+/// versions): the ASCII-format check, the caps-for-emphasis check, then the banned-phrase check. One
+/// funnel so every authored surface runs the same checks and a new check only has to be added here.
+///
+/// `acknowledge` is the blanket soft-block waiver for the format and caps rules (unchanged).
+/// `acknowledged_phrases` is the SCOPED banned-phrase acknowledgement (task_1534): only those
+/// phrases pass, any other banned hit is rejected. With an empty list, `acknowledge` still acts as
+/// the legacy blanket banned-phrase waiver. Returns the banned phrases that were acknowledged
+/// (suppressed) so the caller can surface them.
+pub async fn check_content(
+    pool: &Pool,
+    text: &str,
+    acknowledge: bool,
+    acknowledged_phrases: &[String],
+) -> anyhow::Result<Vec<String>> {
     check_non_ascii(text, acknowledge)?;
     check_caps_emphasis(text, acknowledge)?;
-    check_banned_phrases(pool, text, acknowledge).await?;
-    Ok(())
+    check_banned_phrases(pool, text, acknowledged_phrases, acknowledge).await
+}
+
+/// Merge the banned phrases a content gate acknowledged/suppressed (task_1534) into a response
+/// object under `acknowledged_banned_phrases`, so a scoped or blanket acknowledge is never silent --
+/// the caller sees exactly what the gate let through. No-op when nothing was suppressed or the
+/// response is not a JSON object.
+pub fn surface_suppressed(mut resp: Value, suppressed: Vec<String>) -> Value {
+    if !suppressed.is_empty() {
+        if let Value::Object(ref mut m) = resp {
+            m.insert("acknowledged_banned_phrases".into(), json!(suppressed));
+        }
+    }
+    resp
 }
 
 /// Content-gate a document version published BY CID (task 564). A publish-by-CID carries no inline
@@ -10297,15 +10360,19 @@ pub async fn check_cid_content(
     cid: &str,
     content_type: &str,
     acknowledge: bool,
-) -> anyhow::Result<()> {
-    if acknowledge {
-        return Ok(());
+    acknowledged_phrases: &[String],
+) -> anyhow::Result<Vec<String>> {
+    // A pure blanket acknowledge (no scoped list) suppresses everything, so there is nothing to
+    // scan or surface and we skip the fetch. A scoped list must still be enforced, so it falls
+    // through to fetch + check_content, which rejects any banned hit not in the list (task_1534).
+    if acknowledge && acknowledged_phrases.is_empty() {
+        return Ok(Vec::new());
     }
     let Some(url) = ipfs_api_url else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if !is_text_content_type(content_type) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let bytes = crate::ipfs::cat(url, cid, DOCUMENT_READ_LIMIT_BYTES)
         .await
@@ -10317,9 +10384,9 @@ pub async fn check_cid_content(
         )
         })?;
     if let Ok(text) = String::from_utf8(bytes) {
-        check_content(pool, &text, acknowledge).await?;
+        return check_content(pool, &text, acknowledge, acknowledged_phrases).await;
     }
-    Ok(())
+    Ok(Vec::new())
 }
 
 /// Non-bailing dry-run lint (task 558): run the SAME authoritative checks as `check_content`
@@ -25201,11 +25268,13 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
-        // Empty list: nothing matches, and check passes.
+        // Empty list: nothing matches, and check passes (nothing suppressed).
         assert!(scan_banned_phrases(&pool, "anything at all")
             .await?
             .is_empty());
-        check_banned_phrases(&pool, "anything at all", false).await?;
+        assert!(check_banned_phrases(&pool, "anything at all", &[], false)
+            .await?
+            .is_empty());
 
         // Add two phrases (stored lowercased; idempotent + note-updating on re-add).
         add_banned_phrase(&pool, "The Floor", Some("jargon"), Some("librarian")).await?;
@@ -25243,13 +25312,68 @@ mod tests {
             .is_empty());
 
         // check bails on a hit, unless acknowledged.
-        let err = check_banned_phrases(&pool, "down to the floor", false)
+        let err = check_banned_phrases(&pool, "down to the floor", &[], false)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.starts_with("banned phrase"), "got: {err}");
         assert!(err.contains("the floor"), "names the phrase: {err}");
-        check_banned_phrases(&pool, "down to the floor", true).await?; // acknowledged -> passes
+
+        // task_1534 scoped acknowledgement. A blanket acknowledge still passes, but now RETURNS the
+        // suppressed phrases so the surface layer can name what it let through (never silent).
+        assert_eq!(
+            check_banned_phrases(&pool, "down to the floor", &[], true).await?,
+            vec!["the floor"],
+            "blanket acknowledge surfaces the phrase it suppressed"
+        );
+
+        // A scoped list carries forward only the named phrase and returns it as suppressed.
+        assert_eq!(
+            check_banned_phrases(
+                &pool,
+                "down to the floor",
+                &["the floor".to_string()],
+                false
+            )
+            .await?,
+            vec!["the floor"],
+            "listed phrase carries forward"
+        );
+
+        // The list match is case-insensitive (stored phrases are lowercase).
+        assert_eq!(
+            check_banned_phrases(
+                &pool,
+                "down to the floor",
+                &["THE FLOOR".to_string()],
+                false
+            )
+            .await?,
+            vec!["the floor"],
+            "acknowledged_phrases matches case-insensitively"
+        );
+
+        // A phrase NOT in the scoped list is still rejected, even alongside a listed one, so a word
+        // newly introduced by the same edit cannot slip through a scoped acknowledge. The blanket
+        // flag does not widen the list.
+        let err = check_banned_phrases(
+            &pool,
+            "we are totally floored, right down to the floor",
+            &["the floor".to_string()],
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("banned phrase"), "got: {err}");
+        assert!(
+            err.contains("floored"),
+            "names the un-acknowledged phrase: {err}"
+        );
+        assert!(
+            !err.contains("\"the floor\""),
+            "does not re-flag the acknowledged phrase: {err}"
+        );
 
         // Remove one; it stops matching and the list shrinks. An actual delete bumps the version.
         let r = remove_banned_phrase(&pool, "THE FLOOR").await?;
@@ -31553,17 +31677,19 @@ mod tests {
 
         // No IPFS backend -> cannot fetch, so it cannot gate: Ok without touching the network.
         assert!(
-            check_cid_content(&pool, None, "Qm-whatever", "text/markdown", false)
+            check_cid_content(&pool, None, "Qm-whatever", "text/markdown", false, &[])
                 .await
                 .is_ok()
         );
-        // A configured backend URL that we never reach, because acknowledge short-circuits first.
+        // A configured backend URL that we never reach, because a pure blanket acknowledge (no
+        // scoped list) short-circuits first.
         assert!(check_cid_content(
             &pool,
             Some("http://127.0.0.1:1"),
             "Qm-x",
             "text/markdown",
-            true
+            true,
+            &[]
         )
         .await
         .is_ok());
@@ -31573,7 +31699,8 @@ mod tests {
             Some("http://127.0.0.1:1"),
             "Qm-x",
             "image/png",
-            false
+            false,
+            &[]
         )
         .await
         .is_ok());

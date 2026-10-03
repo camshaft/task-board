@@ -1268,6 +1268,11 @@ pub struct CommentTaskArgs {
     /// Use only for an intentional occurrence, e.g. quoting a banned phrase to discuss it.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases you are carrying forward.
+    /// Only these pass; any other banned phrase is still rejected, so a newly introduced one cannot
+    /// slip through. Preferred over `acknowledge_banned` for carrying pre-existing tokens forward.
+    #[serde(default)]
+    pub acknowledged_phrases: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1884,6 +1889,11 @@ pub struct CreateDocumentArgs {
     /// it). Text content is scanned; non-text content is not.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases you are carrying forward.
+    /// Only these pass; any other banned phrase is still rejected. Preferred over
+    /// `acknowledge_banned`.
+    #[serde(default)]
+    pub acknowledged_phrases: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1913,6 +1923,11 @@ pub struct PublishVersionArgs {
     /// it). Text content is scanned; non-text content is not.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases you are carrying forward
+    /// from the prior version. Only these pass; any banned phrase newly introduced by this version
+    /// is still rejected. Preferred over `acknowledge_banned`.
+    #[serde(default)]
+    pub acknowledged_phrases: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2074,6 +2089,11 @@ pub struct CommentDocumentArgs {
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases you are carrying forward.
+    /// Only these pass; any other banned phrase is still rejected. Preferred over
+    /// `acknowledge_banned`.
+    #[serde(default)]
+    pub acknowledged_phrases: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2139,6 +2159,11 @@ pub struct AnnotateCommentArgs {
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases you are carrying forward.
+    /// Only these pass; any other banned phrase is still rejected. Preferred over
+    /// `acknowledge_banned`.
+    #[serde(default)]
+    pub acknowledged_phrases: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3490,10 +3515,15 @@ impl Board {
         Parameters(a): Parameters<CommentTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let author = self.me_opt(s(&a.author));
-        core::check_content(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
-            .await
-            .map_err(err)?;
-        core::comment_task(
+        let suppressed = core::check_content(
+            &self.pool,
+            &a.body,
+            a.acknowledge_banned.unwrap_or(false),
+            a.acknowledged_phrases.as_deref().unwrap_or(&[]),
+        )
+        .await
+        .map_err(err)?;
+        let resp = core::comment_task(
             &self.pool,
             a.task_id,
             &a.body,
@@ -3503,8 +3533,8 @@ impl Board {
             a.reply_to,
         )
         .await
-        .map_err(err)
-        .and_then(ok)
+        .map_err(err)?;
+        ok(core::surface_suppressed(resp, suppressed))
     }
 
     // --- Subscriptions ---
@@ -3797,7 +3827,7 @@ impl Board {
 
     // --- Banned phrases (pre-submit content lint for docs + comments) ---
     #[tool(
-        description = "Add a phrase to the fleet banned-phrases list (jargon/idioms we've agreed not to use in docs and comments). The pre-submit lint on create_document / publish_version / comment_task / comment_document then rejects authored content containing it (case-insensitive, whole-phrase), unless the author passes acknowledge_banned. Idempotent on the phrase; pass an optional note for why or what to write instead."
+        description = "Add a phrase to the fleet banned-phrases list (jargon/idioms we've agreed not to use in docs and comments). The pre-submit lint on create_document / publish_version / comment_task / comment_document then rejects authored content containing it (case-insensitive, whole-phrase), unless the author acknowledges it -- either the scoped acknowledged_phrases list (names the specific phrases to carry forward; any other banned phrase is still rejected, so a newly introduced one cannot slip through) or the legacy acknowledge_banned=true blanket (which now also surfaces the phrases it suppressed, so it is never silent). Idempotent on the phrase; pass an optional note for why or what to write instead."
     )]
     async fn add_banned_phrase(
         &self,
@@ -4433,9 +4463,12 @@ impl Board {
         &self,
         Parameters(a): Parameters<CreateDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let ack = a.acknowledge_banned.unwrap_or(false);
+        let phrases = a.acknowledged_phrases.as_deref().unwrap_or(&[]);
+        let mut suppressed = Vec::new();
         if let Some(c) = a.content.as_deref() {
             if core::is_text_content_type(a.content_type.as_deref().unwrap_or("text/markdown")) {
-                core::check_content(&self.pool, c, a.acknowledge_banned.unwrap_or(false))
+                suppressed = core::check_content(&self.pool, c, ack, phrases)
                     .await
                     .map_err(err)?;
             }
@@ -4449,17 +4482,18 @@ impl Board {
         .map_err(err)?;
         // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
         if a.content.is_none() {
-            core::check_cid_content(
+            suppressed = core::check_cid_content(
                 &self.pool,
                 self.ipfs_api_url.as_deref(),
                 &cid,
                 a.content_type.as_deref().unwrap_or("text/markdown"),
-                a.acknowledge_banned.unwrap_or(false),
+                ack,
+                phrases,
             )
             .await
             .map_err(err)?;
         }
-        core::create_document(
+        let resp = core::create_document(
             &self.pool,
             &a.title,
             a.project_id,
@@ -4471,8 +4505,8 @@ impl Board {
             s(&a.content),
         )
         .await
-        .map_err(err)
-        .and_then(ok)
+        .map_err(err)?;
+        ok(core::surface_suppressed(resp, suppressed))
     }
 
     #[tool(
@@ -4482,9 +4516,12 @@ impl Board {
         &self,
         Parameters(a): Parameters<PublishVersionArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let ack = a.acknowledge_banned.unwrap_or(false);
+        let phrases = a.acknowledged_phrases.as_deref().unwrap_or(&[]);
+        let mut suppressed = Vec::new();
         if let Some(c) = a.content.as_deref() {
             if core::is_text_content_type(a.content_type.as_deref().unwrap_or("text/markdown")) {
-                core::check_content(&self.pool, c, a.acknowledge_banned.unwrap_or(false))
+                suppressed = core::check_content(&self.pool, c, ack, phrases)
                     .await
                     .map_err(err)?;
             }
@@ -4498,17 +4535,18 @@ impl Board {
         .map_err(err)?;
         // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
         if a.content.is_none() {
-            core::check_cid_content(
+            suppressed = core::check_cid_content(
                 &self.pool,
                 self.ipfs_api_url.as_deref(),
                 &cid,
                 a.content_type.as_deref().unwrap_or("text/markdown"),
-                a.acknowledge_banned.unwrap_or(false),
+                ack,
+                phrases,
             )
             .await
             .map_err(err)?;
         }
-        core::publish_version(
+        let resp = core::publish_version(
             &self.pool,
             a.document_id,
             &cid,
@@ -4518,8 +4556,8 @@ impl Board {
             s(&a.content),
         )
         .await
-        .map_err(err)
-        .and_then(ok)
+        .map_err(err)?;
+        ok(core::surface_suppressed(resp, suppressed))
     }
 
     #[tool(
@@ -4686,10 +4724,15 @@ impl Board {
         &self,
         Parameters(a): Parameters<CommentDocumentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::check_content(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
-            .await
-            .map_err(err)?;
-        core::comment_document(
+        let suppressed = core::check_content(
+            &self.pool,
+            &a.body,
+            a.acknowledge_banned.unwrap_or(false),
+            a.acknowledged_phrases.as_deref().unwrap_or(&[]),
+        )
+        .await
+        .map_err(err)?;
+        let resp = core::comment_document(
             &self.pool,
             a.document_id,
             a.version_id,
@@ -4700,8 +4743,8 @@ impl Board {
             s(&a.external_author),
         )
         .await
-        .map_err(err)
-        .and_then(ok)
+        .map_err(err)?;
+        ok(core::surface_suppressed(resp, suppressed))
     }
 
     #[tool(
@@ -4743,10 +4786,15 @@ impl Board {
         &self,
         Parameters(a): Parameters<AnnotateCommentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::check_content(&self.pool, &a.body, a.acknowledge_banned.unwrap_or(false))
-            .await
-            .map_err(err)?;
-        core::annotate_comment(
+        let suppressed = core::check_content(
+            &self.pool,
+            &a.body,
+            a.acknowledge_banned.unwrap_or(false),
+            a.acknowledged_phrases.as_deref().unwrap_or(&[]),
+        )
+        .await
+        .map_err(err)?;
+        let resp = core::annotate_comment(
             &self.pool,
             a.comment_id,
             s(&a.author),
@@ -4756,8 +4804,8 @@ impl Board {
             s(&a.external_author),
         )
         .await
-        .map_err(err)
-        .and_then(ok)
+        .map_err(err)?;
+        ok(core::surface_suppressed(resp, suppressed))
     }
 
     #[tool(

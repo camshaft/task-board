@@ -2617,6 +2617,11 @@ struct CommentBody {
     reply_to: Option<i64>,
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
     acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases being carried forward. Only
+    /// these pass; any other banned phrase is still rejected, so a newly introduced one cannot slip
+    /// through a blanket acknowledge. Preferred over `acknowledge_banned` for carrying pre-existing
+    /// tokens forward.
+    acknowledged_phrases: Option<Vec<String>>,
 }
 
 async fn comment_task(
@@ -2624,19 +2629,24 @@ async fn comment_task(
     Path(TaskRef(task_id)): Path<TaskRef>,
     Json(b): Json<CommentBody>,
 ) -> ApiResult {
-    core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
-    Ok(Json(
-        core::comment_task(
-            &st.pool,
-            task_id,
-            &b.body,
-            b.author.as_deref(),
-            b.external_author.as_deref(),
-            b.external_link,
-            b.reply_to,
-        )
-        .await?,
-    ))
+    let suppressed = core::check_content(
+        &st.pool,
+        &b.body,
+        b.acknowledge_banned.unwrap_or(false),
+        b.acknowledged_phrases.as_deref().unwrap_or(&[]),
+    )
+    .await?;
+    let resp = core::comment_task(
+        &st.pool,
+        task_id,
+        &b.body,
+        b.author.as_deref(),
+        b.external_author.as_deref(),
+        b.external_link,
+        b.reply_to,
+    )
+    .await?;
+    Ok(Json(core::surface_suppressed(resp, suppressed)))
 }
 
 async fn get_comment(State(st): State<AppState>, Path(comment_id): Path<i64>) -> ApiResult {
@@ -4290,15 +4300,21 @@ struct CreateDocumentBody {
     /// Submit even if the content contains a banned phrase (the pre-submit lint otherwise rejects
     /// it). Text content is scanned; non-text content is not.
     acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases being carried forward. Only
+    /// these pass; any other banned phrase is still rejected. Preferred over `acknowledge_banned`.
+    acknowledged_phrases: Option<Vec<String>>,
 }
 
 async fn create_document(
     State(st): State<AppState>,
     Json(b): Json<CreateDocumentBody>,
 ) -> ApiResult {
+    let ack = b.acknowledge_banned.unwrap_or(false);
+    let phrases = b.acknowledged_phrases.as_deref().unwrap_or(&[]);
+    let mut suppressed = Vec::new();
     if let Some(c) = b.content.as_deref() {
         if core::is_text_content_type(b.content_type.as_deref().unwrap_or("text/markdown")) {
-            core::check_content(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
+            suppressed = core::check_content(&st.pool, c, ack, phrases).await?;
         }
     }
     let cid = ipfs::resolve_cid(
@@ -4309,29 +4325,29 @@ async fn create_document(
     .await?;
     // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
     if b.content.is_none() {
-        core::check_cid_content(
+        suppressed = core::check_cid_content(
             &st.pool,
             st.ipfs_api_url.as_deref(),
             &cid,
             b.content_type.as_deref().unwrap_or("text/markdown"),
-            b.acknowledge_banned.unwrap_or(false),
+            ack,
+            phrases,
         )
         .await?;
     }
-    Ok(Json(
-        core::create_document(
-            &st.pool,
-            &b.title,
-            b.project_id,
-            &cid,
-            b.summary.as_deref(),
-            b.created_by.as_deref(),
-            b.metadata,
-            b.content_type.as_deref(),
-            b.content.as_deref(),
-        )
-        .await?,
-    ))
+    let resp = core::create_document(
+        &st.pool,
+        &b.title,
+        b.project_id,
+        &cid,
+        b.summary.as_deref(),
+        b.created_by.as_deref(),
+        b.metadata,
+        b.content_type.as_deref(),
+        b.content.as_deref(),
+    )
+    .await?;
+    Ok(Json(core::surface_suppressed(resp, suppressed)))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4541,6 +4557,10 @@ struct PublishVersionBody {
     /// Submit even if the content contains a banned phrase (the pre-submit lint otherwise rejects
     /// it). Text content is scanned; non-text content is not.
     acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases being carried forward from
+    /// the prior version. Only these pass; any banned phrase newly introduced by this version is
+    /// still rejected. Preferred over `acknowledge_banned`.
+    acknowledged_phrases: Option<Vec<String>>,
 }
 
 async fn publish_version(
@@ -4548,9 +4568,12 @@ async fn publish_version(
     Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<PublishVersionBody>,
 ) -> ApiResult {
+    let ack = b.acknowledge_banned.unwrap_or(false);
+    let phrases = b.acknowledged_phrases.as_deref().unwrap_or(&[]);
+    let mut suppressed = Vec::new();
     if let Some(c) = b.content.as_deref() {
         if core::is_text_content_type(b.content_type.as_deref().unwrap_or("text/markdown")) {
-            core::check_content(&st.pool, c, b.acknowledge_banned.unwrap_or(false)).await?;
+            suppressed = core::check_content(&st.pool, c, ack, phrases).await?;
         }
     }
     let cid = ipfs::resolve_cid(
@@ -4561,27 +4584,27 @@ async fn publish_version(
     .await?;
     // Published by CID (no inline content the check above could see): fetch + gate the bytes (task 564).
     if b.content.is_none() {
-        core::check_cid_content(
+        suppressed = core::check_cid_content(
             &st.pool,
             st.ipfs_api_url.as_deref(),
             &cid,
             b.content_type.as_deref().unwrap_or("text/markdown"),
-            b.acknowledge_banned.unwrap_or(false),
+            ack,
+            phrases,
         )
         .await?;
     }
-    Ok(Json(
-        core::publish_version(
-            &st.pool,
-            document_id,
-            &cid,
-            b.summary.as_deref(),
-            b.created_by.as_deref(),
-            b.content_type.as_deref(),
-            b.content.as_deref(),
-        )
-        .await?,
-    ))
+    let resp = core::publish_version(
+        &st.pool,
+        document_id,
+        &cid,
+        b.summary.as_deref(),
+        b.created_by.as_deref(),
+        b.content_type.as_deref(),
+        b.content.as_deref(),
+    )
+    .await?;
+    Ok(Json(core::surface_suppressed(resp, suppressed)))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4636,6 +4659,9 @@ struct CommentDocumentBody {
     external_author: Option<String>,
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
     acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases being carried forward. Only
+    /// these pass; any other banned phrase is still rejected. Preferred over `acknowledge_banned`.
+    acknowledged_phrases: Option<Vec<String>>,
 }
 
 async fn comment_document(
@@ -4643,20 +4669,25 @@ async fn comment_document(
     Path(DocRef(document_id)): Path<DocRef>,
     Json(b): Json<CommentDocumentBody>,
 ) -> ApiResult {
-    core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
-    Ok(Json(
-        core::comment_document(
-            &st.pool,
-            document_id,
-            b.version_id,
-            b.author.as_deref(),
-            &b.body,
-            b.region,
-            b.reply_to,
-            b.external_author.as_deref(),
-        )
-        .await?,
-    ))
+    let suppressed = core::check_content(
+        &st.pool,
+        &b.body,
+        b.acknowledge_banned.unwrap_or(false),
+        b.acknowledged_phrases.as_deref().unwrap_or(&[]),
+    )
+    .await?;
+    let resp = core::comment_document(
+        &st.pool,
+        document_id,
+        b.version_id,
+        b.author.as_deref(),
+        &b.body,
+        b.region,
+        b.reply_to,
+        b.external_author.as_deref(),
+    )
+    .await?;
+    Ok(Json(core::surface_suppressed(resp, suppressed)))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4716,6 +4747,9 @@ struct AnnotateCommentBody {
     external_author: Option<String>,
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
     acknowledge_banned: Option<bool>,
+    /// Scoped acknowledgement (task_1534): the specific banned phrases being carried forward. Only
+    /// these pass; any other banned phrase is still rejected. Preferred over `acknowledge_banned`.
+    acknowledged_phrases: Option<Vec<String>>,
 }
 
 async fn annotate_comment(
@@ -4723,19 +4757,24 @@ async fn annotate_comment(
     Path(comment_id): Path<i64>,
     Json(b): Json<AnnotateCommentBody>,
 ) -> ApiResult {
-    core::check_content(&st.pool, &b.body, b.acknowledge_banned.unwrap_or(false)).await?;
-    Ok(Json(
-        core::annotate_comment(
-            &st.pool,
-            comment_id,
-            b.author.as_deref(),
-            &b.body,
-            b.region,
-            b.reply_to,
-            b.external_author.as_deref(),
-        )
-        .await?,
-    ))
+    let suppressed = core::check_content(
+        &st.pool,
+        &b.body,
+        b.acknowledge_banned.unwrap_or(false),
+        b.acknowledged_phrases.as_deref().unwrap_or(&[]),
+    )
+    .await?;
+    let resp = core::annotate_comment(
+        &st.pool,
+        comment_id,
+        b.author.as_deref(),
+        &b.body,
+        b.region,
+        b.reply_to,
+        b.external_author.as_deref(),
+    )
+    .await?;
+    Ok(Json(core::surface_suppressed(resp, suppressed)))
 }
 
 async fn resolve_comment_annotation(
