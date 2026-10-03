@@ -9877,8 +9877,15 @@ pub async fn report_session_state(
     .bind(&ts)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
-    Ok(session_state_json(
+    // Emit session.state_changed into the global append-only log for the replication tail
+    // (doc_3436 / doc_3437 emit-completeness, task_1531): the tail rebuilds the harness replica by
+    // applying events, so this report-up must emit or the tail silently misses phase, progress, and
+    // generation. In the "session" event class (alongside session.abort / attach_active / detach /
+    // steer). The data is the SAME value the call returns. No explicit recipient: the event lands in
+    // the log that get_events tails and emit's firehose class-union delivers it to a board=true /
+    // board + ["session"] subscriber; the reporting host does not need delivery to itself.
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let state = session_state_json(
         session_id,
         phase,
         step,
@@ -9887,7 +9894,23 @@ pub async fn report_session_state(
         failure_reason,
         generation,
         &ts,
-    ))
+    );
+    emit(
+        &mut tx,
+        &mut hooks,
+        "session.state_changed",
+        None,
+        None,
+        None,
+        None,
+        None,
+        state.clone(),
+        Recipients::Explicit(BTreeSet::new()),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(state)
 }
 
 /// Read a session's reported state (task_1519): the reconciler-queryable read. Null when the session
@@ -10121,7 +10144,29 @@ pub async fn ack_recovery_directive(
     .bind(session_id)
     .execute(&mut *tx)
     .await?;
+    // Emit agent.recovery_directive_acked into the global log for the replication tail (doc_3436 /
+    // doc_3437 emit-completeness, task_1531): the ack is a harness-relevant state change (the board
+    // records that the current host acked the directive), so a tail replicating by events must see
+    // it or the replica shows the directive perpetually un-acked and a reconciler reading the
+    // replica mis-drives. In the "agent" event class, mirroring set_recovery_directive's
+    // agent.recovery_directive_changed. No explicit recipient: the "agent" class-union in emit
+    // delivers to board + ["agent"] subscribers and the global log carries it to the tail.
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    emit(
+        &mut tx,
+        &mut hooks,
+        "agent.recovery_directive_acked",
+        None,
+        None,
+        None,
+        None,
+        None,
+        json!({ "session_id": session_id, "version": ack_version, "generation": generation }),
+        Recipients::Explicit(BTreeSet::new()),
+    )
+    .await?;
     tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
     get_recovery_directive(pool, session_id).await
 }
 
@@ -34494,6 +34539,67 @@ mod tests {
         let d = get_recovery_directive(&pool, "sess-1").await?;
         assert_eq!(d["version"], json!(2));
         assert_eq!(d["acked"], json!(false), "a fresh push is unacked");
+        Ok(())
+    }
+
+    /// Acceptance (task_1531, doc_3437 emit-completeness): report_session_state emits a
+    /// session.state_changed event into the global append-only log carrying phase, step, and
+    /// generation, so the replication tail (doc_3436) rebuilds the session's replica state from
+    /// events instead of silently missing the report-up.
+    #[tokio::test]
+    async fn report_session_state_emits_state_changed_event() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        report_session_state(&pool, "sess-1", 2, "streaming", 7, None, None).await?;
+
+        // Exactly one event, in the global log, carrying the reported fields.
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE type='session.state_changed'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(n, 1, "one report-up => one session.state_changed");
+
+        // The replication tail's authoritative path is the global get_events pull (doc_3436): the
+        // event appears there with the reported phase, step, and generation.
+        let events = get_events(&pool, 0, 100, None, false).await?;
+        let ev = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == json!("session.state_changed"))
+            .expect("session.state_changed must be in the global event log get_events tails");
+        assert_eq!(ev["data"]["session_id"], json!("sess-1"));
+        assert_eq!(ev["data"]["phase"], json!("streaming"));
+        assert_eq!(ev["data"]["step"], json!(7));
+        assert_eq!(ev["data"]["generation"], json!(2));
+        Ok(())
+    }
+
+    /// Acceptance (task_1531, doc_3437 emit-completeness): ack_recovery_directive emits an
+    /// agent.recovery_directive_acked event carrying the session_id, the acked version, and the
+    /// generation, so the tail replicates the directive ack rather than showing it perpetually
+    /// un-acked (which would mis-drive a reconciler reading the replica).
+    #[tokio::test]
+    async fn ack_recovery_directive_emits_acked_event() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        report_session_state(&pool, "sess-1", 4, "idle", 0, None, None).await?;
+        set_recovery_directive(&pool, "sess-1", "continue", None, Some("controller")).await?;
+
+        ack_recovery_directive(&pool, "sess-1", 4, None).await?;
+
+        let data: String = sqlx::query_scalar(
+            "SELECT data FROM events WHERE type='agent.recovery_directive_acked' ORDER BY seq DESC \
+             LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let v: Value = serde_json::from_str(&data)?;
+        assert_eq!(v["session_id"], json!("sess-1"));
+        assert_eq!(v["version"], json!(1), "the acked version");
+        assert_eq!(v["generation"], json!(4));
         Ok(())
     }
 
