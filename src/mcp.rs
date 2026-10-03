@@ -512,9 +512,55 @@ pub struct ReportSpendArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct EffectiveConfigArgs {
+    pub agent_id: String,
+    /// The config namespace, e.g. "tool" (ask 4) or "decider" (ask 11).
+    pub config_kind: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetBudgetArgs {
     /// The agent whose effective cap + current spend to read.
     pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListRoleConfigArgs {
+    pub role: String,
+    pub config_kind: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetRoleConfigEntryArgs {
+    pub role: String,
+    pub config_kind: String,
+    /// Stable entry id, unique per (role, config_kind). Reusing an id edits/toggles that entry.
+    pub entry_id: String,
+    /// Grant (true) or withhold (false). enabled=false withholds for the whole role (N8).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub scope: Option<serde_json::Value>,
+    /// Optional per-entry policy (for config_kind=tool: authz/argument constraints, M3).
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub position: Option<i64>,
+    #[serde(rename = "principal", alias = "actor", alias = "by", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveRoleConfigEntryArgs {
+    pub role: String,
+    pub config_kind: String,
+    pub entry_id: String,
+    #[serde(rename = "principal", alias = "actor", alias = "by", default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2719,6 +2765,56 @@ impl Board {
     }
 
     #[tool(
+        description = "The EFFECTIVE per-agent config set for one config_kind (task_1459, doc_3426 ask 4): merged from role-level grants (inherited) + the agent's own overrides, in ONE read, so the harness does not resolve roles itself. An agent entry overrides a same-id role entry; a role entry with enabled=false withholds that id for the whole role (N8) unless the agent overrides it. Each entry carries source=agent|role; ordered by position then id. Returns role, role_version, agent_version (both change via agent.config_changed). For config_kind=tool this is the granted-tool-set read (a grant = an enabled entry; payload carries per-tool authz/argument policy, M3)."
+    )]
+    async fn effective_config(
+        &self,
+        Parameters(a): Parameters<EffectiveConfigArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::effective_config_entries(&self.pool, &a.agent_id, &a.config_kind)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Read a ROLE's own config set for one config_kind (task_1459, ask 4) -- the role-level base inherited by every agent in the role, before per-agent overrides. For the merged per-agent view use effective_config."
+    )]
+    async fn list_role_config(
+        &self,
+        Parameters(a): Parameters<ListRoleConfigArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_role_config_entries(&self.pool, &a.role, &a.config_kind)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Upsert a ROLE-level config entry (task_1459, ask 4): a grant inherited by every agent in the role unless an agent overrides the same entry_id. enabled=false withholds the entry for the whole role (the N8 unattended-window guarantee), overridable per agent. For config_kind=tool, `payload` is the optional per-tool authz/argument policy (M3). Bumps the role version + emits agent.config_changed so agents in the role hot-reload. Returns the role's updated set."
+    )]
+    async fn set_role_config_entry(
+        &self,
+        Parameters(a): Parameters<SetRoleConfigEntryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::set_role_config_entry(
+            &self.pool,
+            &a.role,
+            &a.config_kind,
+            &a.entry_id,
+            a.enabled,
+            a.scope.clone(),
+            a.payload.clone(),
+            a.position,
+            actor.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
         description = "Report one turn's realized cost to the spend ledger (task_1461): append-only and lightweight (one row, no event), so fire it off the agent hot path. Only the harness knows the realized token cost, so it reports and the board accumulates current spend over the rolling window. Returns the agent's current spend after the append."
     )]
     async fn report_spend(
@@ -2742,6 +2838,26 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(
+        description = "Remove a ROLE-level config entry (task_1459) by entry_id. Bumps the role version + emits agent.config_changed so agents in the role hot-reload. Returns the shrunk role set."
+    )]
+    async fn remove_role_config_entry(
+        &self,
+        Parameters(a): Parameters<RemoveRoleConfigEntryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::remove_role_config_entry(
+            &self.pool,
+            &a.role,
+            &a.config_kind,
+            &a.entry_id,
+            actor.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     // --- Projects ---
