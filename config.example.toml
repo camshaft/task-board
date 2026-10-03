@@ -17,6 +17,14 @@ port = 8079
 # webhook_url. Delivery is fire-and-forget; this just bounds how long each attempt waits.
 webhook_timeout_secs = 5
 
+# Retention window, in seconds, for ACKED (read) inbox rows (task_1491). A bounded, LOSSLESS sweep
+# deletes inbox rows whose read_at is set AND older than this window, so the inbox table does not
+# grow without bound. UNREAD rows (read_at IS NULL) are NEVER deleted regardless of age -- an unread
+# row is a pending wake, and unread rows are the sole driver of wake + replay-on-reconnect (the
+# no-lost-wake invariant). The full audit trail stays in the events table (never pruned here), so
+# dropping old acked rows loses nothing. Default 604800 (7 days); set to 0 to disable the prune.
+inbox_acked_retention_secs = 604800
+
 # Host authorities the MCP endpoint (/mcp) accepts in the inbound `Host` header. rmcp guards
 # streamable-HTTP against DNS rebinding by accepting only loopback hosts by default, so a
 # LAN-exposed or reverse-proxied deployment must list the authorities clients actually send.

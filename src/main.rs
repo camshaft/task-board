@@ -30,6 +30,11 @@ use tower_http::trace::TraceLayer;
 /// the config through every core signature.
 pub static WEBHOOK_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
+/// ACKED-inbox retention window, in seconds (task_1491). Set once at startup and read by the
+/// inbox-retention prune (core::prune_acked_inbox). Same global-config pattern as WEBHOOK_TIMEOUT,
+/// avoiding threading the config through every core signature. 0 disables the prune.
+pub static INBOX_ACKED_RETENTION_SECS: OnceLock<i64> = OnceLock::new();
+
 const USAGE: &str = "\
 task-board — agent coordination board (MCP + REST + UI)
 
@@ -146,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         None => config::Config::defaults(web_dir),
     };
     let _ = WEBHOOK_TIMEOUT.set(cfg.webhook_timeout);
+    let _ = INBOX_ACKED_RETENTION_SECS.set(cfg.inbox_acked_retention_secs);
 
     // One-shot: pin the UI element schemas into the CAS and print the name->CID manifest, then exit
     // without serving (task_755). The CID of each element's props_schema is its canonical build-time

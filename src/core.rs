@@ -1417,6 +1417,17 @@ pub async fn retire_agent(
         )
         .await?;
     }
+    // Mechanism 2 (task_1491), LOSSLESS: a terminally-retired recipient will NEVER drain its inbox
+    // again, so ALL of its inbox rows -- read AND unread alike -- are dead (a gone agent's unread
+    // rows can no longer become a wake, so there is no wake to lose). Drop them, folded into the
+    // terminal transition (not a separate timer). Done LAST, after the sweep + intent emits, so any
+    // delivery row this very retire routes to the agent itself is cleared too. The `events` audit
+    // log is untouched; only this agent's per-recipient inbox delivery rows go.
+    let dropped_inbox = sqlx::query("DELETE FROM inbox WHERE recipient=?")
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     let row = sqlx::query("SELECT * FROM agents WHERE id=?")
         .bind(agent_id)
         .fetch_one(&mut *tx)
@@ -1425,6 +1436,7 @@ pub async fn retire_agent(
     if let Value::Object(ref mut m) = out {
         m.insert("swept_task_ids".into(), json!(blocked));
         m.insert("swept_task_count".into(), json!(blocked.len()));
+        m.insert("dropped_inbox_count".into(), json!(dropped_inbox));
     }
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
@@ -8175,6 +8187,67 @@ async fn dm_channel(tx: &mut Transaction<'_, Sqlite>, a: &str, b: &str) -> anyho
 
 // --- Notifications / direct messages ---
 
+/// Default ACKED-inbox retention window (task_1491): 7 days, used when the startup global is unset
+/// (e.g. in tests that never boot `main`). Mirrors `webhook_timeout`'s unset fallback.
+pub const DEFAULT_INBOX_ACKED_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// The configured ACKED-inbox retention window, in seconds (task_1491). Read from the startup
+/// global, falling back to the 7-day default. Same pattern as `webhook_timeout`.
+fn inbox_acked_retention_secs() -> i64 {
+    crate::INBOX_ACKED_RETENTION_SECS
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_INBOX_ACKED_RETENTION_SECS)
+}
+
+/// Mechanism 1 (task_1491), bounded + LOSSLESS: prune ACKED inbox rows past the retention window.
+///
+///   DELETE FROM inbox
+///     WHERE [recipient=? AND] read_at IS NOT NULL
+///       AND datetime(read_at) < datetime('now', '-<retention_secs> seconds')
+///
+/// SAFETY INVARIANT: a row with `read_at IS NULL` (UNREAD) is NEVER eligible, regardless of age --
+/// an unread row is a pending wake, and unread rows are the SOLE driver of wake + replay-on-
+/// reconnect (the no-lost-wake guarantee). Only acked/read rows past the window are deleted. The
+/// full audit trail lives in the `events` table (get_events / read_inbox_since by seq), which this
+/// NEVER touches, so dropping old acked delivery rows is lossless.
+///
+/// Optionally scoped to one `recipient` (the bounded, hot per-drain path invoked when an agent
+/// acks); `None` sweeps across all recipients (maintenance). `retention_secs <= 0` disables the
+/// prune (keep every acked row). Returns the number of rows deleted.
+pub async fn prune_acked_inbox(
+    pool: &Pool,
+    recipient: Option<&str>,
+    retention_secs: i64,
+) -> anyhow::Result<u64> {
+    if retention_secs <= 0 {
+        return Ok(0);
+    }
+    let cutoff_modifier = format!("-{retention_secs} seconds");
+    let affected = match recipient {
+        Some(r) => sqlx::query(
+            "DELETE FROM inbox \
+             WHERE recipient=? AND read_at IS NOT NULL \
+               AND datetime(read_at) < datetime('now', ?)",
+        )
+        .bind(r)
+        .bind(&cutoff_modifier)
+        .execute(pool)
+        .await?
+        .rows_affected(),
+        None => sqlx::query(
+            "DELETE FROM inbox \
+             WHERE read_at IS NOT NULL \
+               AND datetime(read_at) < datetime('now', ?)",
+        )
+        .bind(&cutoff_modifier)
+        .execute(pool)
+        .await?
+        .rows_affected(),
+    };
+    Ok(affected)
+}
+
 pub async fn check_notifications(
     pool: &Pool,
     agent_id: &str,
@@ -8234,6 +8307,14 @@ pub async fn check_notifications(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+
+    // Mechanism 1 (task_1491): after a recipient drains+acks, opportunistically prune ITS OWN
+    // long-acked inbox rows so the table does not grow without bound. Bounded to this recipient and
+    // only when we actually acked; best-effort (a prune failure must NEVER fail the drain, and the
+    // audit trail stays in `events`). Never touches unread rows -- see prune_acked_inbox.
+    if mark_read {
+        let _ = prune_acked_inbox(pool, Some(agent_id), inbox_acked_retention_secs()).await;
+    }
 
     // Resolve external_author -> display name AFTER commit (the single-connection pool is free
     // again, so this can't deadlock), so a bridged post/comment in the inbox shows the human's
@@ -8330,6 +8411,9 @@ pub async fn ack_inbox(pool: &Pool, recipient: &str, through_seq: i64) -> anyhow
     .bind(through_seq)
     .execute(pool)
     .await?;
+    // Mechanism 1 (task_1491): this is the explicit ack path, so prune this recipient's own
+    // long-acked rows here too. Bounded to the recipient, best-effort, never touches unread rows.
+    let _ = prune_acked_inbox(pool, Some(recipient), inbox_acked_retention_secs()).await;
     Ok(json!({
         "recipient": recipient,
         "through_seq": through_seq,
@@ -33157,5 +33241,173 @@ mod tests {
             BoardError::unavailable("x").status,
             ErrorStatus::Unavailable
         );
+    }
+
+    // --- task_1491: inbox-retention sweep guard tests (the safety proof for the DELETEs). ---
+
+    /// Seed one `events` row (inbox.event_seq has a NOT NULL FK to events.seq) and return its seq.
+    async fn seed_event(pool: &Pool) -> anyhow::Result<i64> {
+        let seq: i64 = sqlx::query_scalar(
+            "INSERT INTO events(type, created_at) VALUES('t.evt', ?) RETURNING seq",
+        )
+        .bind(now_iso())
+        .fetch_one(pool)
+        .await?;
+        Ok(seq)
+    }
+
+    /// Insert one inbox row with an explicit (possibly NULL) read_at, so the age/eligibility can be
+    /// controlled precisely. `read_at = None` is an UNREAD row.
+    async fn seed_inbox(
+        pool: &Pool,
+        recipient: &str,
+        event_seq: i64,
+        created_at: &str,
+        read_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO inbox(recipient, event_seq, created_at, read_at) VALUES(?,?,?,?)")
+            .bind(recipient)
+            .bind(event_seq)
+            .bind(created_at)
+            .bind(read_at)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    const WEEK_SECS: i64 = 7 * 24 * 60 * 60;
+    // A read_at well past any sane retention window (mechanism 1 should treat it as prunable).
+    const LONG_AGO: &str = "2020-01-01T00:00:00.000000Z";
+
+    /// Guard (a): mechanism 1 DELETES an acked row (read_at set) older than the retention window.
+    #[tokio::test]
+    async fn m1_deletes_acked_row_past_window() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let seq = seed_event(&pool).await?;
+        seed_inbox(&pool, "r", seq, LONG_AGO, Some(LONG_AGO)).await?;
+
+        let deleted = prune_acked_inbox(&pool, None, WEEK_SECS).await?;
+        assert_eq!(
+            deleted, 1,
+            "an acked row older than the window must be pruned"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(remaining, 0, "the stale acked row is gone");
+        Ok(())
+    }
+
+    /// Guard (b): mechanism 1 KEEPS an acked row whose read_at is within the retention window.
+    #[tokio::test]
+    async fn m1_keeps_acked_row_within_window() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let seq = seed_event(&pool).await?;
+        // Acked just now -> read_at is well inside a 7-day window.
+        let now = now_iso();
+        seed_inbox(&pool, "r", seq, &now, Some(now.as_str())).await?;
+
+        let deleted = prune_acked_inbox(&pool, None, WEEK_SECS).await?;
+        assert_eq!(deleted, 0, "a freshly-acked row must NOT be pruned");
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(remaining, 1, "the in-window acked row survives");
+        Ok(())
+    }
+
+    /// Guard (c): mechanism 1 NEVER deletes an UNREAD row (read_at IS NULL), regardless of age --
+    /// the critical no-lost-wake invariant. The row is aged far past the window and must survive.
+    #[tokio::test]
+    async fn m1_never_deletes_unread_row_regardless_of_age() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let seq = seed_event(&pool).await?;
+        // Ancient but UNREAD (read_at NULL): a pending wake no matter how old.
+        seed_inbox(&pool, "r", seq, LONG_AGO, None).await?;
+
+        // Prune with the smallest possible positive window -- maximally aggressive.
+        let deleted = prune_acked_inbox(&pool, None, 1).await?;
+        assert_eq!(
+            deleted, 0,
+            "an unread row is NEVER eligible for mechanism 1"
+        );
+        let unread: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE read_at IS NULL")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(unread, 1, "the ancient unread wake survives the prune");
+        // The events audit row is untouched (mechanism 1 only touches inbox).
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(events, 1, "mechanism 1 never prunes the events table");
+        Ok(())
+    }
+
+    /// Guard (d): mechanism 2 drops a terminal (retired/gone) recipient's ENTIRE inbox -- including
+    /// unread rows -- when the agent is retired, folded into the terminal transition.
+    #[tokio::test]
+    async fn m2_drops_terminal_recipient_entire_inbox() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "gone-agent", None, None, None, None, None).await?;
+        let seq = seed_event(&pool).await?;
+        // One acked and one UNREAD row for the doomed recipient.
+        let now = now_iso();
+        seed_inbox(&pool, "gone-agent", seq, &now, Some(now.as_str())).await?;
+        seed_inbox(&pool, "gone-agent", seq, &now, None).await?;
+
+        let out = retire_agent(&pool, "gone-agent", "board-pm", Some("gone")).await?;
+        // At LEAST the two seeded rows (acked + unread) are dropped; the retire may also route a
+        // self-delivery that is cleared in the same pass. The hard invariant is the empty inbox below.
+        assert!(
+            out["dropped_inbox_count"].as_u64().unwrap() >= 2,
+            "both seeded rows (acked + unread) dropped for the terminal recipient: {out}"
+        );
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE recipient='gone-agent'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(remaining, 0, "a terminal recipient's whole inbox is gone");
+        // The seeded audit event is untouched -- mechanism 2 only deletes inbox rows (the retire
+        // itself legitimately appends its own agent.intent_changed event, so the count grows).
+        let seeded_event: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE seq=?")
+            .bind(seq)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(seeded_event, 1, "mechanism 2 never prunes the events table");
+        Ok(())
+    }
+
+    /// Guard (e): mechanism 2 does NOT drop a LIVE (non-terminal) recipient's inbox. Retiring one
+    /// agent must leave every other agent's inbox intact.
+    #[tokio::test]
+    async fn m2_keeps_live_recipient_inbox() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "gone-agent", None, None, None, None, None).await?;
+        register_agent(&pool, "live-agent", None, None, None, None, None).await?;
+        let seq = seed_event(&pool).await?;
+        seed_inbox(&pool, "gone-agent", seq, &now_iso(), None).await?;
+        seed_inbox(&pool, "live-agent", seq, &now_iso(), None).await?;
+
+        retire_agent(&pool, "gone-agent", "board-pm", Some("gone")).await?;
+
+        let live: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE recipient='live-agent'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            live, 1,
+            "the live recipient's inbox is NOT touched by mechanism 2"
+        );
+        let gone: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM inbox WHERE recipient='gone-agent'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(gone, 0, "only the retired recipient's inbox is dropped");
+        Ok(())
     }
 }

@@ -30,6 +30,14 @@ pub struct Settings {
     pub port: u16,
     /// Timeout, in seconds, for best-effort webhook POSTs to agents that registered one.
     pub webhook_timeout_secs: f64,
+    /// Retention window, in seconds, for ACKED (read) inbox rows (task_1491). A bounded, LOSSLESS
+    /// sweep deletes inbox rows whose `read_at` is set AND older than this window, so the inbox
+    /// table does not grow without bound. UNREAD rows (`read_at IS NULL`) are NEVER deleted
+    /// regardless of age -- an unread row is a pending wake, and unread rows are the sole driver of
+    /// wake + replay-on-reconnect (the no-lost-wake invariant). The full audit trail stays in the
+    /// `events` table (never pruned here), so dropping old acked rows loses nothing. Default
+    /// 604800 (7 days); set to 0 to disable the prune and keep every acked row.
+    pub inbox_acked_retention_secs: i64,
     /// Host authorities the MCP endpoint (`/mcp`) accepts in the inbound `Host` header.
     ///
     /// rmcp guards streamable-HTTP against DNS-rebinding by only accepting loopback hosts
@@ -111,6 +119,7 @@ impl Default for Settings {
             host: "0.0.0.0".to_string(),
             port: 8079,
             webhook_timeout_secs: 5.0,
+            inbox_acked_retention_secs: 7 * 24 * 60 * 60,
             mcp_allowed_hosts: Vec::new(),
             ipfs_api_url: None,
             db_snapshot_enabled: false,
@@ -131,6 +140,9 @@ pub struct Config {
     pub port: u16,
     /// Best-effort HTTP push to agents that registered a webhook_url (fire-and-forget).
     pub webhook_timeout: Duration,
+    /// Retention window, in seconds, for ACKED inbox rows (task_1491). See
+    /// `Settings::inbox_acked_retention_secs`. 0 disables the prune.
+    pub inbox_acked_retention_secs: i64,
     /// Directory of built web UI assets to serve at `/`, if present.
     pub web_dir: Option<String>,
     /// `Host` authorities accepted by the MCP endpoint. Empty == rmcp's loopback-only
@@ -188,6 +200,7 @@ impl Config {
             host: s.host,
             port: s.port,
             webhook_timeout: Duration::from_secs_f64(s.webhook_timeout_secs),
+            inbox_acked_retention_secs: s.inbox_acked_retention_secs,
             web_dir: web_dir.filter(|s| !s.is_empty()),
             mcp_allowed_hosts: s.mcp_allowed_hosts,
             ipfs_api_url: s.ipfs_api_url.filter(|s| !s.is_empty()),
