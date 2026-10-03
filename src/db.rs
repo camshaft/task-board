@@ -612,6 +612,35 @@ CREATE TABLE IF NOT EXISTS agent_config_versions (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (agent_id, config_kind)
 );
+-- Budget / cost admission as board data (task_1461, doc_3426 ask 6). The harness reads a per-agent
+-- or per-role spend cap plus the agent's current spend to admit or defer a turn; the admission
+-- decision stays harness-side (the board serves the data, consistent with board-as-dynamic-config).
+-- `budgets` holds the editable CAP config: a cap over a rolling window, scoped to an agent or a role.
+-- The effective cap for an agent is the agent-scope row if present, else the role-scope row for the
+-- agent's role, else none (unlimited). `version` bumps on every edit so a subscriber hot-reloads on
+-- the budget.updated event. `window_kind` is a rolling window (hour|day|week|month|total); the reset
+-- policy is a rolling horizon (spend older than the window ages out), board-defined + documented.
+-- (`window` is a SQL reserved word, hence `window_kind`.)
+CREATE TABLE IF NOT EXISTS budgets (
+    scope       TEXT NOT NULL,   -- 'agent' | 'role'
+    scope_id    TEXT NOT NULL,   -- the agent id or the role name
+    cap         REAL NOT NULL,
+    window_kind TEXT NOT NULL DEFAULT 'day',
+    version     INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT,
+    PRIMARY KEY (scope, scope_id)
+);
+-- Append-only per-turn spend ledger (task_1461). The harness reports each turn's realized cost (only
+-- it knows the token cost); current_spend over a window is SUM(cost) where created_at is within the
+-- rolling horizon, so the accumulation is deterministic and needs no stored running counter to drift.
+CREATE TABLE IF NOT EXISTS budget_spend (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id    TEXT NOT NULL,
+    cost        REAL NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_budget_spend_agent ON budget_spend(agent_id, created_at);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
