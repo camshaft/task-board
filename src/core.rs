@@ -590,6 +590,69 @@ fn coerce_capabilities_metadata(capabilities: Option<&Value>) -> Option<Value> {
     Some(Value::Array(deduped))
 }
 
+/// Validate a self-registered webhook_url before the board will POST event data to it (task_1492):
+/// require an http/https scheme and reject a host that targets the board's own network -- loopback,
+/// unspecified, private (RFC1918), or link-local/metadata (169.254/16, including 169.254.169.254) --
+/// plus the localhost name. This is the server-side-request-forgery guard on the outbound push: the
+/// url is attacker-influencable (any agent can register one), so a bad target is refused at the
+/// write path (register_agent / update_agent) and re-checked at fire time (fire_webhooks). An IP
+/// literal host is range-checked; a DNS name that resolves to a private address (rebinding) is a
+/// deeper follow-on and not covered here.
+pub(crate) fn validate_webhook_url(url: &str) -> anyhow::Result<()> {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(BoardError::bad_request(
+                "webhook_url must be an http:// or https:// URL"
+            ))
+        })?;
+    // Host = the authority up to the first '/', '?' or '#', minus any 'user@' and ':port'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    // Strip the port. A bracketed IPv6 literal [::1]:port keeps what is inside the brackets.
+    let host = if let Some(h) = host.strip_prefix('[') {
+        h.split(']').next().unwrap_or(h)
+    } else {
+        host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+    };
+    if host.is_empty() {
+        anyhow::bail!(BoardError::bad_request("webhook_url has no host"));
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        anyhow::bail!(BoardError::bad_request(
+            "webhook_url host localhost is not allowed"
+        ));
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let blocked = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || {
+                    // unique-local (fc00::/7) and link-local (fe80::/10) predicates are unstable in
+                    // std, so cover those ranges explicitly on the first hextet.
+                    let seg = v6.segments()[0];
+                    (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+                }
+            }
+        };
+        if blocked {
+            anyhow::bail!(BoardError::bad_request(format!(
+                "webhook_url host {host} targets a private/loopback/link-local address"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn register_agent(
     pool: &Pool,
     agent_id: &str,
@@ -599,6 +662,11 @@ pub async fn register_agent(
     metadata: Option<Value>,
     webhook_url: Option<&str>,
 ) -> anyhow::Result<Value> {
+    // task_1492: a self-registered webhook_url is an outbound-push target, so guard it against
+    // server-side request forgery before it can be stored.
+    if let Some(url) = webhook_url {
+        validate_webhook_url(url)?;
+    }
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let existing = sqlx::query("SELECT metadata FROM agents WHERE id=?")
@@ -682,6 +750,7 @@ pub async fn update_agent(
     metadata: Option<Value>,
     clear: Option<&[String]>,
     priority: Option<&str>,
+    actor: Option<&str>,
 ) -> anyhow::Result<Value> {
     // task_1455: priority is the per-session scheduling weight the reconciler reads; validate the
     // enum up front so a typo can't land as config.
@@ -690,6 +759,20 @@ pub async fn update_agent(
             anyhow::bail!(BoardError::bad_request(format!(
                 "priority must be one of high|normal|low (got '{p}')"
             )));
+        }
+    }
+    // task_1492: setting webhook_url points the board's outbound event push at a URL. Guard it
+    // against server-side request forgery, and restrict the write to the owning agent -- only the
+    // agent itself (actor == agent_id) may set its own webhook_url, closing the cross-agent
+    // fan-out amplifier where one agent redirects another's event stream. (Clearing it via `clear`
+    // is benign and not gated here.)
+    if let Some(url) = webhook_url {
+        validate_webhook_url(url)?;
+        match actor {
+            Some(a) if a == agent_id => {}
+            _ => anyhow::bail!(BoardError::bad_request(
+                "webhook_url can only be set by the owning agent (actor must equal the agent id)"
+            )),
         }
     }
     let mut tx = pool.begin().await?;
@@ -20514,6 +20597,7 @@ mod tests {
             Some(json!({"branch": "main"})),
             None,
             None,
+            None,
         )
         .await?;
         let got = get_agent(&pool, "v-x").await?;
@@ -20537,6 +20621,7 @@ mod tests {
             None,
             None,
             None,
+            Some("v-x"),
         )
         .await?;
         assert_eq!(
@@ -20554,6 +20639,7 @@ mod tests {
             None,
             None,
             Some(&["webhook_url".to_string()]),
+            None,
             None,
         )
         .await?;
@@ -20574,6 +20660,7 @@ mod tests {
             None,
             Some(&["webhook_url".to_string()]),
             None,
+            Some("v-x"),
         )
         .await?;
         assert_eq!(
@@ -20593,17 +20680,18 @@ mod tests {
             None,
             None,
             Some(&["status".to_string()]),
+            None,
             None
         )
         .await
         .is_err());
 
         // update_agent on an unknown agent errors (it's a mutate, not an upsert).
-        assert!(
-            update_agent(&pool, "nope", None, None, None, None, None, None, None, None, None)
-                .await
-                .is_err()
-        );
+        assert!(update_agent(
+            &pool, "nope", None, None, None, None, None, None, None, None, None, None
+        )
+        .await
+        .is_err());
 
         // A fresh agent gets an empty bag by default, not null.
         register_agent(&pool, "v-y", None, None, None, None, None).await?;
@@ -20686,6 +20774,7 @@ mod tests {
             None,
             None,
             Some("high"),
+            None,
         )
         .await?;
         assert_eq!(get_agent(&pool, "v-a").await?["priority"], json!("high"));
@@ -20702,6 +20791,7 @@ mod tests {
                 None,
                 None,
                 Some("urgent"),
+                None,
             )
             .await
             .is_err(),
@@ -21682,6 +21772,7 @@ mod tests {
             None,
             None,
             Some("low"),
+            None,
         )
         .await?;
         assert_eq!(get_budget(&pool, "v-a").await?["priority"], json!("low"));
@@ -21697,6 +21788,100 @@ mod tests {
             .await
             .is_err());
         assert!(report_spend(&pool, "v-a", -5.0).await.is_err());
+        Ok(())
+    }
+
+    /// task_1492: the webhook_url request-forgery guard + self-restriction. validate_webhook_url
+    /// accepts a public http/https target and rejects a non-http scheme or a private / loopback /
+    /// link-local / metadata / localhost host; register_agent + update_agent enforce it at the write
+    /// path; and only the owning agent (actor == id) may set its own webhook_url.
+    #[tokio::test]
+    async fn webhook_url_ssrf_guard_and_self_restriction() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Public http/https targets pass.
+        assert!(validate_webhook_url("https://hooks.example.com/wake").is_ok());
+        assert!(validate_webhook_url("http://198.51.100.7:8080/wake").is_ok());
+        // A non-http scheme, loopback, private, link-local/metadata, unspecified, IPv6 loopback, and
+        // localhost are all rejected.
+        for bad in [
+            "ftp://example.com/x",
+            "not-a-url",
+            "https://localhost/x",
+            "http://127.0.0.1/x",
+            "http://10.0.0.5/x",
+            "http://192.168.1.9/x",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/x",
+            "http://0.0.0.0/x",
+        ] {
+            assert!(validate_webhook_url(bad).is_err(), "should reject {bad}");
+        }
+
+        // register_agent guards the write path; a clean url registers.
+        assert!(register_agent(
+            &pool,
+            "v-a",
+            None,
+            None,
+            None,
+            None,
+            Some("http://127.0.0.1/x")
+        )
+        .await
+        .is_err());
+        register_agent(
+            &pool,
+            "v-a",
+            None,
+            None,
+            None,
+            None,
+            Some("https://hooks.example.com/a"),
+        )
+        .await?;
+        register_agent(&pool, "v-b", None, None, None, None, None).await?;
+
+        // Self-restriction: another agent, or a missing actor, cannot set v-a's webhook_url; the
+        // owning agent can; and the request-forgery guard still applies on a self update.
+        let set = |actor: Option<&'static str>, url: &'static str| {
+            let pool = pool.clone();
+            async move {
+                update_agent(
+                    &pool,
+                    "v-a",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(url),
+                    None,
+                    None,
+                    None,
+                    actor,
+                )
+                .await
+            }
+        };
+        assert!(
+            set(Some("v-b"), "https://ok.example.com/x").await.is_err(),
+            "cross-agent webhook write rejected"
+        );
+        assert!(
+            set(None, "https://ok.example.com/x").await.is_err(),
+            "webhook write requires the owning actor"
+        );
+        set(Some("v-a"), "https://hooks.example.com/a2").await?;
+        assert_eq!(
+            get_agent(&pool, "v-a").await?["webhook_url"],
+            json!("https://hooks.example.com/a2")
+        );
+        assert!(
+            set(Some("v-a"), "http://169.254.169.254/x").await.is_err(),
+            "the request-forgery guard applies even on a self update"
+        );
         Ok(())
     }
 
