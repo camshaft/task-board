@@ -5610,6 +5610,17 @@ pub async fn open_blocking_questions(
         .collect())
 }
 
+/// Normalize a question prompt for the near-duplicate guard (task_1436): trim, collapse every run
+/// of internal whitespace to a single space, and lowercase, so cosmetically-different posts of the
+/// same ask compare equal. `split_whitespace` both trims and collapses. Dedup is on the prompt text
+/// only, not the options -- a genuinely different prompt stays distinct.
+fn normalize_prompt(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// After a BLOCKING question on `task_id` reaches a terminal state, recompute the task's derived
 /// question-block: if no open blocking question remains, the task is no longer question-blocked, so
 /// emit task.unblocked to its watchers (reusing the task notification path). Callers invoke this
@@ -5811,6 +5822,35 @@ pub async fn pose_question_configured(
     };
     let project_id: i64 = task_row.try_get("project_id")?;
     let routed_kind = principal_kind(&mut tx, routed_to).await?;
+    // Near-duplicate guard (task_1436): reject a second BLOCKING question on the same task routed to
+    // the same principal with a near-identical prompt. The task_1083 incident had several
+    // stakeholders pose the same sweep-driven operator question in parallel, then mutual-cancel in
+    // deference -- which briefly ZEROED the block (the exact bare-block the sweep was closing).
+    // Rejecting the duplicate forces the caller to comment on, or supersede_question, the existing
+    // one instead of racing a second. Only blocking questions contribute to the question-block, so
+    // non-blocking posts are unaffected; a genuinely different prompt (normalized) still succeeds.
+    if blocking {
+        let norm_new = normalize_prompt(prompt);
+        let candidates = sqlx::query(&format!(
+            "SELECT id, body FROM comments WHERE task_id=? \
+             AND json_extract(payload,'$.routed_to')=? AND {OPEN_BLOCKING_QUESTION} ORDER BY id"
+        ))
+        .bind(task_id)
+        .bind(routed_to)
+        .fetch_all(&mut *tx)
+        .await?;
+        for r in &candidates {
+            let existing_body: String = r.try_get("body").unwrap_or_default();
+            if normalize_prompt(&existing_body) == norm_new {
+                let existing_id: i64 = r.try_get("id")?;
+                anyhow::bail!(
+                    "task {task_id} already has an open blocking question (comment {existing_id}) \
+                     routed to '{routed_to}' with the same prompt; comment on it or \
+                     supersede_question it -- do not pose a second (task_1436)"
+                );
+            }
+        }
+    }
     if let Some(ref d) = default {
         if let Some(schema) = response_schema.as_ref() {
             validate_value_against_schema(schema, d)
@@ -14409,6 +14449,140 @@ mod tests {
                 .is_err(),
             "a boolean against a non-yes/no string enum is not silently coerced"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pose_question_rejects_near_duplicate_blocking() -> anyhow::Result<()> {
+        // task_1436: a sweep that converts a shared-task decision into a posed operator question
+        // once drew several stakeholders posing the SAME question in parallel, then mutual-cancelling
+        // in deference and briefly zeroing the block. The guard rejects a second OPEN blocking
+        // question on the same task + same routed_to with a near-identical (normalized) prompt and
+        // names the existing comment, so the caller comments on / supersedes it instead of racing.
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(
+            &pool,
+            pid,
+            "T",
+            None,
+            Some("worker"),
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // First blocking operator-routed question lands.
+        let first = pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "Approve the access class?",
+            None,
+            "operator",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await?;
+        let first_id = first["id"].as_i64().unwrap();
+
+        // A SECOND blocking pose, same routed_to, with only a cosmetic difference (case + internal
+        // whitespace) is rejected, and the error names the existing comment + points to supersede.
+        let err = pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "  approve   the ACCESS class?  ",
+            None,
+            "operator",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await
+        .expect_err("a near-identical second blocking question must be rejected");
+        assert!(
+            err.to_string().contains(&format!("comment {first_id}"))
+                && err.to_string().contains("supersede_question"),
+            "the reject must name the existing comment + point to supersede_question: {err}"
+        );
+        // The reject rolled back its tx: still exactly one open blocking question on the task.
+        assert_eq!(
+            get_task(&pool, tid).await?["blocking_questions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the rejected duplicate must not have been stored"
+        );
+
+        // A blocking pose with a genuinely DIFFERENT prompt on the same task still succeeds.
+        pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "Ship the release today?",
+            None,
+            "operator",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await?;
+
+        // The SAME prompt routed to a DIFFERENT principal is not a duplicate -> succeeds.
+        register_agent(&pool, "bob", None, None, None, None, None).await?;
+        pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "Approve the access class?",
+            None,
+            "bob",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await?;
+
+        // A NON-blocking pose with the same prompt + routed_to is unaffected (does not block, so it
+        // is never deduped).
+        pose_question_full(
+            &pool,
+            tid,
+            Some("yes_no"),
+            "Approve the access class?",
+            None,
+            "operator",
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some("worker"),
+        )
+        .await?;
 
         Ok(())
     }
