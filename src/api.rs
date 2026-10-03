@@ -220,6 +220,7 @@ pub fn router(state: AppState) -> Router {
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/agents/{agent_id}/recall", get(recall))
+        .route("/agents/{agent_id}/check-stop", post(check_stop))
         .route(
             "/sessions/{session_id}/transcript-chunks",
             get(list_transcript_chunks).post(append_transcript_chunk),
@@ -911,6 +912,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/recall", summary: "Board-state-recall bundle (task_1464, doc_3426 ask 9): ONE round trip that rebuilds an agent's working context at session (re)start -- its desired config + lifecycle_intent (task_1455/1456), its open assigned tasks with status + blocked_on, its bounded unread inbox (NOT marked read), and, when session_id is given, a handle to that session's transcript-chunk log (task_1463). The board is the recovery authority: recall first, transcript rehydration second. Bounded + efficient per start.", query: "session_id=str&task_limit=int&activity_limit=int", body: None },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/check-stop", summary: "Board-authoritative stop-condition check (task_1479, doc_3426 ask 13): the harness calls this before letting an agent stop. Returns {decision: accept} only when the agent's lifecycle_intent is paused/retired (meant offline); a run-intent agent is never hard-accepted -- {decision: reject, reason, directive} with directive {kind: take, task_ref} if it holds an open actionable (todo/in_progress, non-blocked, non-monitor-exempt) task, else {kind: park} (stay online, idle, wait for a wake). A pure idempotent read on board state (desired-fleet-state + open work), not the agent self-report; the reason is fed to the model verbatim. stop_context is advisory.", query: "", body: Some("CheckStopBody") },
     Endpoint { method: "POST", path: "/api/sessions/{session_id}/transcript-chunks", summary: "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). position is assigned server-side (per-session, monotonic across generations) and returned. kind is window | compaction-boundary; append-only + history-preserving.", query: "", body: Some("AppendTranscriptChunkBody") },
     Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None },
     Endpoint { method: "POST", path: "/api/decider-episodes", summary: "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. Lightweight no-event append — fire it async off the agent hot path. Downstream consumer: the decider corpus (task_1471).", query: "", body: Some("SubmitDeciderEpisodeBody") },
@@ -1052,6 +1054,7 @@ fn body_schemas() -> Value {
         RestoreAgentBody,
         SetLifecycleIntentBody,
         AppendTranscriptChunkBody,
+        CheckStopBody,
         SubmitDeciderEpisodeBody,
         CreateProjectBody,
         UpdateProjectBody,
@@ -1492,6 +1495,24 @@ async fn recall(
             q.activity_limit.unwrap_or(50),
         )
         .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CheckStopBody {
+    /// Advisory stop context (reason tag + free text, open-work summary, last-activity marker). The
+    /// board decides on its own authority (desired-fleet-state + open work), so this is accepted for
+    /// the loop contract but does not change the decision.
+    stop_context: Option<Value>,
+}
+
+async fn check_stop(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<CheckStopBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::check_stop(&st.pool, &agent_id, b.stop_context).await?,
     ))
 }
 
