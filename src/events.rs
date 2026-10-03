@@ -593,7 +593,7 @@ mod tests {
             None,
             None,
             None,
-            Some("http://x/wake"),
+            Some("http://10.2.21.150/wake"),
         )
         .await?;
         crate::core::register_agent(
@@ -603,7 +603,7 @@ mod tests {
             None,
             None,
             None,
-            Some("http://x/wake"),
+            Some("http://10.2.21.150/wake"),
         )
         .await?;
         let p = crate::core::create_project(&pool, "P", None, Some("owner"), None).await?;
@@ -678,7 +678,7 @@ mod tests {
             None,
             None,
             None,
-            Some("http://x/wake"),
+            Some("http://10.2.21.150/wake"),
         )
         .await?;
         // A whole-board (firehose) subscription — no task/project/etc. target.
@@ -852,7 +852,7 @@ mod tests {
             None,
             None,
             None,
-            Some("http://x/wake"),
+            Some("http://10.2.21.150/wake"),
         )
         .await?;
         // A filtered board subscription: only the `created` class.
@@ -943,7 +943,7 @@ mod tests {
             None,
             None,
             None,
-            Some("http://x/wake"),
+            Some("http://10.2.21.150/wake"),
         )
         .await?;
         // Frank joins thread root seq=100 (he is NOT a member of channel 7).

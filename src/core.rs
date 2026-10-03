@@ -590,15 +590,38 @@ fn coerce_capabilities_metadata(capabilities: Option<&Value>) -> Option<Value> {
     Some(Value::Array(deduped))
 }
 
-/// Validate a self-registered webhook_url before the board will POST event data to it (task_1492):
-/// require an http/https scheme and reject a host that targets the board's own network -- loopback,
-/// unspecified, private (RFC1918), or link-local/metadata (169.254/16, including 169.254.169.254) --
-/// plus the localhost name. This is the server-side-request-forgery guard on the outbound push: the
-/// url is attacker-influencable (any agent can register one), so a bad target is refused at the
-/// write path (register_agent / update_agent) and re-checked at fire time (fire_webhooks). An IP
-/// literal host is range-checked; a DNS name that resolves to a private address (rebinding) is a
-/// deeper follow-on and not covered here.
+/// The trusted webhook_url CIDR allowlist, read from one source: the startup-set global
+/// (`WEBHOOK_ALLOWED_CIDRS`, from config), falling back to the built-in default allowlist when the
+/// global is unset (e.g. a unit test that never boots the server). Mirrors how `webhook_timeout`
+/// reads WEBHOOK_TIMEOUT.
+fn webhook_allowed_cidrs() -> std::borrow::Cow<'static, [crate::config::Cidr]> {
+    match crate::WEBHOOK_ALLOWED_CIDRS.get() {
+        Some(v) => std::borrow::Cow::Borrowed(v.as_slice()),
+        None => std::borrow::Cow::Owned(crate::config::default_webhook_allowed_cidrs()),
+    }
+}
+
+/// Validate a self-registered webhook_url before the board will POST event data to it (task_1492,
+/// incident-corrected). The guard is ALLOWLIST-ONLY: require an http/https scheme, then ACCEPT iff
+/// the host is an IP literal that falls within one of the trusted `webhook_allowed_cidrs`, and
+/// REJECT every other host -- public/external IPs, link-local/cloud-metadata (169.254.0.0/16,
+/// including 169.254.169.254), IPv6 link-local (fe80::/10), and non-IP DNS names (which cannot be
+/// proved to resolve into the fleet LAN). The board is private-only and co-resident with the fleet
+/// workers, so a legitimate webhook target is only ever a fleet-internal private/loopback host; a
+/// public target is an untrusted SSRF/exfil destination. The url is attacker-influencable (any agent
+/// can register one), so this is enforced at the write path (register_agent / update_agent) and
+/// re-checked at fire time (fire_webhooks). A DNS name that resolves to an allowed address
+/// (rebinding) is deliberately not accepted here -- membership requires an in-range IP literal.
 pub(crate) fn validate_webhook_url(url: &str) -> anyhow::Result<()> {
+    validate_webhook_url_with(url, &webhook_allowed_cidrs())
+}
+
+/// Core of [`validate_webhook_url`] with the allowlist passed explicitly, so tests can exercise a
+/// specific CIDR set without touching the process-global `WEBHOOK_ALLOWED_CIDRS`.
+pub(crate) fn validate_webhook_url_with(
+    url: &str,
+    allowed: &[crate::config::Cidr],
+) -> anyhow::Result<()> {
     let url = url.trim();
     let rest = url
         .strip_prefix("https://")
@@ -620,37 +643,22 @@ pub(crate) fn validate_webhook_url(url: &str) -> anyhow::Result<()> {
     if host.is_empty() {
         anyhow::bail!(BoardError::bad_request("webhook_url has no host"));
     }
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") {
-        anyhow::bail!(BoardError::bad_request(
-            "webhook_url host localhost is not allowed"
-        ));
+    // Allowlist-only: the host must be an IP literal within a trusted CIDR. A non-IP DNS name (incl
+    // "localhost") cannot be proved to land in the fleet LAN, so it is rejected like any other
+    // untrusted target.
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "webhook_url host {host} is not an allowed address: only fleet-LAN IP literals within a \
+             trusted CIDR are accepted (the board is private-only and co-resident with the fleet)"
+        )));
+    };
+    if allowed.iter().any(|c| c.contains(ip)) {
+        return Ok(());
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let blocked = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback() || v6.is_unspecified() || {
-                    // unique-local (fc00::/7) and link-local (fe80::/10) predicates are unstable in
-                    // std, so cover those ranges explicitly on the first hextet.
-                    let seg = v6.segments()[0];
-                    (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
-                }
-            }
-        };
-        if blocked {
-            anyhow::bail!(BoardError::bad_request(format!(
-                "webhook_url host {host} targets a private/loopback/link-local address"
-            )));
-        }
-    }
-    Ok(())
+    anyhow::bail!(BoardError::bad_request(format!(
+        "webhook_url host {ip} is not within a trusted CIDR allowlist: it targets a public/external, \
+         link-local, or cloud-metadata address, which the board refuses as an outbound-push target"
+    )));
 }
 
 pub async fn register_agent(
@@ -21726,7 +21734,7 @@ mod tests {
             None,
             None,
             None,
-            Some("http://x/wake"),
+            Some("http://10.2.21.150/wake"),
             None,
             None,
             None,
@@ -21735,7 +21743,7 @@ mod tests {
         .await?;
         assert_eq!(
             get_agent(&pool, "v-x").await?["webhook_url"],
-            json!("http://x/wake")
+            json!("http://10.2.21.150/wake")
         );
         update_agent(
             &pool,
@@ -21765,7 +21773,7 @@ mod tests {
             None,
             None,
             None,
-            Some("http://y/wake"),
+            Some("http://192.168.1.10/wake"),
             None,
             Some(&["webhook_url".to_string()]),
             None,
@@ -21774,7 +21782,7 @@ mod tests {
         .await?;
         assert_eq!(
             get_agent(&pool, "v-x").await?["webhook_url"],
-            json!("http://y/wake"),
+            json!("http://192.168.1.10/wake"),
             "explicit value wins over clear"
         );
         // A non-clearable field name is rejected.
@@ -23160,35 +23168,45 @@ mod tests {
         Ok(())
     }
 
-    /// task_1492: the webhook_url request-forgery guard + self-restriction. validate_webhook_url
-    /// accepts a public http/https target and rejects a non-http scheme or a private / loopback /
-    /// link-local / metadata / localhost host; register_agent + update_agent enforce it at the write
-    /// path; and only the owning agent (actor == id) may set its own webhook_url.
+    /// task_1492 (incident-corrected): the webhook_url guard is ALLOWLIST-ONLY -- validate_webhook_url
+    /// accepts a fleet-LAN IP literal within a trusted CIDR and rejects a non-http scheme, a non-IP
+    /// DNS name, a public/external IP, and a link-local/metadata/loopback-outside-the-allowlist host;
+    /// register_agent + update_agent enforce it at the write path; and only the owning agent
+    /// (actor == id) may set its own webhook_url.
     #[tokio::test]
     async fn webhook_url_ssrf_guard_and_self_restriction() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
 
-        // Public http/https targets pass.
-        assert!(validate_webhook_url("https://hooks.example.com/wake").is_ok());
-        assert!(validate_webhook_url("http://198.51.100.7:8080/wake").is_ok());
-        // A non-http scheme, loopback, private, link-local/metadata, unspecified, IPv6 loopback, and
-        // localhost are all rejected.
+        // Fleet-LAN private + loopback IP literals pass under the default allowlist.
+        for ok in [
+            "http://127.0.0.1/wake",
+            "http://10.2.21.150:8080/wake",
+            "http://172.23.235.215/wake",
+            "https://192.168.1.10/wake",
+        ] {
+            assert!(validate_webhook_url(ok).is_ok(), "should accept {ok}");
+        }
+        // A non-http scheme, a non-IP DNS name (incl localhost + a public hostname), a public IP, the
+        // cloud-metadata/link-local target, IPv6 loopback (not in the v4-only default), unspecified,
+        // and fe80::/10 are all rejected.
         for bad in [
             "ftp://example.com/x",
             "not-a-url",
             "https://localhost/x",
-            "http://127.0.0.1/x",
-            "http://10.0.0.5/x",
-            "http://192.168.1.9/x",
+            "https://hooks.example.com/wake",
+            "http://203.0.113.10/x",
+            "http://198.51.100.7:8080/wake",
             "http://169.254.169.254/latest/meta-data",
             "http://[::1]/x",
             "http://0.0.0.0/x",
+            "http://[fe80::1]/x",
         ] {
             assert!(validate_webhook_url(bad).is_err(), "should reject {bad}");
         }
 
-        // register_agent guards the write path; a clean url registers.
+        // register_agent guards the write path; an untrusted (public) url is refused, a fleet-LAN
+        // url registers.
         assert!(register_agent(
             &pool,
             "v-a",
@@ -23196,7 +23214,7 @@ mod tests {
             None,
             None,
             None,
-            Some("http://127.0.0.1/x")
+            Some("http://203.0.113.10/x")
         )
         .await
         .is_err());
@@ -23207,13 +23225,14 @@ mod tests {
             None,
             None,
             None,
-            Some("https://hooks.example.com/a"),
+            Some("http://10.2.21.150/a"),
         )
         .await?;
         register_agent(&pool, "v-b", None, None, None, None, None).await?;
 
-        // Self-restriction: another agent, or a missing actor, cannot set v-a's webhook_url; the
-        // owning agent can; and the request-forgery guard still applies on a self update.
+        // Self-restriction: another agent, or a missing actor, cannot set v-a's webhook_url (even
+        // with an otherwise-valid fleet-LAN url, so ownership is the sole reason); the owning agent
+        // can; and the host guard still applies on a self update.
         let set = |actor: Option<&'static str>, url: &'static str| {
             let pool = pool.clone();
             async move {
@@ -23235,21 +23254,120 @@ mod tests {
             }
         };
         assert!(
-            set(Some("v-b"), "https://ok.example.com/x").await.is_err(),
+            set(Some("v-b"), "http://10.2.21.150/x").await.is_err(),
             "cross-agent webhook write rejected"
         );
         assert!(
-            set(None, "https://ok.example.com/x").await.is_err(),
+            set(None, "http://10.2.21.150/x").await.is_err(),
             "webhook write requires the owning actor"
         );
-        set(Some("v-a"), "https://hooks.example.com/a2").await?;
+        set(Some("v-a"), "http://10.2.21.150/a2").await?;
         assert_eq!(
             get_agent(&pool, "v-a").await?["webhook_url"],
-            json!("https://hooks.example.com/a2")
+            json!("http://10.2.21.150/a2")
         );
         assert!(
             set(Some("v-a"), "http://169.254.169.254/x").await.is_err(),
             "the request-forgery guard applies even on a self update"
+        );
+        Ok(())
+    }
+
+    /// task_1492 incident correction (a): a fleet-LAN private host is ACCEPTED under the default
+    /// allowlist -- the regression that was crash-looping every worker.
+    #[test]
+    fn webhook_allowlist_accepts_fleet_lan_private_hosts() {
+        let allow = crate::config::default_webhook_allowed_cidrs();
+        for ok in [
+            "http://127.0.0.1/wake",
+            "http://172.23.235.215/wake",
+            "http://10.2.21.150:8080/wake",
+            "https://192.168.1.10/wake",
+        ] {
+            assert!(
+                validate_webhook_url_with(ok, &allow).is_ok(),
+                "default allowlist should accept {ok}"
+            );
+        }
+    }
+
+    /// task_1492 incident correction (b): the cloud-metadata / link-local target stays REJECTED
+    /// under the default allowlist, alongside a routable public IP.
+    #[test]
+    fn webhook_allowlist_still_rejects_link_local_metadata() {
+        let allow = crate::config::default_webhook_allowed_cidrs();
+        for bad in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://203.0.113.10/x",
+        ] {
+            assert!(
+                validate_webhook_url_with(bad, &allow).is_err(),
+                "default allowlist should reject {bad}"
+            );
+        }
+    }
+
+    /// task_1492 incident correction (c): CIDR scoping genuinely scopes -- a configured allowlist
+    /// that excludes a private range REJECTS a host in that excluded range (not just allow-all-private).
+    #[test]
+    fn webhook_allowlist_cidr_scoping_rejects_excluded_range() {
+        // Allow only 10.0.0.0/8; 172.16/12 and 192.168/16 are deliberately excluded.
+        let allow = vec![crate::config::Cidr::parse("10.0.0.0/8").unwrap()];
+        assert!(
+            validate_webhook_url_with("http://10.2.21.150/x", &allow).is_ok(),
+            "a host in the single allowed range is accepted"
+        );
+        assert!(
+            validate_webhook_url_with("http://172.23.235.215/x", &allow).is_err(),
+            "a private host OUTSIDE the configured allowlist is rejected -- scoping is real"
+        );
+        assert!(
+            validate_webhook_url_with("http://192.168.1.10/x", &allow).is_err(),
+            "another excluded private range is rejected too"
+        );
+    }
+
+    /// task_1492 incident correction (d): the self-ownership write-restriction still holds -- a
+    /// webhook_url set where actor != agent_id is rejected regardless of the (valid) host.
+    #[tokio::test]
+    async fn webhook_self_ownership_write_restriction_holds() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "v-owner", None, None, None, None, None).await?;
+        register_agent(&pool, "v-other", None, None, None, None, None).await?;
+
+        let set = |actor: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                update_agent(
+                    &pool,
+                    "v-owner",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("http://10.2.21.150/hook"),
+                    None,
+                    None,
+                    None,
+                    actor,
+                )
+                .await
+            }
+        };
+        assert!(
+            set(Some("v-other")).await.is_err(),
+            "a non-owner cannot set the webhook_url even with a trusted host"
+        );
+        assert!(
+            set(None).await.is_err(),
+            "a missing actor cannot set the webhook_url"
+        );
+        set(Some("v-owner")).await?;
+        assert_eq!(
+            get_agent(&pool, "v-owner").await?["webhook_url"],
+            json!("http://10.2.21.150/hook")
         );
         Ok(())
     }

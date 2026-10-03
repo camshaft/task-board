@@ -30,6 +30,12 @@ use tower_http::trace::TraceLayer;
 /// the config through every core signature.
 pub static WEBHOOK_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
+/// Trusted CIDR allowlist for self-registered `webhook_url` hosts (task_1492), set once at startup
+/// and read by the webhook_url guard (core::validate_webhook_url) at both the write path and
+/// fire time. Same global-config pattern as WEBHOOK_TIMEOUT. When unset (e.g. in a unit test that
+/// never boots the server) the guard falls back to `config::default_webhook_allowed_cidrs()`.
+pub static WEBHOOK_ALLOWED_CIDRS: OnceLock<Vec<config::Cidr>> = OnceLock::new();
+
 /// ACKED-inbox retention window, in seconds (task_1491). Set once at startup and read by the
 /// inbox-retention prune (core::prune_acked_inbox). Same global-config pattern as WEBHOOK_TIMEOUT,
 /// avoiding threading the config through every core signature. 0 disables the prune.
@@ -151,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         None => config::Config::defaults(web_dir),
     };
     let _ = WEBHOOK_TIMEOUT.set(cfg.webhook_timeout);
+    let _ = WEBHOOK_ALLOWED_CIDRS.set(cfg.webhook_allowed_cidrs.clone());
     let _ = INBOX_ACKED_RETENTION_SECS.set(cfg.inbox_acked_retention_secs);
 
     // One-shot: pin the UI element schemas into the CAS and print the name->CID manifest, then exit
