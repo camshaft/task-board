@@ -2518,6 +2518,30 @@ pub async fn resolve_create_project(
     }
 }
 
+/// task_1326 (operator directive, cameron): `monitor_exempt` is no longer an agent-settable field.
+/// A task's only honest states are WIP (todo/in_progress), blocked (with a `blocked_on`), or
+/// iceboxed. The ONLY legitimate monitor-exempt carrier is `status=icebox` -- which the derived
+/// `monitor_exempt` bool already reflects (see `get_task`/`list_tasks`) and which is gated on
+/// operator approval via the icebox transition. So reject any attempt to turn
+/// `metadata.monitor_exempt` ON directly through `create_task` or `update_task`. A falsy value is
+/// allowed through so the field can still be CLEARED by the normal update path (the audit cleanup
+/// of the pre-directive self-applied exempts, or an agent self-correcting).
+fn reject_direct_monitor_exempt(metadata: Option<&Value>) -> anyhow::Result<()> {
+    let truthy = metadata
+        .and_then(|m| m.get("monitor_exempt"))
+        .map(|v| v.as_bool() == Some(true) || matches!(v.as_i64(), Some(n) if n != 0))
+        .unwrap_or(false);
+    if truthy {
+        anyhow::bail!(
+            "monitor_exempt is not settable directly (task_1326): a task is monitor-exempt only \
+             when iceboxed via an operator-approved icebox transition (set status=icebox). \
+             Request icebox instead of setting metadata.monitor_exempt. A task's honest states are \
+             WIP (todo/in_progress), blocked (with a blocked_on), or iceboxed."
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_task(
     pool: &Pool,
@@ -2536,6 +2560,8 @@ pub async fn create_task(
     if let Some(d) = description {
         check_bare_refs(d)?;
     }
+    // task_1326: monitor_exempt is not agent-settable; icebox is the only exemption path.
+    reject_direct_monitor_exempt(metadata.as_ref())?;
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
@@ -2686,6 +2712,8 @@ pub async fn update_task(
     if let Some(d) = description {
         check_bare_refs(d)?;
     }
+    // task_1326: monitor_exempt is not agent-settable; icebox is the only exemption path.
+    reject_direct_monitor_exempt(metadata.as_ref())?;
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
@@ -6215,6 +6243,10 @@ pub async fn supersede_question(
 /// Merge arbitrary key/value properties into a task's metadata (JSON). Returns the
 /// merged metadata. Used for pipeline state (ipfs_cid, collection, stage, ...).
 pub async fn set_task_props(pool: &Pool, task_id: i64, props: Value) -> anyhow::Result<Value> {
+    // task_1326: monitor_exempt is not agent-settable here either; icebox is the only exemption
+    // path. set_task_props is a direct metadata merge, so it must enforce the same rule as
+    // create_task / update_task.
+    reject_direct_monitor_exempt(Some(&props))?;
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let row = sqlx::query("SELECT metadata FROM tasks WHERE id=?")
@@ -14748,21 +14780,15 @@ mod tests {
         // Default: not exempt.
         assert_eq!(get_task(&pool, eid).await?["monitor_exempt"], json!(false));
 
-        // Set metadata.monitor_exempt via the update_task metadata merge.
-        update_task(
-            &pool,
-            eid,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("a"),
-            Some(json!({ "monitor_exempt": true })),
-            None,
-            None,
-        )
-        .await?;
+        // Stored metadata.monitor_exempt=true (a pre-task_1326 self-applied exempt) is still
+        // honored by the derived read path until the audit sweep clears it. Enforcement
+        // (task_1326) now blocks setting it via create_task/update_task, so simulate the stored
+        // value with a raw write -- the derived-bool READ path is what this test covers.
+        sqlx::query("UPDATE tasks SET metadata=? WHERE id=?")
+            .bind(json!({ "monitor_exempt": true }).to_string())
+            .bind(eid)
+            .execute(&pool)
+            .await?;
 
         let got = get_task(&pool, eid).await?;
         assert_eq!(
@@ -14797,6 +14823,126 @@ mod tests {
         let by_title = |t: &str| arr.iter().find(|x| x["title"] == json!(t)).unwrap().clone();
         assert_eq!(by_title("exempt")["monitor_exempt"], json!(true));
         assert_eq!(by_title("plain")["monitor_exempt"], json!(false));
+        Ok(())
+    }
+
+    /// task_1326 (operator directive): monitor_exempt is NOT agent-settable. create_task and
+    /// update_task reject an attempt to turn metadata.monitor_exempt ON directly (icebox is the
+    /// only exemption path), while a falsy value is allowed through so the field can still be
+    /// cleared via the normal update path. Iceboxing stays the legitimate exemption mechanism.
+    #[tokio::test]
+    async fn monitor_exempt_is_not_agent_settable() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+
+        // create_task rejects a truthy monitor_exempt in metadata.
+        let created = create_task(
+            &pool,
+            pid,
+            "nope",
+            None,
+            None,
+            None,
+            Some("a"),
+            Some(json!({ "monitor_exempt": true })),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            created.is_err(),
+            "create_task must reject a direct monitor_exempt=true"
+        );
+
+        // A plain task is created fine; update_task rejects turning monitor_exempt on (incl. int 1).
+        let t = create_task(
+            &pool,
+            pid,
+            "plain",
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let upd = update_task(
+            &pool,
+            tid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("a"),
+            Some(json!({ "monitor_exempt": 1 })),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            upd.is_err(),
+            "update_task must reject a direct monitor_exempt truthy set (incl. int 1)"
+        );
+        // The rejected update rolled back: the task is still un-exempt.
+        assert_eq!(get_task(&pool, tid).await?["monitor_exempt"], json!(false));
+
+        // A falsy value is allowed through (so the field can be CLEARED via the normal path), and
+        // other keys in the same merge land normally.
+        update_task(
+            &pool,
+            tid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("a"),
+            Some(json!({ "monitor_exempt": false, "note": "ok" })),
+            None,
+            None,
+        )
+        .await?;
+        let got = get_task(&pool, tid).await?;
+        assert_eq!(got["monitor_exempt"], json!(false));
+        assert_eq!(
+            got["metadata"]["note"],
+            json!("ok"),
+            "other keys merge normally"
+        );
+
+        // set_task_props is a direct metadata merge and enforces the same rule.
+        let props = set_task_props(&pool, tid, json!({ "monitor_exempt": true })).await;
+        assert!(
+            props.is_err(),
+            "set_task_props must reject a direct monitor_exempt=true"
+        );
+
+        // Iceboxing remains the legitimate exemption path -- derived from status, no metadata set.
+        update_task(
+            &pool,
+            tid,
+            Some("icebox"),
+            None,
+            None,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            get_task(&pool, tid).await?["monitor_exempt"],
+            json!(true),
+            "iceboxing a task makes it monitor-exempt via status, with no metadata.monitor_exempt"
+        );
         Ok(())
     }
 
