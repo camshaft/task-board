@@ -3470,16 +3470,15 @@ async fn get_document(
     State(st): State<AppState>,
     Path(DocRef(document_id)): Path<DocRef>,
     Query(q): Query<GetDocumentQuery>,
-) -> ApiResult {
-    Ok(Json(
-        core::get_document_with_body(
-            &st.pool,
-            st.ipfs_api_url.as_deref(),
-            document_id,
-            q.include_body,
-        )
-        .await?,
-    ))
+) -> Result<Response, ApiError> {
+    let value = core::get_document_with_body(
+        &st.pool,
+        st.ipfs_api_url.as_deref(),
+        document_id,
+        q.include_body,
+    )
+    .await?;
+    Ok(no_cache(Json(value).into_response()))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -3537,6 +3536,21 @@ struct DocumentContentQuery {
     /// `version_no`.
     #[serde(default)]
     approved: Option<bool>,
+}
+
+/// Attach `Cache-Control: no-cache` to a response. `no-cache` lets the client/proxy STORE the body
+/// but forces revalidation before every reuse; combined with the ETag the document reads already
+/// emit, revalidation stays a cheap conditional 304 while guaranteeing an operator_review view
+/// never renders a stale version against a freshly published one (task_1360). Without it, an
+/// intermediary (the reverse proxy/CDN) or the browser applies heuristic caching and can serve a
+/// stale copy on a soft reload. The by-CID `/api/ipfs/{cid}` body stays `immutable` and is untouched
+/// -- a CID never changes, so that path is correctly cached forever.
+fn no_cache(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    resp
 }
 
 /// Does an `If-None-Match` header match our ETag? Handles `*`, a comma-separated list, and a weak
@@ -3607,7 +3621,7 @@ async fn read_document_content(
         .and_then(|c| c.as_str())
         .map(|c| format!("\"{c}\""));
     let Some(etag) = etag else {
-        return Ok(Json(value).into_response());
+        return Ok(no_cache(Json(value).into_response()));
     };
     let not_modified = headers
         .get(axum::http::header::IF_NONE_MATCH)
@@ -3621,16 +3635,15 @@ async fn read_document_content(
     if let Ok(hv) = axum::http::HeaderValue::from_str(&etag) {
         resp.headers_mut().insert(axum::http::header::ETAG, hv);
     }
-    Ok(resp)
+    Ok(no_cache(resp))
 }
 
 async fn get_document_versions(
     State(st): State<AppState>,
     Path(DocRef(document_id)): Path<DocRef>,
-) -> ApiResult {
-    Ok(Json(
-        core::get_document_versions(&st.pool, document_id).await?,
-    ))
+) -> Result<Response, ApiError> {
+    let value = core::get_document_versions(&st.pool, document_id).await?;
+    Ok(no_cache(Json(value).into_response()))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4609,6 +4622,71 @@ mod tests {
         assert!(if_none_match_matches("W/\"bafyv1\"", etag));
         assert!(!if_none_match_matches("\"other\"", etag));
         assert!(!if_none_match_matches("\"bafyv2\"", etag));
+    }
+
+    /// Dynamic document reads carry `Cache-Control: no-cache` so a reverse proxy / browser must
+    /// revalidate before reuse and an operator_review view never renders a stale version against a
+    /// freshly published one (task_1360). Asserted on the metadata read and the version-list read
+    /// (no IPFS backend needed); `read_document_content` sets the same header on every branch
+    /// alongside its existing ETag.
+    #[tokio::test]
+    async fn document_reads_are_no_cache() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = core::create_document(
+            &pool,
+            "Contract",
+            None,
+            "bafyv1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        let (events_tx, _rx) = broadcast::channel(16);
+        let state = AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
+            link_rules: Default::default(),
+        };
+        let get = |uri: String| {
+            let app = router(state.clone());
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        for uri in [
+            format!("/documents/{did}"),
+            format!("/documents/{did}/versions"),
+        ] {
+            let resp = get(uri.clone()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} reads OK");
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-cache"),
+                "{uri} must be no-cache so a stale version is never served on a soft reload"
+            );
+        }
+        Ok(())
     }
 
     /// The health beacon reports 200 when the database is reachable — the signal an agent checks
