@@ -934,6 +934,11 @@ pub struct CommentTaskArgs {
     /// duplicate; otherwise the comment is created and the link recorded atomically.
     #[serde(default)]
     pub external_link: Option<core::ExternalRef>,
+    /// Optional parent comment id to thread this reply under (one level, like comment_document). The
+    /// parent must be an existing comment ON THE SAME task; a cross-task or unknown parent is
+    /// rejected. Use it to reply in a thread rather than at the top level.
+    #[serde(default, deserialize_with = "de_opt_i64_lenient")]
+    pub reply_to: Option<i64>,
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
     /// Use only for an intentional occurrence, e.g. quoting a banned phrase to discuss it.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
@@ -2658,7 +2663,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Add a comment to a task. Notifies the task's subscribers/assignee (except you)."
+        description = "Add a comment to a task. Notifies the task's subscribers/assignee (except you). Pass reply_to (a parent comment id on the SAME task) to thread the reply one level under it instead of posting at the top level."
     )]
     async fn comment_task(
         &self,
@@ -2675,6 +2680,7 @@ impl Board {
             author.as_deref(),
             s(&a.external_author),
             a.external_link,
+            a.reply_to,
         )
         .await
         .map_err(err)

@@ -4455,6 +4455,7 @@ pub async fn comment_task(
     author: Option<&str>,
     external_author: Option<&str>,
     external_link: Option<ExternalRef>,
+    reply_to: Option<i64>,
 ) -> anyhow::Result<Value> {
     // Reject an ambiguous bare "#N" in the submitted comment body (task #517 hard-fail).
     check_bare_refs(body)?;
@@ -4468,6 +4469,24 @@ pub async fn comment_task(
         .is_none()
     {
         anyhow::bail!("no task {task_id}");
+    }
+    // task_1449: a reply_to threads this comment one level under a parent comment (parity with
+    // comment_document / channel posts, so doc_20's reply-in-threads rule is honorable on task
+    // comments). Validate the parent is an existing comment ON THE SAME task -- reject a cross-task
+    // or dangling parent so a thread can never point off-task.
+    if let Some(parent) = reply_to {
+        if sqlx::query("SELECT 1 FROM comments WHERE id=? AND task_id=?")
+            .bind(parent)
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none()
+        {
+            anyhow::bail!(BoardError::bad_request(format!(
+                "reply_to comment_{parent} is not a comment on task_{task_id}: a reply must thread \
+                 under an existing comment on the same task"
+            )));
+        }
     }
     // Idempotent ingest (task 270): if an external_link is given and a comment is ALREADY linked
     // on (source, external_id), return it with `created:false` — no duplicate comment, no repeat
@@ -4490,11 +4509,12 @@ pub async fn comment_task(
     // notification actor); `external_author`, when set, is the external_identities id the
     // comment is attributed TO — an ingested human renders as that person, not the ingester.
     let cid: i64 = sqlx::query(
-        "INSERT INTO comments(task_id, author, body, created_at, external_author) VALUES(?,?,?,?,?) RETURNING id",
+        "INSERT INTO comments(task_id, author, body, reply_to, created_at, external_author) VALUES(?,?,?,?,?,?) RETURNING id",
     )
     .bind(task_id)
     .bind(author)
     .bind(body)
+    .bind(reply_to)
     .bind(&ts)
     .bind(external_author)
     .fetch_one(&mut *tx)
@@ -4505,6 +4525,9 @@ pub async fn comment_task(
     // activity (operator subscription-based wake model). Idempotent; unregistered @tokens ignored.
     subscribe_mentions(&mut tx, body, task_id).await?;
     let mut data = json!({ "comment_id": cid, "body": body });
+    if let Some(parent) = reply_to {
+        data["reply_to"] = json!(parent);
+    }
     if let Some(ext) = external_author {
         data["external_author"] = json!(ext);
     }
@@ -13394,6 +13417,7 @@ mod tests {
             Some("planner"),
             None,
             None,
+            None,
         )
         .await?;
         update_task(
@@ -13554,7 +13578,7 @@ mod tests {
         .await?;
         let tid = t["id"].as_i64().unwrap();
         for i in 0..5 {
-            comment_task(&pool, tid, &format!("c{i}"), Some("a"), None, None).await?;
+            comment_task(&pool, tid, &format!("c{i}"), Some("a"), None, None, None).await?;
         }
 
         // None => all five, chronological, not truncated.
@@ -13613,7 +13637,7 @@ mod tests {
         .await?;
         let tid = t["id"].as_i64().unwrap();
 
-        let c = comment_task(&pool, tid, "plain one", Some("a"), None, None).await?;
+        let c = comment_task(&pool, tid, "plain one", Some("a"), None, None, None).await?;
         let cid = c["comment_id"].as_i64().unwrap();
 
         // A plain comment: type defaults to plain, payload parses to an empty object, ref present.
@@ -14957,7 +14981,8 @@ mod tests {
         // Writes a plain comment then promotes it to a question (the ops slice writes these directly;
         // the read-side under test only cares about the stored columns).
         async fn pose(pool: &Pool, tid: i64, body: &str, payload: &str) -> anyhow::Result<i64> {
-            let cid = comment_task(pool, tid, body, Some("asker"), None, None).await?["comment_id"]
+            let cid = comment_task(pool, tid, body, Some("asker"), None, None, None).await?
+                ["comment_id"]
                 .as_i64()
                 .unwrap();
             sqlx::query("UPDATE comments SET type='question', state='open', payload=? WHERE id=?")
@@ -15242,7 +15267,7 @@ mod tests {
         let tid = t["id"].as_i64().unwrap();
 
         // Comment with a bare ref -> rejected with an actionable, typed-form-naming error.
-        let err = comment_task(&pool, tid, "duplicate of #7", Some("a"), None, None)
+        let err = comment_task(&pool, tid, "duplicate of #7", Some("a"), None, None, None)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -15269,15 +15294,26 @@ mod tests {
             Some("a"),
             None,
             None,
+            None,
         )
         .await?;
         // A bare "#N" inside inline code or a fenced block is NOT a reference -> allowed.
-        comment_task(&pool, tid, "the literal `#9` token", Some("a"), None, None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "the literal `#9` token",
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         comment_task(
             &pool,
             tid,
             "```\nsee #9 in code\n```",
             Some("a"),
+            None,
             None,
             None,
         )
@@ -15951,7 +15987,7 @@ mod tests {
         )
         .await?;
         let tid = t["id"].as_i64().unwrap();
-        comment_task(&pool, tid, "hi", Some("alice"), None, None).await?;
+        comment_task(&pool, tid, "hi", Some("alice"), None, None, None).await?;
         create_project(&pool, "B", None, Some("alice"), None).await?;
 
         // The watcher hears all four: project.created (A, silent to others), task.created,
@@ -16328,7 +16364,7 @@ mod tests {
         let tid = t["id"].as_i64().unwrap();
 
         // Baseline: another agent's comment reaches the creator (they're in the fan-out).
-        comment_task(&pool, tid, "hello", Some("bob"), None, None).await?;
+        comment_task(&pool, tid, "hello", Some("bob"), None, None, None).await?;
         let n = check_notifications(&pool, "owner", true, 50, None).await?;
         assert_eq!(
             n["count"],
@@ -16338,7 +16374,7 @@ mod tests {
 
         // Mute for the owner → subsequent task events no longer reach them.
         mute_task(&pool, "owner", tid).await?;
-        comment_task(&pool, tid, "hello again", Some("bob"), None, None).await?;
+        comment_task(&pool, tid, "hello again", Some("bob"), None, None, None).await?;
         let n = check_notifications(&pool, "owner", true, 50, None).await?;
         assert_eq!(
             n["count"],
@@ -16348,7 +16384,7 @@ mod tests {
 
         // Unmute → back in the fan-out.
         unmute_task(&pool, "owner", tid).await?;
-        comment_task(&pool, tid, "third", Some("bob"), None, None).await?;
+        comment_task(&pool, tid, "third", Some("bob"), None, None, None).await?;
         let n = check_notifications(&pool, "owner", true, 50, None).await?;
         assert_eq!(n["count"], json!(1), "unmuted creator hears comments again");
 
@@ -20191,6 +20227,7 @@ mod tests {
             Some("owner"),
             None,
             None,
+            None,
         )
         .await?;
         let task = get_task(&pool, tid).await?;
@@ -20852,6 +20889,100 @@ mod tests {
         Ok(())
     }
 
+    /// task_1449: comment_task accepts an optional reply_to to thread a reply one level under a
+    /// parent comment ON THE SAME task (parity with comment_document); a reply_to pointing at a
+    /// comment on a different task is rejected, and a plain comment (reply_to=None) is un-threaded.
+    #[tokio::test]
+    async fn comment_task_reply_to_threads_same_task_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "a", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t1 = create_task(
+            &pool,
+            pid,
+            "t1",
+            None,
+            Some("a"),
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        let t2 = create_task(
+            &pool,
+            pid,
+            "t2",
+            None,
+            Some("a"),
+            None,
+            Some("a"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+
+        // Parent comment on t1.
+        let parent = comment_task(&pool, t1, "parent", Some("a"), None, None, None).await?
+            ["comment_id"]
+            .as_i64()
+            .unwrap();
+
+        // (1) A reply to a same-task parent persists reply_to; the read model threads it.
+        let rid = comment_task(&pool, t1, "child", Some("a"), None, None, Some(parent)).await?
+            ["comment_id"]
+            .as_i64()
+            .unwrap();
+        let find = |task: Value, id: i64| -> Value {
+            task["comments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == json!(id))
+                .cloned()
+                .unwrap()
+        };
+        let child = find(get_task(&pool, t1).await?, rid);
+        assert_eq!(
+            child["reply_to"],
+            json!(parent),
+            "read model threads the reply under its parent: {child}"
+        );
+
+        // (3) A plain comment (reply_to=None) is un-threaded.
+        let plain = comment_task(&pool, t1, "plain", Some("a"), None, None, None).await?
+            ["comment_id"]
+            .as_i64()
+            .unwrap();
+        let plain_c = find(get_task(&pool, t1).await?, plain);
+        assert!(
+            plain_c["reply_to"].is_null(),
+            "a plain comment is un-threaded: {plain_c}"
+        );
+
+        // (2) A reply_to a comment on a DIFFERENT task is rejected, and adds nothing to t2.
+        let e = comment_task(&pool, t2, "cross", Some("a"), None, None, Some(parent))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("same task"), "cross-task reply_to rejected: {e}");
+        let t2_full = get_task(&pool, t2).await?;
+        assert_eq!(
+            t2_full["comments"].as_array().unwrap().len(),
+            0,
+            "the rejected reply added no comment to t2: {t2_full}"
+        );
+        Ok(())
+    }
+
     /// The channels feature opens a pre-channels DB in place: the events table gains a
     /// channel_id column and the channels table is created, so posting works on a legacy DB.
     #[tokio::test]
@@ -20998,6 +21129,7 @@ mod tests {
             "hi from slack",
             Some("slack-bridge"),
             Some("slack:U123"),
+            None,
             None,
         )
         .await?;
@@ -21311,7 +21443,16 @@ mod tests {
         .await?;
 
         // Allowed author -> one reflect event carrying the comment + external target.
-        comment_task(&pool, tid, "reflect me", Some("concierge"), None, None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "reflect me",
+            Some("concierge"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         let r = reflects(&ev, tid);
         assert_eq!(r.len(), 1, "allowed author reflects out");
@@ -21329,6 +21470,7 @@ mod tests {
             "ingested from github",
             Some("gh-bridge"),
             Some("github:U9"),
+            None,
             None,
         )
         .await?;
@@ -21354,7 +21496,7 @@ mod tests {
         )
         .await?;
         let plain_id = plain["id"].as_i64().unwrap();
-        comment_task(&pool, plain_id, "hi", Some("concierge"), None, None).await?;
+        comment_task(&pool, plain_id, "hi", Some("concierge"), None, None, None).await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         assert_eq!(
             reflects(&ev, plain_id).len(),
@@ -21374,7 +21516,16 @@ mod tests {
             Some(json!({ "direction": "in" })),
         )
         .await?;
-        comment_task(&pool, tid, "second reflect", Some("concierge"), None, None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "second reflect",
+            Some("concierge"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let ev = get_events(&pool, 0, 500, None, false).await?;
         let r = reflects(&ev, tid);
         assert_eq!(
@@ -21480,6 +21631,7 @@ mod tests {
             Some("gh"),
             Some("github:U1"),
             Some(clink.clone()),
+            None,
         )
         .await?;
         assert_eq!(c1["created"], json!(true));
@@ -21491,6 +21643,7 @@ mod tests {
             Some("gh"),
             Some("github:U1"),
             Some(clink.clone()),
+            None,
         )
         .await?;
         assert_eq!(c2["created"], json!(false));
@@ -21521,7 +21674,7 @@ mod tests {
         )
         .await?;
         assert_eq!(plain["created"], json!(true));
-        let pc = comment_task(&pool, tid, "manual comment", Some("gh"), None, None).await?;
+        let pc = comment_task(&pool, tid, "manual comment", Some("gh"), None, None, None).await?;
         assert_eq!(pc["created"], json!(true));
         Ok(())
     }
@@ -21969,7 +22122,16 @@ mod tests {
         );
 
         // Direction 2: a new task comment -> a thread reply.
-        comment_task(&pool, tid, "reply from board", Some("worker"), None, None).await?;
+        comment_task(
+            &pool,
+            tid,
+            "reply from board",
+            Some("worker"),
+            None,
+            None,
+            None,
+        )
+        .await?;
         let posts = get_channel_posts(&pool, cid, 0, None, 100, false).await?;
         let posts = posts.as_array().unwrap();
         assert_eq!(posts.len(), 3, "root + r1 + the mirrored comment");
@@ -22006,7 +22168,7 @@ mod tests {
         .await?["id"]
             .as_i64()
             .unwrap();
-        comment_task(&pool, solo, "unrelated", Some("worker"), None, None).await?;
+        comment_task(&pool, solo, "unrelated", Some("worker"), None, None, None).await?;
         assert_eq!(
             get_channel_posts(&pool, cid, 0, None, 100, false)
                 .await?
@@ -22053,7 +22215,7 @@ mod tests {
         subscribe(&pool, "watcher", Some(tid), None, None, None, false).await?;
 
         // op1 comments -> the pure subscriber hears it; the author (op1) does not hear its own.
-        comment_task(&pool, tid, "first", Some("op1"), None, None).await?;
+        comment_task(&pool, tid, "first", Some("op1"), None, None, None).await?;
         let w = check_notifications(&pool, "watcher", true, 50, None).await?;
         assert_eq!(
             w["count"].as_i64(),
@@ -22073,7 +22235,7 @@ mod tests {
         );
 
         // Commenting auto-subscribed op1, so it hears a subsequent comment by someone else.
-        comment_task(&pool, tid, "second", Some("watcher"), None, None).await?;
+        comment_task(&pool, tid, "second", Some("watcher"), None, None, None).await?;
         let o = check_notifications(&pool, "op1", true, 50, None).await?;
         assert_eq!(
             o["count"].as_i64(),
@@ -22121,7 +22283,7 @@ mod tests {
         .await?["id"]
             .as_i64()
             .unwrap();
-        comment_task(&pool, tid, "hi", Some("b"), None, None).await?;
+        comment_task(&pool, tid, "hi", Some("b"), None, None, None).await?;
 
         let all = get_events(&pool, 0, 500, None, false).await?;
         assert!(
@@ -22213,7 +22375,7 @@ mod tests {
         );
 
         // The feed advances: a new event becomes the new desc head.
-        comment_task(&pool, tids[0], "newest", Some("a"), None, None).await?;
+        comment_task(&pool, tids[0], "newest", Some("a"), None, None, None).await?;
         let latest2 = get_events(&pool, 0, 3, None, true).await?;
         let latest2 = latest2.as_array().unwrap();
         assert_eq!(
@@ -22874,7 +23036,7 @@ mod tests {
                     )
                     .await?;
                     let tid = t["id"].as_i64().unwrap();
-                    comment_task(&pool, tid, "working", Some(&agent), None, None).await?;
+                    comment_task(&pool, tid, "working", Some(&agent), None, None, None).await?;
                     update_task(
                         &pool,
                         tid,
@@ -24660,6 +24822,7 @@ mod tests {
             tid,
             "the quick brown fox",
             Some("author"),
+            None,
             None,
             None,
         )

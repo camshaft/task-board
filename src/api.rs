@@ -1891,6 +1891,9 @@ struct CommentBody {
     /// (source, external_id), the existing comment is returned (`created:false`) instead of a
     /// duplicate. Lets a bridge adapter mirror an external comment exactly-once.
     external_link: Option<core::ExternalRef>,
+    /// Optional parent comment id to thread this reply under (one level). The parent must be a
+    /// comment on the SAME task; a cross-task or unknown parent is rejected (task_1449).
+    reply_to: Option<i64>,
     /// Submit even if the body contains a banned phrase (the pre-submit lint otherwise rejects it).
     acknowledge_banned: Option<bool>,
 }
@@ -1909,6 +1912,7 @@ async fn comment_task(
             b.author.as_deref(),
             b.external_author.as_deref(),
             b.external_link,
+            b.reply_to,
         )
         .await?,
     ))
