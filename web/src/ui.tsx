@@ -1,7 +1,9 @@
 // Small presentational helpers shared across the app.
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { api } from './api'
 import type { AgentStatus, TaskStatus } from './api'
+import { AgentMentionContext } from './markdown'
 import { useIdentityAliases } from './resources'
 
 export const TASK_COLUMNS: TaskStatus[] = [
@@ -95,6 +97,24 @@ export function PriorityDot({ priority }: { priority: string | null }) {
 // so an ingested message reads as the person, not the fleet agent that relayed it (#141 §6).
 // `resolveExternal` maps an external id (e.g. "slack:U123") to a display name; falls back to the
 // bare id. Plain fleet-agent authors render unchanged.
+// A name that links to its profile page when it resolves to a known agent/person/alias (the same
+// app-wide resolver @mentions use), so clicking a comment's author opens their page (task_1426).
+// An unresolved name (unknown id, or "anon") stays plain text -- no dead links.
+function AuthorName({ id }: { id: string }) {
+  const resolve = useContext(AgentMentionContext)
+  const target = resolve(id)
+  if (!target) return <span className="font-mono">{id}</span>
+  return (
+    <Link
+      to={target.href}
+      className="font-mono hover:underline"
+      title={target.canonical !== id ? `${id} -> ${target.canonical}` : undefined}
+    >
+      {id}
+    </Link>
+  )
+}
+
 export function AuthorLabel({
   author,
   externalAuthor,
@@ -109,11 +129,16 @@ export function AuthorLabel({
     return (
       <span>
         <span className="font-mono">{name}</span>
-        {author && <span className="text-[var(--color-muted)]"> · via {author}</span>}
+        {author && (
+          <span className="text-[var(--color-muted)]">
+            {' '}
+            · via <AuthorName id={author} />
+          </span>
+        )}
       </span>
     )
   }
-  return <span className="font-mono">{author ?? 'anon'}</span>
+  return <AuthorName id={author ?? 'anon'} />
 }
 
 // Render an identity id, resolving a known alias to its canonical identity for DISPLAY (task 532).
