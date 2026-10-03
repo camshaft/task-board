@@ -874,7 +874,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/projects/{project_id}/metrics", summary: "Read-only queue-time metrics (task_1265): derived entirely from the events stream, no new tables. pickup_latency_secs (task creation -> first assignment), time_in_todo_secs (summed dwell in status todo), time_blocked_secs (summed dwell in status blocked, sampled over actually-blocked tasks only). Each is {count, p50, p90, max, mean} in whole seconds (nearest-rank percentiles). Mutates nothing. Returns {project_id, task_count, pickup_latency_secs, time_in_todo_secs, time_blocked_secs}.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/system/link-rules", summary: "The deployment-configured link-tag rules (task_1243): a read-only list of {pattern, url_template} the UI uses to linkify custom references (e.g. CR-NNNN) in rendered content, generalizing the built-in typed-ref linkification. Patterns live in the deployment TOML (never in source), so each deployment customizes its own tags; empty when none are configured. Returns {link_rules:[{pattern, url_template}]}. Mutates nothing.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/enforcement/preflight", summary: "Fail-closed preflight for enabling per-operator ACCESS enforcement -- checks WORKSPACE/PROJECT GRANTS, NOT document conformance (use grade_document, the doc_7 A8 rubric, for a doc's conformance). doc_26 A5: enablable=true only when the fleet-coordination team exists and holds its standing grant on every project, so the coordination fleet is never stranded when enforcement flips on. Reports fleet_coordination_team_exists, projects_total, projects_missing_grant, blockers. Read-only.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true.", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool", body: None },
+    Endpoint { method: "GET", path: "/api/tasks", summary: "List/search tasks, optionally filtered. Archived tasks are hidden unless include_archived=true. monitor_exempt=bool filters by the derived monitor-exempt flag (audit the no-hiding-behind-exempt invariant).", query: "project_id=int&status=str&assignee=str&unassigned=bool&parent_id=int&top_level=bool&q=str&blocked_on_kind=str&blocked_on_ref=str&meta_key=str&meta_value=str&include_archived=bool&monitor_exempt=bool", body: None },
     Endpoint { method: "POST", path: "/api/tasks", summary: "Create a task.", query: "", body: Some("CreateTaskBody") },
     Endpoint { method: "GET", path: "/api/tasks/{task_id}", summary: "Fetch one task (with comments).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/tasks/{task_id}", summary: "Update task fields (status, assignee, ...).", query: "", body: Some("UpdateTaskBody") },
@@ -1613,6 +1613,9 @@ struct ListTasksQuery {
     meta_value: Option<String>,
     /// Include archived tasks. Archived tasks are hidden by default; set true to list them too.
     include_archived: Option<bool>,
+    /// Filter by the DERIVED monitor_exempt flag (task_1326): true = only monitor-exempt tasks
+    /// (metadata.monitor_exempt truthy OR status=icebox), false = only non-exempt. Omit for all.
+    monitor_exempt: Option<bool>,
 }
 
 async fn list_tasks(
@@ -1636,6 +1639,9 @@ async fn list_tasks(
         query.include_archived.unwrap_or(false),
     )
     .await?;
+    // Audit filter on the derived monitor_exempt flag (task_1326); applied before the readable-
+    // projects filter. A no-op when the query param is omitted.
+    let tasks = core::filter_tasks_monitor_exempt(tasks, query.monitor_exempt);
     // task_542 B5b: filter to the authenticated caller's readable projects when enforcement is
     // enabled (fail-closed; a no-op while off). The viewer is stamped by force_trusted_user.
     let viewer = viewer.map(|Extension(ForcedViewer(v))| v);
