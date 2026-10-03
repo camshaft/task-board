@@ -7,7 +7,7 @@ import {
   useOutletContext,
   useParams,
 } from 'react-router-dom'
-import { type TaskStatus } from './api'
+import { api, type TaskStatus } from './api'
 import { DocStatusChip } from './Documents'
 import {
   answerQuestion,
@@ -886,4 +886,38 @@ export function TaskRedirect() {
     return <div className="p-6 text-[var(--color-muted)]">Loading…</div>
   }
   return <Navigate to={`/projects/${task.project_id}/tasks/${task.id}${location.hash}`} replace />
+}
+
+// Resolver route for a comment_NNN ref (task_1431): a comment is a child of a task, so look up its
+// parent task via GET /comments/:id, then forward to /tasks/:task_id#comment-:id -- TaskRedirect
+// then resolves the project and preserves the fragment, and TaskDrawer scrolls/flashes/expands the
+// comment. An unknown comment id (or a non-task comment) degrades to a "not found" line, never a
+// dead or crashing link.
+export function CommentRedirect() {
+  const { commentId } = useParams()
+  const id = Number(commentId)
+  const [resolved, setResolved] = useState<
+    { kind: 'ok'; taskId: number } | { kind: 'missing' } | null
+  >(null)
+  useEffect(() => {
+    let alive = true
+    api
+      .getComment(id)
+      .then((c) => {
+        if (alive) setResolved(c.task_id != null ? { kind: 'ok', taskId: c.task_id } : { kind: 'missing' })
+      })
+      .catch(() => {
+        if (alive) setResolved({ kind: 'missing' })
+      })
+    return () => {
+      alive = false
+    }
+  }, [id])
+  if (Number.isNaN(id) || resolved?.kind === 'missing') {
+    return <div className="p-6 text-[var(--color-muted)]">Comment not found.</div>
+  }
+  if (resolved == null) {
+    return <div className="p-6 text-[var(--color-muted)]">Loading…</div>
+  }
+  return <Navigate to={`/tasks/${resolved.taskId}#comment-${id}`} replace />
 }

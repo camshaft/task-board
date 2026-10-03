@@ -187,6 +187,9 @@ export interface AnswerPayload {
 
 export interface Comment {
   id: number
+  // Parent task id (comments are task-scoped). Returned by GET /comments/:id; used to deep-link a
+  // comment_NNN ref to its task view (task_1431).
+  task_id?: number
   author: string | null
   body: string
   created_at: string
@@ -778,6 +781,9 @@ export const api = {
   ) => req<Task>('PATCH', `/tasks/${id}`, b),
   commentTask: (id: number, b: { body: string; principal?: string }) =>
     req<{ comment_id: number; task_id: number }>('POST', `/tasks/${id}/comments`, b),
+  // Resolve one comment by id (carries its parent task_id) -- used to deep-link a comment_NNN ref
+  // to its task view (task_1431).
+  getComment: (commentId: number) => req<Comment>('GET', `/comments/${commentId}`),
   moveTask: (id: number, b: { to_project_id: number; principal?: string }) =>
     req<Task>('POST', `/tasks/${id}/move`, b),
 
