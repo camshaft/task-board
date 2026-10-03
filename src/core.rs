@@ -8791,12 +8791,88 @@ pub fn scan_non_ascii(text: &str) -> Vec<(char, usize, usize)> {
     out
 }
 
+/// Allow-list of acceptable all-caps tokens for the caps-for-emphasis lint (task_1473), PORTED from
+/// the fleet clean-prose ruleset (camshaft/fleet crates/fleet/prose-style.toml `caps_allow`) so the
+/// board gate matches the fleet lint-prose rule rather than inventing a parallel heuristic. Kept
+/// conservative; a token carrying a digit or underscore is an identifier and is never flagged, so it
+/// does not belong here. The sole board addition over the fleet list is CID (board-ubiquitous).
+const CAPS_ALLOW: &[&str] = &[
+    "ABI", "API", "ASCII", "AST", "CD", "CI", "CID", "CLI", "CPU", "DNS", "ETAG", "FIXME", "GB",
+    "GHA", "HTTP", "HTTPS", "ID", "IO", "JSON", "KB", "LAN", "MB", "MCP", "MIDI", "ML", "NOTE",
+    "OK", "OS", "PID", "PR", "RAM", "REST", "RPC", "SAFETY", "SHA", "SQL", "SRI", "SSH", "STT",
+    "TCP", "TODO", "TOML", "TTS", "UA", "UDP", "URI", "URL", "USB", "UTC", "UUID", "VPN", "WASI",
+    "WIT", "YAML",
+];
+
+/// Is `word` an all-caps emphasis token under the allow-list? Mirrors the fleet rule
+/// (prose_lint::is_caps_emphasis): two or more characters, every character an ASCII uppercase letter
+/// (so any digit or underscore rules it out as an identifier), and not allow-listed.
+fn is_caps_emphasis(word: &str, allow: &BTreeSet<&str>) -> bool {
+    word.len() >= 2 && word.chars().all(|c| c.is_ascii_uppercase()) && !allow.contains(word)
+}
+
+/// Every caps-for-emphasis token in `text`, in first-appearance order, deduped. PORTS the fleet
+/// `caps_emphasis_words` tokenizer (a word is a maximal run of ASCII letters, digits, and
+/// underscores, so `FLEET_HOST` or `HTTP2` is one identifier word and is skipped), with one board
+/// adaptation: markdown code spans/blocks are stripped first via `strip_code_regions` (the same
+/// pre-pass bare-ref detection uses), so an all-caps SQL keyword / env var / identifier written as
+/// code (`NOT NULL`, `DEFAULT`, `PATH`) is exempt and only bare-prose caps-for-emphasis is flagged.
+pub fn scan_caps_emphasis(text: &str) -> Vec<String> {
+    let allow: BTreeSet<&str> = CAPS_ALLOW.iter().copied().collect();
+    let stripped = strip_code_regions(text);
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut word = String::new();
+    for c in stripped.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+        } else if !word.is_empty() {
+            if is_caps_emphasis(&word, &allow) && seen.insert(word.clone()) {
+                out.push(word.clone());
+            }
+            word.clear();
+        }
+    }
+    if !word.is_empty() && is_caps_emphasis(&word, &allow) && seen.insert(word.clone()) {
+        out.push(word);
+    }
+    out
+}
+
+/// Pre-submit clean-prose lint (task_1473, operator-firm cameron directive via task_1438): bail if
+/// `text` uses all-caps words for emphasis, unless the author acknowledged. Mirrors the fleet
+/// lint-prose caps-for-emphasis rule, enforced as a board write-gate alongside the banned-phrase +
+/// ASCII checks. `acknowledge=true` is the soft-block escape (submit anyway) for a genuine
+/// missed-allowlist caps token. The message starts with "caps-for-emphasis" so the REST layer maps
+/// it to 400.
+pub fn check_caps_emphasis(text: &str, acknowledge: bool) -> anyhow::Result<()> {
+    if acknowledge {
+        return Ok(());
+    }
+    let hits = scan_caps_emphasis(text);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let list = hits
+        .iter()
+        .map(|w| format!("\"{w}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "caps-for-emphasis: {list}. That is not how we write here -- use normal sentence case and \
+         let the words carry the emphasis (or markdown emphasis), not capitals. Write a code \
+         identifier, SQL keyword, or env var in `backticks` so it reads as code, or pass \
+         acknowledge_banned=true to submit anyway."
+    );
+}
+
 /// Combined pre-submit content lint for authored free text (task/document comments + document
-/// versions): the ASCII-format check then the banned-phrase check, both honoring the same
-/// `acknowledge` escape hatch. One funnel so every authored surface runs the same checks and a new
-/// check only has to be added here.
+/// versions): the ASCII-format check, the caps-for-emphasis check, then the banned-phrase check, all
+/// honoring the same `acknowledge` escape hatch. One funnel so every authored surface runs the same
+/// checks and a new check only has to be added here.
 pub async fn check_content(pool: &Pool, text: &str, acknowledge: bool) -> anyhow::Result<()> {
     check_non_ascii(text, acknowledge)?;
+    check_caps_emphasis(text, acknowledge)?;
     check_banned_phrases(pool, text, acknowledge).await?;
     Ok(())
 }
@@ -8889,12 +8965,16 @@ pub async fn lint_text(pool: &Pool, text: &str) -> anyhow::Result<Value> {
             })
         })
         .collect();
+    // task_1473: the caps-for-emphasis finding, surfaced here so lint_text is a complete pre-send
+    // lint and an author can see every flagged all-caps token before the write-gate rejects it.
+    let caps_emphasis = scan_caps_emphasis(text);
     Ok(json!({
-        "clean": banned.is_empty() && non_ascii.is_empty() && bare_refs.is_empty(),
+        "clean": banned.is_empty() && non_ascii.is_empty() && bare_refs.is_empty() && caps_emphasis.is_empty(),
         "banned_phrases": banned,
         "non_ascii": non_ascii,
         "bare_refs": bare_refs,
         "soft_refs": soft_refs,
+        "caps_emphasis": caps_emphasis,
     }))
 }
 
@@ -26288,6 +26368,52 @@ mod tests {
         assert!(set_review_vetted(&pool, 99999, true, Some("x"), None)
             .await
             .is_err());
+        Ok(())
+    }
+
+    /// task_1473: the caps-for-emphasis lint flags bare all-caps emphasis words, allows the ported
+    /// fleet acronym allow-list, skips identifiers (underscore/digit) and single letters, exempts
+    /// all-caps tokens written inside code spans, and is acknowledge-able. lint_text surfaces it.
+    #[tokio::test]
+    async fn caps_emphasis_lint_flags_shouting_allows_acronyms_code_and_is_acknowledgeable(
+    ) -> anyhow::Result<()> {
+        // Bare all-caps emphasis words are flagged.
+        let hits = scan_caps_emphasis("this is REALLY important and MUST land");
+        assert!(
+            hits.contains(&"REALLY".to_string()) && hits.contains(&"MUST".to_string()),
+            "bare caps emphasis flagged: {hits:?}"
+        );
+        // Ported fleet acronyms + the board CID addition pass unflagged.
+        assert!(
+            scan_caps_emphasis("the API returns a CID over HTTP via REST and JSON").is_empty(),
+            "allow-listed acronyms pass"
+        );
+        // Identifiers (underscore or digit) are one word and skipped; single letters never flag.
+        assert!(
+            scan_caps_emphasis("set FLEET_HOST and HTTP2, grade A on item x").is_empty(),
+            "identifiers + single letters are not caps-emphasis"
+        );
+        // SQL keywords / env vars / identifiers written as code are exempt (code-region stripping).
+        assert!(
+            scan_caps_emphasis("the column is `NOT NULL` with `DEFAULT 0`; export `PATH`")
+                .is_empty(),
+            "all-caps tokens inside code spans are exempt"
+        );
+        // A bare SQL keyword used as prose emphasis is still caught; acknowledge is the escape.
+        assert!(scan_caps_emphasis("you SHALL NOT pass").contains(&"SHALL".to_string()));
+        assert!(check_caps_emphasis("do NOT shout", false).is_err());
+        assert!(check_caps_emphasis("do NOT shout", true).is_ok());
+        assert!(check_caps_emphasis("this reads as ordinary prose", false).is_ok());
+
+        // lint_text surfaces the caps finding and reflects it in `clean`.
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let dirty = lint_text(&pool, "this is WRONG").await?;
+        assert_eq!(dirty["caps_emphasis"], json!(["WRONG"]));
+        assert_eq!(dirty["clean"], json!(false));
+        let clean = lint_text(&pool, "this is fine prose with an API call").await?;
+        assert_eq!(clean["caps_emphasis"].as_array().unwrap().len(), 0);
+        assert_eq!(clean["clean"], json!(true));
         Ok(())
     }
 
