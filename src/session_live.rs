@@ -98,6 +98,7 @@ impl FrameHub {
     /// Current attacher (receiver) count for an agent on the live bus. This is the LIVE fan-out
     /// count for diagnostics; the authoritative attach reference count that gates push-on / off is
     /// the durable `session_attachments` row count, not this.
+    #[allow(dead_code)] // live diagnostic helper; exercised by tests, no prod caller yet
     pub fn receiver_count(&self, agent_id: &str) -> usize {
         self.agents
             .lock()

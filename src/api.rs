@@ -4772,7 +4772,7 @@ async fn session_attach(
                     // Drop-oldest gap: tell the attacher how many frames it missed so it brackets
                     // the dropped frame_seq range (last-seen..next-seen) and re-pulls the chunk log.
                     Ok(Event::default()
-                        .json_data(&json!({ "type": "gap", "dropped": n }))
+                        .json_data(json!({ "type": "gap", "dropped": n }))
                         .unwrap_or_else(|_| Event::default().comment("gap")))
                 }
             }
