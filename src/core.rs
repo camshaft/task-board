@@ -1007,12 +1007,21 @@ pub async fn resolve_agent(pool: &Pool, name: &str) -> anyhow::Result<Value> {
 /// and `meta_key`/`meta_value` (equality on a scalar metadata field, e.g. area/host — for routing
 /// a task to an owning vertical). Always bounded by `limit` (default 200, max 1000) + `offset`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn list_agents(
     pool: &Pool,
     status: Option<&str>,
     q: Option<&str>,
     meta_key: Option<&str>,
     meta_value: Option<&str>,
+    // task_1456: the declared lifecycle_intent WHERE filter (run|paused|retired) the reconciler
+    // reads to get the desired-fleet-state set in one round trip -- e.g. intent=run is the
+    // desired-live set. A real column (unlike the derived `retired` bool, which is post-filtered
+    // in filter_agents_retired), so it filters in SQL like `status`. Independent of presence:
+    // intent=run matches regardless of the live `status` (an intent=run agent that is offline is a
+    // needs-spin-up member of the desired-live set). Pass-through value; the enum is validated at
+    // the write path (set_lifecycle_intent), so an unknown value here simply matches no rows.
+    lifecycle_intent: Option<&str>,
     verbose: bool,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -1038,6 +1047,9 @@ pub async fn list_agents(
     if use_meta {
         conds.push("json_extract(metadata, '$.' || ?) = ?");
     }
+    if lifecycle_intent.is_some() {
+        conds.push("lifecycle_intent=?");
+    }
     if !conds.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&conds.join(" AND "));
@@ -1058,6 +1070,9 @@ pub async fn list_agents(
         query = query
             .bind(meta_key.unwrap().to_string())
             .bind(meta_value.unwrap().to_string());
+    }
+    if let Some(li) = lifecycle_intent {
+        query = query.bind(li.to_string());
     }
     query = query.bind(lim).bind(off);
     let rows = query.fetch_all(pool).await?;
@@ -19042,7 +19057,7 @@ mod tests {
         assert_eq!(a["lifecycle_intent"], json!("run"));
         assert_eq!(a["priority"], json!("normal"));
         assert_eq!(a["retired"], json!(false));
-        let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
+        let roster = list_agents(&pool, None, None, None, None, None, false, None, None).await?;
         let entry = roster
             .as_array()
             .unwrap()
@@ -19155,6 +19170,159 @@ mod tests {
         Ok(())
     }
 
+    /// task_1456: the desired-fleet-state surface. The reconciler reads the declared desired set +
+    /// each agent's lifecycle_intent in one round trip via the list_agents intent filter, driving on
+    /// DECLARED intent (not live presence), and is woken on any agent's intent change by a board +
+    /// ["agent"] classed subscription -- no poll. Covers acceptance (1) one-round-trip desired-state
+    /// + intent=run filter, (3) a subscribed reconciler wakes on agent.intent_changed, (4) intent is
+    /// independent of presence.
+    #[tokio::test]
+    async fn list_agents_desired_fleet_state_filter_and_reconciler_wake() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "v-run", None, None, None, None, None).await?;
+        register_agent(&pool, "v-run-off", None, None, None, None, None).await?;
+        register_agent(&pool, "v-paused", None, None, None, None, None).await?;
+        register_agent(&pool, "v-ret", None, None, None, None, None).await?;
+        register_agent(&pool, "reconciler", None, None, None, None, None).await?;
+
+        // The reconciler subscribes to the fleet control-plane class BEFORE any intent change, so it
+        // is push-woken on every subsequent agent.intent_changed regardless of which agent changed.
+        subscribe_classed(
+            &pool,
+            "reconciler",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &["agent".to_string()],
+        )
+        .await?;
+
+        // Presence is INDEPENDENT of intent: a desired-live (intent=run) agent that is currently
+        // offline is still a member of the desired-live set (it needs spin-up), and a paused agent
+        // that is currently online is NOT.
+        set_status(&pool, "v-run-off", "offline", None).await?;
+        set_lifecycle_intent(&pool, "v-paused", "paused", Some("cameron"), Some("drain")).await?;
+        retire_agent(&pool, "v-ret", "board-pm", Some("gone")).await?;
+
+        // Acceptance (1) + (4): one list_agents call returns the desired-live set (intent=run),
+        // presence-independent -- v-run (online) AND v-run-off (offline) are in, v-paused (online but
+        // paused) and v-ret (retired) are out.
+        let live = list_agents(
+            &pool,
+            None,
+            None,
+            None,
+            None,
+            Some("run"),
+            false,
+            None,
+            None,
+        )
+        .await?;
+        let mut live_ids: Vec<String> = live
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap().to_string())
+            .collect();
+        live_ids.sort();
+        assert_eq!(
+            live_ids,
+            vec!["reconciler".to_string(), "v-run".to_string(), "v-run-off".to_string()],
+            "intent=run is the desired-live set, independent of presence (v-run-off is offline but \
+             still desired-live; v-paused/v-ret excluded): {live}"
+        );
+        // Each returned entry carries the config handle the reconciler drives on: id + the declared
+        // lifecycle_intent + the metadata bag (role/model/effort/interval/repos), in one round trip.
+        let entry = live
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!("v-run-off"))
+            .unwrap();
+        assert_eq!(entry["lifecycle_intent"], json!("run"));
+        assert!(
+            entry.get("metadata").is_some(),
+            "config handle present: {entry}"
+        );
+
+        // The paused and retired values filter cleanly too.
+        let paused = list_agents(
+            &pool,
+            None,
+            None,
+            None,
+            None,
+            Some("paused"),
+            false,
+            None,
+            None,
+        )
+        .await?;
+        let paused_ids: Vec<&str> = paused
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paused_ids,
+            vec!["v-paused"],
+            "intent=paused filter: {paused}"
+        );
+        let retired = list_agents(
+            &pool,
+            None,
+            None,
+            None,
+            None,
+            Some("retired"),
+            false,
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            retired
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == json!("v-ret")),
+            "intent=retired filter returns the retired agent: {retired}"
+        );
+
+        // Acceptance (3): the reconciler was woken (inbox delivery via its board+["agent"] classed
+        // subscription) on BOTH a run->paused change and the terminal retire stamp, naming the agent
+        // + new intent -- so it reconciles on declared intent with no poll.
+        let woke =
+            check_notifications(&pool, "reconciler", false, 50, Some("agent.intent_changed"))
+                .await?;
+        let n = woke["notifications"].as_array().unwrap();
+        let changed: std::collections::BTreeMap<&str, &str> = n
+            .iter()
+            .map(|e| {
+                (
+                    e["data"]["agent_id"].as_str().unwrap(),
+                    e["data"]["new_intent"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            changed.get("v-paused"),
+            Some(&"paused"),
+            "reconciler woken on v-paused run->paused: {woke}"
+        );
+        assert_eq!(
+            changed.get("v-ret"),
+            Some(&"retired"),
+            "reconciler woken on v-ret terminal retire stamp: {woke}"
+        );
+        Ok(())
+    }
+
     /// list_agents is a lightweight roster by default (task #418): compact {id, display_name,
     /// status}, no charter/metadata blob; verbose returns the full objects; status/q/meta filters
     /// and limit/offset narrow it.
@@ -19200,7 +19368,7 @@ mod tests {
         // Default: compact projection — id/display_name/status + the small metadata bag (consumers
         // filter on it, e.g. the fleet watchdog on metadata.native, task 477), but NOT the large
         // charter (the compaction that keeps the roster under the token cap, #418).
-        let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
+        let roster = list_agents(&pool, None, None, None, None, None, false, None, None).await?;
         let arr = roster.as_array().unwrap();
         assert_eq!(arr.len(), 3);
         for a in arr {
@@ -19219,7 +19387,7 @@ mod tests {
         assert_eq!(compiler["metadata"]["area"], json!("compiler"));
 
         // verbose -> full objects (charter present).
-        let full = list_agents(&pool, None, None, None, None, true, None, None).await?;
+        let full = list_agents(&pool, None, None, None, None, None, true, None, None).await?;
         assert!(full
             .as_array()
             .unwrap()
@@ -19227,14 +19395,35 @@ mod tests {
             .all(|a| a["charter"].is_string()));
 
         // status filter.
-        let online =
-            list_agents(&pool, Some("online"), None, None, None, false, None, None).await?;
+        let online = list_agents(
+            &pool,
+            Some("online"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await?;
         let online = online.as_array().unwrap();
         assert_eq!(online.len(), 1);
         assert_eq!(online[0]["id"], json!("v-compiler"));
 
         // q substring over id + display_name.
-        let q = list_agents(&pool, None, Some("runtime"), None, None, false, None, None).await?;
+        let q = list_agents(
+            &pool,
+            None,
+            Some("runtime"),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await?;
         assert_eq!(q.as_array().unwrap().len(), 1);
         assert_eq!(q.as_array().unwrap()[0]["id"], json!("v-runtime"));
 
@@ -19245,6 +19434,7 @@ mod tests {
             None,
             Some("area"),
             Some("compiler"),
+            None,
             false,
             None,
             None,
@@ -19254,8 +19444,10 @@ mod tests {
         assert_eq!(by_area.as_array().unwrap()[0]["id"], json!("v-compiler"));
 
         // limit + offset paginate.
-        let page1 = list_agents(&pool, None, None, None, None, false, Some(2), Some(0)).await?;
-        let page2 = list_agents(&pool, None, None, None, None, false, Some(2), Some(2)).await?;
+        let page1 =
+            list_agents(&pool, None, None, None, None, None, false, Some(2), Some(0)).await?;
+        let page2 =
+            list_agents(&pool, None, None, None, None, None, false, Some(2), Some(2)).await?;
         assert_eq!(page1.as_array().unwrap().len(), 2);
         assert_eq!(page2.as_array().unwrap().len(), 1);
         Ok(())
@@ -19282,7 +19474,7 @@ mod tests {
         )
         .await?;
 
-        let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
+        let roster = list_agents(&pool, None, None, None, None, None, false, None, None).await?;
         let entry = roster
             .as_array()
             .unwrap()
@@ -24309,7 +24501,7 @@ mod tests {
         );
 
         // Surfacing + roster filter: gone-agent is retired; retired=true isolates it.
-        let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
+        let roster = list_agents(&pool, None, None, None, None, None, false, None, None).await?;
         let gone = roster
             .as_array()
             .unwrap()

@@ -243,6 +243,11 @@ pub struct ListAgentsArgs {
     pub meta_key: Option<String>,
     #[serde(default)]
     pub meta_value: Option<String>,
+    /// task_1456: filter by declared lifecycle_intent (run | paused | retired) -- the desired-fleet-state
+    /// read a reconciler drives on. lifecycle_intent=run is the desired-live set (independent of live
+    /// presence) in one round trip. Omit for all.
+    #[serde(default)]
+    pub lifecycle_intent: Option<String>,
     /// Return full agent objects (incl the heavy charter) instead of the compact {id, display_name,
     /// status, metadata} roster projection. Default false.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
@@ -2232,6 +2237,7 @@ impl Board {
             s(&a.q),
             s(&a.meta_key),
             s(&a.meta_value),
+            s(&a.lifecycle_intent),
             a.verbose.unwrap_or(false),
             a.limit,
             a.offset,

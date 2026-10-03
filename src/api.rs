@@ -888,7 +888,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
     Endpoint { method: "GET", path: "/api/metrics", summary: "Request metrics for optimizing board/fleet performance (task_1380): per-endpoint latency p50/p90/p99 in ms (approximate, from coarse log-spaced buckets), request count + process start (a throughput basis), the in-flight / max-in-flight concurrency gauge (a hang shows as a stuck-high in_flight), and 2xx/4xx/5xx status-class counts, plus an overall rollup. Keys are METHOD + route template relative to the /api mount. Aggregate numbers only, mutates nothing.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/admin/db-snapshot", summary: "Download a point-in-time-consistent copy of the SQLite database (VACUUM INTO, integrity-checked), behind HTTP Basic auth. Disabled by default (404 when off); the deployment keeps it loopback/LAN-bound and off the public tunnel. The extraction primitive for host migration + DR.", query: "", body: None },
-    Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata, retired} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match), retired (true=only terminally-gone agents, false=only live). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&retired=bool&limit=int&offset=int", body: None },
+    Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata, retired} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match), lifecycle_intent (run|paused|retired declared desired-fleet-state, independent of live presence; lifecycle_intent=run is the desired-live set), retired (true=only terminally-gone agents, false=only live). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&lifecycle_intent=str&verbose=bool&retired=bool&limit=int&offset=int", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
     Endpoint { method: "GET", path: "/api/resolve-agent", summary: "Resolve an agent name to one exact agent id (task_1251): an exact id wins (never ambiguous even when it is a prefix of a longer id), a unique case-insensitive substring resolves, an ambiguous substring is refused (400) with the sorted candidate ids. The safe recipient-resolver vs picking the first row of a q= search. Returns {name, id, match}.", query: "name=str", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
@@ -1297,6 +1297,11 @@ struct ListAgentsQuery {
     q: Option<String>,
     meta_key: Option<String>,
     meta_value: Option<String>,
+    /// task_1456: filter by declared lifecycle_intent (run|paused|retired). The desired-fleet-state
+    /// read the reconciler drives on -- lifecycle_intent=run is the desired-live set in one round
+    /// trip, independent of live presence. A real column, so it filters in SQL (unlike the derived
+    /// `retired` audit flag below, which post-filters the projection).
+    lifecycle_intent: Option<String>,
     #[serde(default)]
     verbose: bool,
     /// task_1363: true = only retired/gone agents, false = only live. Omit for all.
@@ -1315,6 +1320,7 @@ async fn list_agents(
         query.q.as_deref(),
         query.meta_key.as_deref(),
         query.meta_value.as_deref(),
+        query.lifecycle_intent.as_deref(),
         query.verbose,
         query.limit,
         query.offset,

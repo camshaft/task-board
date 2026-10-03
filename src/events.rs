@@ -94,6 +94,12 @@ fn event_in_classes(event_type: &str, data: &Value, classes: &[String]) -> bool 
         }
         "review" => event_type.starts_with("review."),
         "doc" => event_type.starts_with("document."),
+        // agent = the fleet control-plane class (task_1456): any agent lifecycle/config event --
+        // agent.intent_changed (declared run|paused|retired intent), agent.updated (config change the
+        // reconciler hot-reloads), agent.stand_down_requested. A control-plane reconciler subscribes
+        // board + ["agent"] once and gets a genuine push-wake (subscribed=true) on every such change,
+        // so it reconciles the desired-fleet-state on declared intent with no poll (ask 2 acceptance).
+        "agent" => event_type.starts_with("agent."),
         _ => false,
     })
 }
