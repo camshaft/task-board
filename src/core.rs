@@ -7714,12 +7714,84 @@ async fn dm_limbo_block_reason(
     )))
 }
 
+/// task_1391 board hardening: resolve a DM `to_agent` so a bare, AMBIGUOUS agent name errors loudly
+/// rather than silently opening a DM to a dead/wrong inbox (the v-fleet-tooling vs
+/// v-fleet-tooling-helper misroute class). A DM recipient is NOT always an agent -- it can be an
+/// identity alias (e.g. "operator" -> cameron) or a bridged person (cameron, moose) that is not in
+/// the agents table -- so the agent substring resolver is applied ONLY to a bare name that is not
+/// already a known recipient. Resolve in order, first hit wins verbatim:
+///   (1) an exact agent id -- never ambiguous even as a prefix of a longer id, so v-fleet-tooling
+///       and v-fleet-tooling-helper each route to themselves;
+///   (2) an identity alias (identity_aliases) -- the alias/person path dm_limbo_block_reason relies on;
+///   (3) an exact person id (people);
+/// then (4) the agent substring set (literal case-insensitive, via instr so `_`/`-` are not LIKE
+/// wildcards): exactly one -> resolve it (a unique partial reaches the real inbox instead of a dead
+/// channel); MULTIPLE -> error listing the sorted candidates (the guardrail -- never silently pick);
+/// NONE -> verbatim (an unknown id is a normal agent-style DM, matching dm_limbo_block_reason).
+/// Only step (4) is the new ambiguity guard; steps (1)-(3) preserve today's behavior for exact agent
+/// ids, aliases, and people.
+async fn resolve_dm_recipient(pool: &Pool, to_agent: &str) -> anyhow::Result<String> {
+    let name = to_agent.trim();
+    if name.is_empty() {
+        anyhow::bail!("give a recipient agent id");
+    }
+    // (1) exact agent id wins outright.
+    if sqlx::query("SELECT 1 FROM agents WHERE id=?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
+        return Ok(name.to_string());
+    }
+    // (2) a known identity alias and (3) an exact person id are non-agent recipients -> verbatim.
+    let is_alias = sqlx::query("SELECT 1 FROM identity_aliases WHERE alias=?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+    let is_person = sqlx::query("SELECT 1 FROM people WHERE id=?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+    if is_alias || is_person {
+        return Ok(name.to_string());
+    }
+    // (4) agent substring candidates: unique -> resolve; multiple -> error; none -> verbatim.
+    let needle = name.to_lowercase();
+    let ids: Vec<String> =
+        sqlx::query("SELECT id FROM agents WHERE instr(lower(id), ?) > 0 ORDER BY id")
+            .bind(&needle)
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("id").ok())
+            .collect();
+    match ids.len() {
+        0 => Ok(name.to_string()),
+        1 => Ok(ids.into_iter().next().expect("len==1")),
+        _ => anyhow::bail!(BoardError::bad_request(format!(
+            "'{name}' is ambiguous as a DM recipient: it matches {} agents by substring ({}). \
+             Pass the exact agent id.",
+            ids.len(),
+            ids.join(", ")
+        ))),
+    }
+}
+
 pub async fn send_message(
     pool: &Pool,
     from_agent: &str,
     to_agent: &str,
     body: &str,
 ) -> anyhow::Result<Value> {
+    // task_1391: resolve the recipient exact-first so a bare ambiguous agent name errors loudly
+    // instead of silently DMing a dead/wrong inbox. Aliases, people, and exact agent ids are
+    // untouched (see resolve_dm_recipient). The resolved id is used for the limbo check, the DM
+    // channel, and the returned `to`.
+    let to_agent = resolve_dm_recipient(pool, to_agent).await?;
+    let to_agent = to_agent.as_str();
     // task_1164 (REJECT flip): refuse a non-concierge DM to a limbo human (no agent loop, no Slack
     // bridge) BEFORE creating the channel or delivering -- it would vanish into an unmonitored inbox.
     // The route-via-concierge norm is now seeded fleet-wide (seed-before-flip gate met), so this is a
@@ -26570,6 +26642,89 @@ mod tests {
         assert_eq!(u["match"], json!("unique-substring"));
         // No match errors.
         assert!(resolve_agent(&pool, "nobody-here").await.is_err());
+        Ok(())
+    }
+
+    /// task_1391: send_message hardens the recipient so a bare AMBIGUOUS agent name
+    /// (v-fleet-tooling vs -helper) errors with the candidates instead of silently opening a DM to a
+    /// dead/wrong inbox, while exact agent ids, identity aliases, and bridged people are untouched
+    /// (steps 1-3 pass through verbatim; only a bare unresolved name hits the substring guard).
+    #[tokio::test]
+    async fn send_message_recipient_guard_spares_alias_and_person() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "alice", None, None, None, None, None).await?;
+        register_agent(&pool, "v-fleet-tooling", None, None, None, None, None).await?;
+        register_agent(
+            &pool,
+            "v-fleet-tooling-helper",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        register_agent(&pool, "board-pm", None, None, None, None, None).await?;
+
+        // Exact agent id wins even though it is a strict prefix of -helper.
+        let r = send_message(&pool, "alice", "v-fleet-tooling", "hi").await?;
+        assert_eq!(
+            r["to"],
+            json!("v-fleet-tooling"),
+            "exact id routes to itself, not -helper"
+        );
+        assert_eq!(r["delivered"], json!(true));
+        // The exact -helper id routes to the helper.
+        assert_eq!(
+            send_message(&pool, "alice", "v-fleet-tooling-helper", "hi").await?["to"],
+            json!("v-fleet-tooling-helper")
+        );
+
+        // A bare AMBIGUOUS agent substring errors with both candidates (never silently picks).
+        let e = send_message(&pool, "alice", "fleet-tooling", "hi")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ambiguous"), "unexpected error: {e}");
+        assert!(
+            e.contains("v-fleet-tooling") && e.contains("v-fleet-tooling-helper"),
+            "lists candidates: {e}"
+        );
+
+        // A bare UNIQUE agent substring resolves to the one agent (reaches the real inbox).
+        let u = send_message(&pool, "alice", "board", "hi").await?;
+        assert_eq!(u["to"], json!("board-pm"), "unique partial resolves");
+
+        // An identity alias is a non-agent recipient -> verbatim, NOT run through the agent guard:
+        // the alias "fleet-tooling" would otherwise be an ambiguous agent substring (asserted to
+        // error above), but as an alias it passes through and delivers (limbo resolves it to the
+        // reachable board-pm).
+        set_identity_alias(&pool, "fleet-tooling", "board-pm", Some("alice")).await?;
+        let a = send_message(&pool, "alice", "fleet-tooling", "hi").await?;
+        assert_eq!(
+            a["to"],
+            json!("fleet-tooling"),
+            "alias passes through verbatim"
+        );
+        assert_eq!(
+            a["delivered"],
+            json!(true),
+            "alias recipient still delivers"
+        );
+
+        // A bridged person is a non-agent recipient -> verbatim, delivers (not limbo-blocked).
+        create_person(
+            &pool,
+            "moose",
+            Some("Moose"),
+            Some("alice"),
+            Some(json!({ "bridged": true })),
+        )
+        .await?;
+        let p = send_message(&pool, "alice", "moose", "hi").await?;
+        assert_eq!(p["to"], json!("moose"), "person passes through verbatim");
+        assert_eq!(p["delivered"], json!(true), "bridged person still delivers");
         Ok(())
     }
 
