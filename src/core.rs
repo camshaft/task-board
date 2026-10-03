@@ -8164,6 +8164,96 @@ pub async fn check_notifications(
     Ok(json!({ "count": items.len(), "notifications": items }))
 }
 
+/// task_1490 (no-lost-wake soundness fix): a recipient-filtered, since-seq inbox read -- the clean
+/// primitive the harness drives at-least-once delivery on, decoupled from acking. Returns the
+/// recipient's own events (via its inbox) with event seq STRICTLY GREATER than a client-persisted
+/// cursor, in seq order, bounded by `limit`, with NO ack side-effect (unlike check_notifications,
+/// which defaults mark_read=true and acks on fetch). The harness persists its last durably-processed
+/// seq and replays its own events from it after a crash, without the fetch-ack coupling or the
+/// inbox-never-drains hack. `last_seq` in the response is the max seq returned, i.e. the next cursor.
+/// Independent of read_at (the client cursor is the source of truth), so a replay with an older
+/// cursor re-delivers -- at-least-once by design; pair with ack_inbox for pruning + the legacy unread
+/// view. Additive: check_notifications' semantics are unchanged.
+pub async fn read_inbox_since(
+    pool: &Pool,
+    recipient: &str,
+    since_seq: i64,
+    limit: i64,
+) -> anyhow::Result<Value> {
+    let recipient = recipient.trim();
+    if recipient.is_empty() {
+        anyhow::bail!(BoardError::bad_request("recipient is required".to_string()));
+    }
+    let lim = limit.clamp(1, 1000);
+    let rows = sqlx::query(
+        "SELECT e.seq, e.type, e.actor, e.project_id, e.task_id, e.data, e.created_at \
+         FROM inbox i JOIN events e ON e.seq=i.event_seq \
+         WHERE i.recipient=? AND e.seq>? ORDER BY e.seq ASC LIMIT ?",
+    )
+    .bind(recipient)
+    .bind(since_seq)
+    .bind(lim)
+    .fetch_all(pool)
+    .await?;
+    let mut items = Vec::new();
+    for r in &rows {
+        let mut d = row_to_json(r);
+        if let Value::Object(ref mut m) = d {
+            let data: Value = m
+                .get("data")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| json!({}));
+            m.insert("data".into(), data);
+        }
+        items.push(d);
+    }
+    // Resolve external_author display names (parity with check_notifications), after the fetch.
+    for item in &mut items {
+        if let Some(data) = item.get_mut("data") {
+            add_external_author_name(pool, data).await;
+        }
+    }
+    let last_seq = items
+        .last()
+        .and_then(|i| i.get("seq"))
+        .and_then(Value::as_i64)
+        .unwrap_or(since_seq);
+    Ok(json!({
+        "recipient": recipient,
+        "since_seq": since_seq,
+        "count": items.len(),
+        "last_seq": last_seq,
+        "notifications": items,
+    }))
+}
+
+/// task_1490: a seq-scoped ack -- mark the recipient's inbox rows read UP TO a durably-processed seq
+/// (inclusive), so at-least-once delivery no longer depends on the client draining with
+/// mark_read=false, and acked rows become prunable. Advances read_at only on currently-unread rows at
+/// or below `through_seq`; idempotent (a re-ack through the same or a lower seq is a no-op). Does NOT
+/// change check_notifications' default semantics -- it is the explicit, decoupled ack that pairs with
+/// read_inbox_since. Returns the number of rows acked.
+pub async fn ack_inbox(pool: &Pool, recipient: &str, through_seq: i64) -> anyhow::Result<Value> {
+    let recipient = recipient.trim();
+    if recipient.is_empty() {
+        anyhow::bail!(BoardError::bad_request("recipient is required".to_string()));
+    }
+    let res = sqlx::query(
+        "UPDATE inbox SET read_at=? WHERE recipient=? AND event_seq<=? AND read_at IS NULL",
+    )
+    .bind(now_iso())
+    .bind(recipient)
+    .bind(through_seq)
+    .execute(pool)
+    .await?;
+    Ok(json!({
+        "recipient": recipient,
+        "through_seq": through_seq,
+        "acked": res.rows_affected(),
+    }))
+}
+
 /// Send a direct message. A DM is just a post to the private 1:1 channel for the pair, so
 /// there's one data model — but the wire behavior is unchanged: the post is emitted as a
 /// `message.direct` event (post_to_channel derives that type for DM channels) delivered to
@@ -21980,6 +22070,97 @@ mod tests {
 
         // Unknown agent -> clean error, not a hollow bundle.
         assert!(recall_bundle(&pool, "nobody", None, 50, 50).await.is_err());
+        Ok(())
+    }
+
+    /// task_1490 (no-lost-wake soundness): the recipient-filtered since-seq read + seq-scoped ack
+    /// give the crash-safe pattern -- read since a persisted cursor (no ack on fetch), process, ack
+    /// up to the processed seq, re-read from the cursor returns only greater-than-acked -- without the
+    /// check_notifications fetch-ack coupling. Robust to any extra delivery events: it drives off the
+    /// read's own seqs.
+    #[tokio::test]
+    async fn inbox_since_read_and_seq_ack_crash_safe_pattern() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "sender", None, None, None, None, None).await?;
+        register_agent(&pool, "rcv", None, None, None, None, None).await?;
+        send_message(&pool, "sender", "rcv", "m1").await?;
+        send_message(&pool, "sender", "rcv", "m2").await?;
+        send_message(&pool, "sender", "rcv", "m3").await?;
+
+        // (1) recipient-filtered since-seq read from cursor 0: the recipient's events, seq-ordered.
+        let r = read_inbox_since(&pool, "rcv", 0, 50).await?;
+        let seqs: Vec<i64> = r["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["seq"].as_i64().unwrap())
+            .collect();
+        let n = seqs.len();
+        assert!(n >= 3, "all delivered events are readable: {r}");
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "strictly seq-ascending"
+        );
+        assert_eq!(
+            r["last_seq"].as_i64().unwrap(),
+            seqs[n - 1],
+            "last_seq is the next cursor"
+        );
+
+        // No ack on fetch: a re-read from 0 still returns everything, and check_notifications (unread)
+        // is untouched -- read_inbox_since has no ack side-effect (acceptance 1 vs the fetch-ack footgun).
+        let r2 = read_inbox_since(&pool, "rcv", 0, 50).await?;
+        assert_eq!(
+            r2["notifications"].as_array().unwrap().len(),
+            n,
+            "fetch does not mark read"
+        );
+        let unread = check_notifications(&pool, "rcv", false, 50, None).await?;
+        assert_eq!(
+            unread["count"].as_i64().unwrap(),
+            n as i64,
+            "unread view untouched by the read"
+        );
+
+        // Process through the second-to-last seq, then seq-ack through it (acceptance 2).
+        let cursor = seqs[n - 2];
+        let acked = ack_inbox(&pool, "rcv", cursor).await?;
+        assert_eq!(
+            acked["acked"].as_i64().unwrap(),
+            (n - 1) as i64,
+            "acked every row up to the cursor"
+        );
+
+        // (4) crash-safe: re-read from the acked cursor returns only the greater-than-acked event(s).
+        let r3 = read_inbox_since(&pool, "rcv", cursor, 50).await?;
+        let after: Vec<i64> = r3["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            after,
+            vec![seqs[n - 1]],
+            "only the unprocessed event remains above the cursor"
+        );
+
+        // The seq-ack advanced read_at: check_notifications now shows only the one unacked row.
+        let unread2 = check_notifications(&pool, "rcv", false, 50, None).await?;
+        assert_eq!(
+            unread2["count"].as_i64().unwrap(),
+            1,
+            "seq-ack advanced read_at below the cursor"
+        );
+
+        // Idempotent: re-acking through the same seq acks nothing new.
+        let acked2 = ack_inbox(&pool, "rcv", cursor).await?;
+        assert_eq!(acked2["acked"].as_i64().unwrap(), 0, "re-ack is a no-op");
+
+        // Empty recipient -> clean error.
+        assert!(read_inbox_since(&pool, "", 0, 50).await.is_err());
+        assert!(ack_inbox(&pool, "", 1).await.is_err());
         Ok(())
     }
 

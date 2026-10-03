@@ -1714,6 +1714,29 @@ pub struct CheckNotificationsArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ReadInboxSinceArgs {
+    /// Whose inbox. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Return only events with seq strictly greater than this cursor (omit/0 = from the start).
+    #[serde(default)]
+    pub since_seq: i64,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AckInboxArgs {
+    /// Whose inbox. Defaults to the agent this session registered as.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Mark inbox rows read up to and including this durably-processed seq.
+    pub through_seq: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SendMessageArgs {
     /// Sender. Defaults to the agent this session registered as.
     #[serde(rename = "principal", alias = "from_agent", default)]
@@ -4147,6 +4170,34 @@ impl Board {
     ) -> Result<CallToolResult, McpError> {
         let me = self.me_req(a.agent_id.as_deref())?;
         core::check_notifications(&self.pool, &me, a.mark_read, a.limit, None)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Recipient-filtered since-seq inbox read (task_1490): your own events with seq strictly greater than `since_seq`, in seq order, bounded by `limit`, with NO ack side-effect (fetching never marks read, unlike check_notifications). The no-lost-wake primitive -- persist your last durably-processed seq and replay from it after a restart without the fetch-ack coupling. `last_seq` is the next cursor. Pair with ack_inbox to prune acked rows."
+    )]
+    async fn read_inbox_since(
+        &self,
+        Parameters(a): Parameters<ReadInboxSinceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let me = self.me_req(a.agent_id.as_deref())?;
+        core::read_inbox_since(&self.pool, &me, a.since_seq, a.limit)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Seq-scoped ack (task_1490): mark your inbox read up to and including a durably-processed seq, so at-least-once delivery does not depend on drain discipline and acked rows become prunable. Idempotent (a re-ack through the same or a lower seq is a no-op). Does not change check_notifications default semantics; pairs with read_inbox_since."
+    )]
+    async fn ack_inbox(
+        &self,
+        Parameters(a): Parameters<AckInboxArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let me = self.me_req(a.agent_id.as_deref())?;
+        core::ack_inbox(&self.pool, &me, a.through_seq)
             .await
             .map_err(err)
             .and_then(ok)
