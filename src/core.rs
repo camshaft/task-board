@@ -11120,6 +11120,283 @@ pub async fn list_agent_config_entries(
     }))
 }
 
+/// The budget cap scopes (task_1461, doc_3426 ask 6): a cap is set per agent or per role.
+pub const BUDGET_SCOPES: &[&str] = &["agent", "role"];
+/// The budget rolling-window kinds. Each is a rolling horizon; `total` is lifetime (no reset).
+pub const BUDGET_WINDOWS: &[&str] = &["hour", "day", "week", "month", "total"];
+
+/// Rolling-window lower bound for a budget `window_kind` (task_1461): current spend is the sum of
+/// costs whose created_at is at or after this instant. `total` (or an unknown kind) has no lower
+/// bound = lifetime. The ISO-8601 micros/UTC format matches now_iso(), so the string compare on
+/// created_at is a chronological compare.
+fn budget_window_start(window_kind: &str) -> Option<String> {
+    let dur = match window_kind {
+        "hour" => chrono::Duration::hours(1),
+        "day" => chrono::Duration::hours(24),
+        "week" => chrono::Duration::days(7),
+        "month" => chrono::Duration::days(30),
+        _ => return None,
+    };
+    Some((chrono::Utc::now() - dur).to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+}
+
+/// Sum an agent's spend over a rolling window (task_1461), deterministically from the append-only
+/// ledger -- no stored running counter to drift. `total` sums the whole ledger for the agent.
+async fn budget_current_spend(
+    pool: &Pool,
+    agent_id: &str,
+    window_kind: &str,
+) -> anyhow::Result<f64> {
+    let spend: f64 = match budget_window_start(window_kind) {
+        Some(start) => sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost),0.0) FROM budget_spend WHERE agent_id=? AND created_at>=?",
+        )
+        .bind(agent_id)
+        .bind(start)
+        .fetch_one(pool)
+        .await?,
+        None => {
+            sqlx::query_scalar("SELECT COALESCE(SUM(cost),0.0) FROM budget_spend WHERE agent_id=?")
+                .bind(agent_id)
+                .fetch_one(pool)
+                .await?
+        }
+    };
+    Ok(spend)
+}
+
+/// Set (upsert) an editable budget cap (task_1461, doc_3426 ask 6), scoped to an agent or a role.
+/// Bumps `version` on every edit and emits `budget.updated` so a subscriber hot-reloads (acceptance
+/// 3): an agent-scope change wakes that agent; a role-scope change wakes every agent of that role.
+/// The caps are pure config data -- the admit/defer decision stays harness-side (acceptance 4).
+pub async fn set_budget(
+    pool: &Pool,
+    scope: &str,
+    scope_id: &str,
+    cap: f64,
+    window_kind: Option<&str>,
+    updated_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let scope = scope.trim();
+    if !BUDGET_SCOPES.contains(&scope) {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "scope must be one of {} (got '{scope}')",
+            BUDGET_SCOPES.join("|")
+        )));
+    }
+    let scope_id = scope_id.trim();
+    if scope_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request("scope_id is required"));
+    }
+    if !cap.is_finite() || cap < 0.0 {
+        anyhow::bail!(BoardError::bad_request(
+            "cap must be a finite, non-negative number"
+        ));
+    }
+    let window_kind = window_kind
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .unwrap_or("day");
+    if !BUDGET_WINDOWS.contains(&window_kind) {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "window_kind must be one of {} (got '{window_kind}')",
+            BUDGET_WINDOWS.join("|")
+        )));
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let row = sqlx::query(
+        "INSERT INTO budgets(scope, scope_id, cap, window_kind, version, updated_at, updated_by) \
+         VALUES(?,?,?,?,1,?,?) \
+         ON CONFLICT(scope, scope_id) DO UPDATE SET \
+           cap=excluded.cap, window_kind=excluded.window_kind, version=budgets.version+1, \
+           updated_at=excluded.updated_at, updated_by=excluded.updated_by \
+         RETURNING *",
+    )
+    .bind(scope)
+    .bind(scope_id)
+    .bind(cap)
+    .bind(window_kind)
+    .bind(&ts)
+    .bind(updated_by)
+    .fetch_one(&mut *tx)
+    .await?;
+    let out = row_to_json(&row);
+    let version: i64 = row.try_get("version")?;
+
+    // Hot-reload wake (acceptance 3): the affected agents re-read the budget. agent scope -> that
+    // agent; role scope -> every agent whose metadata.role matches.
+    let mut recips: BTreeSet<String> = BTreeSet::new();
+    if scope == "agent" {
+        recips.insert(scope_id.to_string());
+    } else {
+        let agents = sqlx::query("SELECT id FROM agents WHERE json_extract(metadata,'$.role')=?")
+            .bind(scope_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        for a in agents {
+            recips.insert(a.try_get::<String, _>("id")?);
+        }
+    }
+    if !recips.is_empty() {
+        emit(
+            &mut tx,
+            &mut hooks,
+            "budget.updated",
+            updated_by,
+            None,
+            None,
+            None,
+            None,
+            json!({ "scope": scope, "scope_id": scope_id, "cap": cap, "window_kind": window_kind, "version": version }),
+            Recipients::Explicit(recips),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Report one turn's realized cost to the spend ledger (task_1461). Append-only and lightweight (one
+/// row, no event), so the harness fires it off its hot path. Only the harness knows the realized
+/// token cost, so it reports and the board accumulates. Returns the agent's current spend over its
+/// effective window after the append.
+pub async fn report_spend(pool: &Pool, agent_id: &str, cost: f64) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request("agent_id is required"));
+    }
+    if !cost.is_finite() || cost < 0.0 {
+        anyhow::bail!(BoardError::bad_request(
+            "cost must be a finite, non-negative number"
+        ));
+    }
+    let ts = now_iso();
+    sqlx::query("INSERT INTO budget_spend(agent_id, cost, created_at) VALUES(?,?,?)")
+        .bind(agent_id)
+        .bind(cost)
+        .bind(&ts)
+        .execute(pool)
+        .await?;
+    let (_, window_kind, _) = effective_budget_cap(pool, agent_id).await?;
+    let current_spend = budget_current_spend(pool, agent_id, &window_kind).await?;
+    Ok(json!({
+        "agent_id": agent_id,
+        "cost": cost,
+        "window_kind": window_kind,
+        "current_spend": current_spend,
+    }))
+}
+
+/// Resolve an agent's effective budget cap (task_1461): the agent-scope row if present, else the
+/// role-scope row for the agent's metadata.role, else none. Returns (cap, window_kind, source) where
+/// source is "agent" | "role" | "none"; window_kind defaults to "day" when no cap is configured (so
+/// current spend is still reported over a sane window). cap is None when unlimited.
+async fn effective_budget_cap(
+    pool: &Pool,
+    agent_id: &str,
+) -> anyhow::Result<(Option<f64>, String, String)> {
+    if let Some(row) =
+        sqlx::query("SELECT cap, window_kind FROM budgets WHERE scope='agent' AND scope_id=?")
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await?
+    {
+        return Ok((
+            Some(row.try_get("cap")?),
+            row.try_get("window_kind")?,
+            "agent".into(),
+        ));
+    }
+    // Fall back to the agent's role cap.
+    let role: Option<String> =
+        sqlx::query_scalar("SELECT json_extract(metadata,'$.role') FROM agents WHERE id=?")
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    if let Some(role) = role.as_deref().filter(|r| !r.is_empty()) {
+        if let Some(row) =
+            sqlx::query("SELECT cap, window_kind FROM budgets WHERE scope='role' AND scope_id=?")
+                .bind(role)
+                .fetch_optional(pool)
+                .await?
+        {
+            return Ok((
+                Some(row.try_get("cap")?),
+                row.try_get("window_kind")?,
+                "role".into(),
+            ));
+        }
+    }
+    Ok((None, "day".into(), "none".into()))
+}
+
+/// The one-read budget admission surface (task_1461, acceptance 1 + 5). Returns the agent's effective
+/// cap (role base merged with an agent override), its current spend over the window, the agent's
+/// session priority (task_1455, so a tight budget defers a low-priority turn first), and a
+/// `would_admit` convenience. Deterministic: the same caps + spend yield the same result. The board
+/// serves the data; the harness makes the admit/defer decision (acceptance 4).
+pub async fn get_budget(pool: &Pool, agent_id: &str) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request("agent_id is required"));
+    }
+    let Some(agent) = sqlx::query("SELECT metadata, priority FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        anyhow::bail!(BoardError::bad_request(format!("no agent {agent_id}")));
+    };
+    let priority: String = agent
+        .try_get("priority")
+        .unwrap_or_else(|_| "normal".to_string());
+    let role: Option<String> = agent
+        .try_get::<Option<String>, _>("metadata")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|m| m.get("role").and_then(|v| v.as_str()).map(str::to_string));
+    let (cap, window_kind, cap_source) = effective_budget_cap(pool, agent_id).await?;
+    let current_spend = budget_current_spend(pool, agent_id, &window_kind).await?;
+    let would_admit = cap.map(|c| current_spend < c).unwrap_or(true);
+    let remaining = cap.map(|c| c - current_spend);
+    // The effective cap's version (for the hot-reload watch); None when unlimited.
+    let version: Option<i64> = match cap_source.as_str() {
+        "agent" => {
+            sqlx::query_scalar("SELECT version FROM budgets WHERE scope='agent' AND scope_id=?")
+                .bind(agent_id)
+                .fetch_optional(pool)
+                .await?
+        }
+        "role" => match role.as_deref() {
+            Some(r) => {
+                sqlx::query_scalar("SELECT version FROM budgets WHERE scope='role' AND scope_id=?")
+                    .bind(r)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            None => None,
+        },
+        _ => None,
+    };
+    Ok(json!({
+        "agent_id": agent_id,
+        "role": role,
+        "priority": priority,
+        "cap": cap,
+        "cap_source": cap_source,
+        "window_kind": window_kind,
+        "current_spend": current_spend,
+        "remaining": remaining,
+        "would_admit": would_admit,
+        "version": version,
+    }))
+}
+
 /// Fetch one document with its current version + version list.
 /// Resolve a document reference -- a numeric id OR a wiki path/slug -- to a document id. Agents cite
 /// docs by their wiki path (e.g. charters/v-nix, designs/...), so get_document / read_document accept
@@ -21282,6 +21559,144 @@ mod tests {
         assert!(submit_decider_episode(&pool, "v-a", "d", "c", "  ", None)
             .await
             .is_err());
+        Ok(())
+    }
+
+    /// task_1461 (doc_3426 ask 6): the budget admission surface. get_budget merges a role base cap
+    /// with an agent override; report_spend accumulates current spend over the rolling window and
+    /// flips would_admit; set_budget bumps the version and wakes the affected agents via
+    /// budget.updated; the read is deterministic; and the invalid inputs are rejected.
+    #[tokio::test]
+    async fn budget_admission_surface() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(
+            &pool,
+            "v-a",
+            None,
+            None,
+            None,
+            Some(json!({"role": "builder"})),
+            None,
+        )
+        .await?;
+        register_agent(
+            &pool,
+            "v-b",
+            None,
+            None,
+            None,
+            Some(json!({"role": "builder"})),
+            None,
+        )
+        .await?;
+
+        // No cap configured: unlimited, would_admit true, cap_source none.
+        let b0 = get_budget(&pool, "v-a").await?;
+        assert_eq!(b0["cap"], json!(null));
+        assert_eq!(b0["cap_source"], json!("none"));
+        assert_eq!(b0["would_admit"], json!(true));
+        assert_eq!(b0["current_spend"], json!(0.0));
+
+        // Role cap applies to both builders (merged in from the role).
+        set_budget(
+            &pool,
+            "role",
+            "builder",
+            100.0,
+            Some("day"),
+            Some("cameron"),
+        )
+        .await?;
+        let b1 = get_budget(&pool, "v-a").await?;
+        assert_eq!(b1["cap"], json!(100.0));
+        assert_eq!(b1["cap_source"], json!("role"));
+        assert_eq!(b1["window_kind"], json!("day"));
+
+        // An agent override wins over the role base for that agent only.
+        set_budget(&pool, "agent", "v-a", 10.0, Some("day"), Some("cameron")).await?;
+        let b2 = get_budget(&pool, "v-a").await?;
+        assert_eq!(b2["cap"], json!(10.0));
+        assert_eq!(b2["cap_source"], json!("agent"));
+        // v-b still gets the role cap.
+        assert_eq!(get_budget(&pool, "v-b").await?["cap"], json!(100.0));
+
+        // report_spend accumulates current spend and flips would_admit at the cap.
+        report_spend(&pool, "v-a", 4.0).await?;
+        let r = report_spend(&pool, "v-a", 7.0).await?;
+        assert_eq!(r["current_spend"], json!(11.0));
+        let b3 = get_budget(&pool, "v-a").await?;
+        assert_eq!(b3["current_spend"], json!(11.0));
+        assert_eq!(b3["remaining"], json!(-1.0));
+        assert_eq!(
+            b3["would_admit"],
+            json!(false),
+            "spend over the cap defers the turn"
+        );
+        // v-b's spend is independent (its own ledger rows).
+        assert_eq!(get_budget(&pool, "v-b").await?["current_spend"], json!(0.0));
+
+        // Determinism: the same caps + spend yield the same read.
+        let b3b = get_budget(&pool, "v-a").await?;
+        assert_eq!(b3, b3b);
+
+        // set_budget bumps the version and wakes the affected agents (role change -> both builders).
+        let before: i64 = get_budget(&pool, "v-b").await?["version"].as_i64().unwrap();
+        set_budget(
+            &pool,
+            "role",
+            "builder",
+            200.0,
+            Some("week"),
+            Some("cameron"),
+        )
+        .await?;
+        assert_eq!(
+            get_budget(&pool, "v-b").await?["version"],
+            json!(before + 1)
+        );
+        let ev = check_notifications(&pool, "v-b", false, 50, Some("budget.updated")).await?;
+        let notes = ev["notifications"].as_array().unwrap();
+        assert!(
+            !notes.is_empty(),
+            "a role-cap change wakes an agent of that role: {ev}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n["data"]["version"] == json!(before + 1)),
+            "the latest role-cap change (version {}) is delivered: {ev}",
+            before + 1
+        );
+
+        // The agent's session priority rides along for the admission decision (task_1455).
+        update_agent(
+            &pool,
+            "v-a",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("low"),
+        )
+        .await?;
+        assert_eq!(get_budget(&pool, "v-a").await?["priority"], json!("low"));
+
+        // Validation: bad scope, negative cap, and an unknown window are rejected.
+        assert!(set_budget(&pool, "bogus", "x", 1.0, None, None)
+            .await
+            .is_err());
+        assert!(set_budget(&pool, "agent", "v-a", -1.0, None, None)
+            .await
+            .is_err());
+        assert!(set_budget(&pool, "agent", "v-a", 1.0, Some("decade"), None)
+            .await
+            .is_err());
+        assert!(report_spend(&pool, "v-a", -5.0).await.is_err());
         Ok(())
     }
 

@@ -474,6 +474,24 @@ pub struct SetAgentConfigEntryArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SetBudgetArgs {
+    /// The cap scope: agent or role.
+    pub scope: String,
+    /// The agent id (scope=agent) or role name (scope=role) the cap applies to.
+    pub scope_id: String,
+    /// The spend cap over the window (tokens or cost units; non-negative).
+    pub cap: f64,
+    /// Rolling window the cap and current spend are measured over: hour | day | week | month |
+    /// total (default day). total is a lifetime cap (no reset).
+    #[serde(default)]
+    pub window_kind: Option<String>,
+    /// Who set it (defaults to this session's identity).
+    #[serde(rename = "principal", alias = "updated_by", alias = "actor", default)]
+    pub updated_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RemoveAgentConfigEntryArgs {
     pub agent_id: String,
     pub config_kind: String,
@@ -481,6 +499,22 @@ pub struct RemoveAgentConfigEntryArgs {
     /// Who is removing (defaults to this session's identity).
     #[serde(rename = "principal", alias = "actor", alias = "by", default)]
     pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportSpendArgs {
+    /// The agent whose turn cost to record.
+    pub agent_id: String,
+    /// The realized cost of the turn to add to the rolling spend window (non-negative).
+    pub cost: f64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetBudgetArgs {
+    /// The agent whose effective cap + current spend to read.
+    pub agent_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2661,6 +2695,53 @@ impl Board {
         .await
         .map_err(err)
         .and_then(ok)
+    }
+
+    #[tool(
+        description = "Set (upsert) an editable budget cap (task_1461, doc_3426 ask 6), scoped to an agent or a role, over a rolling window (hour|day|week|month|total). An agent's effective cap is the agent-scope row if set, else the role-scope row for its role. Bumps a version and emits budget.updated so the affected agents hot-reload. The caps are config data; the admit/defer decision stays harness-side."
+    )]
+    async fn set_budget(
+        &self,
+        Parameters(a): Parameters<SetBudgetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let updated_by = self.me_opt(s(&a.updated_by));
+        core::set_budget(
+            &self.pool,
+            &a.scope,
+            &a.scope_id,
+            a.cap,
+            s(&a.window_kind),
+            updated_by.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Report one turn's realized cost to the spend ledger (task_1461): append-only and lightweight (one row, no event), so fire it off the agent hot path. Only the harness knows the realized token cost, so it reports and the board accumulates current spend over the rolling window. Returns the agent's current spend after the append."
+    )]
+    async fn report_spend(
+        &self,
+        Parameters(a): Parameters<ReportSpendArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::report_spend(&self.pool, &a.agent_id, a.cost)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "One-read budget admission surface (task_1461, doc_3426 ask 6): returns an agent's effective spend cap (role base merged with an agent override), its current spend over the window, its session priority, and a would_admit convenience, so the harness admits or defers a turn in one round trip. Deterministic; the board serves the data and the harness decides."
+    )]
+    async fn get_budget(
+        &self,
+        Parameters(a): Parameters<GetBudgetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_budget(&self.pool, &a.agent_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     // --- Projects ---

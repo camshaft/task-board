@@ -238,6 +238,9 @@ pub fn router(state: AppState) -> Router {
             "/decider-episodes",
             get(list_decider_episodes).post(submit_decider_episode),
         )
+        .route("/budgets", post(set_budget))
+        .route("/agents/{agent_id}/budget", get(get_budget))
+        .route("/agents/{agent_id}/spend", post(report_spend))
         .route("/projects", get(list_projects).post(create_project))
         .route(
             "/projects/{project_id}",
@@ -930,6 +933,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None },
     Endpoint { method: "POST", path: "/api/decider-episodes", summary: "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. Lightweight no-event append — fire it async off the agent hot path. Downstream consumer: the decider corpus (task_1471).", query: "", body: Some("SubmitDeciderEpisodeBody") },
     Endpoint { method: "GET", path: "/api/decider-episodes", summary: "Aggregate decider episodes for the corpus relabel/retrain work (task_1478): filter by decider_id, call_type, and a [since, until) created_at window (all optional), ordered by append order, bounded by limit (default 200, max 1000). Returns each episode's inline structured relabel record + CID.", query: "decider_id=str&call_type=str&since=iso&until=iso&limit=int", body: None },
+    Endpoint { method: "POST", path: "/api/budgets", summary: "Set (upsert) an editable budget cap (task_1461, doc_3426 ask 6) scoped to an agent or role over a rolling window (hour|day|week|month|total). Bumps a version and emits budget.updated so affected agents hot-reload. Config data; the admit/defer decision stays harness-side.", query: "", body: Some("SetBudgetBody") },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}/budget", summary: "One-read budget admission surface (task_1461): an agent's effective cap (role base merged with agent override), current spend over the window, session priority, and a would_admit convenience, so the harness admits or defers a turn in one round trip. Deterministic.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/spend", summary: "Report one turn's realized cost to the spend ledger (task_1461): append-only, lightweight, fire off the hot path. The board accumulates current spend over the rolling window. Returns current spend after the append.", query: "", body: Some("ReportSpendBody") },
     Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
@@ -1070,6 +1076,8 @@ fn body_schemas() -> Value {
         CheckStopBody,
         SubmitDeciderEpisodeBody,
         SetAgentConfigEntryBody,
+        SetBudgetBody,
+        ReportSpendBody,
         CreateProjectBody,
         UpdateProjectBody,
         CreateTaskBody,
@@ -1661,6 +1669,52 @@ async fn list_decider_episodes(
         )
         .await?,
     ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetBudgetBody {
+    /// The cap scope: agent or role.
+    scope: String,
+    /// The agent id (scope=agent) or role name (scope=role) the cap applies to.
+    scope_id: String,
+    /// The spend cap over the window (tokens or cost units; non-negative).
+    cap: f64,
+    /// Rolling window: hour | day | week | month | total (default day).
+    window_kind: Option<String>,
+    #[serde(rename = "principal", alias = "updated_by", alias = "actor")]
+    updated_by: Option<String>,
+}
+
+async fn set_budget(State(st): State<AppState>, Json(b): Json<SetBudgetBody>) -> ApiResult {
+    Ok(Json(
+        core::set_budget(
+            &st.pool,
+            &b.scope,
+            &b.scope_id,
+            b.cap,
+            b.window_kind.as_deref(),
+            b.updated_by.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReportSpendBody {
+    /// The realized cost of the turn to add to the rolling spend window (non-negative).
+    cost: f64,
+}
+
+async fn report_spend(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<ReportSpendBody>,
+) -> ApiResult {
+    Ok(Json(core::report_spend(&st.pool, &agent_id, b.cost).await?))
+}
+
+async fn get_budget(State(st): State<AppState>, Path(agent_id): Path<String>) -> ApiResult {
+    Ok(Json(core::get_budget(&st.pool, &agent_id).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]
