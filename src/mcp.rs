@@ -1763,6 +1763,23 @@ pub struct ReadDocumentArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct AssembleMandateArgs {
+    /// The agent whose session-start mandate to assemble (its charter, role prompt, applicable
+    /// standing directives, and applicable recipes), composed from board documents.
+    pub agent: String,
+    /// Optional context tags that narrow context-scoped directives/recipes (a doc whose applicability
+    /// lists one of these contexts rides). Omit for the context-independent set.
+    #[serde(default)]
+    pub contexts: Option<Vec<String>>,
+    /// When true, inline each component's body content (fetched server-side via the board's IPFS
+    /// backend). Omit/false for the cheap refs-only probe (refs + versions + fingerprint only, no
+    /// backend needed) -- e.g. a hot-reload check that only compares the version_fingerprint.
+    #[serde(default, deserialize_with = "de_bool_lenient")]
+    pub include_content: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateDocumentArgs {
     #[serde(deserialize_with = "de_i64_lenient")]
     pub document_id: i64,
@@ -4022,6 +4039,25 @@ impl Board {
             .await
             .map_err(err)
             .and_then(ok)
+    }
+
+    #[tool(
+        description = "Assemble an agent's full session-start mandate from board data in ONE read: its charter, role prompt, the applicable standing directives (the tenets/* corpus), and the applicable point-of-need recipes (the recipes/* corpus), in the deterministic order charter, role, directives, recipes. Each component carries {ref, document_id, version_no} plus content when include_content is set. Applicability is matched server-side (a directive/recipe rides only when its applicability block -- {all, roles, agents, kinds, contexts}, absent = all -- selects this agent/role/kind/context). A version_fingerprint folds every component's (document_id, version_no); component_document_ids lists those docs so the harness subscribes to them and re-runs this read on a document.version_published, comparing the fingerprint, to hot-reload on a shared tenet/recipe edit. The charter falls back to the free-text agents.charter field when no charters/<agent> doc is filed."
+    )]
+    async fn assemble_mandate(
+        &self,
+        Parameters(a): Parameters<AssembleMandateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::assemble_mandate(
+            &self.pool,
+            self.ipfs_api_url.as_deref(),
+            &a.agent,
+            a.contexts,
+            a.include_content,
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(

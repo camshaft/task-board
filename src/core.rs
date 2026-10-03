@@ -11368,6 +11368,314 @@ pub async fn read_document_content_at_path(
     read_document_content(pool, ipfs_api_url, id, None).await
 }
 
+// ---------------------------------------------------------------------------
+// task_1457 (doc_3426 ask 3): mandate-assembly read + point-of-need recipes.
+//
+// The harness composes each agent's system prompt from board data, not a baked template. Every input
+// is ALREADY a versioned board document, so this is a READ that stitches them -- it does NOT re-store
+// the charter. The slots, in the deterministic assembly order the harness replays (charter, role,
+// directives, recipes):
+//   - charter:    the `charters/<agent>` document, else the free-text `agents.charter` field.
+//   - role:       `roles/<role>` where <role> is `agents.metadata.role` (the ask-1 / task_1455 config).
+//   - directives: the `tenets/*` corpus (the board's standing-directive documents), filtered by
+//                 applicability so only the directives that apply to this agent/role/kind/context ride.
+//   - recipes:    a `recipes/*` document convention (point-of-need recipes the harness injects, first
+//                 instance the publish-large-artifact-via-CID recipe, task_1424), same applicability.
+// A `version_fingerprint` over every component's (document_id, version_no) lets the harness detect a
+// change and hot-reload; it wires to the agent.config_changed event class (ask 11 / task_1477) once
+// that lands. Field-charter (no version) changes ride the same agent-row config_changed signal.
+// ---------------------------------------------------------------------------
+
+/// A compact, stable 64-bit FNV-1a hex digest of `s`. Used only for the mandate `version_fingerprint`
+/// -- a change-detection token, not a security hash -- so a dependency-free, deterministic digest
+/// (stable across builds, unlike `std::hash::DefaultHasher`) is exactly right.
+fn fnv1a_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Does a document's optional `applicability` metadata block select `agent_id` (role/kind) under the
+/// requested `contexts`? Absent or empty block = applies to everyone (today's tenets are global). A
+/// present, non-empty block applies when `all` is true, or the agent id / role / kind is listed, or a
+/// requested context is listed; otherwise it does NOT apply.
+fn applicability_applies(
+    meta: &Value,
+    agent_id: &str,
+    role: Option<&str>,
+    kind: Option<&str>,
+    contexts: &[String],
+) -> bool {
+    let Some(appl) = meta.get("applicability") else {
+        return true;
+    };
+    let Some(obj) = appl.as_object() else {
+        // A non-object applicability value is malformed; treat as unscoped rather than hide the doc.
+        return true;
+    };
+    if obj.is_empty() {
+        return true;
+    }
+    if appl.get("all").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let list_has = |key: &str, needle: Option<&str>| -> bool {
+        let Some(needle) = needle else {
+            return false;
+        };
+        appl.get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().any(|x| x.as_str() == Some(needle)))
+            .unwrap_or(false)
+    };
+    if list_has("agents", Some(agent_id)) || list_has("roles", role) || list_has("kinds", kind) {
+        return true;
+    }
+    if let Some(arr) = appl.get("contexts").and_then(Value::as_array) {
+        if contexts
+            .iter()
+            .any(|c| arr.iter().any(|x| x.as_str() == Some(c.as_str())))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build one assembled-mandate component for the live document `document_id`, cited by stable `reference`
+/// (its wiki path). Carries the ref + id + CURRENT version_no always; the body `content` only when
+/// `include_content` (the refs-only mode skips the per-doc CID fetch, so a session-start probe that only
+/// needs the fingerprint stays cheap and needs no IPFS backend).
+async fn mandate_component_for_doc(
+    pool: &Pool,
+    ipfs_api_url: Option<&str>,
+    document_id: i64,
+    reference: &str,
+    include_content: bool,
+) -> anyhow::Result<Value> {
+    let (vn, cid, ct) = resolve_document_version(pool, document_id, None).await?;
+    let mut comp = json!({
+        "ref": reference,
+        "document_id": document_id,
+        "version_no": vn,
+    });
+    if include_content {
+        let body = document_content_value(ipfs_api_url, document_id, vn, cid, ct).await?;
+        comp["content"] = body.get("content").cloned().unwrap_or(Value::Null);
+    }
+    Ok(comp)
+}
+
+/// The live document filed at wiki `path` as a mandate component, or `None` when nothing is filed there.
+async fn mandate_component_at_path(
+    pool: &Pool,
+    ipfs_api_url: Option<&str>,
+    path: &str,
+    include_content: bool,
+) -> anyhow::Result<Option<Value>> {
+    let norm = normalize_wiki_path(path);
+    let row = sqlx::query(
+        "SELECT id FROM documents WHERE path=? AND archived_at IS NULL AND current_version_id IS NOT NULL \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(&norm)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: i64 = row.try_get("id")?;
+    Ok(Some(
+        mandate_component_for_doc(pool, ipfs_api_url, id, &norm, include_content).await?,
+    ))
+}
+
+/// Load every live, versioned document whose wiki path is under `prefix` (e.g. "tenets/"), as
+/// `(id, path, metadata)` tuples ordered deterministically by path then id. The `/index` listing page
+/// under the prefix is skipped (it is a table of contents, not an injectable directive/recipe).
+async fn load_mandate_docs_under(
+    pool: &Pool,
+    prefix: &str,
+) -> anyhow::Result<Vec<(i64, String, Value)>> {
+    let like = format!("{prefix}%");
+    let rows = sqlx::query(
+        "SELECT id, path, metadata FROM documents \
+         WHERE path LIKE ? AND archived_at IS NULL AND current_version_id IS NOT NULL \
+         ORDER BY path, id",
+    )
+    .bind(&like)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for r in rows {
+        let id: i64 = r.try_get("id")?;
+        let Some(path) = r.try_get::<Option<String>, _>("path")? else {
+            continue;
+        };
+        if path.ends_with("/index") {
+            continue;
+        }
+        let meta_s: String = r.try_get("metadata").unwrap_or_default();
+        let meta: Value = serde_json::from_str(&meta_s).unwrap_or_else(|_| json!({}));
+        out.push((id, path, meta));
+    }
+    Ok(out)
+}
+
+/// Assemble an agent's full session-start mandate from board data in ONE read: the charter, the role
+/// prompt, the applicable standing directives, and the applicable point-of-need recipes, in the
+/// deterministic order (charter, role, directives, recipes). `contexts` narrows context-scoped
+/// directives/recipes. `include_content` fetches each body (needs an IPFS backend); false returns the
+/// refs + versions + fingerprint only. The `version_fingerprint` folds every document-backed
+/// component's (document_id, version_no) so any version bump changes it -- the harness watches it to
+/// hot-reload (wires to agent.config_changed, task_1477, once that lands). Errors only if the agent
+/// does not exist; a missing charter/role/directive/recipe is simply an absent/empty slot.
+pub async fn assemble_mandate(
+    pool: &Pool,
+    ipfs_api_url: Option<&str>,
+    agent_id: &str,
+    contexts: Option<Vec<String>>,
+    include_content: bool,
+) -> anyhow::Result<Value> {
+    // The agent must exist; its metadata.role + kind drive role resolution + applicability (ask 1).
+    let agent = get_agent(pool, agent_id).await?;
+    let role = agent
+        .get("metadata")
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let kind = agent
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let contexts = contexts.unwrap_or_default();
+
+    // charter: the charters/<agent> document, else the free-text agents.charter field (always inlined,
+    // it is tiny and has no CID), else an empty slot. The field fallback has no version_no, so its
+    // changes ride the agent-row config_changed signal rather than the fingerprint.
+    let charter = match mandate_component_at_path(
+        pool,
+        ipfs_api_url,
+        &format!("charters/{agent_id}"),
+        include_content,
+    )
+    .await?
+    {
+        Some(mut c) => {
+            c["source"] = json!("document");
+            c
+        }
+        None => match agent.get("charter").and_then(Value::as_str) {
+            Some(t) if !t.is_empty() => json!({
+                "ref": Value::Null,
+                "document_id": Value::Null,
+                "version_no": Value::Null,
+                "source": "agent_field",
+                "content": t,
+            }),
+            _ => json!({
+                "ref": Value::Null,
+                "document_id": Value::Null,
+                "version_no": Value::Null,
+                "source": Value::Null,
+                "content": Value::Null,
+            }),
+        },
+    };
+
+    // role prompt: roles/<metadata.role>, or null when the agent declares no role / the doc is absent.
+    let role_prompt = match &role {
+        Some(r) => {
+            mandate_component_at_path(pool, ipfs_api_url, &format!("roles/{r}"), include_content)
+                .await?
+                .map(|mut c| {
+                    c["role"] = json!(r);
+                    c
+                })
+        }
+        None => None,
+    };
+
+    // directives: the tenets/* corpus, applicability-filtered. recipes: the recipes/* convention, same.
+    let mut directives = Vec::new();
+    for (id, path, meta) in load_mandate_docs_under(pool, "tenets/").await? {
+        if !applicability_applies(&meta, agent_id, role.as_deref(), kind.as_deref(), &contexts) {
+            continue;
+        }
+        let mut c =
+            mandate_component_for_doc(pool, ipfs_api_url, id, &path, include_content).await?;
+        if let Some(a) = meta.get("applicability") {
+            c["applicability"] = a.clone();
+        }
+        directives.push(c);
+    }
+    let mut recipes = Vec::new();
+    for (id, path, meta) in load_mandate_docs_under(pool, "recipes/").await? {
+        if !applicability_applies(&meta, agent_id, role.as_deref(), kind.as_deref(), &contexts) {
+            continue;
+        }
+        let mut c =
+            mandate_component_for_doc(pool, ipfs_api_url, id, &path, include_content).await?;
+        c["id"] = json!(path);
+        if let Some(a) = meta.get("applicability") {
+            c["applicability"] = a.clone();
+        }
+        recipes.push(c);
+    }
+
+    // In assembly order, label every document-backed component so one pass builds both the
+    // version_fingerprint and component_document_ids (the docs the harness subscribes to for
+    // hot-reload -- see below).
+    let mut labelled: Vec<(&str, &Value)> = vec![("charter", &charter)];
+    if let Some(rp) = &role_prompt {
+        labelled.push(("role", rp));
+    }
+    for d in &directives {
+        labelled.push((d.get("ref").and_then(Value::as_str).unwrap_or("tenet"), d));
+    }
+    for r in &recipes {
+        labelled.push((r.get("id").and_then(Value::as_str).unwrap_or("recipe"), r));
+    }
+
+    // version_fingerprint: fold every document-backed component's (id, version) in assembly order so
+    // any version bump changes it. component_document_ids: the distinct docs the harness subscribes to
+    // and re-runs assemble_mandate on a document.version_published, comparing the fingerprint (v-ft
+    // option a). This covers a SHARED tenets/* or recipes/* edit -- which agent.config_changed (an
+    // agent's OWN config) would miss -- without the board tracking per-agent resolved sets. The
+    // field-charter fallback (no document_id) rides the agent-row config_changed signal instead.
+    let mut fp_parts: Vec<String> = Vec::new();
+    let mut component_document_ids: Vec<i64> = Vec::new();
+    for (label, comp) in &labelled {
+        if let (Some(id), Some(v)) = (
+            comp.get("document_id").and_then(Value::as_i64),
+            comp.get("version_no").and_then(Value::as_i64),
+        ) {
+            fp_parts.push(format!("{label}:{id}.{v}"));
+            if !component_document_ids.contains(&id) {
+                component_document_ids.push(id);
+            }
+        }
+    }
+    let version_fingerprint = fnv1a_hex(&fp_parts.join("|"));
+
+    Ok(json!({
+        "agent": agent_id,
+        "role": role,
+        "kind": kind,
+        "order": ["charter", "role", "directives", "recipes"],
+        "charter": charter,
+        "role_prompt": role_prompt,
+        "directives": directives,
+        "recipes": recipes,
+        "includes_content": include_content,
+        "version_fingerprint": version_fingerprint,
+        "component_document_ids": component_document_ids,
+    }))
+}
+
 /// Resolve a document's APPROVED version `(version_no, cid, content_type)`, or `None` when the
 /// document exists but has no approved version yet (`approved_version_id IS NULL`). A missing
 /// document is an error (`no document {id}`), kept distinct from the no-approved-version case so a
@@ -17977,6 +18285,203 @@ mod tests {
             missing.contains("no document filed at path"),
             "an unfiled path is a distinct error, got: {missing}"
         );
+        Ok(())
+    }
+
+    /// task_1457 (doc_3426 ask 3): assemble_mandate stitches the charter + role + applicable
+    /// standing directives (tenets/*) + applicable recipes (recipes/*) in the deterministic order,
+    /// matching applicability server-side, with a version_fingerprint + component_document_ids for
+    /// the harness's subscribe-and-recompare hot-reload. Exercised in refs-only mode (no IPFS), the
+    /// cheap session-start probe path.
+    #[tokio::test]
+    async fn mandate_assembly_stitches_board_data_and_filters_by_applicability(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        register_agent(
+            &pool,
+            "v-a",
+            Some("Agent A"),
+            Some("fleet"),
+            None,
+            Some(json!({ "role": "builder" })),
+            None,
+        )
+        .await?;
+
+        // Helper: create a doc at a wiki path with optional applicability metadata.
+        async fn doc_at(
+            pool: &Pool,
+            title: &str,
+            path: &str,
+            applicability: Option<Value>,
+        ) -> anyhow::Result<i64> {
+            let meta = applicability.map(|a| json!({ "applicability": a }));
+            let d = create_document(
+                pool,
+                title,
+                None,
+                "bafy",
+                None,
+                Some("op"),
+                meta,
+                Some("text/markdown"),
+                None,
+            )
+            .await?;
+            let id = d["id"].as_i64().unwrap();
+            set_document_path(pool, id, path, Some("op")).await?;
+            Ok(id)
+        }
+
+        let charter_id = doc_at(&pool, "Charter A", "charters/v-a", None).await?;
+        let role_id = doc_at(&pool, "Builder role", "roles/builder", None).await?;
+        // Directives: a global tenet (no block) + a role-matched one apply; a role-mismatched one and
+        // the /index listing are excluded.
+        let global_id = doc_at(&pool, "Global tenet", "tenets/global", None).await?;
+        let for_builder_id = doc_at(
+            &pool,
+            "Builder tenet",
+            "tenets/for-builder",
+            Some(json!({ "roles": ["builder"] })),
+        )
+        .await?;
+        doc_at(
+            &pool,
+            "Other tenet",
+            "tenets/scoped",
+            Some(json!({ "roles": ["other"] })),
+        )
+        .await?;
+        doc_at(&pool, "Tenet index", "tenets/index", None).await?;
+        // A context-scoped tenet: excluded without the context, included with it.
+        doc_at(
+            &pool,
+            "Review tenet",
+            "tenets/ctx",
+            Some(json!({ "contexts": ["review"] })),
+        )
+        .await?;
+        // Recipes: an all-applicable one applies; an agent-scoped one for a different agent does not.
+        let recipe_id = doc_at(
+            &pool,
+            "CID publish",
+            "recipes/cid-publish",
+            Some(json!({ "all": true })),
+        )
+        .await?;
+        doc_at(
+            &pool,
+            "Other recipe",
+            "recipes/other-only",
+            Some(json!({ "agents": ["someone-else"] })),
+        )
+        .await?;
+
+        let m = assemble_mandate(&pool, None, "v-a", None, false).await?;
+        assert_eq!(
+            m["order"],
+            json!(["charter", "role", "directives", "recipes"])
+        );
+        assert_eq!(m["role"], json!("builder"));
+        assert_eq!(m["kind"], json!("fleet"));
+        assert_eq!(m["charter"]["ref"], json!("charters/v-a"));
+        assert_eq!(m["charter"]["source"], json!("document"));
+        assert_eq!(m["charter"]["document_id"], json!(charter_id));
+        assert_eq!(m["role_prompt"]["ref"], json!("roles/builder"));
+        assert_eq!(m["role_prompt"]["role"], json!("builder"));
+        // In refs-only mode no body is fetched (no IPFS needed).
+        assert!(m["charter"].get("content").is_none());
+        assert_eq!(m["includes_content"], json!(false));
+
+        // Directives: for-builder + global, path-ordered; scoped/index/ctx excluded.
+        let dirs: Vec<&str> = m["directives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["ref"].as_str().unwrap())
+            .collect();
+        assert_eq!(dirs, vec!["tenets/for-builder", "tenets/global"]);
+
+        // Recipes: only the all-applicable one, carrying its id + applicability.
+        let recs = m["recipes"].as_array().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["id"], json!("recipes/cid-publish"));
+        assert_eq!(recs[0]["applicability"], json!({ "all": true }));
+
+        // component_document_ids = every resolved document (charter, role, 2 tenets, 1 recipe).
+        let ids: Vec<i64> = m["component_document_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        for want in [charter_id, role_id, global_id, for_builder_id, recipe_id] {
+            assert!(
+                ids.contains(&want),
+                "component_document_ids missing {want}: {ids:?}"
+            );
+        }
+        assert_eq!(ids.len(), 5);
+        let fp1 = m["version_fingerprint"].as_str().unwrap().to_string();
+        assert!(!fp1.is_empty());
+
+        // Context filter: the review-scoped tenet rides only when the context is requested.
+        let mctx =
+            assemble_mandate(&pool, None, "v-a", Some(vec!["review".to_string()]), false).await?;
+        let ctx_dirs: Vec<&str> = mctx["directives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["ref"].as_str().unwrap())
+            .collect();
+        assert!(
+            ctx_dirs.contains(&"tenets/ctx"),
+            "context tenet should ride: {ctx_dirs:?}"
+        );
+
+        // A version bump on a component changes the fingerprint (the hot-reload trigger).
+        publish_version(
+            &pool,
+            global_id,
+            "bafy2",
+            None,
+            Some("op"),
+            Some("text/markdown"),
+            None,
+        )
+        .await?;
+        let fp2 = assemble_mandate(&pool, None, "v-a", None, false).await?["version_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            fp1, fp2,
+            "a component version bump must move the fingerprint"
+        );
+
+        // Charter falls back to the free-text agents.charter field when no charter doc is filed.
+        register_agent(
+            &pool,
+            "v-b",
+            Some("Agent B"),
+            Some("fleet"),
+            Some("inline mandate"),
+            None,
+            None,
+        )
+        .await?;
+        let mb = assemble_mandate(&pool, None, "v-b", None, false).await?;
+        assert_eq!(mb["charter"]["source"], json!("agent_field"));
+        assert_eq!(mb["charter"]["content"], json!("inline mandate"));
+        assert_eq!(mb["charter"]["ref"], Value::Null);
+        assert!(mb["role_prompt"].is_null(), "v-b declares no role");
+
+        // An unknown agent is the only error case.
+        assert!(assemble_mandate(&pool, None, "nope", None, false)
+            .await
+            .is_err());
         Ok(())
     }
 

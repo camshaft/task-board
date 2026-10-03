@@ -206,6 +206,7 @@ pub fn router(state: AppState) -> Router {
         .route("/agents", get(list_agents).post(register_agent))
         .route("/resolve-agent", get(resolve_agent))
         .route("/agents/{agent_id}", get(get_agent).patch(update_agent))
+        .route("/agents/{agent_id}/mandate", get(assemble_mandate))
         .route("/agents/{agent_id}/status", post(set_status))
         .route(
             "/agents/{agent_id}/request-stand-down",
@@ -912,6 +913,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/resolve-agent", summary: "Resolve an agent name to one exact agent id (task_1251): an exact id wins (never ambiguous even when it is a prefix of a longer id), a unique case-insensitive substring resolves, an ambiguous substring is refused (400) with the sorted candidate ids. The safe recipient-resolver vs picking the first row of a q= search. Returns {name, id, match}.", query: "name=str", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}", summary: "Fetch a single agent (including its charter + metadata).", query: "", body: None },
     Endpoint { method: "PATCH", path: "/api/agents/{agent_id}", summary: "Update an agent's fields + metadata (the board agent list as a registry). Merge-PATCH: an omitted/null field is left unchanged; to reset a nullable field to null, name it in `clear` (e.g. [\"webhook_url\"]).", query: "", body: Some("UpdateAgentBody") },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}/mandate", summary: "Assemble an agent's session-start mandate from board data in one read (task_1457, doc_3426 ask 3): charter, role prompt, applicable standing directives (tenets/*), and applicable recipes (recipes/*), in the deterministic order charter, role, directives, recipes. Applicability is matched server-side; a version_fingerprint + component_document_ids drive the harness's subscribe-and-recompare hot-reload.", query: "contexts=csv&include_content=bool", body: None },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/status", summary: "Set an agent's presence status.", query: "", body: Some("SetStatusBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/request-stand-down", summary: "Request that an agent gracefully wind down: records the request (who/why/when, shown on the agent's page) and notifies the agent so it stands down on its own terms. A SIGNAL — never changes the agent's status and never kills a live agent. Cleared when the agent goes offline.", query: "", body: Some("RequestStandDownBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/retire", summary: "Terminally retire an agent (task_1363): mark it permanently gone (distinct from offline/stand-down, which are resumable) and run the auto-disposition sweep — every task blocked on it is cleared back to todo (keeping the assignee) and task.blocker_retired is emitted to board-pm for re-homing, so no dependent silently strands. Operator or board-pm only; reversible via /restore.", query: "", body: Some("RetireAgentBody") },
@@ -1692,6 +1694,44 @@ async fn register_agent(State(st): State<AppState>, Json(b): Json<RegisterAgentB
 
 async fn get_agent(State(st): State<AppState>, Path(agent_id): Path<String>) -> ApiResult {
     Ok(Json(core::get_agent(&st.pool, &agent_id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MandateQuery {
+    /// Comma-separated context tags that narrow context-scoped directives/recipes. Omit for the
+    /// context-independent set.
+    #[serde(default)]
+    contexts: Option<String>,
+    /// When true, inline each component's body content (server-side via the IPFS backend). Omit/false
+    /// for the cheap refs-only probe (refs + versions + fingerprint only).
+    #[serde(default)]
+    include_content: Option<bool>,
+}
+
+/// `GET /api/agents/{agent_id}/mandate` (task_1457, doc_3426 ask 3) -- assemble the agent's
+/// session-start mandate (charter, role, applicable directives + recipes) from board data in one read.
+async fn assemble_mandate(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(q): Query<MandateQuery>,
+) -> ApiResult {
+    let contexts = q.contexts.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    Ok(Json(
+        core::assemble_mandate(
+            &st.pool,
+            st.ipfs_api_url.as_deref(),
+            &agent_id,
+            contexts,
+            q.include_content.unwrap_or(false),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize, JsonSchema)]
