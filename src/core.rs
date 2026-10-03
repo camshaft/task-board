@@ -22922,6 +22922,103 @@ mod tests {
         Ok(())
     }
 
+    /// task_1420 regression: re-attest-by-append. A conformance review whose metadata.reviewed_version
+    /// is STALE (append_review_log cannot bump review metadata, and there is no update_review tool)
+    /// still satisfies the gate when its LATEST adversarial_review entry body carries a
+    /// reviewed_version token for the CURRENT version. This is how a doc is re-attested across a new
+    /// version WITHOUT re-spawning the adversarial harness (a fresh review record re-runs the harness,
+    /// whose finding-child-tasks re-block the submit).
+    #[tokio::test]
+    async fn operator_review_gate_accepts_reattest_by_append_over_stale_metadata(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Docs", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let d = create_document(
+            &pool,
+            "Charter",
+            Some(pid),
+            "bafyv1",
+            Some("v1"),
+            Some("charter-steward"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        // Advance to v3 (charter-steward authors each version); current_version_no = 3.
+        publish_version(
+            &pool,
+            did,
+            "bafyv2",
+            Some("v2"),
+            Some("charter-steward"),
+            None,
+            None,
+        )
+        .await?;
+        publish_version(
+            &pool,
+            did,
+            "bafyv3",
+            Some("v3"),
+            Some("charter-steward"),
+            None,
+            None,
+        )
+        .await?;
+
+        // A non-author review created when the doc was at v1 -> metadata.reviewed_version pinned to 1
+        // (stale). append_review_log cannot update it and there is no update_review tool.
+        let r = create_review(
+            &pool,
+            "design_conformance",
+            Some("board-document"),
+            Some(&format!("doc_{did}")),
+            Some("conformance"),
+            None,
+            Some("librarian"),
+            Some("librarian"),
+            Some(json!({ "reviewed_version": 1 })),
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        // Re-attest-by-append: the latest adversarial_review entry body pins the CURRENT version (3)
+        // as a free-text token (route A) -- not JSON, and not in the review metadata.
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some("reviewed_version=3\n\nre-attest of v3; PASS, zero findings"),
+            Some("librarian"),
+            None,
+            None,
+        )
+        .await?;
+
+        // The gate must clear off the entry-body token despite the stale metadata.reviewed_version=1.
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("charter-steward"),
+            None,
+            Some("charter template, not a design doc"),
+            None,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            out["status"],
+            json!("operator_review"),
+            "re-attest-by-append (stale metadata, latest entry-body token = current version) must clear the gate: {out}"
+        );
+        Ok(())
+    }
+
     /// task_1412 regression: the self-review guard keys off the CURRENT version's author, not the
     /// doc record's original creator. A doc created by one agent (librarian, at v1) whose current
     /// version is authored by another (charter-steward) must accept a conformance review by the
