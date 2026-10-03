@@ -1001,7 +1001,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents/{document_id}/versions", summary: "Publish a new immutable version (bare CID).", query: "", body: Some("PublishVersionBody") },
     Endpoint { method: "GET", path: "/api/documents/{document_id}/comments", summary: "List a document's comments (filter by version_id/status).", query: "version_id=int&status=str", body: None },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/comments", summary: "Comment on a document, optionally region-anchored to a version.", query: "", body: Some("CommentDocumentBody") },
-    Endpoint { method: "POST", path: "/api/documents/{document_id}/comments/{comment_id}/resolve", summary: "Mark a document comment resolved.", query: "", body: Some("ResolveCommentBody") },
+    Endpoint { method: "POST", path: "/api/documents/{document_id}/comments/{comment_id}/resolve", summary: "Mark a document comment resolved. task_1418 soft-gate: a text-quote-anchored comment whose exact anchored text is still present verbatim in the current version is rejected with a warning (likely a premature 'addressed' claim); pass acknowledge=true to resolve a legitimately-rephrased-in-place anchor. Best-effort: skipped when there is no anchor or the body cannot be fetched.", query: "", body: Some("ResolveCommentBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-review", summary: "Submit a document for review (status -> in_review).", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/submit-to-operator-review", summary: "Submit a document into the operator's review queue (status -> operator_review) -- the single gated chokepoint before the operator sees it. Rejected unless a template attestation (template_followed or template_waiver_reason) is given AND a design-conformance review has run against the current version with zero open findings. A design-doc submission also requires the read-the-guide attestation (the read_guide_attested field, or the legacy in-body marker).", query: "", body: Some("SubmitToOperatorReviewBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/request-changes", summary: "Request changes on a document (status -> changes_requested).", query: "", body: Some("RequestChangesBody") },
@@ -3861,6 +3861,11 @@ async fn comment_document(
 struct ResolveCommentBody {
     #[serde(rename = "principal", alias = "actor")]
     actor: Option<String>,
+    /// Resolve even when the comment is anchored to a text quote still present verbatim in the current
+    /// version (task_1418). Default false; pass true to resolve a legitimately-rephrased-in-place
+    /// anchor. (Ignored by the annotation-resolve route, which shares this body.)
+    #[serde(default)]
+    acknowledge: Option<bool>,
 }
 
 async fn resolve_comment(
@@ -3869,7 +3874,14 @@ async fn resolve_comment(
     Json(b): Json<ResolveCommentBody>,
 ) -> ApiResult {
     Ok(Json(
-        core::resolve_comment(&st.pool, comment_id, b.actor.as_deref()).await?,
+        core::resolve_comment(
+            &st.pool,
+            comment_id,
+            b.actor.as_deref(),
+            b.acknowledge.unwrap_or(false),
+            st.ipfs_api_url.as_deref(),
+        )
+        .await?,
     ))
 }
 

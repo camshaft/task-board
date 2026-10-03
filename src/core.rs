@@ -10786,21 +10786,80 @@ pub async fn comment_document(
 }
 
 /// Mark a comment resolved and emit `document.comment_resolved` (FromDocument).
+/// task_1418: for a resolve of a text-quote-anchored comment, the anchored `exact` string should no
+/// longer be present verbatim in the content the agent claims to have fixed. Returns the still-present
+/// `exact` text when the comment's `region` carries a non-empty text-quote anchor (either `exact`
+/// directly, or a nested W3C/Hypothesis `TextQuoteSelector.exact`) that still occurs in `content`;
+/// None when there is no anchor, the anchor is empty, or the text is already gone. Pure and total, so
+/// it is unit-testable without a content backend.
+fn anchored_exact_still_present(region: Option<&str>, content: &str) -> Option<String> {
+    let region: Value = serde_json::from_str(region?).ok()?;
+    let exact = region
+        .get("exact")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            region
+                .get("TextQuoteSelector")
+                .and_then(|s| s.get("exact"))
+                .and_then(|v| v.as_str())
+        })?
+        .trim();
+    if !exact.is_empty() && content.contains(exact) {
+        Some(exact.to_string())
+    } else {
+        None
+    }
+}
+
 pub async fn resolve_comment(
     pool: &Pool,
     comment_id: i64,
     actor: Option<&str>,
+    acknowledge: bool,
+    ipfs_api_url: Option<&str>,
 ) -> anyhow::Result<Value> {
-    let mut tx = pool.begin().await?;
-    let mut hooks: Vec<WebhookDelivery> = Vec::new();
-    let Some(row) = sqlx::query("SELECT document_id FROM document_comments WHERE id=?")
+    // Fetch the comment (and its anchor region) BEFORE opening the transaction: the anchored-text
+    // check below reads the document body over the network, which must not run inside an open tx on
+    // the single-connection pool (the same ordering the submit_to_operator_review structural gate
+    // uses).
+    let Some(row) = sqlx::query("SELECT document_id, region FROM document_comments WHERE id=?")
         .bind(comment_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(pool)
         .await?
     else {
         anyhow::bail!("no comment {comment_id}");
     };
     let document_id: i64 = row.try_get("document_id")?;
+    let region: Option<String> = row.try_get::<Option<String>, _>("region").ok().flatten();
+
+    // task_1418 soft-gate: resolving a text-quote-anchored comment while its exact anchored string is
+    // still present verbatim in the document's CURRENT version is usually a premature "addressed"
+    // claim (an operator caught exactly this -- an anchored comment marked resolved while the exact
+    // phrase remained in several spots). Acknowledge-able, never an unconditional block (a legitimate
+    // revision may rephrase in place): bail with a clear message unless the caller passes
+    // acknowledge=true. Best-effort -- skip silently when there is no anchor, no backend, or the body
+    // cannot be fetched; a fetch miss must never block a resolve.
+    if !acknowledge {
+        if let Some(url) = ipfs_api_url {
+            if let Ok(content) = read_document_content(pool, Some(url), document_id, None).await {
+                if let Some(text) = content.get("content").and_then(Value::as_str) {
+                    if let Some(exact) = anchored_exact_still_present(region.as_deref(), text) {
+                        anyhow::bail!(
+                            "comment {comment_id} is anchored to text that is STILL present verbatim \
+                             in the current version of document {document_id}: {exact:?}. Resolving it \
+                             likely claims an un-made change -- confirm the anchored text is gone (and \
+                             reconcile every sibling occurrence of the same premise), or pass \
+                             acknowledge=true to resolve anyway if the revision legitimately rephrased \
+                             it in place."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
     sqlx::query("UPDATE document_comments SET status='resolved' WHERE id=?")
         .bind(comment_id)
         .execute(&mut *tx)
@@ -17275,7 +17334,7 @@ mod tests {
         );
 
         // Resolve flips status and is filterable.
-        let r = resolve_comment(&pool, cid, Some("alice")).await?;
+        let r = resolve_comment(&pool, cid, Some("alice"), false, None).await?;
         assert_eq!(r["status"], json!("resolved"));
         assert_eq!(
             get_document_comments(&pool, did, None, Some("open"))
@@ -17328,7 +17387,107 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(resolve_comment(&pool, 999, Some("x")).await.is_err());
+        assert!(resolve_comment(&pool, 999, Some("x"), false, None)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    /// task_1418: the pure anchored-text helper flags a text-quote anchor whose exact string is still
+    /// present, under either the flat `exact` or a nested `TextQuoteSelector.exact`, and is quiet when
+    /// there is no anchor, the anchor is empty, or the text is gone.
+    #[test]
+    fn anchored_exact_still_present_detects_remaining_quote() {
+        let flat = r#"{"exact":"widgets are great"}"#;
+        assert_eq!(
+            anchored_exact_still_present(Some(flat), "the widgets are great today"),
+            Some("widgets are great".to_string())
+        );
+        assert_eq!(
+            anchored_exact_still_present(Some(flat), "the gadgets are great today"),
+            None,
+            "gone -> no warning"
+        );
+        let nested = r#"{"TextQuoteSelector":{"exact":"foo bar","prefix":"the "}}"#;
+        assert_eq!(
+            anchored_exact_still_present(Some(nested), "the foo bar here"),
+            Some("foo bar".to_string())
+        );
+        assert_eq!(anchored_exact_still_present(None, "anything"), None);
+        assert_eq!(
+            anchored_exact_still_present(Some(r#"{"exact":"   "}"#), "x   y"),
+            None,
+            "whitespace-only anchor does not fire"
+        );
+        assert_eq!(
+            anchored_exact_still_present(Some(r#"{"prefix":"p"}"#), "p anything"),
+            None,
+            "a region with no exact does not fire"
+        );
+    }
+
+    /// task_1418: the resolve soft-gate is best-effort and acknowledge-able. With no IPFS backend the
+    /// anchored-text check is skipped (never hard-fails on a fetch miss), so an anchored comment still
+    /// resolves; and acknowledge=true bypasses the check regardless. (The positive block path needs a
+    /// content backend and is covered by the pure helper above.)
+    #[tokio::test]
+    async fn resolve_comment_soft_gate_is_best_effort_and_acknowledgeable() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let d = create_document(
+            &pool,
+            "Spec",
+            None,
+            "bafy1",
+            Some("v1"),
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        let c = comment_document(
+            &pool,
+            did,
+            None,
+            Some("cameron"),
+            "fix this phrasing",
+            Some(json!({ "exact": "still here" })),
+            None,
+            None,
+        )
+        .await?;
+        let cid = c["id"].as_i64().unwrap();
+        // No ipfs backend -> the anchored-text check cannot fetch the body -> it is skipped and the
+        // resolve proceeds (a fetch miss must never block).
+        let r = resolve_comment(&pool, cid, Some("alice"), false, None).await?;
+        assert_eq!(
+            r["status"],
+            json!("resolved"),
+            "best-effort skip resolves: {r}"
+        );
+
+        // A second anchored comment resolves under acknowledge=true even if a backend were present.
+        let c2 = comment_document(
+            &pool,
+            did,
+            None,
+            Some("cameron"),
+            "and this",
+            Some(json!({ "exact": "still here" })),
+            None,
+            None,
+        )
+        .await?;
+        let cid2 = c2["id"].as_i64().unwrap();
+        let r2 =
+            resolve_comment(&pool, cid2, Some("alice"), true, Some("http://127.0.0.1:1")).await?;
+        assert_eq!(
+            r2["status"],
+            json!("resolved"),
+            "acknowledge bypasses the gate: {r2}"
+        );
         Ok(())
     }
 

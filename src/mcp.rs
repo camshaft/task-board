@@ -1664,6 +1664,12 @@ pub struct ResolveCommentArgs {
     pub comment_id: i64,
     #[serde(rename = "principal", alias = "actor", default)]
     pub actor: Option<String>,
+    /// Resolve even when the comment is anchored to a text quote that is STILL present verbatim in the
+    /// current version (task_1418). Default false: an anchored comment whose exact text remains is
+    /// rejected with a warning, since marking it resolved usually claims an un-made change. Pass true
+    /// to resolve anyway when the revision legitimately rephrased the text in place.
+    #[serde(default)]
+    pub acknowledge: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3765,16 +3771,22 @@ impl Board {
     }
 
     #[tool(
-        description = "Mark a document comment resolved (open -> resolved). Notifies the document's subscribers."
+        description = "Mark a document comment resolved (open -> resolved). Notifies the document's subscribers. task_1418 soft-gate: if the comment is anchored to a text quote (region.exact) that is STILL present verbatim in the document's current version, the resolve is rejected with a warning (likely a premature 'addressed' claim) -- pass acknowledge=true to resolve anyway when the revision legitimately rephrased the text in place. Best-effort: skipped silently when there is no anchor or the body cannot be fetched."
     )]
     async fn resolve_comment(
         &self,
         Parameters(a): Parameters<ResolveCommentArgs>,
     ) -> Result<CallToolResult, McpError> {
-        core::resolve_comment(&self.pool, a.comment_id, s(&a.actor))
-            .await
-            .map_err(err)
-            .and_then(ok)
+        core::resolve_comment(
+            &self.pool,
+            a.comment_id,
+            s(&a.actor),
+            a.acknowledge.unwrap_or(false),
+            self.ipfs_api_url.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
     }
 
     #[tool(
