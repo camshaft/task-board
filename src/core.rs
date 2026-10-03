@@ -8792,16 +8792,18 @@ pub fn scan_non_ascii(text: &str) -> Vec<(char, usize, usize)> {
 }
 
 /// Allow-list of acceptable all-caps tokens for the caps-for-emphasis lint (task_1473), PORTED from
-/// the fleet clean-prose ruleset (camshaft/fleet crates/fleet/prose-style.toml `caps_allow`) so the
-/// board gate matches the fleet lint-prose rule rather than inventing a parallel heuristic. Kept
-/// conservative; a token carrying a digit or underscore is an identifier and is never flagged, so it
-/// does not belong here. The sole board addition over the fleet list is CID (board-ubiquitous).
+/// the fleet clean-prose ruleset (camshaft/fleet crates/fleet/prose-style.toml `caps_allow`, read at
+/// origin/main f9f73b8 and v-fleet-tooling parity-checked) so the board gate matches the fleet
+/// lint-prose rule rather than inventing a parallel heuristic. Kept conservative; a token carrying a
+/// digit or underscore is an identifier and is never flagged, so it does not belong here. The board
+/// set is the fleet caps_allow verbatim plus one board addition, CID (board-ubiquitous);
+/// v-fleet-tooling owns the upstream list, so re-sync this on a fleet edit.
 const CAPS_ALLOW: &[&str] = &[
-    "ABI", "API", "ASCII", "AST", "CD", "CI", "CID", "CLI", "CPU", "DNS", "ETAG", "FIXME", "GB",
-    "GHA", "HTTP", "HTTPS", "ID", "IO", "JSON", "KB", "LAN", "MB", "MCP", "MIDI", "ML", "NOTE",
-    "OK", "OS", "PID", "PR", "RAM", "REST", "RPC", "SAFETY", "SHA", "SQL", "SRI", "SSH", "STT",
-    "TCP", "TODO", "TOML", "TTS", "UA", "UDP", "URI", "URL", "USB", "UTC", "UUID", "VPN", "WASI",
-    "WIT", "YAML",
+    "ABI", "AKIA", "API", "ASCII", "AST", "CD", "CI", "CID", "CLI", "CPU", "DNS", "ETA", "ETAG",
+    "FIXME", "GB", "GHA", "HEAD", "HOME", "HTTP", "HTTPS", "ID", "IO", "JSON", "JSONL", "KB",
+    "LAN", "MB", "MCP", "MIDI", "ML", "NOTE", "OK", "OS", "PID", "PR", "RAM", "REST", "RPC",
+    "SAFETY", "SHA", "SQL", "SRI", "SSH", "STT", "TCP", "TODO", "TOML", "TTS", "UA", "UDP", "URI",
+    "URL", "USB", "UTC", "UUID", "VPN", "WASI", "WIT", "YAML",
 ];
 
 /// Is `word` an all-caps emphasis token under the allow-list? Mirrors the fleet rule
