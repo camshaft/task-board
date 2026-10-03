@@ -17,7 +17,15 @@ import { AuthorLabel, AutoGrowTextarea, relTime } from './ui'
 // One channel (/channels/:channelId): header (label, topic, members, invite), a threaded post
 // pane (one level of reply_to nesting), and a composer. Backed by the resource store; posts
 // live-update via the channel.* / message.direct SSE path (channel_id → touched).
+// Remount the pane per channel (key on the route param) so all scroll/pagination refs + state
+// (initedScroll, atBottom, prevLen, earlier, newCount) reset cleanly on a channel switch instead
+// of leaking across -- React Router reuses the element otherwise, since the route has no key.
 export default function ChannelView() {
+  const { channelId } = useParams()
+  return <ChannelViewPane key={channelId ?? 'none'} />
+}
+
+function ChannelViewPane() {
   const { channelId } = useParams()
   const { actor } = useBoardContext()
   const id = Number(channelId)
@@ -35,9 +43,13 @@ export default function ChannelView() {
   const [noMoreEarlier, setNoMoreEarlier] = useState(false)
 
   const scrollRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
   const initedScroll = useRef(false)
   const atBottom = useRef(true)
   const preserveHeight = useRef<number | null>(null)
+  const prevLen = useRef(0)
+  // Messages that arrived while the user was scrolled up into history; drives the jump-to-bottom pill.
+  const [newCount, setNewCount] = useState(0)
 
   const author = (p: ChannelPost) => p.data.from ?? p.actor ?? 'anon'
 
@@ -60,6 +72,11 @@ export default function ChannelView() {
       await postToChannel(id, { sender: actor, body, reply_to: replyTo ?? undefined })
       setDraft('')
       setReplyTo(null)
+      // Sending re-pins you to the bottom so your own message lands in view.
+      atBottom.current = true
+      setNewCount(0)
+      const el = scrollRef.current
+      if (el) el.scrollTop = el.scrollHeight
     } catch (e) {
       setActionError((e as Error).message)
     } finally {
@@ -126,15 +143,41 @@ export default function ChannelView() {
     if (preserveHeight.current != null) {
       el.scrollTop += el.scrollHeight - preserveHeight.current
       preserveHeight.current = null
+      prevLen.current = merged.length
       return
     }
     if (!initedScroll.current) {
       el.scrollTop = el.scrollHeight
       initedScroll.current = true
+      prevLen.current = merged.length
       return
     }
-    if (atBottom.current) el.scrollTop = el.scrollHeight
+    const added = merged.length - prevLen.current
+    prevLen.current = merged.length
+    if (added <= 0) return // a re-render without new messages -- leave the scroll position alone
+    if (atBottom.current) {
+      // Pinned to the bottom: keep the latest message visible as it arrives.
+      el.scrollTop = el.scrollHeight
+    } else {
+      // Scrolled up reading history: do NOT yank the view down -- surface a jump affordance instead.
+      setNewCount((n) => n + added)
+    }
   }, [merged.length])
+
+  // Keep a pinned-to-bottom viewport glued to the bottom as late/async content (markdown, images,
+  // lazy mermaid/vega) grows the feed AFTER the initial layout. Without this each such growth leaves
+  // the viewport a little above the true bottom, so new-message auto-scroll silently drifts and
+  // stops working (task_1396). Gated on atBottom, so a user who scrolled up is never yanked down.
+  useEffect(() => {
+    const el = scrollRef.current
+    const content = contentRef.current
+    if (!el || !content || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => {
+      if (atBottom.current) el.scrollTop = el.scrollHeight
+    })
+    ro.observe(content)
+    return () => ro.disconnect()
+  }, [])
 
   // Thread one level: top-level posts (no reply_to) in order, each followed by replies whose
   // reply_to points at its seq. Any reply whose parent isn't present renders at top level.
@@ -188,44 +231,63 @@ export default function ChannelView() {
         </div>
       )}
 
-      <div
-        ref={scrollRef}
-        onScroll={(e) => {
-          const el = e.currentTarget
-          atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
-        }}
-        className="min-h-0 flex-1 overflow-y-auto px-5 py-3"
-      >
-        {merged.length > 0 && !noMoreEarlier && (
-          <div className="mb-2 flex justify-center">
-            <button
-              onClick={loadEarlier}
-              disabled={loadingEarlier}
-              className="rounded-md border border-[var(--color-border)] px-3 py-1 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-800 dark:hover:text-sky-300 disabled:opacity-40"
-            >
-              {loadingEarlier ? 'Loading…' : 'Load earlier messages'}
-            </button>
-          </div>
-        )}
-        <ul className="space-y-2">
-          {topLevel.map((p) => (
-            <li key={p.seq}>
-              <PostRow p={p} author={author(p)} extName={extName} onReply={() => setReplyTo(p.seq)} />
-              {repliesOf(p.seq).length > 0 && (
-                <ul className="mt-1.5 space-y-1.5 border-l border-[var(--color-border)] pl-4">
-                  {repliesOf(p.seq).map((r) => (
-                    <li key={r.seq}>
-                      <PostRow p={r} author={author(r)} extName={extName} />
-                    </li>
-                  ))}
-                </ul>
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget
+            const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+            atBottom.current = bottom
+            if (bottom) setNewCount(0) // caught back up -- clear the new-messages affordance
+          }}
+          className="min-h-0 flex-1 overflow-y-auto px-5 py-3"
+        >
+          <div ref={contentRef}>
+            {merged.length > 0 && !noMoreEarlier && (
+              <div className="mb-2 flex justify-center">
+                <button
+                  onClick={loadEarlier}
+                  disabled={loadingEarlier}
+                  className="rounded-md border border-[var(--color-border)] px-3 py-1 text-xs text-[var(--color-muted)] hover:border-sky-500/40 hover:text-sky-800 dark:hover:text-sky-300 disabled:opacity-40"
+                >
+                  {loadingEarlier ? 'Loading…' : 'Load earlier messages'}
+                </button>
+              </div>
+            )}
+            <ul className="space-y-2">
+              {topLevel.map((p) => (
+                <li key={p.seq}>
+                  <PostRow p={p} author={author(p)} extName={extName} onReply={() => setReplyTo(p.seq)} />
+                  {repliesOf(p.seq).length > 0 && (
+                    <ul className="mt-1.5 space-y-1.5 border-l border-[var(--color-border)] pl-4">
+                      {repliesOf(p.seq).map((r) => (
+                        <li key={r.seq}>
+                          <PostRow p={r} author={author(r)} extName={extName} />
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              ))}
+              {merged.length === 0 && (
+                <li className="text-sm text-[var(--color-muted)]">No messages yet.</li>
               )}
-            </li>
-          ))}
-          {merged.length === 0 && (
-            <li className="text-sm text-[var(--color-muted)]">No messages yet.</li>
-          )}
-        </ul>
+            </ul>
+          </div>
+        </div>
+        {newCount > 0 && (
+          <button
+            onClick={() => {
+              const el = scrollRef.current
+              if (el) el.scrollTop = el.scrollHeight
+              atBottom.current = true
+              setNewCount(0)
+            }}
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-sky-700 px-3 py-1 text-xs font-medium text-white shadow-md hover:bg-sky-600"
+          >
+            ↓ {newCount} new message{newCount === 1 ? '' : 's'}
+          </button>
+        )}
       </div>
 
       <div className="border-t border-[var(--color-border)] p-4">
