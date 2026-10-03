@@ -332,6 +332,46 @@ pub struct SetLifecycleIntentArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct AppendTranscriptChunkArgs {
+    /// The session whose transcript-chunk log to append to.
+    pub session_id: String,
+    /// The session generation this chunk belongs to (one session's history spans generations).
+    pub generation: i64,
+    /// The IPFS CID the checkpointed context window was published to. The board stores this pointer
+    /// + metadata only, never the transcript bytes.
+    #[serde(rename = "content_id", alias = "cid")]
+    pub content_id: String,
+    /// window (a checkpointed context window, the default) or compaction-boundary (an in-order
+    /// marker where history was compacted; pre-boundary chunks are retained).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Optional first turn index covered by this window.
+    #[serde(default)]
+    pub turn_start: Option<i64>,
+    /// Optional last turn index covered by this window.
+    #[serde(default)]
+    pub turn_end: Option<i64>,
+    /// Optional byte size of the checkpointed window.
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    /// Optional arbitrary metadata recorded with the entry.
+    #[serde(default)]
+    pub metadata: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListTranscriptChunksArgs {
+    /// The session whose transcript-chunk log to read (ordered across all generations).
+    pub session_id: String,
+    /// Incremental cursor: return only entries strictly after this position (omit/0 = from the
+    /// start). Pass the response's last_position back here to tail-follow.
+    #[serde(default)]
+    pub since_position: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestStandDownArgs {
     /// The agent asked to wind down.
     pub agent_id: String,
@@ -2326,6 +2366,42 @@ impl Board {
         .await
         .map_err(err)
         .and_then(ok)
+    }
+
+    #[tool(
+        description = "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). `position` is assigned server-side (per-session, monotonic across generations) and returned. `kind` is window | compaction-boundary; the log is append-only + history-preserving (a compaction-boundary retains every chunk before it)."
+    )]
+    async fn append_transcript_chunk(
+        &self,
+        Parameters(a): Parameters<AppendTranscriptChunkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::append_transcript_chunk(
+            &self.pool,
+            &a.session_id,
+            a.generation,
+            &a.content_id,
+            s(&a.kind),
+            a.turn_start,
+            a.turn_end,
+            a.size_bytes,
+            a.metadata.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned/migrated session rehydrates its whole history. `since_position` gives the incremental form (only entries after the cursor); the response carries `last_position` as the next cursor. Returns CIDs + metadata; resolve the bytes from IPFS."
+    )]
+    async fn list_transcript_chunks(
+        &self,
+        Parameters(a): Parameters<ListTranscriptChunksArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_transcript_chunks(&self.pool, &a.session_id, a.since_position)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     // --- Projects ---
