@@ -389,6 +389,18 @@ pub struct RecallArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct CheckStopArgs {
+    /// The agent that wants to stop.
+    pub agent_id: String,
+    /// Advisory stop context (reason tag + free text, open-work summary, last-activity). The board
+    /// decides on its own authority, so this is accepted for the loop contract but does not change
+    /// the decision.
+    #[serde(default)]
+    pub stop_context: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitDeciderEpisodeArgs {
     /// The agent whose decider loop produced the episode.
     pub agent_id: String,
@@ -2522,6 +2534,19 @@ impl Board {
         .await
         .map_err(err)
         .and_then(ok)
+    }
+
+    #[tool(
+        description = "Board-authoritative stop-condition check (task_1479, doc_3426 ask 13): call before letting an agent stop. Returns {decision: accept} only when the agent's lifecycle_intent is paused/retired (meant offline); a run-intent agent is never hard-accepted -- {decision: reject, reason, directive} with directive {kind: take, task_ref} if it holds an open actionable (todo/in_progress, non-blocked, non-monitor-exempt) task, else {kind: park} (stay online, idle, wait for an event-wake). A pure idempotent read on board state (desired-fleet-state + open work), not the agent self-report; feed `reason` to the model verbatim. `stop_context` is advisory."
+    )]
+    async fn check_stop(
+        &self,
+        Parameters(a): Parameters<CheckStopArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::check_stop(&self.pool, &a.agent_id, a.stop_context)
+            .await
+            .map_err(err)
+            .and_then(ok)
     }
 
     #[tool(

@@ -10615,6 +10615,92 @@ pub async fn recall_bundle(
     }))
 }
 
+/// task_1479 (doc_3426 ask 13): the board-authoritative stop-condition check the harness calls
+/// before it lets an agent stop. A pure, idempotent read on BOARD state (desired-fleet-state + open
+/// work), never the agent's self-report. It accepts a hard stop ONLY when the agent's declared
+/// lifecycle_intent is paused or retired (it is meant to go offline). A run-intent agent is never
+/// hard-accepted: if it holds an open ACTIONABLE assigned task (todo/in_progress, not blocked, not
+/// monitor-exempt -- the fleet's own actionable rule) it is rejected with a {kind: take, task_ref}
+/// directive naming the highest-priority one; if its queue is empty or fully blocked it is rejected
+/// with a {kind: park} directive (stay online, idle, wait for an event-wake), which keeps a run-intent
+/// agent off the stop-then-respawn thrash path (v-ft comment_8123). The response shares the
+/// {decision, reason, directive} shell with the ask 11 decider result (task_1477); here decision is
+/// accept | reject. `stop_context` (the agent's stop reason + open-work summary + last-activity) is
+/// accepted as advisory for the loop contract and future tightening -- the board decides on its own
+/// authority, so the result is idempotent for any context. cameron's open sub-point (strictly
+/// sync-blocking? structured directive vs free-text) tightens the directive field later; the
+/// synchronous accept/reject-with-reason core here is the stable part.
+pub async fn check_stop(
+    pool: &Pool,
+    agent_id: &str,
+    _stop_context: Option<Value>,
+) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request("agent_id is required".to_string()));
+    }
+    let Some(row) = sqlx::query("SELECT lifecycle_intent FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        anyhow::bail!("no agent {agent_id}");
+    };
+    let intent: String = row
+        .try_get("lifecycle_intent")
+        .unwrap_or_else(|_| "run".to_string());
+
+    // paused/retired: the agent is meant to be offline -> accept the stop.
+    if intent == "paused" || intent == "retired" {
+        return Ok(json!({
+            "decision": "accept",
+            "reason": format!(
+                "lifecycle_intent is '{intent}' -- the agent is meant to be offline; stop accepted."
+            ),
+        }));
+    }
+
+    // run-intent: never a hard stop. Find the highest-priority open ACTIONABLE assigned task
+    // (todo/in_progress, not blocked, not monitor-exempt). One exists -> direct the agent to take it;
+    // otherwise -> direct it to park (stay online, idle). Priority high > normal/unset > low.
+    // monitor_exempt is derived from metadata.monitor_exempt (task_1326: reachable only via the
+    // icebox status, which the status filter already excludes); the metadata guard is belt-and-
+    // suspenders against a legacy flag on a todo/in_progress task.
+    let actionable = sqlx::query(
+        "SELECT id, title, status, priority FROM tasks \
+         WHERE assignee=? AND archived_at IS NULL \
+           AND status IN ('todo','in_progress') AND blocked_on_kind IS NULL \
+           AND COALESCE(json_extract(metadata, '$.monitor_exempt'), 0) NOT IN (1, 'true') \
+         ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'low' THEN 2 ELSE 1 END ASC, id ASC",
+    )
+    .bind(agent_id)
+    .fetch_all(pool)
+    .await?;
+
+    if let Some(top) = actionable.first() {
+        let id: i64 = top.try_get("id")?;
+        let title: String = top.try_get("title").unwrap_or_default();
+        let status: String = top.try_get("status").unwrap_or_default();
+        let n = actionable.len();
+        return Ok(json!({
+            "decision": "reject",
+            "reason": format!(
+                "Stop premature: lifecycle_intent is 'run' and you hold {n} open actionable task(s). \
+                 Work task_{id} ('{title}', {status}, not blocked) before stopping."
+            ),
+            "directive": { "kind": "take", "task_ref": format!("task_{id}") },
+        }));
+    }
+
+    Ok(json!({
+        "decision": "reject",
+        "reason": "No actionable task right now, but desired-fleet-state keeps you 'run'. Park -- \
+                   stay online and idle, and wait for an event-wake -- rather than stopping, so you \
+                   are not respawned.",
+        "directive": { "kind": "park" },
+    }))
+}
+
 /// Serialize one `decider_episodes` row, parsing the stored `episode` JSON string back to a value
 /// (default `{}`), mirroring [`transcript_chunk_json`].
 fn decider_episode_json(row: &SqliteRow) -> Value {
@@ -20353,6 +20439,87 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    /// task_1479 (doc_3426 ask 13): board-authoritative stop-condition check. Accept only on
+    /// paused/retired; a run-intent agent is directed to take an actionable task or to park -- never
+    /// hard-accepted (keeps it off the stop-then-respawn path); a pure idempotent read on board state.
+    #[tokio::test]
+    async fn check_stop_board_authoritative_accept_take_park() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "v-s", None, None, None, None, None).await?;
+        register_agent(&pool, "v-other", None, None, None, None, None).await?;
+        let proj = create_project(&pool, "P", None, Some("cameron"), None).await?;
+        let pid = proj["id"].as_i64().unwrap();
+
+        // run-intent (default) + an open actionable task -> reject with a take directive.
+        let t = create_task(
+            &pool,
+            pid,
+            "do the thing",
+            None,
+            Some("v-s"),
+            Some("high"),
+            Some("cameron"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tid = t["id"].as_i64().unwrap();
+        let r = check_stop(&pool, "v-s", None).await?;
+        assert_eq!(
+            r["decision"],
+            json!("reject"),
+            "run-intent with work -> reject: {r}"
+        );
+        assert_eq!(r["directive"]["kind"], json!("take"));
+        assert_eq!(r["directive"]["task_ref"], json!(format!("task_{tid}")));
+        assert!(r["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("task_{tid}")));
+
+        // Block that only task -> no actionable work -> reject with a PARK directive (not accept).
+        update_task(
+            &pool,
+            tid,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("cameron"),
+            None,
+            None,
+            Some(json!({"kind": "agent", "target": "v-other", "note": "waiting"})),
+        )
+        .await?;
+        let park = check_stop(&pool, "v-s", None).await?;
+        assert_eq!(
+            park["decision"],
+            json!("reject"),
+            "run-intent, no actionable task -> still reject (park), never hard-accept: {park}"
+        );
+        assert_eq!(park["directive"]["kind"], json!("park"));
+        // Idempotent + board-authoritative: a second check with a different stop_context is the same.
+        let park2 = check_stop(&pool, "v-s", Some(json!({"reason": "no-ready-work"}))).await?;
+        assert_eq!(park2["decision"], park["decision"]);
+        assert_eq!(
+            park2["directive"]["kind"],
+            json!("park"),
+            "decision is idempotent regardless of stop_context"
+        );
+
+        // paused -> accept the stop (the agent is meant to go offline).
+        set_lifecycle_intent(&pool, "v-s", "paused", Some("cameron"), None).await?;
+        let acc = check_stop(&pool, "v-s", None).await?;
+        assert_eq!(acc["decision"], json!("accept"), "paused -> accept: {acc}");
+
+        // Unknown agent -> clean error.
+        assert!(check_stop(&pool, "nobody", None).await.is_err());
         Ok(())
     }
 

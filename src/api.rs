@@ -220,6 +220,7 @@ pub fn router(state: AppState) -> Router {
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/agents/{agent_id}/recall", get(recall))
+        .route("/agents/{agent_id}/check-stop", post(check_stop))
         .route(
             "/agents/{agent_id}/config/{config_kind}",
             get(list_agent_config).post(set_agent_config_entry),
@@ -922,6 +923,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Read an agent's per-config_kind editable-config set (task_1477, doc_3426 ask 11): one read returns {agent_id, config_kind, version, count, entries} in dispatch order (position then id). config_kind namespaces the shared per-agent editable-config surface -- 'decider' (ask 11: payload = {kind, criteria, bands}, scope = applies_to_call_types) and 'tool' (ask 4). Each entry is the {id, enabled, scope, payload} envelope + position. The harness reads at session start and re-reads on an agent.config_changed wake (subscribe board + [\"agent\"]); version is the watchable key.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Upsert one entry in an agent's config set (task_1477): add a new entry or edit/toggle an existing one by entry_id. An omitted field keeps the existing value (edit) or the default (add: enabled=true, scope=null=all-call-types, payload={}, position appended). scope=null clears to all call types. Bumps the version + emits agent.config_changed so a subscribed harness hot-reloads. Returns the full updated set.", query: "", body: Some("SetAgentConfigEntryBody") },
     Endpoint { method: "DELETE", path: "/api/agents/{agent_id}/config/{config_kind}/{entry_id}", summary: "Remove one entry from an agent's config set (task_1477). Bumps the version + emits agent.config_changed like an edit. Returns the shrunk set.", query: "actor=str", body: None },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/check-stop", summary: "Board-authoritative stop-condition check (task_1479, doc_3426 ask 13): the harness calls this before letting an agent stop. Returns {decision: accept} only when the agent's lifecycle_intent is paused/retired (meant offline); a run-intent agent is never hard-accepted -- {decision: reject, reason, directive} with directive {kind: take, task_ref} if it holds an open actionable (todo/in_progress, non-blocked, non-monitor-exempt) task, else {kind: park} (stay online, idle, wait for a wake). A pure idempotent read on board state (desired-fleet-state + open work), not the agent self-report; the reason is fed to the model verbatim. stop_context is advisory.", query: "", body: Some("CheckStopBody") },
     Endpoint { method: "POST", path: "/api/sessions/{session_id}/transcript-chunks", summary: "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). position is assigned server-side (per-session, monotonic across generations) and returned. kind is window | compaction-boundary; append-only + history-preserving.", query: "", body: Some("AppendTranscriptChunkBody") },
     Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None },
     Endpoint { method: "POST", path: "/api/decider-episodes", summary: "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. Lightweight no-event append — fire it async off the agent hot path. Downstream consumer: the decider corpus (task_1471).", query: "", body: Some("SubmitDeciderEpisodeBody") },
@@ -1063,6 +1065,7 @@ fn body_schemas() -> Value {
         RestoreAgentBody,
         SetLifecycleIntentBody,
         AppendTranscriptChunkBody,
+        CheckStopBody,
         SubmitDeciderEpisodeBody,
         SetAgentConfigEntryBody,
         CreateProjectBody,
@@ -1573,6 +1576,24 @@ async fn remove_agent_config_entry(
             q.actor.as_deref(),
         )
         .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CheckStopBody {
+    /// Advisory stop context (reason tag + free text, open-work summary, last-activity marker). The
+    /// board decides on its own authority (desired-fleet-state + open work), so this is accepted for
+    /// the loop contract but does not change the decision.
+    stop_context: Option<Value>,
+}
+
+async fn check_stop(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<CheckStopBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::check_stop(&st.pool, &agent_id, b.stop_context).await?,
     ))
 }
 
