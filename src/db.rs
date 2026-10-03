@@ -612,6 +612,21 @@ CREATE TABLE IF NOT EXISTS agent_config_versions (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (agent_id, config_kind)
 );
+-- Live-attach state (task_1462, doc_3426 ask 7): the set of callers currently attached to an
+-- agent's live session, so attach is REFERENCE-COUNTED (the harness pushes live frames while at
+-- least one attacher is present and stops on the last detach) and the count survives a board
+-- restart. One row per (attached-to agent, attacher). The live transcript/thought-process FRAMES
+-- are NOT stored here or anywhere -- they fan out ephemerally over an in-process per-agent
+-- broadcast (bounded, drop-oldest), distinct from the durable transcript_chunks recovery log.
+-- Only the attach-state transitions (first-attach / last-detach) and the steer/abort control items
+-- are durable, delivered to the headless harness as events on the existing emit+inbox+push path.
+CREATE TABLE IF NOT EXISTS session_attachments (
+    agent_id   TEXT NOT NULL,
+    attacher   TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, attacher)
+);
+CREATE INDEX IF NOT EXISTS idx_session_attachments_agent ON session_attachments(agent_id);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
