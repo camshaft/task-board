@@ -19,7 +19,7 @@
 //! table, not in this bus's live receiver count.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,10 +63,6 @@ pub struct FrameHub {
 }
 
 impl FrameHub {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
     /// Subscribe an attacher to an agent's live frames, creating the agent's channel if needed.
     /// The returned receiver drops the oldest frames (reported as `Lagged(n)`) if the attacher
     /// falls behind, so it can never backpressure the publisher or other attachers.
@@ -112,6 +108,15 @@ impl FrameHub {
     }
 }
 
+/// The process-global live frame hub. The frame fan-out is in-memory, ephemeral, per-process state
+/// with no DB tailer, so a single shared instance backs every attach stream and frame push -- a
+/// singleton bus, distinct from the events-tailer broadcast in `AppState` that mirrors the durable
+/// event log. A static avoids threading the hub through `AppState` and its many construction sites.
+pub fn hub() -> &'static FrameHub {
+    static HUB: LazyLock<FrameHub> = LazyLock::new(FrameHub::default);
+    &HUB
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,7 +134,7 @@ mod tests {
 
     #[test]
     fn publish_with_no_attacher_is_a_noop() {
-        let hub = FrameHub::new();
+        let hub = FrameHub::default();
         assert_eq!(hub.receiver_count("a1"), 0);
         // Best-effort: a push to an unattached agent reaches nobody and does not panic.
         assert_eq!(hub.publish("a1", frame(1)), 0);
@@ -137,7 +142,7 @@ mod tests {
 
     #[tokio::test]
     async fn attacher_receives_published_frames_in_order() {
-        let hub = FrameHub::new();
+        let hub = FrameHub::default();
         let mut rx = hub.subscribe("a1");
         assert_eq!(hub.receiver_count("a1"), 1);
         assert_eq!(hub.publish("a1", frame(1)), 1);
@@ -148,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lagging_attacher_sees_a_gap_not_backpressure() {
-        let hub = FrameHub::new();
+        let hub = FrameHub::default();
         let mut rx = hub.subscribe("a1");
         // Overrun the ring without the receiver draining: the publisher never blocks.
         for seq in 0..(FRAME_RING as i64 + 10) {
@@ -164,7 +169,7 @@ mod tests {
 
     #[test]
     fn channel_is_reclaimed_once_all_attachers_drop() {
-        let hub = FrameHub::new();
+        let hub = FrameHub::default();
         let rx = hub.subscribe("a1");
         assert_eq!(hub.receiver_count("a1"), 1);
         drop(rx);

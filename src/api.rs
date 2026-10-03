@@ -439,6 +439,10 @@ pub fn router(state: AppState) -> Router {
             "/documents/{document_id}/deprecate",
             post(deprecate_document),
         )
+        .route("/agents/{agent_id}/attach", get(session_attach))
+        .route("/agents/{agent_id}/frames", post(session_push_frame))
+        .route("/agents/{agent_id}/steer", post(session_steer))
+        .route("/agents/{agent_id}/abort", post(session_abort))
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
@@ -1077,6 +1081,10 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/documents/{document_id}/restore", summary: "Restore a previously archived document (clears the archive stamp).", query: "", body: Some("DocumentActorBody") },
     Endpoint { method: "POST", path: "/api/documents/{document_id}/deprecate", summary: "Mark a document deprecated (optionally superseded_by a replacing document id), or deprecated=false to clear it. Orthogonal to archive: a deprecated doc stays VISIBLE (clients show a banner) rather than hidden. deprecated defaults to true.", query: "", body: Some("DeprecateDocumentBody") },
     Endpoint { method: "GET", path: "/api/stream", summary: "Server-Sent Events feed of live board activity.", query: "last_event_id=int", body: None },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}/attach", summary: "Server-Sent Events stream of an agent's live transcript + thought-process frames (doc_3426 ask 7). Reference-counts the attach (the first attacher wakes the headless harness to start pushing frames) and detaches on disconnect. Frames are ephemeral and best-effort: a lagging attacher gets a gap marker (the dropped count) and re-pulls the durable transcript-chunk log, never backpressuring the agent. Authz: the operator, the agent's lead, or a same-team teammate.", query: "caller=str", body: None },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/frames", summary: "The headless harness pushes one live frame {session_id, turn_id?, frame_seq, kind: transcript-delta|thought-process, payload}, fanned out to the agent's current attachers (a no-op if none). Ephemeral and best-effort; never blocks on a slow or gone attacher.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/steer", summary: "Deliver a steer message as the agent's next input (a durable session.steer control item the harness consumes at its next input boundary). Authz: the operator or the agent's lead.", query: "", body: Some("SteerBody") },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/abort", summary: "Deliver a non-destructive abort (the M4 abort verb): the harness cancels the current turn at its next checkpoint and preserves session state (a durable session.abort control item). Authz: the operator or the agent's lead.", query: "", body: Some("AbortBody") },
 ];
 
 /// Build the JSON Schemas for every referenced request body, keyed by struct name.
@@ -1102,6 +1110,8 @@ fn body_schemas() -> Value {
         SetAgentConfigEntryBody,
         SetBudgetBody,
         ReportSpendBody,
+        SteerBody,
+        AbortBody,
         CreateProjectBody,
         UpdateProjectBody,
         CreateTaskBody,
@@ -4678,6 +4688,171 @@ async fn detach_document(
 ) -> ApiResult {
     Ok(Json(
         core::detach_document(&st.pool, document_id, b.task_id, b.actor.as_deref()).await?,
+    ))
+}
+
+// --- Live session attach / stream / steer / abort (task_1462, doc_3426 ask 7) ---
+
+#[derive(Deserialize, JsonSchema)]
+struct AttachQuery {
+    /// The attaching caller's id (the authz subject): the operator, the agent's lead, or a
+    /// same-team teammate may read-attach.
+    caller: String,
+}
+
+/// `GET /api/agents/{agent_id}/attach` -- Server-Sent Events stream of an agent's live transcript +
+/// thought-process frames. Attaching reference-counts the agent (the first attacher wakes the
+/// headless harness to start pushing frames); the stream tears down and detaches on disconnect, so
+/// a gone attacher never holds the agent in push-on. Frames are ephemeral and best-effort: a lagging
+/// attacher is sent a `gap` marker (the dropped count, to bracket the missed frame_seq range and
+/// re-pull the durable chunk log) rather than ever backpressuring the agent.
+async fn session_attach(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(q): Query<AttachQuery>,
+) -> Response {
+    match core::can_read_attach(&st.pool, &q.caller, &agent_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "not authorized to attach to this agent" })),
+            )
+                .into_response()
+        }
+        Err(e) => return ApiError(e).into_response(),
+    }
+    if let Err(e) = core::attach_session(&st.pool, &agent_id, &q.caller).await {
+        return ApiError(e).into_response();
+    }
+
+    let rx = crate::session_live::hub().subscribe(&agent_id);
+
+    // Detach (and emit the last-detach wake) when the client disconnects. The Sse body owns this
+    // guard, so dropping the response on disconnect runs it; Drop can't be async, so it hands the
+    // detach to a task on the runtime.
+    struct DetachOnDrop {
+        pool: Pool,
+        agent_id: String,
+        caller: String,
+    }
+    impl Drop for DetachOnDrop {
+        fn drop(&mut self) {
+            let (pool, agent_id, caller) = (
+                self.pool.clone(),
+                self.agent_id.clone(),
+                self.caller.clone(),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = core::detach_session(&pool, &agent_id, &caller).await {
+                    tracing::warn!("[task-board] session detach on disconnect failed: {e}");
+                }
+            });
+        }
+    }
+    let guard = DetachOnDrop {
+        pool: st.pool.clone(),
+        agent_id: agent_id.clone(),
+        caller: q.caller.clone(),
+    };
+
+    let live =
+        tokio_stream::StreamExt::map(tokio_stream::wrappers::BroadcastStream::new(rx), move |r| {
+            // Keep the detach guard alive for exactly the stream's lifetime.
+            let _keep = &guard;
+            use axum::response::sse::Event;
+            match r {
+                Ok(frame) => Ok::<_, std::convert::Infallible>(
+                    Event::default()
+                        .id(frame.frame_seq.to_string())
+                        .json_data(&frame)
+                        .unwrap_or_else(|_| Event::default().comment("unserializable frame")),
+                ),
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    // Drop-oldest gap: tell the attacher how many frames it missed so it brackets
+                    // the dropped frame_seq range (last-seen..next-seen) and re-pulls the chunk log.
+                    Ok(Event::default()
+                        .json_data(&json!({ "type": "gap", "dropped": n }))
+                        .unwrap_or_else(|_| Event::default().comment("gap")))
+                }
+            }
+        });
+    let body = futures_util::StreamExt::take_until(live, st.shutdown.cancelled_owned());
+    axum::response::sse::Sse::new(body)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// `POST /api/agents/{agent_id}/frames` -- the headless harness pushes one live frame, fanned out
+/// to the agent's current attachers (a no-op if none, so an unattached agent costs nothing).
+/// Ephemeral and best-effort: it never blocks on a slow or gone attacher. (Transport auth stamps
+/// the pushing agent; a per-agent-self push gate lands with the task_542 B5b enforcement.)
+async fn session_push_frame(
+    Path(agent_id): Path<String>,
+    Json(frame): Json<crate::session_live::Frame>,
+) -> ApiResult {
+    let reached = crate::session_live::hub().publish(&agent_id, frame);
+    Ok(Json(
+        json!({ "agent_id": agent_id, "attachers_reached": reached }),
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SteerBody {
+    /// The steering caller's id (the authz subject): operator or the agent's lead.
+    #[serde(rename = "principal", alias = "from", default)]
+    from: Option<String>,
+    /// The message delivered to the agent as its next input.
+    text: String,
+}
+
+/// `POST /api/agents/{agent_id}/steer` -- deliver a steer message as the agent's next input (a
+/// durable `session.steer` control item). Control tier: operator or the agent's lead only.
+async fn session_steer(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<SteerBody>,
+) -> ApiResult {
+    let from = b.from.unwrap_or_default();
+    if !core::can_control(&st.pool, &from, &agent_id).await? {
+        return Err(ApiError(
+            core::BoardError::forbidden("not authorized to steer this agent").into(),
+        ));
+    }
+    Ok(Json(
+        core::steer_session(&st.pool, &agent_id, &from, &b.text).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AbortBody {
+    /// The aborting caller's id (the authz subject): operator or the agent's lead.
+    #[serde(rename = "principal", alias = "from", default)]
+    from: Option<String>,
+    /// Optional human-readable reason, surfaced to the agent.
+    reason: Option<String>,
+}
+
+/// `POST /api/agents/{agent_id}/abort` -- deliver a non-destructive abort (the M4 abort verb): a
+/// durable `session.abort` control item the harness honors at its turn-loop's next checkpoint,
+/// cancelling the current turn and preserving session state. Control tier: operator or lead only.
+async fn session_abort(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<AbortBody>,
+) -> ApiResult {
+    let from = b.from.unwrap_or_default();
+    if !core::can_control(&st.pool, &from, &agent_id).await? {
+        return Err(ApiError(
+            core::BoardError::forbidden("not authorized to abort this agent").into(),
+        ));
+    }
+    Ok(Json(
+        core::abort_session(&st.pool, &agent_id, &from, b.reason.as_deref()).await?,
     ))
 }
 
