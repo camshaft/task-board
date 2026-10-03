@@ -350,6 +350,15 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(remove_banned_phrase),
         )
         .route(
+            "/admission-rules",
+            get(list_admission_rules).post(set_admission_rule),
+        )
+        .route(
+            "/admission-rules/{role}/{action_class}",
+            axum::routing::delete(remove_admission_rule),
+        )
+        .route("/admission-check", get(check_admission))
+        .route(
             "/identity-aliases",
             get(list_identity_aliases).post(set_identity_alias),
         )
@@ -1012,6 +1021,10 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/banned-phrases", summary: "List the fleet banned-phrases list -- the authoritative runtime source the pre-submit content lint checks docs and comments against (doc_3426 ask 5). Returns {policy_kind, version, count, phrases}. version is the watchable key: a harness re-reads on a policy.changed wake (board + [\"policy\"]) comparing version to hot-reload the list.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/banned-phrases", summary: "Add a phrase to the banned-phrases list (idempotent on the phrase, stored lowercased).", query: "", body: Some("AddBannedPhraseBody") },
     Endpoint { method: "DELETE", path: "/api/banned-phrases/{phrase}", summary: "Remove a phrase from the banned-phrases list.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/admission-rules", summary: "List per-role admission rules with the watchable version (task_1460, doc_3426 ask 5): {policy_kind, version, count, rules, role}. With ?role= set, returns that role's own rules UNION the \"*\" class-defaults (the set that applies to the role); without it, every rule. The harness reads this to admit/decline by role and re-reads on a policy.changed wake (board + [\"policy\"]) comparing version.", query: "role=str", body: None },
+    Endpoint { method: "POST", path: "/api/admission-rules", summary: "Set a per-role admission rule: (role, action_class) -> effect allow|deny. role=\"*\" sets the per-action-class default (applies to every role) so a sensitive action_class can be made default-deny without flipping the global default-allow. action_class is an opaque harness-owned string (doc_3428 admission vocabulary). Bumps the 'admission' policy version + emits policy.changed.", query: "", body: Some("SetAdmissionRuleBody") },
+    Endpoint { method: "DELETE", path: "/api/admission-rules/{role}/{action_class}", summary: "Remove a per-role admission rule. Only a real delete bumps the 'admission' policy version + emits policy.changed.", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/admission-check", summary: "Evaluate the admission decision for a (role, action_class) server-side: precedence exact rule > per-class default (role=\"*\") > global default-allow. Returns {role, action_class, effect, source (rule|class_default|global_default)}.", query: "role=str&action_class=str", body: None },
     Endpoint { method: "GET", path: "/api/identity-aliases", summary: "List the identity aliases (alias -> canonical identity, e.g. operator -> cameron). A small config table consumers/UI use to resolve or display a floating name as the canonical identity across assignee, blocked_on, and @-mentions.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/people", summary: "List people (first-class human identities, multi-operator model doc_26). A separate registry from agents; resolved together with agents at read time.", query: "", body: None },
     Endpoint { method: "POST", path: "/api/people", summary: "Create or upsert a person by stable string id (e.g. cameron).", query: "", body: Some("CreatePersonBody") },
@@ -1131,6 +1144,7 @@ fn body_schemas() -> Value {
         PromoteThreadBody,
         SetWorkspaceKindBody,
         AddBannedPhraseBody,
+        SetAdmissionRuleBody,
         LintTextBody,
         GradeDocumentBody,
         UpdateDocumentBody,
@@ -3426,6 +3440,83 @@ async fn remove_team_member(
 
 async fn remove_banned_phrase(State(st): State<AppState>, Path(phrase): Path<String>) -> ApiResult {
     Ok(Json(core::remove_banned_phrase(&st.pool, &phrase).await?))
+}
+
+// --- Per-role admission rules (task_1460, doc_3426 ask 5 piece 2) ---
+
+#[derive(Deserialize, JsonSchema)]
+struct SetAdmissionRuleBody {
+    /// The role the rule governs; "*" for the per-action-class default (applies to every role).
+    role: String,
+    /// The action class -- an opaque harness-owned string (the doc_3428 admission vocabulary).
+    action_class: String,
+    /// "allow" or "deny".
+    effect: String,
+    /// Optional structured payload the harness interprets (opaque to the board).
+    payload: Option<serde_json::Value>,
+    /// Optional note: why the rule exists.
+    note: Option<String>,
+    #[serde(rename = "principal", alias = "created_by")]
+    created_by: Option<String>,
+}
+
+async fn set_admission_rule(
+    State(st): State<AppState>,
+    Json(b): Json<SetAdmissionRuleBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_admission_rule(
+            &st.pool,
+            &b.role,
+            &b.action_class,
+            &b.effect,
+            b.payload,
+            b.note.as_deref(),
+            b.created_by.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AdmissionListQuery {
+    /// Optional role filter: that role's own rules UNION the "*" class-defaults. Omit for all rules.
+    role: Option<String>,
+}
+
+async fn list_admission_rules(
+    State(st): State<AppState>,
+    Query(q): Query<AdmissionListQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_admission_rules(&st.pool, q.role.as_deref()).await?,
+    ))
+}
+
+async fn remove_admission_rule(
+    State(st): State<AppState>,
+    Path((role, action_class)): Path<(String, String)>,
+) -> ApiResult {
+    Ok(Json(
+        core::remove_admission_rule(&st.pool, &role, &action_class).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AdmissionCheckQuery {
+    /// The role performing the action.
+    role: String,
+    /// The action class being attempted.
+    action_class: String,
+}
+
+async fn check_admission(
+    State(st): State<AppState>,
+    Query(q): Query<AdmissionCheckQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::admission_decision(&st.pool, &q.role, &q.action_class).await?,
+    ))
 }
 
 // --- Reviews (Document #5, increment 1: a typed review over an artifact, A2 lifecycle + log) ---
