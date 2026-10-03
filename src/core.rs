@@ -16522,6 +16522,95 @@ mod tests {
         Ok(())
     }
 
+    /// task_1331 Piece 2 (task_1269 fold-in): while a document is under review, a comment on it
+    /// wakes EVERY assigned reviewer -- the primary assignee AND an extra review_assignees reviewer --
+    /// even one who never separately subscribed to the document; a non-assigned non-subscriber is not
+    /// widened in.
+    #[tokio::test]
+    async fn document_comment_wakes_all_assigned_reviewers() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "reviewer1", None, None, None, None, None).await?;
+        register_agent(&pool, "reviewer2", None, None, None, None, None).await?;
+        let d = create_document(
+            &pool,
+            "Spec under review",
+            None,
+            "bafy1",
+            None,
+            Some("alice"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+
+        // A review over the doc: reviewer1 primary + reviewer2 as an extra assignee. Neither
+        // subscribes to the document, so only the all-reviewers fold can reach them.
+        let r = create_review(
+            &pool,
+            "document",
+            Some("board_doc"),
+            Some(&format!("doc_{did}")),
+            Some("conformance"),
+            Some("in_review"),
+            Some("alice"),
+            Some("reviewer1"),
+            None,
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        add_review_assignees(&pool, rid, &["reviewer2".into()], Some("alice")).await?;
+
+        // The doc owner comments; both assigned reviewers must be woken with no prior subscription.
+        comment_document(
+            &pool,
+            did,
+            None,
+            Some("alice"),
+            "re-reading section 2 before I vet",
+            None,
+            None,
+            None,
+        )
+        .await?;
+        for who in ["reviewer1", "reviewer2"] {
+            let n = check_notifications(&pool, who, true, 50, None).await?;
+            let hit = n["notifications"].as_array().unwrap().iter().any(|e| {
+                e["type"] == json!("document.comment") && e["data"]["document_id"] == json!(did)
+            });
+            assert!(hit, "assigned reviewer {who} woken on the doc comment: {n}");
+        }
+
+        // A registered agent who is neither assigned nor subscribed is NOT woken -- the fold reaches
+        // only the review's assignee set, it does not widen to everyone.
+        register_agent(&pool, "bystander", None, None, None, None, None).await?;
+        comment_document(
+            &pool,
+            did,
+            None,
+            Some("alice"),
+            "second note",
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let by = check_notifications(&pool, "bystander", true, 50, None).await?;
+        let by_hit = by["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == json!("document.comment"));
+        assert!(
+            !by_hit,
+            "a non-assigned non-subscriber must not be woken: {by}"
+        );
+        Ok(())
+    }
+
     /// A document's owner is notified when it's approved (and on the other review transitions),
     /// with a self-describing payload — document_id, title, new status — plus the approver as the
     /// event actor, so they can act without a lookup. The approver is excluded from their own
