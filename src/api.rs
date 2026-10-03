@@ -190,11 +190,17 @@ path_ref!(ChannelRef, "channel");
 path_ref!(DocRef, "doc");
 
 pub fn router(state: AppState) -> Router {
+    // Per-process request metrics (task_1380): one registry shared by the recording middleware
+    // (added below as a route_layer so MatchedPath is populated) and the GET /api/metrics handler
+    // (via an Extension). Created here rather than threaded through AppState, so every test that
+    // builds a router gets an isolated registry.
+    let metrics = std::sync::Arc::new(crate::metrics::Metrics::new());
     Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/tunnels", get(tunnels))
         .route("/meta", get(meta))
+        .route("/metrics", get(metrics_endpoint))
         .route("/admin/db-snapshot", get(db_snapshot))
         .route("/agents", get(list_agents).post(register_agent))
         .route("/resolve-agent", get(resolve_agent))
@@ -390,6 +396,18 @@ pub fn router(state: AppState) -> Router {
         .route("/stream", get(stream))
         // Unknown /api/* paths return a JSON 404, not the SPA's index.html.
         .fallback(api_not_found)
+        // Per-endpoint request metrics (task_1380): a route_layer so each request already carries
+        // its MatchedPath when timed. route_layer skips the fallback, so random unmatched 404 URLs
+        // are not timed at all, and matched requests key by route template (not by id).
+        .route_layer(axum::middleware::from_fn({
+            let metrics = metrics.clone();
+            move |req, next| {
+                let metrics = metrics.clone();
+                async move { crate::metrics::record_request_metrics(metrics, req, next).await }
+            }
+        }))
+        // Make the registry available to the GET /api/metrics handler.
+        .layer(Extension(metrics))
         // Trusted-front-door identity: force the acting user from a configured header on
         // non-loopback writes (task_1030). A no-op when `trusted_user_header` is unset.
         .layer(axum::middleware::from_fn_with_state(
@@ -401,6 +419,17 @@ pub fn router(state: AppState) -> Router {
 
 async fn api_not_found() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response()
+}
+
+/// `GET /api/metrics` — a JSON snapshot of per-endpoint request metrics (task_1380): latency
+/// p50/p90/p99 (ms, approximate), request count + process start (a throughput basis), the
+/// in-flight / max-in-flight concurrency gauge, and 2xx/4xx/5xx status-class counts, plus an
+/// overall rollup. Aggregate numbers only (no request content), so it is an unauthenticated read
+/// like the other GETs. The registry is injected by `router()` as an [`Extension`].
+async fn metrics_endpoint(
+    Extension(metrics): Extension<std::sync::Arc<crate::metrics::Metrics>>,
+) -> Response {
+    Json(metrics.snapshot()).into_response()
 }
 
 /// Acting-principal field names a write body may carry — the fields that attribute WHO is acting,
@@ -851,6 +880,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/tunnels", summary: "Diagnostic: which agents currently have a live reverse tunnel (so the board can push a wake rather than the agent polling). An agent absent here has no live tunnel — its wakes fall back to the inbox + poll.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/health", summary: "Health beacon: cheap liveness+readiness probe. 200 {ok:true,db:true} when the process is up and the database is reachable; 503 {ok:false} when the database is not ready. Check before a full tick and treat any non-200 (incl a 502 from the origin when it is down) as back-off-and-retry.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/meta", summary: "Status vocabularies (task/project/agent).", query: "", body: None },
+    Endpoint { method: "GET", path: "/api/metrics", summary: "Request metrics for optimizing board/fleet performance (task_1380): per-endpoint latency p50/p90/p99 in ms (approximate, from coarse log-spaced buckets), request count + process start (a throughput basis), the in-flight / max-in-flight concurrency gauge (a hang shows as a stuck-high in_flight), and 2xx/4xx/5xx status-class counts, plus an overall rollup. Keys are METHOD + route template relative to the /api mount. Aggregate numbers only, mutates nothing.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/admin/db-snapshot", summary: "Download a point-in-time-consistent copy of the SQLite database (VACUUM INTO, integrity-checked), behind HTTP Basic auth. Disabled by default (404 when off); the deployment keeps it loopback/LAN-bound and off the public tunnel. The extraction primitive for host migration + DR.", query: "", body: None },
     Endpoint { method: "GET", path: "/api/agents", summary: "List agents as a lightweight roster: compact {id, display_name, status, metadata} by default (the small metadata bag is kept for filtering, e.g. metadata.native; only the heavy charter is dropped to stay under the token cap). Pass verbose=true for full objects (incl charter), or GET /api/agents/{id} for one. Filters: status, q (id+display_name substring), meta_key+meta_value (scalar metadata match). Bounded by limit (default 200, max 1000) + offset.", query: "status=str&q=str&meta_key=str&meta_value=str&verbose=bool&limit=int&offset=int", body: None },
     Endpoint { method: "POST", path: "/api/agents", summary: "Register (or update) an agent, trust-on-first-use.", query: "", body: Some("RegisterAgentBody") },
@@ -4900,5 +4930,96 @@ mod tests {
             missing.is_empty() && stale.is_empty(),
             "ENDPOINTS is out of sync with router().\n  routes missing from catalog: {missing:?}\n  stale catalog entries: {stale:?}",
         );
+    }
+
+    fn metrics_test_state(pool: Pool) -> AppState {
+        let (events_tx, _rx) = broadcast::channel(16);
+        AppState {
+            pool,
+            events_tx,
+            ipfs_api_url: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            db_path: String::new(),
+            db_snapshot: DbSnapshotCfg::disabled(),
+            host_auth: Default::default(),
+            link_rules: Default::default(),
+        }
+    }
+
+    /// GET /api/metrics returns a 200 JSON snapshot with the expected top-level shape (task_1380).
+    #[tokio::test]
+    async fn metrics_endpoint_returns_snapshot_shape() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let resp = router(metrics_test_state(pool))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: Value = serde_json::from_slice(&bytes)?;
+        assert!(v["overall"].is_object(), "has overall rollup");
+        assert!(v["endpoints"].is_object(), "has per-endpoint map");
+        assert!(v["started_unix"].is_u64(), "has process start");
+        assert!(v["uptime_secs"].is_u64(), "has uptime");
+        Ok(())
+    }
+
+    /// The recording middleware counts a request against its matched-route key, leaves the
+    /// in-flight gauge back at zero once it completes (with max_in_flight observed >= 1), and
+    /// populates a latency percentile. Uses ONE router instance (cloned per request) so both calls
+    /// share the same metrics registry (task_1380).
+    #[tokio::test]
+    async fn metrics_records_count_and_in_flight_settles() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let app = router(metrics_test_state(pool));
+
+        // A real matched GET; list_projects works against an empty board.
+        let r1 = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/projects")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        // Drain the body so the response fully completes before we read metrics.
+        let _ = axum::body::to_bytes(r1.into_body(), usize::MAX).await?;
+
+        let r2 = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(r2.into_body(), usize::MAX).await?;
+        let v: Value = serde_json::from_slice(&bytes)?;
+        let ep = &v["endpoints"]["GET /projects"];
+        assert!(
+            ep["count"].as_u64().unwrap_or(0) >= 1,
+            "GET /projects recorded at least once: {v:#}"
+        );
+        assert_eq!(ep["in_flight"].as_i64(), Some(0), "in-flight settles to 0");
+        assert!(
+            ep["max_in_flight"].as_i64().unwrap_or(0) >= 1,
+            "max in-flight observed at least 1"
+        );
+        assert!(ep["p50_ms"].is_u64(), "a latency percentile is present");
+        Ok(())
     }
 }
