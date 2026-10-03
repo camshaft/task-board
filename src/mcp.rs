@@ -247,6 +247,10 @@ pub struct ListAgentsArgs {
     /// status, metadata} roster projection. Default false.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub verbose: Option<bool>,
+    /// Filter by the terminal-retirement flag (task_1363): true = only retired/gone agents, false =
+    /// only live (not retired) agents. Omit for all. Audits who is terminally gone vs resumable.
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub retired: Option<bool>,
     /// Max rows (default 200, capped at 1000).
     #[serde(default)]
     pub limit: Option<i64>,
@@ -312,6 +316,29 @@ pub struct RequestStandDownArgs {
     /// Optional reason shown to the agent + on its page.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetireAgentArgs {
+    /// The agent to mark terminally gone (permanently, not coming back).
+    pub agent_id: String,
+    /// Who is retiring it (defaults to this session's identity). Must be an operator or board-pm.
+    #[serde(rename = "principal", alias = "retired_by", alias = "actor", default)]
+    pub retired_by: Option<String>,
+    /// Optional reason recorded on the agent + on each swept task's disposition note.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreAgentArgs {
+    /// The agent to un-retire (clear the terminal marker; does not un-sweep already-disposed tasks).
+    pub agent_id: String,
+    /// Who is restoring it (defaults to this session's identity). Must be an operator or board-pm.
+    #[serde(rename = "principal", alias = "actor", alias = "restored_by", default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2134,7 +2161,35 @@ impl Board {
     }
 
     #[tool(
-        description = "List agents as a lightweight roster: each entry is a compact {id, display_name, status, metadata} — the small metadata bag is kept so callers can filter (e.g. metadata.native); only the heavy charter is dropped to stay under the token cap. Use get_agent for one agent's full charter, or pass verbose:true for full objects. Filters: status (exact), q (substring over id + display_name), and meta_key+meta_value (match a scalar metadata field like area/host — e.g. to find the vertical that owns a repo/area). Bounded by limit (default 200, max 1000) + offset."
+        description = "Terminally retire an agent (task_1363): mark it permanently GONE — not coming back — distinct from presence=offline and from a stand-down request, which are both resumable (a stopped agent is NOT a retire signal). Setting it runs an auto-disposition SWEEP: every task currently blocked on this agent has its dead block cleared and returns to todo (so it resurfaces as actionable instead of silently stranding), keeping the current assignee, and emits task.blocker_retired to board-pm + the assignee for re-homing. Restricted to an operator or board-pm; never self or peer. Reversible via restore_agent for a mis-mark."
+    )]
+    async fn retire_agent(
+        &self,
+        Parameters(a): Parameters<RetireAgentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let retired_by = self.me_req(a.retired_by.as_deref())?;
+        core::retire_agent(&self.pool, &a.agent_id, &retired_by, s(&a.reason))
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Reverse a terminal retirement (task_1363): clear the gone marker so a mis-marked agent is live again. Does NOT un-sweep — tasks already re-dispositioned by the retire stay as they are. Restricted to an operator or board-pm."
+    )]
+    async fn restore_agent(
+        &self,
+        Parameters(a): Parameters<RestoreAgentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_req(a.actor.as_deref())?;
+        core::restore_agent(&self.pool, &a.agent_id, &actor)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "List agents as a lightweight roster: each entry is a compact {id, display_name, status, metadata, retired} — the small metadata bag is kept so callers can filter (e.g. metadata.native); only the heavy charter is dropped to stay under the token cap. Use get_agent for one agent's full charter, or pass verbose:true for full objects. Filters: status (exact), q (substring over id + display_name), meta_key+meta_value (match a scalar metadata field like area/host — e.g. to find the vertical that owns a repo/area), and retired (true = only terminally-gone agents, false = only live). Bounded by limit (default 200, max 1000) + offset."
     )]
     async fn list_agents(
         &self,
@@ -2151,6 +2206,8 @@ impl Board {
             a.offset,
         )
         .await
+        // Audit filter on the derived retired flag (task_1363); a no-op when omitted.
+        .map(|agents| core::filter_agents_retired(agents, a.retired))
         .map_err(err)
         .and_then(ok)
     }

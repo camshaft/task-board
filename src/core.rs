@@ -475,6 +475,11 @@ fn agent_json(row: &SqliteRow) -> Value {
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or_else(|| json!({}));
     obj.insert("metadata".into(), meta);
+    // Surface a derived `retired` bool (task_1363): true iff the terminal retirement marker is set.
+    // retired_at/retired_by/retired_reason stay in the object as the detail; this is the lean
+    // predicate a roster scan or filter reads without inspecting the timestamp.
+    let retired = obj.get("retired_at").map(|v| !v.is_null()).unwrap_or(false);
+    obj.insert("retired".into(), Value::Bool(retired));
     Value::Object(obj)
 }
 
@@ -883,7 +888,7 @@ pub const FLEET_CONSUMED_ROSTER_FIELDS: &[&str] = &["metadata"];
 /// load-bearing [`FLEET_CONSUMED_ROSTER_FIELDS`], minus the heavy `charter` (the one field whose size
 /// overflowed the caller token cap, so the one dropped). `get_agent` / verbose still return the full
 /// object. Keep every [`FLEET_CONSUMED_ROSTER_FIELDS`] entry in this list or the contract test reds.
-const COMPACT_ROSTER_FIELDS: &[&str] = &["id", "display_name", "status", "metadata"];
+const COMPACT_ROSTER_FIELDS: &[&str] = &["id", "display_name", "status", "metadata", "retired"];
 
 /// Safely resolve an agent name to a single exact agent id (task_1251): the board-side guard against
 /// the prefix/substring-collision misroute (e.g. a caller resolving "v-fleet-tooling" via a
@@ -1088,6 +1093,194 @@ pub async fn request_stand_down(
     tx.commit().await?;
     fire_webhooks(hooks, webhook_timeout(pool));
     Ok(out)
+}
+
+/// task_1363: authorize who may terminally retire (or restore) an agent. Retirement is NOT self- or
+/// peer-settable because it fires a fleet-wide auto-disposition sweep (every task blocked on the
+/// agent is re-dispositioned). Authorization lives HERE, in core, the single choke point both the
+/// MCP and REST surfaces call, so neither can bypass it. Allowed iff the actor resolves to an
+/// operator identity (via the operator identity-alias; today operator -> cameron, so this tracks new
+/// operators as they are added to that mechanism) OR is board-pm (the coordinator role). This one
+/// helper is the extension point -- broaden the operator predicate here, never scatter id checks.
+async fn is_retire_authorized(pool: &Pool, actor: &str) -> bool {
+    let actor = actor.trim();
+    if actor.is_empty() {
+        return false;
+    }
+    // board-pm, the coordinator role, may retire.
+    if actor == "board-pm" {
+        return true;
+    }
+    // Operator identity: resolve both the actor and the `operator` alias through the same alias map
+    // and compare canonicals, so "operator" and the operator's own id (cameron) both authorize, and
+    // operators added to the alias mechanism are picked up without a code change. When the operator
+    // alias is unset, resolve returns "operator" verbatim, so only a literal "operator" matches --
+    // never a plain agent.
+    let operator_canon = resolve_identity_alias(pool, "operator").await;
+    let actor_canon = resolve_identity_alias(pool, actor).await;
+    actor_canon.eq_ignore_ascii_case(&operator_canon)
+}
+
+/// Terminally retire an agent (task_1363): mark it permanently gone (retired_at/by/reason) and run
+/// the auto-disposition sweep. "Gone" is distinct from presence=offline and from a pending
+/// stand_down request, both of which are resumable -- a stopped agent is not a retire signal.
+///
+/// SWEEP (disposition B, board-pm comment_7424): every task blocked on this agent (blocked_on_kind
+/// =agent, blocked_on_ref=<agent>) that is currently status=blocked has its dead block CLEARED and
+/// returns to status=todo -- so it leaves the nudge-suppressed blocked state and resurfaces as
+/// actionable instead of silently stranding (the task_1375 harm). The current assignee is KEPT (no
+/// auto-reassign); board-pm re-homes from the single task.blocker_retired feed. A naming comment is
+/// posted on each swept task. The sweep is keyed solely on this terminal retirement, so an
+/// at-rest/offline agent's dependents are never touched (they stay legitimately blocked awaiting the
+/// agent's revival); if such an agent is later retired, its dependents sweep then.
+///
+/// Authorized to operators + board-pm only (see is_retire_authorized); never self, never peer.
+pub async fn retire_agent(
+    pool: &Pool,
+    agent_id: &str,
+    retired_by: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<Value> {
+    if !is_retire_authorized(pool, retired_by).await {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "'{retired_by}' may not retire an agent: terminal retirement is restricted to an \
+             operator or board-pm (it triggers a fleet-wide re-disposition sweep). No self- or \
+             peer-retire."
+        )));
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    // Mark terminally gone. Idempotent re-retire refreshes the stamp/reason.
+    let n =
+        sqlx::query("UPDATE agents SET retired_at=?, retired_by=?, retired_reason=? WHERE id=?")
+            .bind(&ts)
+            .bind(retired_by)
+            .bind(reason)
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    if n == 0 {
+        anyhow::bail!("no agent {agent_id}");
+    }
+    // SWEEP: re-disposition every task currently blocked on this now-gone agent.
+    let blocked: Vec<i64> = sqlx::query(
+        "SELECT id FROM tasks WHERE blocked_on_kind='agent' AND blocked_on_ref=? AND status='blocked' ORDER BY id",
+    )
+    .bind(agent_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .iter()
+    .filter_map(|r| r.try_get::<i64, _>("id").ok())
+    .collect();
+    for tid in &blocked {
+        let row = sqlx::query("SELECT project_id, assignee FROM tasks WHERE id=?")
+            .bind(tid)
+            .fetch_one(&mut *tx)
+            .await?;
+        let pid: Option<i64> = row.try_get("project_id").ok();
+        let assignee: Option<String> = row.try_get::<Option<String>, _>("assignee").ok().flatten();
+        // Clear the dead block and return to the actionable, nudged state (blocked -> todo). Keep
+        // the assignee (board-pm re-homes); clearing blocked_on_* keeps the not-blocked invariant.
+        sqlx::query(
+            "UPDATE tasks SET status='todo', blocked_on_kind=NULL, blocked_on_ref=NULL, \
+             blocked_on_note=NULL, updated_at=? WHERE id=?",
+        )
+        .bind(&ts)
+        .bind(tid)
+        .execute(&mut *tx)
+        .await?;
+        // System note naming the retired blocker (ASCII, typed refs, no bare #).
+        let body = format!(
+            "Auto-disposition (task_1363): the agent this task was blocked on ({agent_id}) was \
+             terminally retired, so the dead block was cleared and the task returned to todo for \
+             re-disposition. Assignee kept; board-pm re-homes. Retired by {retired_by}."
+        );
+        sqlx::query("INSERT INTO comments(task_id, author, body, created_at) VALUES(?,?,?,?)")
+            .bind(tid)
+            .bind(retired_by)
+            .bind(&body)
+            .bind(&ts)
+            .execute(&mut *tx)
+            .await?;
+        // One disposition feed: deliver task.blocker_retired to board-pm (the re-home coordinator)
+        // and the task's current assignee (owner), naming the retired blocker.
+        let mut recips: BTreeSet<String> = BTreeSet::new();
+        recips.insert("board-pm".to_string());
+        if let Some(a) = &assignee {
+            recips.insert(a.clone());
+        }
+        emit(
+            &mut tx,
+            &mut hooks,
+            "task.blocker_retired",
+            Some(retired_by),
+            Some(*tid),
+            pid,
+            None,
+            None,
+            json!({
+                "retired_agent": agent_id,
+                "retired_by": retired_by,
+                "task_id": tid,
+                "assignee": assignee,
+                "disposition": "unblocked_to_todo",
+            }),
+            Recipients::Explicit(recips),
+        )
+        .await?;
+    }
+    let row = sqlx::query("SELECT * FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let mut out = agent_json(&row);
+    if let Value::Object(ref mut m) = out {
+        m.insert("swept_task_ids".into(), json!(blocked));
+        m.insert("swept_task_count".into(), json!(blocked.len()));
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(out)
+}
+
+/// Reverse a terminal retirement (task_1363): clear retired_at/by/reason so a mis-marked agent is
+/// live again. Does NOT un-sweep -- tasks already re-dispositioned by the retire stay as they are.
+/// Same operator/board-pm authorization as retire_agent (un-retiring is also a lifecycle decision).
+pub async fn restore_agent(pool: &Pool, agent_id: &str, actor: &str) -> anyhow::Result<Value> {
+    if !is_retire_authorized(pool, actor).await {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "'{actor}' may not restore an agent: lifecycle changes are restricted to an operator or \
+             board-pm."
+        )));
+    }
+    let n = sqlx::query(
+        "UPDATE agents SET retired_at=NULL, retired_by=NULL, retired_reason=NULL WHERE id=?",
+    )
+    .bind(agent_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        anyhow::bail!("no agent {agent_id}");
+    }
+    get_agent(pool, agent_id).await
+}
+
+/// Filter a `list_agents` result array by the derived `retired` bool (task_1363): keep only retired
+/// (`Some(true)`) or only live (`Some(false)`) agents; `None` is a no-op. Mirrors
+/// filter_tasks_monitor_exempt so the MCP/REST roster can audit who is terminally gone.
+pub fn filter_agents_retired(agents: Value, want: Option<bool>) -> Value {
+    match (agents, want) {
+        (Value::Array(items), Some(want)) => Value::Array(
+            items
+                .into_iter()
+                .filter(|v| v.get("retired").and_then(Value::as_bool).unwrap_or(false) == want)
+                .collect(),
+        ),
+        (other, _) => other,
+    }
 }
 
 // --- Projects ---
@@ -22809,6 +23002,163 @@ mod tests {
             out["status"],
             json!("operator_review"),
             "both ALL-policy assignees vetted -> gate clears: {out}"
+        );
+        Ok(())
+    }
+
+    /// task_1363: retire_agent marks an agent terminally gone and runs the auto-disposition sweep --
+    /// every task blocked_on that agent (kind=agent) returns to todo (block cleared, assignee kept)
+    /// and emits task.blocker_retired to board-pm, while a task blocked on a DIFFERENT, merely
+    /// offline / stood-down agent STAYS blocked (the sweep is keyed on terminal retirement only).
+    /// The guard allows only an operator or board-pm (never self, never peer); surfacing + the
+    /// retired roster filter work; restore clears the marker without un-sweeping.
+    #[tokio::test]
+    async fn retire_agent_sweeps_dead_blocks_and_guards_authorization() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "gone-agent", None, None, None, None, None).await?;
+        register_agent(&pool, "other-agent", None, None, None, None, None).await?;
+        register_agent(&pool, "worker", None, None, None, None, None).await?;
+        register_agent(&pool, "board-pm", None, None, None, None, None).await?;
+        let p = create_project(&pool, "P", None, Some("worker"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let mk = |title: &'static str| {
+            let pool = pool.clone();
+            async move {
+                create_task(
+                    &pool,
+                    pid,
+                    title,
+                    None,
+                    Some("worker"),
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|t| t["id"].as_i64().unwrap())
+            }
+        };
+        let dep1 = mk("dep on gone").await?;
+        let dep2 = mk("dep on other").await?;
+        let block = |tid: i64, agent: &'static str| {
+            let pool = pool.clone();
+            async move {
+                update_task(
+                    &pool,
+                    tid,
+                    Some("blocked"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("worker"),
+                    None,
+                    None,
+                    Some(json!({ "kind": "agent", "target": agent })),
+                )
+                .await
+            }
+        };
+        block(dep1, "gone-agent").await?;
+        block(dep2, "other-agent").await?;
+        // other-agent is merely at-rest (offline + a pending stand-down) -- NOT a terminal retire.
+        set_status(&pool, "other-agent", "offline", None).await?;
+        request_stand_down(&pool, "other-agent", Some("board-pm"), Some("resting")).await?;
+
+        // GUARD: a peer agent and a self-retire are both rejected (operator alias not yet set).
+        assert!(
+            retire_agent(&pool, "gone-agent", "worker", None)
+                .await
+                .is_err(),
+            "a peer agent cannot retire another"
+        );
+        assert!(
+            retire_agent(&pool, "gone-agent", "gone-agent", None)
+                .await
+                .is_err(),
+            "no self-retire"
+        );
+        assert_eq!(
+            get_agent(&pool, "gone-agent").await?["retired"],
+            json!(false),
+            "rejected attempts left it live"
+        );
+
+        // Authorize an operator via the operator alias, then retire.
+        set_identity_alias(&pool, "operator", "cameron", Some("worker")).await?;
+        let out = retire_agent(&pool, "gone-agent", "cameron", Some("decommissioned")).await?;
+        assert_eq!(out["retired"], json!(true));
+        assert_eq!(out["retired_by"], json!("cameron"));
+        assert_eq!(out["retired_reason"], json!("decommissioned"));
+        assert!(out["retired_at"].is_string());
+        assert_eq!(
+            out["swept_task_count"],
+            json!(1),
+            "exactly dep1 swept: {out}"
+        );
+        assert_eq!(out["swept_task_ids"], json!([dep1]));
+
+        // dep1: dead block cleared, back to actionable todo, assignee kept (no auto-reassign).
+        let d1 = get_task(&pool, dep1).await?;
+        assert_eq!(d1["status"], json!("todo"), "swept to actionable: {d1}");
+        assert!(d1["blocked_on"].is_null(), "block cleared: {d1}");
+        assert_eq!(d1["assignee"], json!("worker"), "assignee kept");
+        // dep2: blocked on a merely offline/stood-down agent -> UNTOUCHED, stays blocked.
+        let d2 = get_task(&pool, dep2).await?;
+        assert_eq!(
+            d2["status"],
+            json!("blocked"),
+            "an at-rest-agent dependent stays blocked: {d2}"
+        );
+        assert_eq!(d2["blocked_on"]["target"], json!("other-agent"));
+
+        // task.blocker_retired delivered to board-pm (the single disposition feed).
+        let feed =
+            check_notifications(&pool, "board-pm", false, 50, Some("task.blocker_retired")).await?;
+        assert_eq!(
+            feed["notifications"].as_array().unwrap().len(),
+            1,
+            "board-pm gets one disposition feed: {feed}"
+        );
+        assert_eq!(
+            feed["notifications"][0]["data"]["retired_agent"],
+            json!("gone-agent")
+        );
+
+        // Surfacing + roster filter: gone-agent is retired; retired=true isolates it.
+        let roster = list_agents(&pool, None, None, None, None, false, None, None).await?;
+        let gone = roster
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!("gone-agent"))
+            .unwrap();
+        assert_eq!(
+            gone["retired"],
+            json!(true),
+            "compact roster surfaces the retired bool"
+        );
+        let only_retired = filter_agents_retired(roster.clone(), Some(true));
+        assert_eq!(only_retired.as_array().unwrap().len(), 1);
+        assert_eq!(only_retired[0]["id"], json!("gone-agent"));
+        let only_live = filter_agents_retired(roster, Some(false));
+        assert!(only_live
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["id"] != json!("gone-agent")));
+
+        // RESTORE: clears the marker; does NOT re-block the already-swept dep1.
+        let restored = restore_agent(&pool, "gone-agent", "board-pm").await?;
+        assert_eq!(restored["retired"], json!(false));
+        assert!(restored["retired_at"].is_null());
+        assert_eq!(
+            get_task(&pool, dep1).await?["status"],
+            json!("todo"),
+            "restore does not un-sweep"
         );
         Ok(())
     }

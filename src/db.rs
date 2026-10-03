@@ -25,7 +25,15 @@ CREATE TABLE IF NOT EXISTS agents (
     -- reaped mid-work. Cleared when the agent goes offline (request honored). Purely advisory.
     stand_down_requested_at TEXT,
     stand_down_requested_by TEXT,
-    stand_down_reason       TEXT
+    stand_down_reason       TEXT,
+    -- Terminal retirement (task_1363): an agent marked permanently gone, NOT coming back — distinct
+    -- from presence=offline and from a pending stand_down request, which are both resumable (a
+    -- stopped agent is not a retire signal). `retired_at IS NOT NULL` is the sole "gone" predicate.
+    -- Setting it triggers an auto-disposition sweep of every task blocked_on this agent; see
+    -- core::retire_agent. Reversible via core::restore_agent for a mis-mark. All nullable.
+    retired_at              TEXT,
+    retired_by              TEXT,
+    retired_reason          TEXT
 );
 CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -723,6 +731,26 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
             .execute(&pool)
             .await?;
         sqlx::query("ALTER TABLE agents ADD COLUMN stand_down_reason TEXT")
+            .execute(&pool)
+            .await?;
+    }
+
+    // Back-fill the terminal-retirement columns (task_1363): a permanently-gone agent, distinct from
+    // offline/stand-down (both resumable). All nullable — an old DB simply has no retired agents.
+    // One ALTER-ADD-COLUMN batch, gated on the first column's presence.
+    let agents_have_retired = sqlx::query("PRAGMA table_info(agents)")
+        .fetch_all(&pool)
+        .await?
+        .iter()
+        .any(|r| r.get::<String, _>("name") == "retired_at");
+    if !agents_have_retired {
+        sqlx::query("ALTER TABLE agents ADD COLUMN retired_at TEXT")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE agents ADD COLUMN retired_by TEXT")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE agents ADD COLUMN retired_reason TEXT")
             .execute(&pool)
             .await?;
     }
