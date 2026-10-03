@@ -219,6 +219,8 @@ pub fn router(state: AppState) -> Router {
             post(set_lifecycle_intent),
         )
         .route("/agents/{agent_id}/notifications", get(get_notifications))
+        .route("/agents/{agent_id}/inbox", get(read_inbox_since))
+        .route("/agents/{agent_id}/inbox/ack", post(ack_inbox))
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/agents/{agent_id}/recall", get(recall))
         .route("/agents/{agent_id}/check-stop", post(check_stop))
@@ -931,6 +933,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/restore", summary: "Reverse a terminal retirement (task_1363): clear the gone marker so a mis-marked agent is live again. Does not un-sweep already-disposed tasks. Operator or board-pm only.", query: "", body: Some("RestoreAgentBody") },
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/lifecycle-intent", summary: "Set an agent's DECLARED lifecycle intent (task_1455): run or paused — the desired state the reconciler drives on, distinct from live presence. 'retired' is set via /retire (guarded auto-disposition sweep) and reversed via /restore, not here. Emits agent.intent_changed so a subscribed reconciler acts without a re-fetch.", query: "", body: Some("SetLifecycleIntentBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}/inbox", summary: "Recipient-filtered since-seq inbox read (task_1490): returns the agent's own events with seq strictly greater than since_seq, in seq order, bounded by limit, with NO ack side-effect (fetching never marks read, unlike /notifications). The clean no-lost-wake primitive -- the harness persists its last durably-processed seq and replays from it after a crash without the fetch-ack coupling. last_seq in the response is the next cursor; independent of read_at, so it is at-least-once by the client cursor. Pair with the inbox/ack endpoint for pruning.", query: "since_seq=int&limit=int", body: None },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/inbox/ack", summary: "Seq-scoped ack (task_1490): mark the agent's inbox rows read up to and including a durably-processed seq, so at-least-once delivery does not depend on drain discipline and acked rows become prunable. Idempotent; advances read_at only on unread rows at or below through_seq. Does not change the /notifications default semantics.", query: "", body: Some("AckInboxBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/recall", summary: "Board-state-recall bundle (task_1464, doc_3426 ask 9): ONE round trip that rebuilds an agent's working context at session (re)start -- its desired config + lifecycle_intent (task_1455/1456), its open assigned tasks with status + blocked_on, its bounded unread inbox (NOT marked read), and, when session_id is given, a handle to that session's transcript-chunk log (task_1463). The board is the recovery authority: recall first, transcript rehydration second. Bounded + efficient per start.", query: "session_id=str&task_limit=int&activity_limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Read an agent's per-config_kind editable-config set (task_1477, doc_3426 ask 11): one read returns {agent_id, config_kind, version, count, entries} in dispatch order (position then id). config_kind namespaces the shared per-agent editable-config surface -- 'decider' (ask 11: payload = {kind, criteria, bands}, scope = applies_to_call_types) and 'tool' (ask 4: payload = authz/argument policy). Each entry is the {id, enabled, scope, payload} envelope + position. The harness reads at session start and re-reads on an agent.config_changed wake (subscribe board + [\"agent\"]); version is the watchable key. Pass effective=true for the merged per-agent set = role-level grants + agent overrides (task_1459 ask 4; adds role, role_version, agent_version, and a per-entry source).", query: "effective=bool", body: None },
@@ -1084,6 +1088,7 @@ fn body_schemas() -> Value {
         RestoreAgentBody,
         SetLifecycleIntentBody,
         AppendTranscriptChunkBody,
+        AckInboxBody,
         CheckStopBody,
         SubmitDeciderEpisodeBody,
         SetAgentConfigEntryBody,
@@ -1980,6 +1985,41 @@ async fn get_notifications(
 ) -> ApiResult {
     Ok(Json(
         core::check_notifications(&st.pool, &agent_id, q.mark_read, q.limit, None).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct InboxSinceQuery {
+    /// Return only the recipient's events with seq strictly greater than this cursor (omit/0 = all).
+    #[serde(default)]
+    since_seq: i64,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+async fn read_inbox_since(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(q): Query<InboxSinceQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::read_inbox_since(&st.pool, &agent_id, q.since_seq, q.limit).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AckInboxBody {
+    /// Mark the recipient's inbox rows read up to and including this durably-processed seq.
+    through_seq: i64,
+}
+
+async fn ack_inbox(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(b): Json<AckInboxBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::ack_inbox(&st.pool, &agent_id, b.through_seq).await?,
     ))
 }
 
