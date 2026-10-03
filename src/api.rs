@@ -101,6 +101,7 @@ impl IntoResponse for ApiError {
             || msg.starts_with("reparenting would create a cycle")
             || msg.contains("is in a different project")
             || msg.starts_with("banned phrase")
+            || msg.starts_with("caps-for-emphasis")
             || msg.starts_with("non-ASCII")
             || msg.starts_with("ambiguous bare reference")
             || msg.starts_with("unknown review status")
