@@ -10615,6 +10615,139 @@ pub async fn recall_bundle(
     }))
 }
 
+/// Serialize one `decider_episodes` row, parsing the stored `episode` JSON string back to a value
+/// (default `{}`), mirroring [`transcript_chunk_json`].
+fn decider_episode_json(row: &SqliteRow) -> Value {
+    let mut obj = match row_to_json(row) {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let ep = obj
+        .get("episode")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| json!({}));
+    obj.insert("episode".into(), ep);
+    Value::Object(obj)
+}
+
+/// Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478,
+/// doc_3426 ask 12). When a decider returns no, the agent retries in-loop until it passes and the
+/// failed attempts are rolled out of context; the harness records that episode and submits it here
+/// as the decider training signal. `content_id` is the IPFS CID of the full episode payload (the
+/// bulky attempt outputs + block explanations live off-board, the ask-8 content-addressing posture),
+/// while `episode` carries the STRUCTURED relabel record inline (the inputs, each decider verdict +
+/// decision band per retry step, and the final passing output) so the aggregation query returns
+/// labelable data without a CID fetch (acceptance 4). Keyed by (agent_id, decider_id, call_type).
+/// A lightweight single-row insert with NO event/notification, so the harness fires it
+/// asynchronously and forgets -- it never blocks the agent turn (acceptance 2). Append-only +
+/// durable (acceptance 1). The corpus relabel/retrain work (task_1471) is the downstream consumer.
+pub async fn submit_decider_episode(
+    pool: &Pool,
+    agent_id: &str,
+    decider_id: &str,
+    call_type: &str,
+    content_id: &str,
+    episode: Option<Value>,
+) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    let decider_id = decider_id.trim();
+    let call_type = call_type.trim();
+    let content_id = content_id.trim();
+    for (name, val) in [
+        ("agent_id", agent_id),
+        ("decider_id", decider_id),
+        ("call_type", call_type),
+        ("content_id", content_id),
+    ] {
+        if val.is_empty() {
+            anyhow::bail!(BoardError::bad_request(format!("{name} is required")));
+        }
+    }
+    let episode_str = episode
+        .filter(|e| !e.is_null())
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+    let ts = now_iso();
+    let row = sqlx::query(
+        "INSERT INTO decider_episodes(agent_id, decider_id, call_type, content_id, episode, created_at) \
+         VALUES(?,?,?,?,?,?) RETURNING *",
+    )
+    .bind(agent_id)
+    .bind(decider_id)
+    .bind(call_type)
+    .bind(content_id)
+    .bind(&episode_str)
+    .bind(&ts)
+    .fetch_one(pool)
+    .await?;
+    Ok(decider_episode_json(&row))
+}
+
+/// Aggregate decider episodes for the corpus relabel/retrain work (task_1478, doc_3426 ask 12,
+/// acceptance 3), filtered by `decider_id`, `call_type`, and a `[since, until)` created_at window --
+/// every filter optional, so an omitted one widens the scan. Returns the episodes (incl their inline
+/// structured relabel record) ordered by append order (id ASC), bounded by `limit` (default 200, max
+/// 1000) so a large corpus pages. The downstream consumer is task_1471.
+pub async fn list_decider_episodes(
+    pool: &Pool,
+    decider_id: Option<&str>,
+    call_type: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: Option<i64>,
+) -> anyhow::Result<Value> {
+    let decider_id = decider_id.map(str::trim).filter(|s| !s.is_empty());
+    let call_type = call_type.map(str::trim).filter(|s| !s.is_empty());
+    let since = since.map(str::trim).filter(|s| !s.is_empty());
+    let until = until.map(str::trim).filter(|s| !s.is_empty());
+    let mut clauses: Vec<&str> = Vec::new();
+    if decider_id.is_some() {
+        clauses.push("decider_id=?");
+    }
+    if call_type.is_some() {
+        clauses.push("call_type=?");
+    }
+    if since.is_some() {
+        clauses.push("created_at>=?");
+    }
+    if until.is_some() {
+        clauses.push("created_at<?");
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+    // `limit` is clamped and interpolated as a bare integer (no injection surface); the string
+    // filters are bound parameters below.
+    let lim = limit.unwrap_or(200).clamp(1, 1000);
+    let sql = format!("SELECT * FROM decider_episodes {where_sql} ORDER BY id ASC LIMIT {lim}");
+    let mut q = sqlx::query(&sql);
+    if let Some(d) = decider_id {
+        q = q.bind(d);
+    }
+    if let Some(c) = call_type {
+        q = q.bind(c);
+    }
+    if let Some(s) = since {
+        q = q.bind(s);
+    }
+    if let Some(u) = until {
+        q = q.bind(u);
+    }
+    let rows = q.fetch_all(pool).await?;
+    let episodes: Vec<Value> = rows.iter().map(decider_episode_json).collect();
+    Ok(json!({
+        "decider_id": decider_id,
+        "call_type": call_type,
+        "since": since,
+        "until": until,
+        "count": episodes.len(),
+        "episodes": episodes,
+    }))
+}
+
 /// Fetch one document with its current version + version list.
 /// Resolve a document reference -- a numeric id OR a wiki path/slug -- to a document id. Agents cite
 /// docs by their wiki path (e.g. charters/v-nix, designs/...), so get_document / read_document accept
@@ -19894,6 +20027,127 @@ mod tests {
         )
         .await
         .is_err());
+        Ok(())
+    }
+
+    /// task_1478 (doc_3426 ask 12): the decider fail-retry-pass episode ingest + aggregation
+    /// surface. Append returns the stored entry (id + inline structured episode) keyed by
+    /// agent/decider/call-type; the aggregation query filters by decider_id, call_type, and a
+    /// [since, until) time window (each optional) and returns the labelable record for task_1471;
+    /// required fields are validated.
+    #[tokio::test]
+    async fn decider_episode_ingest_and_aggregation() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // (1) + (4) append returns an id and carries the structured relabel record inline.
+        let ep = json!({
+            "inputs": {"prompt": "p"},
+            "steps": [
+                {"attempt": "a1", "verdict": "no", "band": "low", "explanation": "missing x"},
+                {"attempt": "a2", "verdict": "yes", "band": "high"}
+            ],
+            "final_pass": "a2"
+        });
+        let e1 = submit_decider_episode(
+            &pool,
+            "v-a",
+            "quality-decider",
+            "code-review",
+            "bafyEP1",
+            Some(ep.clone()),
+        )
+        .await?;
+        assert!(e1["id"].as_i64().unwrap() > 0, "append returns an id");
+        assert_eq!(e1["agent_id"], json!("v-a"));
+        assert_eq!(e1["decider_id"], json!("quality-decider"));
+        assert_eq!(e1["call_type"], json!("code-review"));
+        assert_eq!(e1["content_id"], json!("bafyEP1"));
+        assert_eq!(
+            e1["episode"]["steps"][0]["band"],
+            json!("low"),
+            "structured relabel record stored + returned inline"
+        );
+        assert_eq!(e1["episode"]["final_pass"], json!("a2"));
+
+        // A few more across deciders / call-types for the aggregation filters.
+        submit_decider_episode(
+            &pool,
+            "v-b",
+            "quality-decider",
+            "code-review",
+            "bafyEP2",
+            None,
+        )
+        .await?;
+        submit_decider_episode(
+            &pool,
+            "v-a",
+            "quality-decider",
+            "doc-review",
+            "bafyEP3",
+            None,
+        )
+        .await?;
+        submit_decider_episode(
+            &pool,
+            "v-a",
+            "safety-decider",
+            "code-review",
+            "bafyEP4",
+            None,
+        )
+        .await?;
+
+        // (3) aggregate by decider + call-type.
+        let agg = list_decider_episodes(
+            &pool,
+            Some("quality-decider"),
+            Some("code-review"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            agg["count"],
+            json!(2),
+            "two quality-decider/code-review episodes: {agg}"
+        );
+        let cids: Vec<&str> = agg["episodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["content_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(cids, vec!["bafyEP1", "bafyEP2"], "ordered by append order");
+
+        // Filter by decider only widens across call-types.
+        let by_decider =
+            list_decider_episodes(&pool, Some("quality-decider"), None, None, None, None).await?;
+        assert_eq!(by_decider["count"], json!(3));
+
+        // (3) time-window filter: until excludes everything, since includes all.
+        let before_any =
+            list_decider_episodes(&pool, None, None, None, Some("2000-01-01T00:00:00Z"), None)
+                .await?;
+        assert_eq!(before_any["count"], json!(0), "until lower-bounds out all");
+        let since_epoch =
+            list_decider_episodes(&pool, None, None, Some("2000-01-01T00:00:00Z"), None, None)
+                .await?;
+        assert_eq!(
+            since_epoch["count"],
+            json!(4),
+            "since the epoch returns all"
+        );
+
+        // Validation: a missing required key is rejected.
+        assert!(submit_decider_episode(&pool, "  ", "d", "c", "bafyX", None)
+            .await
+            .is_err());
+        assert!(submit_decider_episode(&pool, "v-a", "d", "c", "  ", None)
+            .await
+            .is_err());
         Ok(())
     }
 

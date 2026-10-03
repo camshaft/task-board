@@ -224,6 +224,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{session_id}/transcript-chunks",
             get(list_transcript_chunks).post(append_transcript_chunk),
         )
+        .route(
+            "/decider-episodes",
+            get(list_decider_episodes).post(submit_decider_episode),
+        )
         .route("/projects", get(list_projects).post(create_project))
         .route(
             "/projects/{project_id}",
@@ -909,6 +913,8 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/recall", summary: "Board-state-recall bundle (task_1464, doc_3426 ask 9): ONE round trip that rebuilds an agent's working context at session (re)start -- its desired config + lifecycle_intent (task_1455/1456), its open assigned tasks with status + blocked_on, its bounded unread inbox (NOT marked read), and, when session_id is given, a handle to that session's transcript-chunk log (task_1463). The board is the recovery authority: recall first, transcript rehydration second. Bounded + efficient per start.", query: "session_id=str&task_limit=int&activity_limit=int", body: None },
     Endpoint { method: "POST", path: "/api/sessions/{session_id}/transcript-chunks", summary: "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). position is assigned server-side (per-session, monotonic across generations) and returned. kind is window | compaction-boundary; append-only + history-preserving.", query: "", body: Some("AppendTranscriptChunkBody") },
     Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None },
+    Endpoint { method: "POST", path: "/api/decider-episodes", summary: "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. Lightweight no-event append — fire it async off the agent hot path. Downstream consumer: the decider corpus (task_1471).", query: "", body: Some("SubmitDeciderEpisodeBody") },
+    Endpoint { method: "GET", path: "/api/decider-episodes", summary: "Aggregate decider episodes for the corpus relabel/retrain work (task_1478): filter by decider_id, call_type, and a [since, until) created_at window (all optional), ordered by append order, bounded by limit (default 200, max 1000). Returns each episode's inline structured relabel record + CID.", query: "decider_id=str&call_type=str&since=iso&until=iso&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
     Endpoint { method: "POST", path: "/api/projects", summary: "Create a project.", query: "", body: Some("CreateProjectBody") },
     Endpoint { method: "GET", path: "/api/projects/{project_id}", summary: "Fetch one project.", query: "", body: None },
@@ -1046,6 +1052,7 @@ fn body_schemas() -> Value {
         RestoreAgentBody,
         SetLifecycleIntentBody,
         AppendTranscriptChunkBody,
+        SubmitDeciderEpisodeBody,
         CreateProjectBody,
         UpdateProjectBody,
         CreateTaskBody,
@@ -1483,6 +1490,70 @@ async fn recall(
             q.session_id.as_deref(),
             q.task_limit.unwrap_or(50),
             q.activity_limit.unwrap_or(50),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SubmitDeciderEpisodeBody {
+    /// The agent whose decider loop produced the episode.
+    agent_id: String,
+    /// The decider that gated the retries.
+    decider_id: String,
+    /// The call type the decider gated (e.g. code-review).
+    call_type: String,
+    /// IPFS CID of the full fail-retry-pass episode payload (pointer + inline record, not bytes).
+    #[serde(rename = "content_id", alias = "cid")]
+    content_id: String,
+    /// Structured relabel record stored inline: inputs, each verdict + band per retry step, final
+    /// pass -- so the corpus (task_1471) relabels without a CID fetch.
+    episode: Option<serde_json::Value>,
+}
+
+async fn submit_decider_episode(
+    State(st): State<AppState>,
+    Json(b): Json<SubmitDeciderEpisodeBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::submit_decider_episode(
+            &st.pool,
+            &b.agent_id,
+            &b.decider_id,
+            &b.call_type,
+            &b.content_id,
+            b.episode,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ListDeciderEpisodesQuery {
+    /// Filter to one decider (omit to span all).
+    decider_id: Option<String>,
+    /// Filter to one call type (omit to span all).
+    call_type: Option<String>,
+    /// Lower bound on created_at (ISO 8601, inclusive).
+    since: Option<String>,
+    /// Upper bound on created_at (ISO 8601, exclusive).
+    until: Option<String>,
+    /// Max episodes (default 200, max 1000).
+    limit: Option<i64>,
+}
+
+async fn list_decider_episodes(
+    State(st): State<AppState>,
+    Query(q): Query<ListDeciderEpisodesQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_decider_episodes(
+            &st.pool,
+            q.decider_id.as_deref(),
+            q.call_type.as_deref(),
+            q.since.as_deref(),
+            q.until.as_deref(),
+            q.limit,
         )
         .await?,
     ))

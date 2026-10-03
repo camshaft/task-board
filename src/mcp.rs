@@ -389,6 +389,46 @@ pub struct RecallArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SubmitDeciderEpisodeArgs {
+    /// The agent whose decider loop produced the episode.
+    pub agent_id: String,
+    /// The decider that gated the retries.
+    pub decider_id: String,
+    /// The call type the decider gated (e.g. code-review).
+    pub call_type: String,
+    /// IPFS CID of the full fail-retry-pass episode payload. The board stores this pointer +
+    /// the inline structured record, never the bulky attempt bytes.
+    #[serde(rename = "content_id", alias = "cid")]
+    pub content_id: String,
+    /// Structured relabel record stored inline: the inputs, each decider verdict + decision band
+    /// per retry step, and the final passing output -- so the corpus (task_1471) relabels without
+    /// a CID fetch.
+    #[serde(default)]
+    pub episode: Option<JsonObject>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListDeciderEpisodesArgs {
+    /// Filter to one decider (omit to span all).
+    #[serde(default)]
+    pub decider_id: Option<String>,
+    /// Filter to one call type (omit to span all).
+    #[serde(default)]
+    pub call_type: Option<String>,
+    /// Lower bound on created_at (ISO 8601, inclusive); omit for no lower bound.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Upper bound on created_at (ISO 8601, exclusive); omit for no upper bound.
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Max episodes to return (default 200, max 1000).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestStandDownArgs {
     /// The agent asked to wind down.
     pub agent_id: String,
@@ -2434,6 +2474,46 @@ impl Board {
             a.session_id.as_deref(),
             a.task_limit.unwrap_or(50),
             a.activity_limit.unwrap_or(50),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID of the full episode), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. A lightweight append with no event -- fire it asynchronously off the agent hot path so it never blocks a turn. The downstream consumer is the decider corpus (task_1471). Returns the stored entry incl its id."
+    )]
+    async fn submit_decider_episode(
+        &self,
+        Parameters(a): Parameters<SubmitDeciderEpisodeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::submit_decider_episode(
+            &self.pool,
+            &a.agent_id,
+            &a.decider_id,
+            &a.call_type,
+            &a.content_id,
+            a.episode.map(Value::Object),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Aggregate decider episodes for the corpus relabel/retrain work (task_1478): filter by decider_id, call_type, and a [since, until) created_at window (all optional, ISO 8601 timestamps), ordered by append order, bounded by limit (default 200, max 1000). Returns each episode's inline structured relabel record + its CID -- enough to turn into labeled training data without re-deriving."
+    )]
+    async fn list_decider_episodes(
+        &self,
+        Parameters(a): Parameters<ListDeciderEpisodesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_decider_episodes(
+            &self.pool,
+            s(&a.decider_id),
+            s(&a.call_type),
+            s(&a.since),
+            s(&a.until),
+            a.limit,
         )
         .await
         .map_err(err)

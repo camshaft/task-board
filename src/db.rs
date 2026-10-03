@@ -552,6 +552,30 @@ CREATE TABLE IF NOT EXISTS transcript_chunks (
     created_at  TEXT NOT NULL,
     UNIQUE(session_id, position)
 );
+-- Decider training-corpus ingest: append-only log of decider fail-retry-pass mini-transcripts
+-- (task_1478, doc_3426 ask 12). When a decider returns no, the agent retries in-loop until it
+-- passes and context rollback wipes the failed attempts; the harness records that fail-retry-pass
+-- episode and submits it here as the decider training signal (consumed by task_1471, the corpus
+-- relabel/retrain work -- this is its ingest + aggregation surface, not a duplicate). Same
+-- content-addressing posture as the ask-8 transcript_chunks: `content_id` is the IPFS CID of the
+-- full episode payload (the bulky attempt outputs + block explanations live off-board), while
+-- `episode` holds the STRUCTURED relabel record inline (the inputs, each decider verdict + decision
+-- band per retry step, and the final passing output) so the aggregation query returns labelable
+-- data without a CID fetch (acceptance 4). Keyed by (agent_id, decider_id, call_type); the append
+-- is a lightweight single-row insert with no event/notification, so the harness fires it
+-- asynchronously and forgets -- it never blocks the agent turn (acceptance 2).
+CREATE TABLE IF NOT EXISTS decider_episodes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id    TEXT NOT NULL,
+    decider_id  TEXT NOT NULL,
+    call_type   TEXT NOT NULL,
+    content_id  TEXT NOT NULL,
+    episode     TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL
+);
+-- Backs the aggregation query (filter by decider_id + call_type + created_at window, ordered).
+CREATE INDEX IF NOT EXISTS idx_decider_episodes_query
+    ON decider_episodes(decider_id, call_type, created_at);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
