@@ -11290,7 +11290,7 @@ pub async fn submit_to_operator_review(
     let target_ref = document_id.to_string();
     let target_ref_doc = format!("doc_{document_id}");
     let summaries = sqlx::query(
-        "SELECT r.metadata AS metadata, rl.body AS body, rl.author AS entry_author FROM review_log rl \
+        "SELECT r.id AS review_id, r.metadata AS metadata, rl.body AS body, rl.author AS entry_author FROM review_log rl \
          JOIN reviews r ON r.id = rl.review_id \
          WHERE (r.source IS NULL OR r.source IN ('board_doc','board-document')) AND r.target_ref IN (?, ?) \
            AND rl.entry_type='adversarial_review'",
@@ -11353,19 +11353,84 @@ pub async fn submit_to_operator_review(
             _ => false,
         }
     };
-    let ran_current = summaries.iter().any(|s| {
+    // task_1331 Piece 1: the gate is POLICY-AWARE over the multi-reviewer assignee set (task_1323).
+    // Conformance stays strictly version-pinned on adversarial_review entries at the current version
+    // (a record_review_approval `approval` entry carries no version pin and does NOT substitute), and
+    // the self-review exclusion + null-source tolerance are preserved. For each review targeting this
+    // doc we gather its current-version, non-author adversarial_review entries, then test them against
+    // THAT review's approval_policy over its assignee set (reviews.assignee UNION review_assignees):
+    //   - no explicit approval_policy -> today's rule: any one non-author current entry clears (exact
+    //     back-compat, so every pre-task_1323 single-assignee review is unchanged).
+    //   - all    -> every assignee must have recorded a current-version non-author entry.
+    //   - k_of_n -> at least approval_k assignees must have (default k=1).
+    //   - any    -> any one non-author current entry clears (same as today).
+    // The doc clears if ANY targeting review passes its policy.
+    struct ReviewAgg {
+        metadata: Option<String>,
+        current_authors: BTreeSet<String>,
+        any_current_nonauthor: bool,
+    }
+    let mut by_review: std::collections::HashMap<i64, ReviewAgg> = std::collections::HashMap::new();
+    for s in &summaries {
         let from_meta =
             reviewed_version_of(s.try_get::<Option<String>, _>("metadata").ok().flatten());
         let from_body =
             reviewed_version_from_body(s.try_get::<Option<String>, _>("body").ok().flatten());
         let version_matches =
             from_meta == Some(current_version_no) || from_body == Some(current_version_no);
+        if !version_matches {
+            continue;
+        }
         let entry_author: Option<String> = s
             .try_get::<Option<String>, _>("entry_author")
             .ok()
             .flatten();
-        version_matches && !is_self_review(entry_author.as_deref())
-    });
+        if is_self_review(entry_author.as_deref()) {
+            continue;
+        }
+        let review_id: i64 = s.try_get("review_id")?;
+        let review_metadata: Option<String> =
+            s.try_get::<Option<String>, _>("metadata").ok().flatten();
+        let agg = by_review.entry(review_id).or_insert_with(|| ReviewAgg {
+            metadata: review_metadata,
+            current_authors: BTreeSet::new(),
+            any_current_nonauthor: false,
+        });
+        agg.any_current_nonauthor = true;
+        if let Some(a) = entry_author {
+            agg.current_authors.insert(a);
+        }
+    }
+    let mut ran_current = false;
+    for (review_id, agg) in &by_review {
+        let meta: Value = agg
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or_else(|| json!({}));
+        let passes = match meta.get("approval_policy").and_then(|v| v.as_str()) {
+            Some("all") => {
+                let assignees = review_assignee_set_tx(&mut tx, *review_id).await?;
+                !assignees.is_empty() && assignees.iter().all(|a| agg.current_authors.contains(a))
+            }
+            Some("k_of_n") => {
+                let k = meta.get("approval_k").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                let assignees = review_assignee_set_tx(&mut tx, *review_id).await?;
+                let approving = assignees
+                    .iter()
+                    .filter(|a| agg.current_authors.contains(*a))
+                    .count();
+                approving >= k.max(1)
+            }
+            // "any", an unknown policy string, or no explicit policy reduce to today's rule: one
+            // non-author current entry clears.
+            _ => agg.any_current_nonauthor,
+        };
+        if passes {
+            ran_current = true;
+            break;
+        }
+    }
     if !ran_current && !conformance_exempt {
         anyhow::bail!(
             "design-conformance review has not run against the current version (v{current_version_no}) of document {document_id}: no adversarial_review entry by a NON-AUTHOR reviewer on a review targeting this document (target_ref '{document_id}' or 'doc_{document_id}') records reviewed_version={current_version_no} (checked review.metadata.reviewed_version and the entry body -- JSON {{\"reviewed_version\":{current_version_no}}} or a reviewed_version={current_version_no} token; a review authored by the doc's own author does not count). An independent conformance review must run (or re-run) on the current version before the doc can reach the operator"
@@ -22647,6 +22712,104 @@ mod tests {
         assert!(request_stand_down(&pool, "ghost", Some("x"), None)
             .await
             .is_err());
+        Ok(())
+    }
+
+    /// task_1331 Piece 1: under an ALL approval_policy the operator-review gate requires EVERY
+    /// assignee's current-version conformance entry, not just one non-author reviewer. One of two
+    /// assignees is not enough; the gate clears only once both have recorded a reviewed_version entry.
+    #[tokio::test]
+    async fn operator_review_gate_is_policy_aware_all() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "Docs", None, Some("u"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let d = create_document(
+            &pool,
+            "Design: Multi",
+            Some(pid),
+            "bafyv1",
+            Some("v1"),
+            Some("author"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let did = d["id"].as_i64().unwrap();
+        let dref = did.to_string();
+
+        // A conformance review with an explicit ALL policy over two assignees (r1 primary + r2 extra).
+        let r = create_review(
+            &pool,
+            "design_conformance",
+            Some("board_doc"),
+            Some(dref.as_str()),
+            Some("conformance"),
+            None,
+            Some("author"),
+            Some("r1"),
+            Some(json!({ "approval_policy": "all" })),
+            None,
+        )
+        .await?;
+        let rid = r["id"].as_i64().unwrap();
+        add_review_assignees(&pool, rid, &["r2".into()], Some("author")).await?;
+
+        // Only r1 has vetted the current version -> ALL policy NOT satisfied -> gate rejects.
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 1 }).to_string()),
+            Some("r1"),
+            None,
+            None,
+        )
+        .await?;
+        assert!(
+            submit_to_operator_review(
+                &pool,
+                did,
+                Some("author"),
+                Some("design-doc-template"),
+                None,
+                None,
+                false,
+                None
+            )
+            .await
+            .is_err(),
+            "one of two ALL-policy assignees is not enough to clear the gate"
+        );
+
+        // r2 also vets the current version -> every assignee has a current entry -> gate clears.
+        append_review_log(
+            &pool,
+            rid,
+            "adversarial_review",
+            Some(&json!({ "reviewed_version": 1 }).to_string()),
+            Some("r2"),
+            None,
+            None,
+        )
+        .await?;
+        let out = submit_to_operator_review(
+            &pool,
+            did,
+            Some("author"),
+            Some("design-doc-template"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            out["status"],
+            json!("operator_review"),
+            "both ALL-policy assignees vetted -> gate clears: {out}"
+        );
         Ok(())
     }
 
