@@ -9,6 +9,7 @@ mod events;
 mod ipfs;
 mod mcp;
 mod metrics;
+mod session_live;
 mod sse;
 mod tunnel;
 
