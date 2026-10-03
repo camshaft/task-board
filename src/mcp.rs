@@ -294,6 +294,10 @@ pub struct UpdateAgentArgs {
     /// reconciler reads, not strict preemption). Operator-facing agents are typically high.
     #[serde(default)]
     pub priority: Option<String>,
+    /// Who is making the change (your agent id). Required to set `webhook_url` (task_1492): the
+    /// outbound-push target may only be set by the owning agent, so this must equal `agent_id`.
+    #[serde(rename = "principal", alias = "actor", alias = "by", default)]
+    pub actor: Option<String>,
     /// Return the full agent (including the `charter`) in the response. Default false — the response
     /// omits the charter to keep a looping caller's context light; fetch it with get_agent.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
@@ -2605,6 +2609,7 @@ impl Board {
         Parameters(a): Parameters<UpdateAgentArgs>,
     ) -> Result<CallToolResult, McpError> {
         let verbose = a.verbose.unwrap_or(false);
+        let actor = self.me_opt(s(&a.actor));
         core::update_agent(
             &self.pool,
             &a.agent_id,
@@ -2617,6 +2622,7 @@ impl Board {
             a.metadata.map(Value::Object),
             a.clear.as_deref(),
             s(&a.priority),
+            actor.as_deref(),
         )
         .await
         .map(|v| {

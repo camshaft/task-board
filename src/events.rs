@@ -544,6 +544,17 @@ pub fn fire_webhooks(hooks: Vec<WebhookDelivery>, timeout: Duration) {
             }
         };
         for h in hooks {
+            // task_1492: re-validate at fire time (defense in depth) so a webhook_url stored before
+            // the write-path guard existed can never make the board POST to a private/loopback/
+            // link-local target. A bad URL is skipped (the inbox still delivers the event on poll).
+            if let Err(e) = crate::core::validate_webhook_url(&h.url) {
+                tracing::warn!(
+                    "[task-board] skipping webhook to {} ({}): {e}",
+                    h.agent_id,
+                    h.url
+                );
+                continue;
+            }
             let mut body = h.payload.clone();
             if let Value::Object(ref mut m) = body {
                 m.insert("recipient".into(), Value::String(h.agent_id.clone()));

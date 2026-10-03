@@ -1919,6 +1919,10 @@ struct UpdateAgentBody {
     clear: Option<Vec<String>>,
     /// Per-session scheduling priority/tier (task_1455): high | normal | low (a weighted floor).
     priority: Option<String>,
+    /// Who is making the change (your agent id). Required to set `webhook_url` (task_1492): the
+    /// outbound-push target may only be set by the owning agent, so this must equal the path id.
+    #[serde(rename = "principal", alias = "actor", alias = "by")]
+    actor: Option<String>,
     /// Return the full agent (including `charter`) in the response. Default false — the response
     /// omits the charter to keep a looping caller's context light; fetch it via GET /api/agents/{id}.
     #[serde(default)]
@@ -1942,6 +1946,7 @@ async fn update_agent(
         b.metadata,
         b.clear.as_deref(),
         b.priority.as_deref(),
+        b.actor.as_deref(),
     )
     .await?;
     Ok(Json(if b.verbose.unwrap_or(false) {
