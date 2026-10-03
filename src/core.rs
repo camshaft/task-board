@@ -8395,6 +8395,267 @@ pub async fn get_events(
     Ok(Value::Array(out))
 }
 
+// --- Live session attach / steer / abort (task_1462, doc_3426 ask 7) ---
+//
+// A caller attaches to a running agent's live session to stream its transcript + thought-process
+// frames and to steer it. The agent is headless (no inbound endpoint), so the board mediates both:
+// the live frames fan out ephemerally over the in-process FrameHub (see `session_live`), while the
+// attach-state transitions and the steer/abort control items are DURABLE, delivered to the agent as
+// events on the existing emit + inbox + push path -- new `type` strings + Explicit recipients only,
+// with `events::emit` and the inbox unchanged. Attach is reference-counted (the session_attachments
+// table) so the harness pushes frames only while at least one attacher is present (no always-on cost).
+
+async fn agent_exists(tx: &mut Transaction<'_, Sqlite>, agent_id: &str) -> anyhow::Result<bool> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(n > 0)
+}
+
+async fn attacher_count(tx: &mut Transaction<'_, Sqlite>, agent_id: &str) -> anyhow::Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT COUNT(*) FROM session_attachments WHERE agent_id=?")
+            .bind(agent_id)
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
+
+/// The lead an agent reports to (its `metadata.reports_to`), if any.
+async fn agent_lead(pool: &Pool, agent_id: &str) -> anyhow::Result<Option<String>> {
+    let meta: Option<String> =
+        sqlx::query_scalar::<_, String>("SELECT metadata FROM agents WHERE id=?")
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(meta
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| {
+            v.get("reports_to")
+                .and_then(|r| r.as_str())
+                .map(str::to_string)
+        }))
+}
+
+/// Whether `caller` sits in a seeded operators team (`operator` / `operators`).
+async fn in_operators_team(pool: &Pool, caller: &str) -> anyhow::Result<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM team_members WHERE member_id=? AND team_id IN ('operator','operators')",
+    )
+    .bind(caller)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+/// Whether `caller` resolves to the operator identity (alias-canonical match) or sits in an
+/// operators team. Mirrors the alias-canonicalization used elsewhere so "operator" and the
+/// operator's own id both authorize.
+async fn is_operator(pool: &Pool, caller: &str) -> anyhow::Result<bool> {
+    let caller_canon = resolve_identity_alias(pool, caller).await;
+    let operator_canon = resolve_identity_alias(pool, "operator").await;
+    Ok(caller_canon == operator_canon || in_operators_team(pool, caller).await?)
+}
+
+/// Whether `caller` and `agent_id` share at least one team (id match; member_kind ignored for v1).
+async fn shares_team(pool: &Pool, caller: &str, agent_id: &str) -> anyhow::Result<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM team_members a JOIN team_members b ON a.team_id=b.team_id \
+         WHERE a.member_id=? AND b.member_id=?",
+    )
+    .bind(caller)
+    .bind(agent_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+/// Read-attach / stream authz (the broader tier): operator, the agent's lead (`reports_to`), or a
+/// same-team teammate. Read is low-risk, so teammates are allowed. See [`can_control`] for the
+/// stronger steer/abort tier.
+pub async fn can_read_attach(pool: &Pool, caller: &str, agent_id: &str) -> anyhow::Result<bool> {
+    if is_operator(pool, caller).await? {
+        return Ok(true);
+    }
+    if agent_lead(pool, agent_id).await?.as_deref() == Some(caller) {
+        return Ok(true);
+    }
+    shares_team(pool, caller, agent_id).await
+}
+
+/// Steer / abort authz (the control tier): operator or the agent's lead only, since steering is a
+/// write capability over a live session.
+pub async fn can_control(pool: &Pool, caller: &str, agent_id: &str) -> anyhow::Result<bool> {
+    if is_operator(pool, caller).await? {
+        return Ok(true);
+    }
+    Ok(agent_lead(pool, agent_id).await?.as_deref() == Some(caller))
+}
+
+/// Attach `attacher` to `agent_id`'s live session (reference-counted). The first attacher emits a
+/// durable `session.attach_active` wake so the headless harness starts pushing live frames; a repeat
+/// attach by the same attacher is idempotent and does not re-emit. Authz (`can_read_attach`) is
+/// enforced by the api/mcp caller.
+pub async fn attach_session(pool: &Pool, agent_id: &str, attacher: &str) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    if !agent_exists(&mut tx, agent_id).await? {
+        anyhow::bail!("no agent {agent_id}");
+    }
+    let before = attacher_count(&mut tx, agent_id).await?;
+    sqlx::query(
+        "INSERT INTO session_attachments(agent_id, attacher, created_at) VALUES(?,?,?) \
+         ON CONFLICT(agent_id, attacher) DO NOTHING",
+    )
+    .bind(agent_id)
+    .bind(attacher)
+    .bind(now_iso())
+    .execute(&mut *tx)
+    .await?;
+    let after = attacher_count(&mut tx, agent_id).await?;
+    let newly_active = before == 0 && after > 0;
+    if newly_active {
+        let mut recips = BTreeSet::new();
+        recips.insert(agent_id.to_string());
+        emit(
+            &mut tx,
+            &mut hooks,
+            "session.attach_active",
+            Some(attacher),
+            None,
+            None,
+            None,
+            None,
+            json!({ "agent_id": agent_id, "attacher": attacher, "attachers": after }),
+            Recipients::Explicit(recips),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({
+        "agent_id": agent_id,
+        "attacher": attacher,
+        "attachers": after,
+        "attach_active": after > 0,
+        "newly_active": newly_active,
+    }))
+}
+
+/// Detach `attacher` from `agent_id` (reference-counted). The last detach emits a durable
+/// `session.detach` wake so the harness stops pushing frames; detaching an absent attacher is a
+/// no-op. Also used by the api layer on an attacher's stream disconnect, so a gone attacher is
+/// cleaned up and never holds the agent in push-on.
+pub async fn detach_session(pool: &Pool, agent_id: &str, attacher: &str) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let deleted = sqlx::query("DELETE FROM session_attachments WHERE agent_id=? AND attacher=?")
+        .bind(agent_id)
+        .bind(attacher)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let after = attacher_count(&mut tx, agent_id).await?;
+    let newly_idle = deleted > 0 && after == 0;
+    if newly_idle {
+        let mut recips = BTreeSet::new();
+        recips.insert(agent_id.to_string());
+        emit(
+            &mut tx,
+            &mut hooks,
+            "session.detach",
+            Some(attacher),
+            None,
+            None,
+            None,
+            None,
+            json!({ "agent_id": agent_id, "attacher": attacher, "attachers": after }),
+            Recipients::Explicit(recips),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({
+        "agent_id": agent_id,
+        "attacher": attacher,
+        "attachers": after,
+        "attach_active": after > 0,
+        "detached": deleted > 0,
+        "newly_idle": newly_idle,
+    }))
+}
+
+/// Deliver a steer message to `agent_id` as its next input: a durable `session.steer` control item
+/// the harness consumes at its next input boundary (process-before-ack like any event). Authz
+/// (`can_control`) is enforced by the api/mcp caller.
+pub async fn steer_session(
+    pool: &Pool,
+    agent_id: &str,
+    from: &str,
+    text: &str,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    if !agent_exists(&mut tx, agent_id).await? {
+        anyhow::bail!("no agent {agent_id}");
+    }
+    let mut recips = BTreeSet::new();
+    recips.insert(agent_id.to_string());
+    let seq = emit(
+        &mut tx,
+        &mut hooks,
+        "session.steer",
+        Some(from),
+        None,
+        None,
+        None,
+        None,
+        json!({ "agent_id": agent_id, "from": from, "text": text }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "agent_id": agent_id, "from": from, "event_seq": seq, "delivered": true }))
+}
+
+/// Deliver a non-destructive abort to `agent_id` (the M4 abort verb): a durable `session.abort`
+/// control item the harness honors at its turn-loop's next checkpoint, cancelling the current turn
+/// and preserving session state. Best-effort and time-sensitive, but durable so a brief gap does
+/// not drop it. Authz (`can_control`) is enforced by the api/mcp caller.
+pub async fn abort_session(
+    pool: &Pool,
+    agent_id: &str,
+    from: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    if !agent_exists(&mut tx, agent_id).await? {
+        anyhow::bail!("no agent {agent_id}");
+    }
+    let mut recips = BTreeSet::new();
+    recips.insert(agent_id.to_string());
+    let seq = emit(
+        &mut tx,
+        &mut hooks,
+        "session.abort",
+        Some(from),
+        None,
+        None,
+        None,
+        None,
+        json!({ "agent_id": agent_id, "from": from, "reason": reason }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(json!({ "agent_id": agent_id, "from": from, "event_seq": seq, "delivered": true }))
+}
+
 // --- External identities (bridged actors) ---
 
 /// Register or update an external identity — a human/actor from a bridged system (Slack,
@@ -15584,6 +15845,57 @@ pub async fn review_improvement_trend(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// task_1462 (doc_3426 ask 7): attach is reference-counted and emits a durable control item to
+    /// the agent only on the attach-state transitions (first-attach / last-detach), and steer/abort
+    /// each emit exactly one durable item to the agent's inbox.
+    #[tokio::test]
+    async fn live_attach_is_reference_counted_and_emits_transitions() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "a1", Some("Agent 1"), None, None, None, None).await?;
+
+        // First attacher flips to active and emits attach_active.
+        let r = attach_session(&pool, "a1", "op").await?;
+        assert_eq!(r["attachers"], json!(1));
+        assert_eq!(r["newly_active"], json!(true));
+        // Re-attach by the same attacher is idempotent, no re-emit.
+        let r = attach_session(&pool, "a1", "op").await?;
+        assert_eq!(r["attachers"], json!(1));
+        assert_eq!(r["newly_active"], json!(false));
+        // A second attacher does not re-emit attach_active.
+        let r = attach_session(&pool, "a1", "op2").await?;
+        assert_eq!(r["attachers"], json!(2));
+        assert_eq!(r["newly_active"], json!(false));
+        // The first detach is not the last, so no detach emit.
+        let r = detach_session(&pool, "a1", "op").await?;
+        assert_eq!(r["attachers"], json!(1));
+        assert_eq!(r["newly_idle"], json!(false));
+        // The last detach emits detach.
+        let r = detach_session(&pool, "a1", "op2").await?;
+        assert_eq!(r["attachers"], json!(0));
+        assert_eq!(r["newly_idle"], json!(true));
+        // Detaching an absent attacher is a no-op.
+        let r = detach_session(&pool, "a1", "ghost").await?;
+        assert_eq!(r["detached"], json!(false));
+        assert_eq!(r["newly_idle"], json!(false));
+
+        // Steer + abort each deliver one durable control item.
+        steer_session(&pool, "a1", "op", "focus on the gate").await?;
+        abort_session(&pool, "a1", "op", Some("stop")).await?;
+
+        // Exactly one of each transition reached the agent's inbox (durable, Explicit recipient).
+        for (kind, want) in [
+            ("session.attach_active", 1),
+            ("session.detach", 1),
+            ("session.steer", 1),
+            ("session.abort", 1),
+        ] {
+            let n = check_notifications(&pool, "a1", false, 100, Some(kind)).await?;
+            assert_eq!(n["count"], json!(want), "wrong count for {kind}");
+        }
+        Ok(())
+    }
 
     /// Port of scripts/smoke.py: exercises the core flow and asserts the exact
     /// notification semantics (planner hears 3, fixer hears 2, no self-notifications).
