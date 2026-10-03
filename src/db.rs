@@ -687,6 +687,64 @@ CREATE TABLE IF NOT EXISTS session_attachments (
     PRIMARY KEY (agent_id, attacher)
 );
 CREATE INDEX IF NOT EXISTS idx_session_attachments_agent ON session_attachments(agent_id);
+-- Per-session state report-up (task_1519, doc_3426 ask 15; the substrate doc_3431's failure-mode
+-- catalog rests on). The session actor REPORTS UP its true state here on each transition and on a
+-- failed turn, so recovery is directed from live state rather than inferred from silence. Keyed by
+-- session_id (the harness-internal coordinate, opaque to the board). `phase` is the state-machine
+-- phase (idle | awaiting-model | streaming | awaiting-tool-result | blocked | suspended). Progress
+-- is a monotonic `step` counter plus `last_advance_at` (the timestamp of the last step ADVANCE,
+-- distinct from `updated_at` which moves on every report) -- the liveness/progress marker a
+-- no-progress mode (fm-16) keys on (updated_at advances while last_advance_at stalls). `failure_*`
+-- is the nullable {class, reason}: `failure_class` is a failure-class vocabulary id (an fm-id from
+-- doc_3431), `failure_reason` free text; both NULL on a non-failing report. `generation` is the
+-- session generation fence (doc_3424 goal 12): a report from a stale (lower) generation is rejected
+-- so only the current-generation host writes -- the current-generation host is the one holding the
+-- highest generation the board has seen for the session, so a respawn/migration takes over by
+-- reporting a higher generation and the superseded host can no longer write.
+CREATE TABLE IF NOT EXISTS session_state (
+    session_id      TEXT PRIMARY KEY,
+    phase           TEXT NOT NULL,
+    step            INTEGER NOT NULL DEFAULT 0,
+    last_advance_at TEXT NOT NULL,
+    failure_class   TEXT,
+    failure_reason  TEXT,
+    generation      INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL
+);
+-- Per-session recovery directive push-down (task_1519, doc_3426 ask 15): the board -> session
+-- control channel. The controller SETS a directive (continue | change-approach | decompose |
+-- reassign) with an optional payload; setting it bumps the watchable `version` and emits
+-- agent.recovery_directive_changed in the task_1456 'agent' event class, so a session host
+-- subscribed board + ["agent"] WAKES over the SAME key-version wake task_1456/task_1477 use (no
+-- parallel wake mechanism). The session read + ack is generation-fenced against the current session
+-- generation in session_state: `acked_generation`/`acked_version` record the last ack, and an ack
+-- from a stale generation is rejected. One row per session.
+CREATE TABLE IF NOT EXISTS session_recovery_directive (
+    session_id       TEXT PRIMARY KEY,
+    directive        TEXT NOT NULL,
+    payload          TEXT,
+    version          INTEGER NOT NULL DEFAULT 0,
+    acked_generation INTEGER,
+    acked_version    INTEGER,
+    set_by           TEXT,
+    updated_at       TEXT NOT NULL
+);
+-- Two board-owned versioned vocabularies (task_1519, doc_3426 ask 15): the shared report-up/push-down
+-- contract. `vocab` namespaces the set: 'failure_class' (seeded from doc_3431's fm-id set, fm-01..;
+-- GROW-ONLY -- an id is append-only and never renumbered, so the board adds a new fm-id and no
+-- existing token changes) and 'directive' (continue | change-approach | decompose | reassign).
+-- `grp` is the OPTIONAL secondary group a failure-class term carries (transient-environmental |
+-- deterministic-request-intrinsic | agent-state-lifecycle, derived from doc_3431's grouping); NULL
+-- on a directive term. An out-of-vocabulary report-up class OR a set directive outside its vocab is
+-- rejected (bad_request). The per-vocab watchable version reuses the policy_versions counter (keys
+-- 'failure_class_vocab' / 'directive_vocab'), so a vocab read returns a monotonic version.
+CREATE TABLE IF NOT EXISTS vocabularies (
+    vocab      TEXT NOT NULL,
+    term       TEXT NOT NULL,
+    grp        TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (vocab, term)
+);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
@@ -1226,6 +1284,51 @@ pub async fn init(db_path: &str) -> anyhow::Result<Pool> {
     .bind(&now)
     .execute(&pool)
     .await?;
+
+    // Seed the two board-owned versioned vocabularies (task_1519, doc_3426 ask 15). Idempotent +
+    // GROW-ONLY: INSERT OR IGNORE adds any new term without touching an existing one, so appending a
+    // later fm-id to the seed list (a one-line additive change) adds the token on the next boot and
+    // never renumbers a live token. The per-vocab watchable version (reusing the policy_versions
+    // counter) is set to the term count after seeding -- monotonic for a grow-only vocab, so a vocab
+    // read surfaces a version the harness can compare. The failure-class terms are the fm-ids from
+    // doc_3431 (the authoritative failure-mode catalog) with each id's doc_3431 group; the directive
+    // terms are the fixed recovery-directive set.
+    for &(vocab, term, grp) in crate::core::VOCABULARY_SEED {
+        sqlx::query(
+            "INSERT OR IGNORE INTO vocabularies(vocab, term, grp, created_at) VALUES(?,?,?,?)",
+        )
+        .bind(vocab)
+        .bind(term)
+        .bind(grp)
+        .bind(&now)
+        .execute(&pool)
+        .await?;
+    }
+    for (vocab, policy_kind) in [
+        (
+            crate::core::VOCAB_FAILURE_CLASS,
+            crate::core::POLICY_FAILURE_CLASS_VOCAB,
+        ),
+        (
+            crate::core::VOCAB_DIRECTIVE,
+            crate::core::POLICY_DIRECTIVE_VOCAB,
+        ),
+    ] {
+        let count: i64 = sqlx::query("SELECT COUNT(*) AS c FROM vocabularies WHERE vocab=?")
+            .bind(vocab)
+            .fetch_one(&pool)
+            .await?
+            .get("c");
+        sqlx::query(
+            "INSERT INTO policy_versions(policy_kind, version, updated_at) VALUES(?,?,?) \
+             ON CONFLICT(policy_kind) DO UPDATE SET version=excluded.version, updated_at=excluded.updated_at",
+        )
+        .bind(policy_kind)
+        .bind(count)
+        .bind(&now)
+        .execute(&pool)
+        .await?;
+    }
 
     Ok(pool)
 }

@@ -9556,6 +9556,526 @@ pub async fn admission_decision(
     )
 }
 
+// --- Per-session state report-up + recovery-directive push-down + the two board-owned vocabularies
+// (task_1519, doc_3426 ask 15) -------------------------------------------------------------------
+//
+// The harness-enabling control plane doc_3431's failure-mode catalog rests on. A session actor
+// continuously REPORTS UP its true state (phase, a progress/liveness marker, and on a failed turn
+// the failure class + reason), the board holds the desired state and PUSHES DOWN a recovery
+// directive, and the session observes the directive over the SAME key-version watchable wake
+// task_1456/task_1477 established (the 'agent' event class). Two board-owned versioned vocabularies
+// are the shared report-up/push-down contract: the failure-class vocab (doc_3431's fm-ids) and the
+// directive vocab. Both halves are generation-fenced on the session generation so only the
+// current-generation host writes/acks (doc_3424 goal 12 migration fence).
+
+/// The failure-class vocabulary name (the fm-id set from doc_3431 the session reports up).
+pub const VOCAB_FAILURE_CLASS: &str = "failure_class";
+/// The recovery-directive vocabulary name (the set the board pushes down).
+pub const VOCAB_DIRECTIVE: &str = "directive";
+/// policy_versions key carrying the failure-class vocab's watchable version (reuses the task_1460
+/// monotonic policy-version counter rather than a parallel table).
+pub const POLICY_FAILURE_CLASS_VOCAB: &str = "failure_class_vocab";
+/// policy_versions key carrying the directive vocab's watchable version.
+pub const POLICY_DIRECTIVE_VOCAB: &str = "directive_vocab";
+
+/// The session state-machine phases (the `phase` field of a report-up). The board stores the
+/// reported phase verbatim after validating it is one of these.
+pub const SESSION_PHASES: &[&str] = &[
+    "idle",
+    "awaiting-model",
+    "streaming",
+    "awaiting-tool-result",
+    "blocked",
+    "suspended",
+];
+
+/// The recovery directives the board pushes down (the `directive` vocabulary). Seeded into
+/// `vocabularies` and enforced on set_recovery_directive.
+pub const RECOVERY_DIRECTIVES: &[&str] = &["continue", "change-approach", "decompose", "reassign"];
+
+// doc_3431 groups each failure mode into one of three groups by the response it calls for. Carried
+// as the OPTIONAL secondary `grp` on a failure-class vocab term; the PRIMARY required token is the
+// fm-id. (The human-readable mode TITLE stays in doc_3431, never on the board.)
+const FM_GROUP_TRANSIENT: &str = "transient-environmental";
+const FM_GROUP_DETERMINISTIC: &str = "deterministic-request-intrinsic";
+const FM_GROUP_AGENT_STATE: &str = "agent-state-lifecycle";
+
+/// The board-owned vocabulary seed (task_1519): the failure-class terms are doc_3431's fm-ids
+/// fm-01..fm-21 with each id's doc_3431 group, and the directive terms are the fixed recovery set.
+/// GROW-ONLY: an fm-id is append-only and never renumbered, so a later catalog append (e.g. fm-22)
+/// is a one-line additive entry here -- adding it adds the board token with no existing token
+/// changing. db::init seeds this with INSERT OR IGNORE on every boot.
+pub const VOCABULARY_SEED: &[(&str, &str, Option<&str>)] = &[
+    // Transient and environmental modes (fm-01..fm-05).
+    (VOCAB_FAILURE_CLASS, "fm-01", Some(FM_GROUP_TRANSIENT)),
+    (VOCAB_FAILURE_CLASS, "fm-02", Some(FM_GROUP_TRANSIENT)),
+    (VOCAB_FAILURE_CLASS, "fm-03", Some(FM_GROUP_TRANSIENT)),
+    (VOCAB_FAILURE_CLASS, "fm-04", Some(FM_GROUP_TRANSIENT)),
+    (VOCAB_FAILURE_CLASS, "fm-05", Some(FM_GROUP_TRANSIENT)),
+    // Deterministic and request-intrinsic modes (fm-06..fm-13).
+    (VOCAB_FAILURE_CLASS, "fm-06", Some(FM_GROUP_DETERMINISTIC)),
+    (VOCAB_FAILURE_CLASS, "fm-07", Some(FM_GROUP_DETERMINISTIC)),
+    (VOCAB_FAILURE_CLASS, "fm-08", Some(FM_GROUP_DETERMINISTIC)),
+    (VOCAB_FAILURE_CLASS, "fm-09", Some(FM_GROUP_DETERMINISTIC)),
+    (VOCAB_FAILURE_CLASS, "fm-10", Some(FM_GROUP_DETERMINISTIC)),
+    (VOCAB_FAILURE_CLASS, "fm-11", Some(FM_GROUP_DETERMINISTIC)),
+    (VOCAB_FAILURE_CLASS, "fm-12", Some(FM_GROUP_DETERMINISTIC)),
+    (VOCAB_FAILURE_CLASS, "fm-13", Some(FM_GROUP_DETERMINISTIC)),
+    // Agent-state and lifecycle modes (fm-14..fm-21).
+    (VOCAB_FAILURE_CLASS, "fm-14", Some(FM_GROUP_AGENT_STATE)),
+    (VOCAB_FAILURE_CLASS, "fm-15", Some(FM_GROUP_AGENT_STATE)),
+    (VOCAB_FAILURE_CLASS, "fm-16", Some(FM_GROUP_AGENT_STATE)),
+    (VOCAB_FAILURE_CLASS, "fm-17", Some(FM_GROUP_AGENT_STATE)),
+    (VOCAB_FAILURE_CLASS, "fm-18", Some(FM_GROUP_AGENT_STATE)),
+    (VOCAB_FAILURE_CLASS, "fm-19", Some(FM_GROUP_AGENT_STATE)),
+    (VOCAB_FAILURE_CLASS, "fm-20", Some(FM_GROUP_AGENT_STATE)),
+    (VOCAB_FAILURE_CLASS, "fm-21", Some(FM_GROUP_AGENT_STATE)),
+    // Recovery directives (no group).
+    (VOCAB_DIRECTIVE, "continue", None),
+    (VOCAB_DIRECTIVE, "change-approach", None),
+    (VOCAB_DIRECTIVE, "decompose", None),
+    (VOCAB_DIRECTIVE, "reassign", None),
+];
+
+/// Whether `term` is in the board-owned `vocab`. Backs the out-of-vocabulary rejection on a
+/// report-up failure-class and on a set directive.
+async fn vocab_has_term(pool: &Pool, vocab: &str, term: &str) -> anyhow::Result<bool> {
+    Ok(
+        sqlx::query("SELECT 1 FROM vocabularies WHERE vocab=? AND term=?")
+            .bind(vocab)
+            .bind(term)
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Shape one `vocabularies` row as JSON (term + optional group).
+fn vocab_term_json(term: &str, grp: Option<&str>) -> Value {
+    json!({ "term": term, "group": grp })
+}
+
+/// The failure-class vocabulary with its watchable version (task_1519): `{vocab, version, count,
+/// terms:[{term, group}]}`. The fm-id token is the primary required class on a report-up; `group`
+/// is the optional secondary doc_3431 grouping. Grow-only; `version` is monotonic.
+pub async fn list_failure_class_vocab(pool: &Pool) -> anyhow::Result<Value> {
+    let rows = sqlx::query("SELECT term, grp FROM vocabularies WHERE vocab=? ORDER BY term")
+        .bind(VOCAB_FAILURE_CLASS)
+        .fetch_all(pool)
+        .await?;
+    let terms: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            vocab_term_json(
+                &r.try_get::<String, _>("term").unwrap_or_default(),
+                r.try_get::<Option<String>, _>("grp")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            )
+        })
+        .collect();
+    Ok(json!({
+        "vocab": VOCAB_FAILURE_CLASS,
+        "version": policy_version(pool, POLICY_FAILURE_CLASS_VOCAB).await?,
+        "count": terms.len(),
+        "terms": terms,
+    }))
+}
+
+/// The directive vocabulary with its watchable version (task_1519): `{vocab, version, count,
+/// terms:[{term, group}]}` (group is null for every directive term).
+pub async fn list_directive_vocab(pool: &Pool) -> anyhow::Result<Value> {
+    let rows = sqlx::query("SELECT term, grp FROM vocabularies WHERE vocab=? ORDER BY term")
+        .bind(VOCAB_DIRECTIVE)
+        .fetch_all(pool)
+        .await?;
+    let terms: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            vocab_term_json(
+                &r.try_get::<String, _>("term").unwrap_or_default(),
+                r.try_get::<Option<String>, _>("grp")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            )
+        })
+        .collect();
+    Ok(json!({
+        "vocab": VOCAB_DIRECTIVE,
+        "version": policy_version(pool, POLICY_DIRECTIVE_VOCAB).await?,
+        "count": terms.len(),
+        "terms": terms,
+    }))
+}
+
+/// Shape a `session_state` row as JSON, with the nullable {class, reason} surfaced both flat and as
+/// a nested `failure` object (null when the session is not in a failed state).
+#[allow(clippy::too_many_arguments)]
+fn session_state_json(
+    session_id: &str,
+    phase: &str,
+    step: i64,
+    last_advance_at: &str,
+    failure_class: Option<&str>,
+    failure_reason: Option<&str>,
+    generation: i64,
+    updated_at: &str,
+) -> Value {
+    let failure = match failure_class {
+        Some(class) => json!({ "class": class, "reason": failure_reason }),
+        None => Value::Null,
+    };
+    json!({
+        "session_id": session_id,
+        "phase": phase,
+        "step": step,
+        "last_advance_at": last_advance_at,
+        "failure": failure,
+        "failure_class": failure_class,
+        "failure_reason": failure_reason,
+        "generation": generation,
+        "updated_at": updated_at,
+    })
+}
+
+/// Report-up a session's current state (task_1519, doc_3426 ask 15): the generation-fenced write the
+/// session actor makes on each state transition and on a failed turn. `phase` must be one of
+/// [`SESSION_PHASES`]; a non-null `failure_class` must be in the failure-class vocabulary
+/// (out-of-vocabulary is rejected bad_request). GENERATION FENCE: a write whose `generation` is
+/// BELOW the generation the board has already recorded for the session is rejected (forbidden) --
+/// only the current-generation host (the highest generation seen) may write, so a superseded host
+/// cannot clobber the state after a respawn/migration took over at a higher generation. `step` is a
+/// monotonic progress counter; `last_advance_at` is bumped to now only when the step ADVANCES (or a
+/// higher generation takes over), while `updated_at` moves on every report -- the split lets a
+/// no-progress mode (fm-16) be detected as updated_at advancing while last_advance_at stalls.
+pub async fn report_session_state(
+    pool: &Pool,
+    session_id: &str,
+    generation: i64,
+    phase: &str,
+    step: i64,
+    failure_class: Option<&str>,
+    failure_reason: Option<&str>,
+) -> anyhow::Result<Value> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "session_id is required".to_string()
+        ));
+    }
+    let phase = phase.trim();
+    if !SESSION_PHASES.contains(&phase) {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "phase must be one of {} (got '{phase}')",
+            SESSION_PHASES.join("|")
+        )));
+    }
+    let failure_class = failure_class.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(fc) = failure_class {
+        if !vocab_has_term(pool, VOCAB_FAILURE_CLASS, fc).await? {
+            anyhow::bail!(BoardError::bad_request(format!(
+                "failure class '{fc}' is not in the '{VOCAB_FAILURE_CLASS}' vocabulary (an fm-id \
+                 from doc_3431); read the vocabulary for the valid set"
+            )));
+        }
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let existing = sqlx::query(
+        "SELECT step, last_advance_at, generation FROM session_state WHERE session_id=?",
+    )
+    .bind(session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // last_advance_at tracks the last PROGRESS advance: now when the step advances or a higher
+    // generation takes over, else the prior value held (while updated_at always moves to now).
+    let advanced_ts = match &existing {
+        None => ts.clone(),
+        Some(row) => {
+            let cur_gen: i64 = row.try_get("generation")?;
+            if generation < cur_gen {
+                anyhow::bail!(BoardError::forbidden(format!(
+                    "stale generation {generation}: the current-generation host for session \
+                     '{session_id}' is at generation {cur_gen}; only it may report state"
+                )));
+            }
+            let prior_step: i64 = row.try_get("step")?;
+            let prior_adv: String = row.try_get("last_advance_at")?;
+            if generation > cur_gen || step > prior_step {
+                ts.clone()
+            } else {
+                prior_adv
+            }
+        }
+    };
+    sqlx::query(
+        "INSERT INTO session_state(session_id, phase, step, last_advance_at, failure_class, \
+           failure_reason, generation, updated_at) VALUES(?,?,?,?,?,?,?,?) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+           phase=excluded.phase, step=excluded.step, last_advance_at=excluded.last_advance_at, \
+           failure_class=excluded.failure_class, failure_reason=excluded.failure_reason, \
+           generation=excluded.generation, updated_at=excluded.updated_at",
+    )
+    .bind(session_id)
+    .bind(phase)
+    .bind(step)
+    .bind(&advanced_ts)
+    .bind(failure_class)
+    .bind(failure_reason)
+    .bind(generation)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(session_state_json(
+        session_id,
+        phase,
+        step,
+        &advanced_ts,
+        failure_class,
+        failure_reason,
+        generation,
+        &ts,
+    ))
+}
+
+/// Read a session's reported state (task_1519): the reconciler-queryable read. Null when the session
+/// has never reported.
+pub async fn get_session_state(pool: &Pool, session_id: &str) -> anyhow::Result<Value> {
+    let row = sqlx::query(
+        "SELECT phase, step, last_advance_at, failure_class, failure_reason, generation, updated_at \
+         FROM session_state WHERE session_id=?",
+    )
+    .bind(session_id.trim())
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        None => Value::Null,
+        Some(r) => session_state_json(
+            session_id.trim(),
+            &r.try_get::<String, _>("phase")?,
+            r.try_get::<i64, _>("step")?,
+            &r.try_get::<String, _>("last_advance_at")?,
+            r.try_get::<Option<String>, _>("failure_class")
+                .ok()
+                .flatten()
+                .as_deref(),
+            r.try_get::<Option<String>, _>("failure_reason")
+                .ok()
+                .flatten()
+                .as_deref(),
+            r.try_get::<i64, _>("generation")?,
+            &r.try_get::<String, _>("updated_at")?,
+        ),
+    })
+}
+
+/// Current recorded generation for a session (0 if it has never reported) -- the fence value a
+/// stale write/ack is compared against.
+async fn session_generation(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_id: &str,
+) -> anyhow::Result<i64> {
+    Ok(
+        sqlx::query("SELECT generation FROM session_state WHERE session_id=?")
+            .bind(session_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .and_then(|r| r.try_get::<i64, _>("generation").ok())
+            .unwrap_or(0),
+    )
+}
+
+/// Shape a `session_recovery_directive` row as JSON (payload parsed back to a value; the ack state
+/// surfaced plus an `acked` convenience = the current version has been acked by the current host).
+#[allow(clippy::too_many_arguments)]
+fn recovery_directive_json(
+    session_id: &str,
+    directive: &str,
+    payload: Option<&str>,
+    version: i64,
+    acked_generation: Option<i64>,
+    acked_version: Option<i64>,
+    set_by: Option<&str>,
+    updated_at: &str,
+) -> Value {
+    json!({
+        "session_id": session_id,
+        "directive": directive,
+        "payload": payload.and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "version": version,
+        "acked_generation": acked_generation,
+        "acked_version": acked_version,
+        "acked": acked_version == Some(version),
+        "set_by": set_by,
+        "updated_at": updated_at,
+    })
+}
+
+/// Push down a recovery directive to a session (task_1519, doc_3426 ask 15): the board -> session
+/// control write the controller makes. `directive` must be in the directive vocabulary
+/// (out-of-vocabulary is rejected bad_request). Setting it BUMPS the per-session watchable `version`
+/// and emits agent.recovery_directive_changed {session_id, directive, version} in the task_1456
+/// 'agent' event class -- so a session host subscribed board + ["agent"] WAKES over the SAME
+/// key-version watchable wake task_1456/task_1477 use, with no parallel wake mechanism. Returns the
+/// stored directive + the new version.
+pub async fn set_recovery_directive(
+    pool: &Pool,
+    session_id: &str,
+    directive: &str,
+    payload: Option<Value>,
+    set_by: Option<&str>,
+) -> anyhow::Result<Value> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "session_id is required".to_string()
+        ));
+    }
+    let directive = directive.trim();
+    if !vocab_has_term(pool, VOCAB_DIRECTIVE, directive).await? {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "directive '{directive}' is not in the '{VOCAB_DIRECTIVE}' vocabulary ({}); read the \
+             vocabulary for the valid set",
+            RECOVERY_DIRECTIVES.join("|")
+        )));
+    }
+    let payload_s = payload.map(|p| p.to_string());
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    sqlx::query(
+        "INSERT INTO session_recovery_directive(session_id, directive, payload, version, set_by, updated_at) \
+         VALUES(?,?,?,1,?,?) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+           directive=excluded.directive, payload=excluded.payload, \
+           version=session_recovery_directive.version+1, set_by=excluded.set_by, \
+           updated_at=excluded.updated_at",
+    )
+    .bind(session_id)
+    .bind(directive)
+    .bind(&payload_s)
+    .bind(set_by)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    let version: i64 =
+        sqlx::query("SELECT version FROM session_recovery_directive WHERE session_id=?")
+            .bind(session_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("version")?;
+    // Wake the session over the task_1456 'agent' key-version wake: an agent.* event is delivered to
+    // a board + ["agent"] subscriber (the firehose class union in `emit`) as a genuine wake, exactly
+    // as agent.config_changed / agent.intent_changed are. The session_id is also an Explicit
+    // recipient so a host draining its own session inbox sees it directly.
+    let mut recips = BTreeSet::new();
+    recips.insert(session_id.to_string());
+    emit(
+        &mut tx,
+        &mut hooks,
+        "agent.recovery_directive_changed",
+        set_by,
+        None,
+        None,
+        None,
+        None,
+        json!({ "session_id": session_id, "directive": directive, "version": version }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+    Ok(recovery_directive_json(
+        session_id,
+        directive,
+        payload_s.as_deref(),
+        version,
+        None,
+        None,
+        set_by,
+        &ts,
+    ))
+}
+
+/// Read a session's current recovery directive (task_1519). Null when none has been set.
+pub async fn get_recovery_directive(pool: &Pool, session_id: &str) -> anyhow::Result<Value> {
+    let row = sqlx::query(
+        "SELECT directive, payload, version, acked_generation, acked_version, set_by, updated_at \
+         FROM session_recovery_directive WHERE session_id=?",
+    )
+    .bind(session_id.trim())
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        None => Value::Null,
+        Some(r) => recovery_directive_json(
+            session_id.trim(),
+            &r.try_get::<String, _>("directive")?,
+            r.try_get::<Option<String>, _>("payload")
+                .ok()
+                .flatten()
+                .as_deref(),
+            r.try_get::<i64, _>("version")?,
+            r.try_get::<Option<i64>, _>("acked_generation")
+                .ok()
+                .flatten(),
+            r.try_get::<Option<i64>, _>("acked_version").ok().flatten(),
+            r.try_get::<Option<String>, _>("set_by")
+                .ok()
+                .flatten()
+                .as_deref(),
+            &r.try_get::<String, _>("updated_at")?,
+        ),
+    })
+}
+
+/// Acknowledge a session's recovery directive (task_1519): the generation-fenced session-side ack.
+/// GENERATION FENCE: an ack whose `generation` is below the session's current recorded generation is
+/// rejected (forbidden) -- a superseded host cannot ack. `version` defaults to the directive's
+/// current version (ack the latest). Records `acked_generation` + `acked_version`. Returns the
+/// directive with its ack state.
+pub async fn ack_recovery_directive(
+    pool: &Pool,
+    session_id: &str,
+    generation: i64,
+    version: Option<i64>,
+) -> anyhow::Result<Value> {
+    let session_id = session_id.trim();
+    let mut tx = pool.begin().await?;
+    let cur_gen = session_generation(&mut tx, session_id).await?;
+    if generation < cur_gen {
+        anyhow::bail!(BoardError::forbidden(format!(
+            "stale generation {generation}: the current-generation host for session '{session_id}' \
+             is at generation {cur_gen}; only it may ack a directive"
+        )));
+    }
+    let Some(row) =
+        sqlx::query("SELECT version FROM session_recovery_directive WHERE session_id=?")
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await?
+    else {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "no recovery directive set for session '{session_id}' to ack"
+        )));
+    };
+    let dir_version: i64 = row.try_get("version")?;
+    let ack_version = version.unwrap_or(dir_version);
+    sqlx::query(
+        "UPDATE session_recovery_directive SET acked_generation=?, acked_version=? WHERE session_id=?",
+    )
+    .bind(generation)
+    .bind(ack_version)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    get_recovery_directive(pool, session_id).await
+}
+
 /// Whether `needle` occurs in `haystack` as a whole phrase — bounded by a non-alphanumeric
 /// character (or the string ends) on each side, so "the floor" does not match inside "the
 /// floorboard". Both arguments must already be lowercased by the caller.
@@ -33526,6 +34046,315 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(gone, 0, "only the retired recipient's inbox is dropped");
+        Ok(())
+    }
+
+    // --- task_1519 (doc_3426 ask 15): per-session state report-up + recovery-directive push-down
+    // + the two board-owned versioned vocabularies ---
+
+    /// Acceptance: the board stores + serves the per-session state record, a current-generation host
+    /// write succeeds, and the reconciler can query it (phase, progress, failure).
+    #[tokio::test]
+    async fn session_state_report_up_and_reconciler_read() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Before any report, the reconciler read is null.
+        assert_eq!(get_session_state(&pool, "sess-1").await?, Value::Null);
+
+        // A current-generation host writes on a transition.
+        let r = report_session_state(&pool, "sess-1", 0, "awaiting-model", 1, None, None).await?;
+        assert_eq!(r["phase"], json!("awaiting-model"));
+        assert_eq!(r["step"], json!(1));
+        assert_eq!(r["generation"], json!(0));
+        assert_eq!(r["failure"], Value::Null);
+        let first_advance = r["last_advance_at"].as_str().unwrap().to_string();
+
+        // A failed-turn report carries the {class, reason}; last_advance_at holds when step does
+        // NOT advance (a phase change at the same step is not progress), while updated_at moves.
+        let r = report_session_state(
+            &pool,
+            "sess-1",
+            0,
+            "blocked",
+            1,
+            Some("fm-07"),
+            Some("guardrail refusal"),
+        )
+        .await?;
+        assert_eq!(r["phase"], json!("blocked"));
+        assert_eq!(r["failure"]["class"], json!("fm-07"));
+        assert_eq!(r["failure"]["reason"], json!("guardrail refusal"));
+        assert_eq!(
+            r["last_advance_at"].as_str().unwrap(),
+            first_advance,
+            "no step advance => last_advance_at held"
+        );
+
+        // The reconciler reads the current state back.
+        let got = get_session_state(&pool, "sess-1").await?;
+        assert_eq!(got["phase"], json!("blocked"));
+        assert_eq!(got["step"], json!(1));
+        assert_eq!(got["failure"]["class"], json!("fm-07"));
+        assert_eq!(got["generation"], json!(0));
+        Ok(())
+    }
+
+    /// Acceptance: a stale-generation report-up is rejected (only the current-generation host may
+    /// write); a higher generation takes over and advances the fence.
+    #[tokio::test]
+    async fn session_state_generation_fence_rejects_stale_host() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // Generation 2 establishes the current-generation host.
+        report_session_state(&pool, "sess-1", 2, "streaming", 5, None, None).await?;
+
+        // A write from generation 1 (a superseded host) is rejected.
+        let err = report_session_state(&pool, "sess-1", 1, "streaming", 6, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("stale generation"),
+            "stale-generation write must be rejected, got: {err}"
+        );
+        assert!(matches!(
+            err.downcast_ref::<BoardError>().map(|e| &e.status),
+            Some(ErrorStatus::Forbidden)
+        ));
+        // The stale write did not clobber state.
+        assert_eq!(get_session_state(&pool, "sess-1").await?["step"], json!(5));
+
+        // The same generation keeps writing (idempotent continuation).
+        report_session_state(&pool, "sess-1", 2, "idle", 6, None, None).await?;
+        // A higher generation takes over (respawn/migration) and becomes current.
+        let r = report_session_state(&pool, "sess-1", 3, "awaiting-model", 0, None, None).await?;
+        assert_eq!(r["generation"], json!(3));
+        // Now generation 2 is stale and rejected.
+        assert!(
+            report_session_state(&pool, "sess-1", 2, "idle", 7, None, None)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// Acceptance: setting a recovery directive bumps the watchable version and WAKES a session host
+    /// subscribed board + ["agent"] over the SAME task_1456 key-version wake (agent.* event class),
+    /// and is also delivered to the session's own inbox.
+    #[tokio::test]
+    async fn recovery_directive_set_bumps_version_and_wakes_over_agent_class() -> anyhow::Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "controller", None, None, None, None, None).await?;
+
+        // A reconciler/host watches the task_1456 fleet control-plane class: board + ["agent"].
+        subscribe_classed(
+            &pool,
+            "host-watcher",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &["agent".to_string()],
+        )
+        .await?;
+
+        // No directive yet.
+        assert_eq!(get_recovery_directive(&pool, "sess-1").await?, Value::Null);
+
+        // The controller sets one; version starts at 1.
+        let r = set_recovery_directive(
+            &pool,
+            "sess-1",
+            "change-approach",
+            Some(json!({ "hint": "try a smaller step" })),
+            Some("controller"),
+        )
+        .await?;
+        assert_eq!(r["directive"], json!("change-approach"));
+        assert_eq!(r["version"], json!(1));
+        assert_eq!(r["payload"]["hint"], json!("try a smaller step"));
+
+        // The board + ["agent"] subscriber WOKE on the agent.recovery_directive_changed event (the
+        // task_1456 key-version wake), exactly as it would on agent.config_changed.
+        let woke = check_notifications(
+            &pool,
+            "host-watcher",
+            false,
+            100,
+            Some("agent.recovery_directive_changed"),
+        )
+        .await?;
+        assert_eq!(
+            woke["count"],
+            json!(1),
+            "board+[agent] subscriber must wake"
+        );
+
+        // The session's own inbox also carries it (Explicit recipient).
+        let direct = check_notifications(
+            &pool,
+            "sess-1",
+            false,
+            100,
+            Some("agent.recovery_directive_changed"),
+        )
+        .await?;
+        assert_eq!(direct["count"], json!(1));
+
+        // Setting it again bumps the version monotonically.
+        let r =
+            set_recovery_directive(&pool, "sess-1", "decompose", None, Some("controller")).await?;
+        assert_eq!(r["version"], json!(2));
+        assert_eq!(r["directive"], json!("decompose"));
+        Ok(())
+    }
+
+    /// Acceptance: the session read + ack is generation-fenced -- a stale-generation ack is rejected,
+    /// the current-generation host acks, and the ack state surfaces on the directive read.
+    #[tokio::test]
+    async fn recovery_directive_ack_is_generation_fenced() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // The session reports in at generation 4 (establishes the fence).
+        report_session_state(&pool, "sess-1", 4, "idle", 0, None, None).await?;
+        set_recovery_directive(&pool, "sess-1", "continue", None, Some("controller")).await?;
+
+        // A stale-generation ack (generation 3) is rejected.
+        let err = ack_recovery_directive(&pool, "sess-1", 3, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("stale generation"),
+            "stale-generation ack must be rejected, got: {err}"
+        );
+
+        // The current-generation host acks the current version.
+        let r = ack_recovery_directive(&pool, "sess-1", 4, None).await?;
+        assert_eq!(r["acked_generation"], json!(4));
+        assert_eq!(r["acked_version"], json!(1));
+        assert_eq!(r["acked"], json!(true));
+
+        // After a new directive is pushed, acked goes false until re-acked.
+        set_recovery_directive(&pool, "sess-1", "reassign", None, Some("controller")).await?;
+        let d = get_recovery_directive(&pool, "sess-1").await?;
+        assert_eq!(d["version"], json!(2));
+        assert_eq!(d["acked"], json!(false), "a fresh push is unacked");
+        Ok(())
+    }
+
+    /// Acceptance: the two vocabularies are queryable versioned data -- the failure-class vocab is
+    /// seeded from doc_3431's fm-ids (fm-01..fm-21) each with its group, and the directive vocab is
+    /// the fixed recovery set.
+    #[tokio::test]
+    async fn vocabularies_are_queryable_versioned_data() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        let fc = list_failure_class_vocab(&pool).await?;
+        assert_eq!(fc["vocab"], json!("failure_class"));
+        assert_eq!(fc["count"], json!(21), "doc_3431 fm-01..fm-21 => 21 ids");
+        assert_eq!(fc["version"], json!(21), "monotonic grow-only version");
+        let terms: Vec<String> = fc["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["term"].as_str().unwrap().to_string())
+            .collect();
+        for n in 1..=21 {
+            assert!(
+                terms.contains(&format!("fm-{n:02}")),
+                "fm-{n:02} must be seeded"
+            );
+        }
+        // Group derivation from doc_3431.
+        let group_of = |term: &str| -> Value {
+            fc["terms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["term"] == json!(term))
+                .unwrap()["group"]
+                .clone()
+        };
+        assert_eq!(group_of("fm-01"), json!("transient-environmental"));
+        assert_eq!(group_of("fm-06"), json!("deterministic-request-intrinsic"));
+        assert_eq!(group_of("fm-21"), json!("agent-state-lifecycle"));
+
+        let dv = list_directive_vocab(&pool).await?;
+        assert_eq!(dv["vocab"], json!("directive"));
+        assert_eq!(dv["count"], json!(4));
+        let dterms: Vec<String> = dv["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["term"].as_str().unwrap().to_string())
+            .collect();
+        for d in ["continue", "change-approach", "decompose", "reassign"] {
+            assert!(dterms.contains(&d.to_string()), "{d} must be seeded");
+        }
+        // A directive term carries no group.
+        assert_eq!(dv["terms"][0]["group"], Value::Null);
+        Ok(())
+    }
+
+    /// Conformance (task_1519): stale-generation report-up rejected; setting a directive bumps the
+    /// version; the vocabulary is enforced BOTH directions (out-of-vocab failure-class on report-up
+    /// AND out-of-vocab directive on set are rejected bad_request).
+    #[tokio::test]
+    async fn session_control_plane_conformance() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // (1) stale-generation report-up rejected.
+        report_session_state(&pool, "s", 5, "idle", 0, None, None).await?;
+        assert!(report_session_state(&pool, "s", 4, "idle", 1, None, None)
+            .await
+            .is_err());
+
+        // (2) setting a directive bumps the version.
+        let v1 = set_recovery_directive(&pool, "s", "continue", None, None).await?["version"]
+            .as_i64()
+            .unwrap();
+        let v2 = set_recovery_directive(&pool, "s", "decompose", None, None).await?["version"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(v2, v1 + 1, "a set bumps the watchable version");
+
+        // (3a) out-of-vocab failure-class on report-up is rejected bad_request.
+        let err = report_session_state(&pool, "s", 5, "blocked", 1, Some("fm-99"), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vocabulary"));
+        assert!(matches!(
+            err.downcast_ref::<BoardError>().map(|e| &e.status),
+            Some(ErrorStatus::BadRequest)
+        ));
+        // A valid fm-id is accepted.
+        report_session_state(
+            &pool,
+            "s",
+            5,
+            "blocked",
+            1,
+            Some("fm-11"),
+            Some("bad model id"),
+        )
+        .await?;
+
+        // (3b) out-of-vocab directive on set is rejected bad_request.
+        let err = set_recovery_directive(&pool, "s", "retry-harder", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vocabulary"));
+        assert!(matches!(
+            err.downcast_ref::<BoardError>().map(|e| &e.status),
+            Some(ErrorStatus::BadRequest)
+        ));
         Ok(())
     }
 }

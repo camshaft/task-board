@@ -531,6 +531,69 @@ pub struct GetBudgetArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ReportSessionStateArgs {
+    /// The session whose state to report (the harness-internal session id).
+    pub session_id: String,
+    /// The session generation this report is from. A report whose generation is below the board's
+    /// recorded generation for the session is rejected (only the current-generation host writes).
+    pub generation: i64,
+    /// The state-machine phase: idle | awaiting-model | streaming | awaiting-tool-result | blocked
+    /// | suspended.
+    pub phase: String,
+    /// Monotonic progress/step counter; last_advance_at bumps only when it advances.
+    pub step: i64,
+    /// On a failed turn, the failure class -- an fm-id from the failure-class vocabulary (doc_3431).
+    /// Out-of-vocabulary is rejected. Omit on a non-failing report.
+    #[serde(default)]
+    pub failure_class: Option<String>,
+    /// Free-text failure reason paired with failure_class.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetSessionStateArgs {
+    /// The session whose reported state to read.
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetRecoveryDirectiveArgs {
+    /// The session to push the directive to.
+    pub session_id: String,
+    /// continue | change-approach | decompose | reassign. Out-of-vocabulary is rejected.
+    pub directive: String,
+    /// Optional opaque payload carried with the directive (e.g. the task to decompose into).
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    /// Who set it (defaults to this session's identity).
+    #[serde(rename = "principal", alias = "set_by", alias = "actor", default)]
+    pub set_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetRecoveryDirectiveArgs {
+    /// The session whose current recovery directive to read.
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AckRecoveryDirectiveArgs {
+    /// The session whose directive is being acked.
+    pub session_id: String,
+    /// The acking host's session generation. A stale (below-current) generation is rejected.
+    pub generation: i64,
+    /// The directive version being acked; omit to ack the current version.
+    #[serde(default)]
+    pub version: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListRoleConfigArgs {
     pub role: String,
     pub config_kind: String,
@@ -2913,6 +2976,106 @@ impl Board {
         Parameters(a): Parameters<GetBudgetArgs>,
     ) -> Result<CallToolResult, McpError> {
         core::get_budget(&self.pool, &a.agent_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Report-up a session's current state (task_1519, doc_3426 ask 15): the generation-fenced write the session actor makes on each state transition and on a failed turn. phase is idle | awaiting-model | streaming | awaiting-tool-result | blocked | suspended; step is a monotonic progress counter (last_advance_at bumps only on an advance); failure_class, when the turn failed, is an fm-id from the failure-class vocabulary (doc_3431) with free-text failure_reason. GENERATION FENCE: a report whose generation is below the board's recorded generation for the session is rejected -- only the current-generation host (the highest generation seen) may write, so a superseded host cannot clobber state after a respawn/migration. An out-of-vocabulary failure_class is rejected. Reconciler-queryable via get_session_state."
+    )]
+    async fn report_session_state(
+        &self,
+        Parameters(a): Parameters<ReportSessionStateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::report_session_state(
+            &self.pool,
+            &a.session_id,
+            a.generation,
+            &a.phase,
+            a.step,
+            s(&a.failure_class),
+            s(&a.failure_reason),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Read a session's reported state (task_1519): the reconciler-queryable read -- {session_id, phase, step, last_advance_at, failure:{class,reason}|null, generation, updated_at}. Null when the session has never reported."
+    )]
+    async fn get_session_state(
+        &self,
+        Parameters(a): Parameters<GetSessionStateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_session_state(&self.pool, &a.session_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Push down a recovery directive to a session (task_1519, doc_3426 ask 15): the board -> session control write the controller makes. directive is continue | change-approach | decompose | reassign (out-of-vocabulary is rejected), with an optional opaque payload. Setting it BUMPS the per-session watchable version and emits agent.recovery_directive_changed {session_id, directive, version} in the task_1456 'agent' event class -- so a session host subscribed board + [\"agent\"] WAKES over the SAME key-version watchable wake task_1456/task_1477 use, with no parallel wake mechanism. Returns the stored directive + the new version."
+    )]
+    async fn set_recovery_directive(
+        &self,
+        Parameters(a): Parameters<SetRecoveryDirectiveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let set_by = self.me_opt(s(&a.set_by));
+        core::set_recovery_directive(
+            &self.pool,
+            &a.session_id,
+            &a.directive,
+            a.payload.clone(),
+            set_by.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Read a session's current recovery directive (task_1519): {session_id, directive, payload, version, acked_generation, acked_version, acked, set_by, updated_at}. Null when none has been set. The session reads this on the agent.recovery_directive_changed wake, then acks via ack_recovery_directive."
+    )]
+    async fn get_recovery_directive(
+        &self,
+        Parameters(a): Parameters<GetRecoveryDirectiveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::get_recovery_directive(&self.pool, &a.session_id)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Acknowledge a session's recovery directive (task_1519): the generation-fenced session-side ack. GENERATION FENCE: an ack whose generation is below the session's current recorded generation is rejected -- a superseded host cannot ack. version defaults to the directive's current version (ack the latest). Records acked_generation + acked_version. Returns the directive with its ack state."
+    )]
+    async fn ack_recovery_directive(
+        &self,
+        Parameters(a): Parameters<AckRecoveryDirectiveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::ack_recovery_directive(&self.pool, &a.session_id, a.generation, a.version)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "The board-owned failure-class vocabulary (task_1519, doc_3426 ask 15): {vocab, version, count, terms:[{term, group}]}. Seeded from doc_3431's fm-ids (fm-01..) -- the primary required class token on a report-up -- each with its optional secondary group (transient-environmental | deterministic-request-intrinsic | agent-state-lifecycle). Grow-only (an fm-id is append-only, never renumbered); version is monotonic. The authoritative set a report-up failure_class is validated against."
+    )]
+    async fn failure_class_vocab(&self) -> Result<CallToolResult, McpError> {
+        core::list_failure_class_vocab(&self.pool)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "The board-owned recovery-directive vocabulary (task_1519): {vocab, version, count, terms:[{term, group}]} -- continue | change-approach | decompose | reassign (group null). The set a set_recovery_directive is validated against."
+    )]
+    async fn directive_vocab(&self) -> Result<CallToolResult, McpError> {
+        core::list_directive_vocab(&self.pool)
             .await
             .map_err(err)
             .and_then(ok)

@@ -251,6 +251,20 @@ pub fn router(state: AppState) -> Router {
         .route("/budgets", post(set_budget))
         .route("/agents/{agent_id}/budget", get(get_budget))
         .route("/agents/{agent_id}/spend", post(report_spend))
+        .route(
+            "/sessions/{session_id}/state",
+            get(get_session_state).post(report_session_state),
+        )
+        .route(
+            "/sessions/{session_id}/directive",
+            get(get_recovery_directive).post(set_recovery_directive),
+        )
+        .route(
+            "/sessions/{session_id}/directive/ack",
+            post(ack_recovery_directive),
+        )
+        .route("/vocabularies/failure-class", get(failure_class_vocab))
+        .route("/vocabularies/directive", get(directive_vocab))
         .route("/projects", get(list_projects).post(create_project))
         .route(
             "/projects/{project_id}",
@@ -965,6 +979,13 @@ inventory::submit! { Endpoint { method: "POST", path: "/api/sessions/{session_id
 inventory::submit! { Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None } }
 inventory::submit! { Endpoint { method: "POST", path: "/api/decider-episodes", summary: "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. Lightweight no-event append — fire it async off the agent hot path. Downstream consumer: the decider corpus (task_1471).", query: "", body: Some("SubmitDeciderEpisodeBody") } }
 inventory::submit! { Endpoint { method: "GET", path: "/api/decider-episodes", summary: "Aggregate decider episodes for the corpus relabel/retrain work (task_1478): filter by decider_id, call_type, and a [since, until) created_at window (all optional), ordered by append order, bounded by limit (default 200, max 1000). Returns each episode's inline structured relabel record + CID.", query: "decider_id=str&call_type=str&since=iso&until=iso&limit=int", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/sessions/{session_id}/state", summary: "Report-up a session's current state (task_1519, doc_3426 ask 15): the generation-fenced write the session actor makes on each transition + on a failed turn. Body: generation, phase (idle|awaiting-model|streaming|awaiting-tool-result|blocked|suspended), step (monotonic), optional failure_class (an fm-id from the failure-class vocabulary, doc_3431) + failure_reason. A write from a stale (below-current) generation is rejected 403 (only the current-generation host writes); an out-of-vocabulary failure_class is rejected 400. last_advance_at bumps only when step advances.", query: "", body: Some("ReportSessionStateBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/sessions/{session_id}/state", summary: "Read a session's reported state (task_1519): the reconciler-queryable read -- {session_id, phase, step, last_advance_at, failure:{class,reason}|null, generation, updated_at}. Null when the session has never reported.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/sessions/{session_id}/directive", summary: "Push down a recovery directive to a session (task_1519, doc_3426 ask 15): board -> session control. Body: directive (continue|change-approach|decompose|reassign; out-of-vocab rejected 400) + optional payload. Setting it bumps the per-session watchable version and emits agent.recovery_directive_changed in the task_1456 'agent' event class, so a session host subscribed board+[\"agent\"] wakes over the same key-version wake. Returns the stored directive + version.", query: "", body: Some("SetRecoveryDirectiveBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/sessions/{session_id}/directive", summary: "Read a session's current recovery directive (task_1519): {session_id, directive, payload, version, acked_generation, acked_version, acked, set_by, updated_at}. Null when none has been set.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "POST", path: "/api/sessions/{session_id}/directive/ack", summary: "Acknowledge a session's recovery directive (task_1519): the generation-fenced session-side ack. Body: generation (a stale below-current generation is rejected 403), optional version (defaults to the current directive version). Records acked_generation + acked_version.", query: "", body: Some("AckRecoveryDirectiveBody") } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/vocabularies/failure-class", summary: "The board-owned failure-class vocabulary (task_1519, doc_3426 ask 15): {vocab, version, count, terms:[{term, group}]}. Seeded from doc_3431's fm-ids (fm-01..) with each id's optional group (transient-environmental|deterministic-request-intrinsic|agent-state-lifecycle). Grow-only; version is monotonic. The authoritative set a report-up failure_class is checked against.", query: "", body: None } }
+inventory::submit! { Endpoint { method: "GET", path: "/api/vocabularies/directive", summary: "The board-owned recovery-directive vocabulary (task_1519): {vocab, version, count, terms:[{term, group}]} -- continue|change-approach|decompose|reassign (group null). The set a set-directive is checked against.", query: "", body: None } }
 inventory::submit! { Endpoint { method: "POST", path: "/api/budgets", summary: "Set (upsert) an editable budget cap (task_1461, doc_3426 ask 6) scoped to an agent or role over a rolling window (hour|day|week|month|total). Bumps a version and emits budget.updated so affected agents hot-reload. Config data; the admit/defer decision stays harness-side.", query: "", body: Some("SetBudgetBody") } }
 inventory::submit! { Endpoint { method: "GET", path: "/api/agents/{agent_id}/budget", summary: "One-read budget admission surface (task_1461): an agent's effective cap (role base merged with agent override), current spend over the window, session priority, and a would_admit convenience, so the harness admits or defers a turn in one round trip. Deterministic.", query: "", body: None } }
 inventory::submit! { Endpoint { method: "POST", path: "/api/agents/{agent_id}/spend", summary: "Report one turn's realized cost to the spend ledger (task_1461): append-only, lightweight, fire off the hot path. The board accumulates current spend over the rolling window. Returns current spend after the append.", query: "", body: Some("ReportSpendBody") } }
@@ -1140,6 +1161,9 @@ body_schema!(SubmitDeciderEpisodeBody);
 body_schema!(SetAgentConfigEntryBody);
 body_schema!(SetBudgetBody);
 body_schema!(ReportSpendBody);
+body_schema!(ReportSessionStateBody);
+body_schema!(SetRecoveryDirectiveBody);
+body_schema!(AckRecoveryDirectiveBody);
 body_schema!(SteerBody);
 body_schema!(AbortBody);
 body_schema!(CreateProjectBody);
@@ -1573,6 +1597,117 @@ async fn list_transcript_chunks(
     Ok(Json(
         core::list_transcript_chunks(&st.pool, &session_id, q.since_position).await?,
     ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReportSessionStateBody {
+    /// The session generation this report is from. A report whose generation is below the
+    /// board's recorded generation for the session is rejected (403): only the current-generation
+    /// host may write.
+    generation: i64,
+    /// The state-machine phase: idle | awaiting-model | streaming | awaiting-tool-result | blocked
+    /// | suspended.
+    phase: String,
+    /// Monotonic progress/step counter. last_advance_at is bumped only when it advances.
+    step: i64,
+    /// On a failed turn, the failure class -- an fm-id from the failure-class vocabulary (doc_3431).
+    /// Out-of-vocabulary is rejected (400). Null/omitted on a non-failing report.
+    #[serde(default)]
+    failure_class: Option<String>,
+    /// Free-text failure reason paired with failure_class.
+    #[serde(default)]
+    failure_reason: Option<String>,
+}
+
+async fn report_session_state(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(b): Json<ReportSessionStateBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::report_session_state(
+            &st.pool,
+            &session_id,
+            b.generation,
+            &b.phase,
+            b.step,
+            b.failure_class.as_deref(),
+            b.failure_reason.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+async fn get_session_state(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+) -> ApiResult {
+    Ok(Json(core::get_session_state(&st.pool, &session_id).await?))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetRecoveryDirectiveBody {
+    /// The directive to push down: continue | change-approach | decompose | reassign. Out-of-vocab
+    /// is rejected (400). Setting it bumps the watchable version + wakes the session.
+    directive: String,
+    /// Optional opaque payload carried with the directive (e.g. the task to decompose into).
+    #[serde(default)]
+    payload: Option<Value>,
+    #[serde(rename = "principal", alias = "set_by", alias = "actor", default)]
+    set_by: Option<String>,
+}
+
+async fn set_recovery_directive(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(b): Json<SetRecoveryDirectiveBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_recovery_directive(
+            &st.pool,
+            &session_id,
+            &b.directive,
+            b.payload,
+            b.set_by.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+async fn get_recovery_directive(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+) -> ApiResult {
+    Ok(Json(
+        core::get_recovery_directive(&st.pool, &session_id).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AckRecoveryDirectiveBody {
+    /// The acking host's session generation. A stale (below-current) generation is rejected (403).
+    generation: i64,
+    /// The directive version being acked; omit to ack the current version.
+    #[serde(default)]
+    version: Option<i64>,
+}
+
+async fn ack_recovery_directive(
+    State(st): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(b): Json<AckRecoveryDirectiveBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::ack_recovery_directive(&st.pool, &session_id, b.generation, b.version).await?,
+    ))
+}
+
+async fn failure_class_vocab(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_failure_class_vocab(&st.pool).await?))
+}
+
+async fn directive_vocab(State(st): State<AppState>) -> ApiResult {
+    Ok(Json(core::list_directive_vocab(&st.pool).await?))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -5033,8 +5168,8 @@ mod tests {
     #[test]
     fn inventory_collects_under_cargo_test() {
         // Previously-registered counts (frozen; bump intentionally when adding an endpoint/schema).
-        const EXPECTED_ENDPOINTS: usize = 161;
-        const EXPECTED_SCHEMAS: usize = 77;
+        const EXPECTED_ENDPOINTS: usize = 168;
+        const EXPECTED_SCHEMAS: usize = 80;
 
         let endpoints: Vec<&Endpoint> = inventory::iter::<Endpoint>.into_iter().collect();
         let schemas: Vec<&BodySchema> = inventory::iter::<BodySchema>.into_iter().collect();
@@ -5079,6 +5214,7 @@ mod tests {
         let expected_schema_names: BTreeSet<&str> = [
             "AbortBody",
             "AckInboxBody",
+            "AckRecoveryDirectiveBody",
             "AddBannedPhraseBody",
             "AnnotateCommentBody",
             "AnswerQuestionBody",
@@ -5121,6 +5257,7 @@ mod tests {
             "PromoteThreadBody",
             "PublishVersionBody",
             "RegisterAgentBody",
+            "ReportSessionStateBody",
             "ReportSpendBody",
             "RequestChangesBody",
             "RequestStandDownBody",
@@ -5137,6 +5274,7 @@ mod tests {
             "SetDocumentPropsBody",
             "SetIdentityAliasBody",
             "SetLifecycleIntentBody",
+            "SetRecoveryDirectiveBody",
             "SetReviewMetadataBody",
             "SetReviewStatusBody",
             "SetReviewVettedBody",
