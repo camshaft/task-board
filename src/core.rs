@@ -10748,6 +10748,292 @@ pub async fn list_decider_episodes(
     }))
 }
 
+/// Serialize one agent_config_entries row into the shared {id, enabled, scope, payload} envelope
+/// (plus position + updated_at), parsing the stored scope/payload JSON strings back to values
+/// (task_1477, doc_3426 ask 11). scope is a call-type-tag array or null (= all call types); payload
+/// is the opaque per-kind config body the harness interprets.
+fn agent_config_entry_json(row: &SqliteRow) -> Value {
+    let scope: Value = row
+        .try_get::<Option<String>, _>("scope")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(Value::Null);
+    let payload: Value = row
+        .try_get::<Option<String>, _>("payload")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "id": row.try_get::<String, _>("entry_id").unwrap_or_default(),
+        "enabled": row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
+        "scope": scope,
+        "payload": payload,
+        "position": row.try_get::<i64, _>("position").unwrap_or(0),
+        "updated_at": row.try_get::<String, _>("updated_at").unwrap_or_default(),
+    })
+}
+
+/// Bump the monotonic version for one (agent_id, config_kind) inside a tx and return the new value
+/// (task_1477 acceptance 2). The read returns it; each bump pairs with an agent.config_changed emit.
+async fn bump_config_version(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_id: &str,
+    config_kind: &str,
+    ts: &str,
+) -> anyhow::Result<i64> {
+    sqlx::query(
+        "INSERT INTO agent_config_versions(agent_id, config_kind, version, updated_at) \
+         VALUES(?,?,1,?) \
+         ON CONFLICT(agent_id, config_kind) DO UPDATE SET version=version+1, updated_at=excluded.updated_at",
+    )
+    .bind(agent_id)
+    .bind(config_kind)
+    .bind(ts)
+    .execute(&mut **tx)
+    .await?;
+    let v: i64 =
+        sqlx::query("SELECT version FROM agent_config_versions WHERE agent_id=? AND config_kind=?")
+            .bind(agent_id)
+            .bind(config_kind)
+            .fetch_one(&mut **tx)
+            .await?
+            .try_get("version")?;
+    Ok(v)
+}
+
+/// Emit agent.config_changed so a harness subscribed to the fleet control-plane class (board +
+/// ["agent"]) hot-reloads an agent's config set with no restart (task_1477, reusing the task_1456
+/// "agent" event class). Carries the config_kind + the new version the read returns, and is also
+/// delivered to the agent itself (Explicit), while the classed board subscribers are unioned in by
+/// the firehose path in emit -- the same delivery shape as agent.intent_changed.
+async fn emit_config_changed(
+    tx: &mut Transaction<'_, Sqlite>,
+    hooks: &mut Vec<WebhookDelivery>,
+    agent_id: &str,
+    config_kind: &str,
+    version: i64,
+    actor: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut recips = BTreeSet::new();
+    recips.insert(agent_id.to_string());
+    emit(
+        tx,
+        hooks,
+        "agent.config_changed",
+        actor,
+        None,
+        None,
+        None,
+        None,
+        json!({ "agent_id": agent_id, "config_kind": config_kind, "version": version }),
+        Recipients::Explicit(recips),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Upsert one entry in an agent's per-config_kind editable-config set (task_1477, doc_3426 ask 11;
+/// the reusable shell ask 4 tool-registry task_1459 adopts). Adds a new entry or edits/toggles an
+/// existing one keyed by entry_id. An explicit field value wins; an omitted field keeps the existing
+/// value on an edit, or the default on an add (enabled=true; scope=null=all; payload={}; position
+/// appends after the current max). `scope`=Null clears to all-call-types. Bumps the (agent,
+/// config_kind) version and emits agent.config_changed so a subscribed harness hot-reloads. Returns
+/// the full updated set.
+#[allow(clippy::too_many_arguments)]
+pub async fn set_agent_config_entry(
+    pool: &Pool,
+    agent_id: &str,
+    config_kind: &str,
+    entry_id: &str,
+    enabled: Option<bool>,
+    scope: Option<Value>,
+    payload: Option<Value>,
+    position: Option<i64>,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    let config_kind = config_kind.trim();
+    let entry_id = entry_id.trim();
+    if agent_id.is_empty() || config_kind.is_empty() || entry_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "agent_id, config_kind, and entry_id are required".to_string()
+        ));
+    }
+    // The config is per EXISTING agent (the registry row), so a typo'd agent id is a clean error
+    // rather than an orphan config set.
+    if sqlx::query("SELECT 1 FROM agents WHERE id=?")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("no agent {agent_id}");
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let existing = sqlx::query(
+        "SELECT enabled, scope, payload, position FROM agent_config_entries \
+         WHERE agent_id=? AND config_kind=? AND entry_id=?",
+    )
+    .bind(agent_id)
+    .bind(config_kind)
+    .bind(entry_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let enabled_v: i64 = match enabled {
+        Some(b) => i64::from(b),
+        None => existing
+            .as_ref()
+            .and_then(|r| r.try_get::<i64, _>("enabled").ok())
+            .unwrap_or(1),
+    };
+    let scope_v: Option<String> = match &scope {
+        Some(Value::Null) => None,
+        Some(v) => Some(v.to_string()),
+        None => existing
+            .as_ref()
+            .and_then(|r| r.try_get::<Option<String>, _>("scope").ok().flatten()),
+    };
+    let payload_v: String = match &payload {
+        Some(v) => v.to_string(),
+        None => existing
+            .as_ref()
+            .and_then(|r| r.try_get::<String, _>("payload").ok())
+            .unwrap_or_else(|| "{}".to_string()),
+    };
+    let position_v: i64 = match position {
+        Some(p) => p,
+        None => match existing
+            .as_ref()
+            .and_then(|r| r.try_get::<i64, _>("position").ok())
+        {
+            Some(p) => p,
+            None => sqlx::query(
+                "SELECT COALESCE(MAX(position),0)+1 AS n FROM agent_config_entries \
+                 WHERE agent_id=? AND config_kind=?",
+            )
+            .bind(agent_id)
+            .bind(config_kind)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("n")?,
+        },
+    };
+
+    sqlx::query(
+        "INSERT INTO agent_config_entries(agent_id, config_kind, entry_id, enabled, scope, payload, position, created_at, updated_at) \
+         VALUES(?,?,?,?,?,?,?,?,?) \
+         ON CONFLICT(agent_id, config_kind, entry_id) DO UPDATE SET \
+           enabled=excluded.enabled, scope=excluded.scope, payload=excluded.payload, \
+           position=excluded.position, updated_at=excluded.updated_at",
+    )
+    .bind(agent_id)
+    .bind(config_kind)
+    .bind(entry_id)
+    .bind(enabled_v)
+    .bind(scope_v.as_deref())
+    .bind(&payload_v)
+    .bind(position_v)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+
+    let version = bump_config_version(&mut tx, agent_id, config_kind, &ts).await?;
+    emit_config_changed(&mut tx, &mut hooks, agent_id, config_kind, version, actor).await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+
+    list_agent_config_entries(pool, agent_id, config_kind).await
+}
+
+/// Remove one entry from an agent's config set (task_1477). Bumps the version + emits
+/// agent.config_changed like an edit, so the harness hot-reloads the shrunk set. Returns the set.
+pub async fn remove_agent_config_entry(
+    pool: &Pool,
+    agent_id: &str,
+    config_kind: &str,
+    entry_id: &str,
+    actor: Option<&str>,
+) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    let config_kind = config_kind.trim();
+    let entry_id = entry_id.trim();
+    if agent_id.is_empty() || config_kind.is_empty() || entry_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "agent_id, config_kind, and entry_id are required".to_string()
+        ));
+    }
+    let ts = now_iso();
+    let mut tx = pool.begin().await?;
+    let mut hooks: Vec<WebhookDelivery> = Vec::new();
+    let res = sqlx::query(
+        "DELETE FROM agent_config_entries WHERE agent_id=? AND config_kind=? AND entry_id=?",
+    )
+    .bind(agent_id)
+    .bind(config_kind)
+    .bind(entry_id)
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!(BoardError::bad_request(format!(
+            "no config entry '{entry_id}' for agent '{agent_id}' kind '{config_kind}'"
+        )));
+    }
+    let version = bump_config_version(&mut tx, agent_id, config_kind, &ts).await?;
+    emit_config_changed(&mut tx, &mut hooks, agent_id, config_kind, version, actor).await?;
+    tx.commit().await?;
+    fire_webhooks(hooks, webhook_timeout(pool));
+
+    list_agent_config_entries(pool, agent_id, config_kind).await
+}
+
+/// Read an agent's full editable-config set for one config_kind in dispatch order, with the current
+/// version (task_1477 acceptance 1 + 5). ONE read returns {agent_id, config_kind, version, count,
+/// entries}: the harness reads this at session start and re-reads on an agent.config_changed wake.
+/// Ordered by position then entry_id so dispatch is stable + reproducible.
+pub async fn list_agent_config_entries(
+    pool: &Pool,
+    agent_id: &str,
+    config_kind: &str,
+) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    let config_kind = config_kind.trim();
+    if agent_id.is_empty() || config_kind.is_empty() {
+        anyhow::bail!(BoardError::bad_request(
+            "agent_id and config_kind are required".to_string()
+        ));
+    }
+    let rows = sqlx::query(
+        "SELECT * FROM agent_config_entries WHERE agent_id=? AND config_kind=? \
+         ORDER BY position ASC, entry_id ASC",
+    )
+    .bind(agent_id)
+    .bind(config_kind)
+    .fetch_all(pool)
+    .await?;
+    let entries: Vec<Value> = rows.iter().map(agent_config_entry_json).collect();
+    let version: i64 =
+        sqlx::query("SELECT version FROM agent_config_versions WHERE agent_id=? AND config_kind=?")
+            .bind(agent_id)
+            .bind(config_kind)
+            .fetch_optional(pool)
+            .await?
+            .map(|r| r.try_get::<i64, _>("version").unwrap_or(0))
+            .unwrap_or(0);
+    Ok(json!({
+        "agent_id": agent_id,
+        "config_kind": config_kind,
+        "version": version,
+        "count": entries.len(),
+        "entries": entries,
+    }))
+}
+
 /// Fetch one document with its current version + version list.
 /// Resolve a document reference -- a numeric id OR a wiki path/slug -- to a document id. Agents cite
 /// docs by their wiki path (e.g. charters/v-nix, designs/...), so get_document / read_document accept
@@ -19891,6 +20177,182 @@ mod tests {
 
         // Unknown agent -> clean error, not a hollow bundle.
         assert!(recall_bundle(&pool, "nobody", None, 50, 50).await.is_err());
+        Ok(())
+    }
+
+    /// task_1477 (doc_3426 ask 11): the per-agent editable-config surface (shared {id, enabled,
+    /// scope, payload} envelope). Upsert adds/edits/toggles, remove deletes; each edit bumps the
+    /// per-(agent, config_kind) version and emits agent.config_changed (the task_1456 "agent" class)
+    /// so a subscribed harness hot-reloads; reads return the set in stable dispatch order; a
+    /// different config_kind is an independent set (the shell ask 4 tool-registry reuses).
+    #[tokio::test]
+    async fn agent_config_entries_envelope_version_and_reconciler_wake() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "v-a", None, None, None, None, None).await?;
+        register_agent(&pool, "harness", None, None, None, None, None).await?;
+        // The harness watches the fleet control-plane class for hot-reload wakes.
+        subscribe_classed(
+            &pool,
+            "harness",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &["agent".to_string()],
+        )
+        .await?;
+
+        // Add two decider entries: one scoped to a call-type set, one unscoped (= all call types).
+        let set1 = set_agent_config_entry(
+            &pool,
+            "v-a",
+            "decider",
+            "ascii",
+            None,
+            Some(json!(["board-comment", "board-status"])),
+            Some(json!({"kind": "builtin", "criteria": {"name": "ascii"}})),
+            None,
+            Some("cameron"),
+        )
+        .await?;
+        assert_eq!(set1["version"], json!(1), "first edit bumps version to 1");
+        set_agent_config_entry(
+            &pool,
+            "v-a",
+            "decider",
+            "secret-scan",
+            None,
+            None, // scope omitted on add -> null -> all call types
+            Some(json!({"kind": "builtin", "criteria": {"name": "structured-secret"}})),
+            None,
+            Some("cameron"),
+        )
+        .await?;
+
+        // One read returns the full set, ordered by position, with the envelope + version (acc 1,5).
+        let got = list_agent_config_entries(&pool, "v-a", "decider").await?;
+        assert_eq!(got["version"], json!(2));
+        let entries = got["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0]["id"],
+            json!("ascii"),
+            "position order: first added is first"
+        );
+        assert_eq!(
+            entries[0]["enabled"],
+            json!(true),
+            "enabled defaults true on add"
+        );
+        assert_eq!(
+            entries[0]["scope"],
+            json!(["board-comment", "board-status"])
+        );
+        assert_eq!(entries[0]["payload"]["criteria"]["name"], json!("ascii"));
+        assert_eq!(entries[1]["id"], json!("secret-scan"));
+        assert_eq!(
+            entries[1]["scope"],
+            Value::Null,
+            "omitted scope = all call types"
+        );
+
+        // Edit/toggle in place: same id, enabled=false; version bumps, no new row, omitted fields kept.
+        let toggled = set_agent_config_entry(
+            &pool,
+            "v-a",
+            "decider",
+            "ascii",
+            Some(false),
+            None,
+            None,
+            None,
+            Some("cameron"),
+        )
+        .await?;
+        assert_eq!(toggled["version"], json!(3));
+        let ascii = toggled["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == json!("ascii"))
+            .unwrap();
+        assert_eq!(ascii["enabled"], json!(false), "toggle persists");
+        assert_eq!(
+            ascii["scope"],
+            json!(["board-comment", "board-status"]),
+            "omitted scope kept on edit"
+        );
+        assert_eq!(
+            toggled["entries"].as_array().unwrap().len(),
+            2,
+            "edit does not add a row"
+        );
+
+        // Remove: entry gone, version bumps.
+        let removed =
+            remove_agent_config_entry(&pool, "v-a", "decider", "secret-scan", Some("cameron"))
+                .await?;
+        assert_eq!(removed["version"], json!(4));
+        assert_eq!(removed["entries"].as_array().unwrap().len(), 1);
+
+        // A different config_kind is an independent set + version (the shared shell, e.g. ask 4 tools).
+        let tools = set_agent_config_entry(
+            &pool,
+            "v-a",
+            "tool",
+            "fetch",
+            None,
+            None,
+            Some(json!({"tools": ["fetch"]})),
+            None,
+            Some("cameron"),
+        )
+        .await?;
+        assert_eq!(
+            tools["version"],
+            json!(1),
+            "config_kind versions are independent"
+        );
+
+        // Acceptance 2: the harness (board+["agent"]) is woken on config changes (agent.config_changed).
+        let woke =
+            check_notifications(&pool, "harness", false, 50, Some("agent.config_changed")).await?;
+        let n = woke["notifications"].as_array().unwrap();
+        assert!(
+            n.iter()
+                .any(|e| e["data"]["config_kind"] == json!("decider")),
+            "woken on a decider edit: {woke}"
+        );
+        assert!(
+            n.iter().any(|e| e["data"]["config_kind"] == json!("tool")),
+            "woken on the tool edit: {woke}"
+        );
+        assert!(
+            n.last().unwrap()["data"]["version"].as_i64().is_some(),
+            "the wake carries the new version"
+        );
+
+        // Unknown target agent + missing entry -> clean errors.
+        assert!(set_agent_config_entry(
+            &pool,
+            "nobody",
+            "decider",
+            "x",
+            None,
+            None,
+            None,
+            None,
+            Some("cameron")
+        )
+        .await
+        .is_err());
+        assert!(
+            remove_agent_config_entry(&pool, "v-a", "decider", "ghost", Some("cameron"))
+                .await
+                .is_err()
+        );
         Ok(())
     }
 

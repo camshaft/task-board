@@ -221,6 +221,14 @@ pub fn router(state: AppState) -> Router {
         .route("/agents/{agent_id}/messages", get(get_messages))
         .route("/agents/{agent_id}/recall", get(recall))
         .route(
+            "/agents/{agent_id}/config/{config_kind}",
+            get(list_agent_config).post(set_agent_config_entry),
+        )
+        .route(
+            "/agents/{agent_id}/config/{config_kind}/{entry_id}",
+            delete(remove_agent_config_entry),
+        )
+        .route(
             "/sessions/{session_id}/transcript-chunks",
             get(list_transcript_chunks).post(append_transcript_chunk),
         )
@@ -911,6 +919,9 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/recall", summary: "Board-state-recall bundle (task_1464, doc_3426 ask 9): ONE round trip that rebuilds an agent's working context at session (re)start -- its desired config + lifecycle_intent (task_1455/1456), its open assigned tasks with status + blocked_on, its bounded unread inbox (NOT marked read), and, when session_id is given, a handle to that session's transcript-chunk log (task_1463). The board is the recovery authority: recall first, transcript rehydration second. Bounded + efficient per start.", query: "session_id=str&task_limit=int&activity_limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Read an agent's per-config_kind editable-config set (task_1477, doc_3426 ask 11): one read returns {agent_id, config_kind, version, count, entries} in dispatch order (position then id). config_kind namespaces the shared per-agent editable-config surface -- 'decider' (ask 11: payload = {kind, criteria, bands}, scope = applies_to_call_types) and 'tool' (ask 4). Each entry is the {id, enabled, scope, payload} envelope + position. The harness reads at session start and re-reads on an agent.config_changed wake (subscribe board + [\"agent\"]); version is the watchable key.", query: "", body: None },
+    Endpoint { method: "POST", path: "/api/agents/{agent_id}/config/{config_kind}", summary: "Upsert one entry in an agent's config set (task_1477): add a new entry or edit/toggle an existing one by entry_id. An omitted field keeps the existing value (edit) or the default (add: enabled=true, scope=null=all-call-types, payload={}, position appended). scope=null clears to all call types. Bumps the version + emits agent.config_changed so a subscribed harness hot-reloads. Returns the full updated set.", query: "", body: Some("SetAgentConfigEntryBody") },
+    Endpoint { method: "DELETE", path: "/api/agents/{agent_id}/config/{config_kind}/{entry_id}", summary: "Remove one entry from an agent's config set (task_1477). Bumps the version + emits agent.config_changed like an edit. Returns the shrunk set.", query: "actor=str", body: None },
     Endpoint { method: "POST", path: "/api/sessions/{session_id}/transcript-chunks", summary: "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). position is assigned server-side (per-session, monotonic across generations) and returned. kind is window | compaction-boundary; append-only + history-preserving.", query: "", body: Some("AppendTranscriptChunkBody") },
     Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None },
     Endpoint { method: "POST", path: "/api/decider-episodes", summary: "Append a decider fail-retry-pass mini-transcript to the training-corpus ingest log (task_1478): keyed by agent/decider/call-type, content-addressed (content_id = IPFS CID), with the structured relabel record (inputs, each verdict + band per retry step, final pass) stored inline. Lightweight no-event append — fire it async off the agent hot path. Downstream consumer: the decider corpus (task_1471).", query: "", body: Some("SubmitDeciderEpisodeBody") },
@@ -1053,6 +1064,7 @@ fn body_schemas() -> Value {
         SetLifecycleIntentBody,
         AppendTranscriptChunkBody,
         SubmitDeciderEpisodeBody,
+        SetAgentConfigEntryBody,
         CreateProjectBody,
         UpdateProjectBody,
         CreateTaskBody,
@@ -1490,6 +1502,75 @@ async fn recall(
             q.session_id.as_deref(),
             q.task_limit.unwrap_or(50),
             q.activity_limit.unwrap_or(50),
+        )
+        .await?,
+    ))
+}
+
+async fn list_agent_config(
+    State(st): State<AppState>,
+    Path((agent_id, config_kind)): Path<(String, String)>,
+) -> ApiResult {
+    Ok(Json(
+        core::list_agent_config_entries(&st.pool, &agent_id, &config_kind).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetAgentConfigEntryBody {
+    /// Stable entry id, unique per (agent, config_kind). Re-POSTing the same id edits/toggles it.
+    entry_id: String,
+    /// Toggle without removing. Omit on an edit to keep the current value; defaults true on add.
+    enabled: Option<bool>,
+    /// Call-type-tag array the entry applies to; null/empty = all call types. Omit to keep existing.
+    scope: Option<Value>,
+    /// Opaque per-kind config body (decider = {kind, criteria, bands}). Omit to keep existing.
+    payload: Option<Value>,
+    /// Dispatch order; omit to append after the current max (add) or keep (edit).
+    position: Option<i64>,
+    #[serde(rename = "actor", alias = "principal", alias = "by")]
+    actor: Option<String>,
+}
+
+async fn set_agent_config_entry(
+    State(st): State<AppState>,
+    Path((agent_id, config_kind)): Path<(String, String)>,
+    Json(b): Json<SetAgentConfigEntryBody>,
+) -> ApiResult {
+    Ok(Json(
+        core::set_agent_config_entry(
+            &st.pool,
+            &agent_id,
+            &config_kind,
+            &b.entry_id,
+            b.enabled,
+            b.scope,
+            b.payload,
+            b.position,
+            b.actor.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RemoveAgentConfigEntryQuery {
+    #[serde(rename = "actor", alias = "principal", alias = "by")]
+    actor: Option<String>,
+}
+
+async fn remove_agent_config_entry(
+    State(st): State<AppState>,
+    Path((agent_id, config_kind, entry_id)): Path<(String, String, String)>,
+    Query(q): Query<RemoveAgentConfigEntryQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::remove_agent_config_entry(
+            &st.pool,
+            &agent_id,
+            &config_kind,
+            &entry_id,
+            q.actor.as_deref(),
         )
         .await?,
     ))
