@@ -865,6 +865,11 @@ pub struct ListTasksArgs {
     /// Include archived tasks. Archived tasks are hidden by default; set true to list them too.
     #[serde(default, deserialize_with = "de_opt_bool_lenient")]
     pub include_archived: Option<bool>,
+    /// Filter by the DERIVED monitor_exempt flag (task_1326): true = only monitor-exempt tasks
+    /// (metadata.monitor_exempt truthy OR status=icebox), false = only non-exempt. Omit for all.
+    /// Makes the "nothing hides behind exempt" invariant auditable from the list surface.
+    #[serde(default, deserialize_with = "de_opt_bool_lenient")]
+    pub monitor_exempt: Option<bool>,
     /// Max tasks to return (task_969 pagination; default 100, max 1000) so a large project stays
     /// under the read/token cap. Order is by id, so a stable page.
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
@@ -2570,6 +2575,8 @@ impl Board {
         )
         .await
         .map_err(err)?;
+        // Audit filter on the derived monitor_exempt flag (task_1326); a no-op when omitted.
+        let tasks = core::filter_tasks_monitor_exempt(tasks, a.monitor_exempt);
         // task_542 B5b: filter to the authenticated caller's readable projects when enforcement is
         // enabled (fail-closed; inert while off) BEFORE paging, so a page never surfaces a task the
         // caller cannot see.

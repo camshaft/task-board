@@ -4157,6 +4157,23 @@ pub async fn list_tasks(
     Ok(Value::Array(out))
 }
 
+/// Filter a `list_tasks` result array by the DERIVED monitor_exempt flag (task_1326): keep only
+/// exempt (`Some(true)`) or only non-exempt (`Some(false)`) rows, matching the `monitor_exempt`
+/// bool `list_tasks` already surfaces (metadata.monitor_exempt truthy OR status=icebox). `None`
+/// returns the list unchanged. Applied at the MCP + REST surfaces so the "nothing hides behind
+/// exempt" invariant is auditable without an arity change to the widely-called `list_tasks`.
+pub fn filter_tasks_monitor_exempt(tasks: Value, want: Option<bool>) -> Value {
+    let Some(want) = want else { return tasks };
+    match tasks {
+        Value::Array(rows) => Value::Array(
+            rows.into_iter()
+                .filter(|v| v.get("monitor_exempt").and_then(Value::as_bool) == Some(want))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// Add `assignee_status` + `assignee_last_seen` to each task object, read from the assignee's agent
 /// row (task 340 part 2). One batched query over the distinct assignees (not a JOIN -- the list
 /// query's own `status` column would collide with `agents.status`). A task with no assignee, or an
@@ -8999,6 +9016,15 @@ pub async fn block_on_external(
         .map(|r| r.try_get("project_id"))
         .transpose()?
         .ok_or_else(|| anyhow::anyhow!("no task {waiter_task_id}"))?;
+    // v1 external-waits are GitHub PRs; default kind so a waiter cannot create a kind-less E
+    // that the bridge sync then logs-and-skips (task_1328) -- which would leave the waiter
+    // blocked forever. A direct ensure_external_entity_task call without kind still stores it
+    // kind-less (backstopped by the bridge's log-and-skip); this safe-by-default is the waiter path.
+    let kind = match kind {
+        Some(k) => Some(k),
+        None if source.eq_ignore_ascii_case("github") => Some("pr"),
+        None => None,
+    };
     let e = ensure_external_entity_task(pool, source, repo, number, url, kind, project_id, actor)
         .await?;
     let e_id = e
@@ -18532,6 +18558,83 @@ mod tests {
             "waiter B auto-unblocked on E done"
         );
         Ok(())
+    }
+
+    /// block_on_external defaults kind=pr for a GitHub source when the caller omits kind
+    /// (task_1328 + the task_1326 hardening): a waiter cannot create a kind-less E that the bridge
+    /// sync logs-and-skips, which would leave the waiter blocked forever.
+    #[tokio::test]
+    async fn block_on_external_defaults_github_kind_to_pr() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "w1", None, None, None, None, None).await?;
+        let proj = create_project(&pool, "P", None, Some("w1"), None).await?["id"]
+            .as_i64()
+            .unwrap();
+        let waiter = create_task(
+            &pool,
+            proj,
+            "waiter",
+            None,
+            None,
+            None,
+            Some("w1"),
+            None,
+            None,
+            None,
+        )
+        .await?["id"]
+            .as_i64()
+            .unwrap();
+        // kind omitted (None) on a github wait -> E is created with kind=pr by default.
+        block_on_external(
+            &pool,
+            waiter,
+            "github",
+            "Owner/Repo",
+            7,
+            None,
+            None,
+            Some("w1"),
+        )
+        .await?;
+        let links = list_external_links(&pool, Some("github"), Some("task"), None).await?;
+        let links = links.as_array().unwrap().clone();
+        assert_eq!(links.len(), 1, "one entity-task created");
+        let e_id = links[0]["board_id"].as_i64().unwrap();
+        let e = get_task(&pool, e_id).await?;
+        let meta = &e["metadata"];
+        let meta: Value = if meta.is_string() {
+            serde_json::from_str(meta.as_str().unwrap())?
+        } else {
+            meta.clone()
+        };
+        assert_eq!(
+            meta["external_entity"]["kind"],
+            json!("pr"),
+            "a github wait with no kind defaults to pr"
+        );
+        Ok(())
+    }
+
+    /// filter_tasks_monitor_exempt keeps only exempt / only non-exempt rows by the surfaced bool
+    /// (task_1326), and is a no-op when the filter is None.
+    #[test]
+    fn filter_tasks_monitor_exempt_selects_by_surfaced_bool() {
+        let tasks = json!([
+            {"id": 1, "title": "exempt", "monitor_exempt": true},
+            {"id": 2, "title": "plain", "monitor_exempt": false},
+        ]);
+        let exempt = filter_tasks_monitor_exempt(tasks.clone(), Some(true));
+        let a = exempt.as_array().unwrap();
+        assert_eq!(a.len(), 1, "only the exempt row");
+        assert_eq!(a[0]["id"], json!(1));
+        let plain = filter_tasks_monitor_exempt(tasks.clone(), Some(false));
+        let b = plain.as_array().unwrap();
+        assert_eq!(b.len(), 1, "only the non-exempt row");
+        assert_eq!(b[0]["id"], json!(2));
+        let all = filter_tasks_monitor_exempt(tasks, None);
+        assert_eq!(all.as_array().unwrap().len(), 2, "None is a no-op");
     }
 
     /// list_tasks(unassigned=true) returns only tasks with no assignee, and that intent takes
