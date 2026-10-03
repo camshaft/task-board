@@ -1,0 +1,58 @@
+name: gate
+
+# The no-local-compile CI gate for camshaft/task-board (task_1561). It runs the SAME
+# scripts/gate.sh an agent would run locally -- rustfmt --check, cargo test, clippy
+# -D warnings, the web build, and (when the web deps change vs origin/main) the web
+# FOD -- but on a CI runner, so a board PR can be gated without a local compile under
+# the operator local-compile pause (concierge channel_114). The job verdict is
+# gate.sh's exit code: the script runs under `set -euo pipefail`, so any failing stage
+# fails the job -- the verdict is never an eyeballed tail.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One in-flight gate per ref; a newer push/PR-sync cancels the stale run.
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0: gate.sh diffs origin/main to decide the web-FOD step, so it
+      # needs the base ref and full history, not a shallow clone.
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Make origin/main resolvable as a remote-tracking ref. On a pull_request the
+      # checked-out ref is the PR merge commit and origin/main is not set up by
+      # default; without this gate.sh's `git rev-parse origin/main` misses and the
+      # web-FOD diff is silently skipped. (On push to main this is a no-op refresh.)
+      - name: Fetch origin/main for the gate's base-ref diff
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+      # The flake pins the whole toolchain (rustc/clippy/rustfmt 1.90 + node 22);
+      # gate.sh self-pins into `nix develop .#default`, so the runner only needs Nix
+      # with flakes. The installer enables nix-command + flakes by default. The flake
+      # exposes devShells for every default system, so x86_64 ubuntu-latest is fine --
+      # it need not match the fleet aarch64 host.
+      - name: Install Nix (flakes enabled)
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      # GitHub-Actions-cache-backed Nix store cache, so repeat runs do not rebuild the
+      # pinned toolchain and dependency closure from scratch. Non-fatal: a cache miss
+      # only costs speed, never correctness.
+      - name: Nix store cache
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Run the gate
+        run: bash scripts/gate.sh
