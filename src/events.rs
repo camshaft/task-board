@@ -219,6 +219,45 @@ async fn recipients_for_document(
             recips.insert(s.try_get::<String, _>("subscriber")?);
         }
     }
+    // task_1269 fold-in (task_1331 Piece 2): while a doc is under review, a new comment or a newly
+    // published version wakes EVERY assigned reviewer -- the review's primary `reviews.assignee`
+    // UNION every `review_assignees` row -- not just the doc owner + document subscribers above. An
+    // assigned reviewer who never separately subscribed to the document would otherwise miss a
+    // reviewer-comment or a revision pushed under them. Scoped to the comment + new-version events so
+    // a reviewer is not woken on every unrelated document event. "Under review" = a review targeting
+    // this doc (matched across both target_ref conventions, with the null-source tolerance the
+    // operator-review gate uses) whose status is not terminal (approved/closed). Additive; no schema
+    // change.
+    if matches!(
+        event_type,
+        "document.comment" | "document.version_published"
+    ) {
+        let target_ref = document_id.to_string();
+        let target_ref_doc = format!("doc_{document_id}");
+        let review_rows = sqlx::query(
+            "SELECT r.assignee AS primary_assignee, ra.assignee AS extra_assignee \
+             FROM reviews r LEFT JOIN review_assignees ra ON ra.review_id = r.id \
+             WHERE (r.source IS NULL OR r.source IN ('board_doc','board-document')) \
+               AND r.target_ref IN (?, ?) \
+               AND r.status NOT IN ('approved','closed')",
+        )
+        .bind(&target_ref)
+        .bind(&target_ref_doc)
+        .fetch_all(&mut **tx)
+        .await?;
+        for row in review_rows {
+            if let Ok(Some(a)) = row.try_get::<Option<String>, _>("primary_assignee") {
+                if !a.is_empty() {
+                    recips.insert(a);
+                }
+            }
+            if let Ok(Some(a)) = row.try_get::<Option<String>, _>("extra_assignee") {
+                if !a.is_empty() {
+                    recips.insert(a);
+                }
+            }
+        }
+    }
     if let Some(actor) = actor {
         recips.remove(actor);
     }
