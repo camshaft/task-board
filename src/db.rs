@@ -612,6 +612,17 @@ CREATE TABLE IF NOT EXISTS agent_config_versions (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (agent_id, config_kind)
 );
+-- SHARED fleet policy version (task_1460, doc_3426 ask 5): the fleet-wide analog of
+-- agent_config_versions -- one monotonic counter per policy_kind ('banned_phrases', 'admission'),
+-- bumped on every edit. The read surface returns it so the harness compares versions, and each bump
+-- emits policy.changed {policy_kind, version} in the 'policy' event class, so a board+['policy']
+-- subscriber hot-reloads the shared policy with no restart. Shared (keyed by policy_kind alone, no
+-- agent) because the banned-phrase list + per-role admission rules apply fleet-wide.
+CREATE TABLE IF NOT EXISTS policy_versions (
+    policy_kind TEXT PRIMARY KEY,
+    version     INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL
+);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no

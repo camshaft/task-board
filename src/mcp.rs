@@ -3373,7 +3373,7 @@ impl Board {
     }
 
     #[tool(
-        description = "List the fleet banned-phrases list (the phrases the pre-submit content lint checks docs and comments against)."
+        description = "List the fleet banned-phrases list -- the authoritative runtime source the pre-submit content lint checks docs and comments against (doc_3426 ask 5). Returns {policy_kind, version, count, phrases:[..]}. version is the watchable key: a harness reads this at session start and re-reads on a policy.changed wake (subscribe board + [\"policy\"]), comparing version, to hot-reload the list without a restart."
     )]
     async fn list_banned_phrases(&self) -> Result<CallToolResult, McpError> {
         core::list_banned_phrases(&self.pool)

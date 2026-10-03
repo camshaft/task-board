@@ -100,6 +100,11 @@ fn event_in_classes(event_type: &str, data: &Value, classes: &[String]) -> bool 
         // board + ["agent"] once and gets a genuine push-wake (subscribed=true) on every such change,
         // so it reconciles the desired-fleet-state on declared intent with no poll (ask 2 acceptance).
         "agent" => event_type.starts_with("agent."),
+        // policy = the fleet-SHARED policy class (task_1460, doc_3426 ask 5): policy.changed on a
+        // banned-phrase or admission-rule edit. A harness subscribes board + ["policy"] once and
+        // hot-reloads the shared runtime policy on every edit -- the shared analog of the per-agent
+        // "agent" class, since banned-phrases + per-role admission apply fleet-wide, not per-agent.
+        "policy" => event_type.starts_with("policy."),
         _ => false,
     })
 }
@@ -789,6 +794,17 @@ mod tests {
             "document.approved",
             &json!({}),
             &["doc".to_string()]
+        ));
+        // policy = the fleet-shared policy class (task_1460): policy.changed rides it, task events do not.
+        assert!(event_in_classes(
+            "policy.changed",
+            &json!({ "policy_kind": "banned_phrases", "version": 1 }),
+            &["policy".to_string()]
+        ));
+        assert!(!event_in_classes(
+            "task.created",
+            &json!({}),
+            &["policy".to_string()]
         ));
         // Non-matching type, and an unknown class name, match nothing.
         assert!(!event_in_classes(
