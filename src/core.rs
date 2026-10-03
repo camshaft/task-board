@@ -10894,16 +10894,41 @@ async fn bump_config_version(
 /// "agent" event class). Carries the config_kind + the new version the read returns, and is also
 /// delivered to the agent itself (Explicit), while the classed board subscribers are unioned in by
 /// the firehose path in emit -- the same delivery shape as agent.intent_changed.
+/// The recipients woken by an agent.config_changed on `subject` (task_1477/task_1459). An agent
+/// subject wakes just that agent. A "role:" subject FANS OUT to every agent currently in the role
+/// (plus the role subject itself) -- so an agent that watches only its own agent.config_changed is
+/// still woken on a role-level grant change and never misses a role edit (v-ft comment_8251), without
+/// depending on it also subscribing to a role-scoped event. A single event row is delivered to the
+/// whole set, not N events.
+async fn config_changed_recipients(
+    tx: &mut Transaction<'_, Sqlite>,
+    subject: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut recips = BTreeSet::new();
+    recips.insert(subject.to_string());
+    if let Some(role) = subject.strip_prefix("role:") {
+        let rows = sqlx::query("SELECT id FROM agents WHERE json_extract(metadata, '$.role')=?")
+            .bind(role)
+            .fetch_all(&mut **tx)
+            .await?;
+        for r in rows {
+            if let Ok(id) = r.try_get::<String, _>("id") {
+                recips.insert(id);
+            }
+        }
+    }
+    Ok(recips)
+}
+
 async fn emit_config_changed(
     tx: &mut Transaction<'_, Sqlite>,
     hooks: &mut Vec<WebhookDelivery>,
-    agent_id: &str,
+    subject: &str,
     config_kind: &str,
     version: i64,
     actor: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut recips = BTreeSet::new();
-    recips.insert(agent_id.to_string());
+    let recips = config_changed_recipients(tx, subject).await?;
     emit(
         tx,
         hooks,
@@ -10913,7 +10938,7 @@ async fn emit_config_changed(
         None,
         None,
         None,
-        json!({ "agent_id": agent_id, "config_kind": config_kind, "version": version }),
+        json!({ "agent_id": subject, "config_kind": config_kind, "version": version }),
         Recipients::Explicit(recips),
     )
     .await?;
@@ -20874,6 +20899,24 @@ mod tests {
                 .iter()
                 .any(|e| e["id"] == json!("shell")),
             "role entry removed -> gone from every agent's effective set"
+        );
+
+        // Fan-out wake (v-ft comment_8251): a role-level edit delivers agent.config_changed to every
+        // agent IN the role, so v-b -- which subscribed to nothing -- is woken on the role grants and
+        // the role removal via its own inbox, and never misses a role-level change.
+        let vb_wakes =
+            check_notifications(&pool, "v-b", false, 50, Some("agent.config_changed")).await?;
+        assert!(
+            vb_wakes["count"].as_i64().unwrap() >= 1,
+            "a role member is woken by role-level edits via per-agent fan-out: {vb_wakes}"
+        );
+        assert!(
+            vb_wakes["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["data"]["agent_id"] == json!("role:backend")),
+            "the fan-out wake names the role subject so the agent re-reads its effective set"
         );
         Ok(())
     }
