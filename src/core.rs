@@ -10409,8 +10409,12 @@ const REQUIRED_SECTIONS: &[&str] = &[
 ];
 /// Title/heading length ceiling (doc_7 A8): a title or heading must be under this many characters.
 const HEADING_MAX_LEN: usize = 60;
-/// Default main-body prose budget in words (doc_7 A8; board-pm's locked basis, task_625 comment 2543).
-const DEFAULT_BODY_BUDGET_WORDS: i64 = 700;
+/// Default main-body prose budget in words: a warn-only concision advisory (never a hard_fail), not
+/// a hard target. Right-sized 700 -> 1400 per task_1520 + board-pm so the warn clears the normal
+/// conformant multi-solution range (~900-1300) and fires only on genuinely long docs (2000+) as
+/// optional trim candidates, rather than on every doc_7-structured doc (doc_7 A8; board-pm's basis,
+/// task_625 comment 2543, recalibrated task_1520).
+const DEFAULT_BODY_BUDGET_WORDS: i64 = 1400;
 /// Line-leading status/provenance/placeholder markers that do not belong in a doc body (doc_7 A8 #6).
 const PROVENANCE_PREFIXES: &[&str] = &[
     "draft",
@@ -10824,7 +10828,7 @@ pub async fn grade_document(
             "body-length",
             "warn",
             None,
-            format!("the main body is about {words} prose words, over the ~{budget}-word budget; tighten it or move detail to the Appendix"),
+            format!("the main body is about {words} prose words, over the ~{budget}-word concision advisory; move exposition to the Appendix if the body carries appendix-grade detail. Advisory, not a hard target -- a multi-solution doc that enumerates several alternatives plus a recommendation legitimately runs over."),
         ));
     }
 

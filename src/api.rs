@@ -3486,7 +3486,7 @@ struct GradeDocumentBody {
     /// defaults to empty (title-specific checks are skipped when absent).
     #[serde(default)]
     title: Option<String>,
-    /// Override the main-body prose-word budget (A8 #8). Defaults to the locked ~700-word basis.
+    /// Override the main-body prose-word budget (A8 #8). Defaults to the ~1400-word concision advisory.
     #[serde(default)]
     body_length_budget_words: Option<i64>,
 }

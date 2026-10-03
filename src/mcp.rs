@@ -1638,7 +1638,7 @@ pub struct GradeDocumentArgs {
     /// The document title, graded separately from the body (title/heading rules). Optional.
     #[serde(default)]
     pub title: Option<String>,
-    /// Override the main-body prose-word budget. Defaults to the locked ~700-word basis.
+    /// Override the main-body prose-word budget. Defaults to the ~1400-word concision advisory.
     #[serde(default, deserialize_with = "de_opt_i64_lenient")]
     pub body_length_budget_words: Option<i64>,
 }
