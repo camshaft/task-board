@@ -8,6 +8,7 @@ mod db;
 mod events;
 mod ipfs;
 mod mcp;
+mod metrics;
 mod sse;
 mod tunnel;
 
