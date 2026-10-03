@@ -218,6 +218,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/agents/{agent_id}/notifications", get(get_notifications))
         .route("/agents/{agent_id}/messages", get(get_messages))
+        .route("/agents/{agent_id}/recall", get(recall))
         .route(
             "/sessions/{session_id}/transcript-chunks",
             get(list_transcript_chunks).post(append_transcript_chunk),
@@ -904,6 +905,7 @@ const ENDPOINTS: &[Endpoint] = &[
     Endpoint { method: "POST", path: "/api/agents/{agent_id}/lifecycle-intent", summary: "Set an agent's DECLARED lifecycle intent (task_1455): run or paused — the desired state the reconciler drives on, distinct from live presence. 'retired' is set via /retire (guarded auto-disposition sweep) and reversed via /restore, not here. Emits agent.intent_changed so a subscribed reconciler acts without a re-fetch.", query: "", body: Some("SetLifecycleIntentBody") },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/notifications", summary: "Drain an agent's inbox (event notifications).", query: "mark_read=bool&limit=int", body: None },
     Endpoint { method: "GET", path: "/api/agents/{agent_id}/messages", summary: "Read direct messages sent to an agent.", query: "mark_read=bool&limit=int", body: None },
+    Endpoint { method: "GET", path: "/api/agents/{agent_id}/recall", summary: "Board-state-recall bundle (task_1464, doc_3426 ask 9): ONE round trip that rebuilds an agent's working context at session (re)start -- its desired config + lifecycle_intent (task_1455/1456), its open assigned tasks with status + blocked_on, its bounded unread inbox (NOT marked read), and, when session_id is given, a handle to that session's transcript-chunk log (task_1463). The board is the recovery authority: recall first, transcript rehydration second. Bounded + efficient per start.", query: "session_id=str&task_limit=int&activity_limit=int", body: None },
     Endpoint { method: "POST", path: "/api/sessions/{session_id}/transcript-chunks", summary: "Append a transcript-window pointer to a session's durable chunk log (task_1463): the harness checkpoints a context window to IPFS and records the CID + metadata here (never the bytes). position is assigned server-side (per-session, monotonic across generations) and returned. kind is window | compaction-boundary; append-only + history-preserving.", query: "", body: Some("AppendTranscriptChunkBody") },
     Endpoint { method: "GET", path: "/api/sessions/{session_id}/transcript-chunks", summary: "List a session's transcript-chunk pointers in order (task_1463), ACROSS generations so a respawned session rehydrates its whole history. since_position gives the incremental form; the response carries last_position as the next cursor. Returns CIDs + metadata; resolve bytes from IPFS.", query: "since_position=int", body: None },
     Endpoint { method: "GET", path: "/api/projects", summary: "List projects (with task counts).", query: "status=str", body: None },
@@ -1454,6 +1456,34 @@ async fn list_transcript_chunks(
 ) -> ApiResult {
     Ok(Json(
         core::list_transcript_chunks(&st.pool, &session_id, q.since_position).await?,
+    ))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RecallQuery {
+    /// The session being recovered; when present the bundle includes a handle to that session's
+    /// transcript-chunk log (task_1463). Omit to recall board state only.
+    session_id: Option<String>,
+    /// Bound the open-task list (default 50, max 500).
+    task_limit: Option<i64>,
+    /// Bound the unread-inbox list (default 50, max 500).
+    activity_limit: Option<i64>,
+}
+
+async fn recall(
+    State(st): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(q): Query<RecallQuery>,
+) -> ApiResult {
+    Ok(Json(
+        core::recall_bundle(
+            &st.pool,
+            &agent_id,
+            q.session_id.as_deref(),
+            q.task_limit.unwrap_or(50),
+            q.activity_limit.unwrap_or(50),
+        )
+        .await?,
     ))
 }
 

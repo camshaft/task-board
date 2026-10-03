@@ -10466,6 +10466,73 @@ pub async fn list_transcript_chunks(
     }))
 }
 
+/// task_1464 (doc_3426 ask 9): the one-round-trip board-state-recall bundle an agent's harness runs
+/// at session (re)start to rebuild working context from board state (the board is the recovery
+/// authority -- board-state-recall first, transcript rehydration second). ONE call returns the whole
+/// bundle, so a (re)start costs one round trip instead of N, composing the existing surfaces: the
+/// agent's desired config + declared lifecycle_intent + priority (task_1455/1456, via get_agent); its
+/// open assigned work with status + the blocked_on triple (what each task waits on); its bounded
+/// unread inbox (the pending wakes; NOT marked read, so recall never consumes one); and, when a
+/// session_id is given, a handle to that session's durable transcript-chunk log (task_1463).
+///
+/// `task_limit` / `activity_limit` bound the two lists so a recall stays small and efficient per start
+/// regardless of backlog. A read-only consolidation: it adds no new state, only one query path over
+/// surfaces that already exist, which is the ask-9 "confirm + consolidate into one recall round trip".
+pub async fn recall_bundle(
+    pool: &Pool,
+    agent_id: &str,
+    session_id: Option<&str>,
+    task_limit: i64,
+    activity_limit: i64,
+) -> anyhow::Result<Value> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        anyhow::bail!(BoardError::bad_request("agent_id is required"));
+    }
+    // Desired config + lifecycle_intent + priority. Bails if the agent is unknown, so a recall for a
+    // non-agent is a clean error rather than a hollow bundle.
+    let agent = get_agent(pool, agent_id).await?;
+
+    // Open assigned work: everything not terminal (done/cancelled) or shelved (icebox), newest first,
+    // bounded. Carries status + the blocked_on triple so recall shows what each open task is waiting
+    // on without a follow-up get_task.
+    let task_limit = task_limit.clamp(1, 500);
+    let task_rows = sqlx::query(
+        "SELECT id, project_id, title, status, priority, parent_id, \
+         blocked_on_kind, blocked_on_ref, blocked_on_note, updated_at \
+         FROM tasks \
+         WHERE assignee=? AND archived_at IS NULL \
+           AND status NOT IN ('done','cancelled','icebox') \
+         ORDER BY updated_at DESC LIMIT ?",
+    )
+    .bind(agent_id)
+    .bind(task_limit)
+    .fetch_all(pool)
+    .await?;
+    let open_tasks: Vec<Value> = task_rows.iter().map(row_to_json).collect();
+    let open_task_count = open_tasks.len();
+
+    // Bounded unread inbox -- the pending wakes/activity the agent must act on. mark_read=false:
+    // recall is a read, it must never consume a notification the agent still has to handle.
+    let inbox =
+        check_notifications(pool, agent_id, false, activity_limit.clamp(1, 500), None).await?;
+
+    // Transcript-chunk-log handle (task_1463), only when the harness supplies the session being
+    // recovered. The board returns CID pointers + metadata; the caller resolves bytes from IPFS.
+    let transcript = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sid) => list_transcript_chunks(pool, sid, None).await?,
+        None => Value::Null,
+    };
+
+    Ok(json!({
+        "agent": agent,
+        "open_tasks": open_tasks,
+        "open_task_count": open_task_count,
+        "inbox": inbox,
+        "transcript": transcript,
+    }))
+}
+
 /// Fetch one document with its current version + version list.
 /// Resolve a document reference -- a numeric id OR a wiki path/slug -- to a document id. Agents cite
 /// docs by their wiki path (e.g. charters/v-nix, designs/...), so get_document / read_document accept
@@ -19457,6 +19524,158 @@ mod tests {
             Some(&"retired"),
             "reconciler woken on v-ret terminal retire stamp: {woke}"
         );
+        Ok(())
+    }
+
+    /// task_1464 (doc_3426 ask 9): the one-round-trip board-state-recall bundle. ONE call returns an
+    /// agent's desired config + lifecycle_intent, its open assigned tasks (done/cancelled excluded)
+    /// with status + blocked_on, its bounded unread inbox WITHOUT consuming it (mark_read=false), and
+    /// a transcript-chunk-log handle when a session is given -- composing task_1455/1456 + task_1463.
+    #[tokio::test]
+    async fn recall_bundle_consolidates_config_tasks_inbox_transcript_in_one_call(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        register_agent(&pool, "v-x", None, None, None, None, None).await?;
+        register_agent(&pool, "v-other", None, None, None, None, None).await?;
+        // Declared intent run->paused, so recall reflects DESIRED config (also seeds an inbox item:
+        // agent.intent_changed is delivered to the agent itself).
+        set_lifecycle_intent(&pool, "v-x", "paused", Some("cameron"), Some("drain")).await?;
+
+        let proj = create_project(&pool, "P", None, Some("cameron"), None).await?;
+        let pid = proj["id"].as_i64().unwrap();
+        let t_open = create_task(
+            &pool,
+            pid,
+            "open work",
+            None,
+            Some("v-x"),
+            None,
+            Some("cameron"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let t_blocked = create_task(
+            &pool,
+            pid,
+            "blocked work",
+            None,
+            Some("v-x"),
+            None,
+            Some("cameron"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let t_done = create_task(
+            &pool,
+            pid,
+            "finished",
+            None,
+            Some("v-x"),
+            None,
+            Some("cameron"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let tb_id = t_blocked["id"].as_i64().unwrap();
+        let td_id = t_done["id"].as_i64().unwrap();
+        update_task(
+            &pool,
+            tb_id,
+            Some("blocked"),
+            None,
+            None,
+            None,
+            None,
+            Some("cameron"),
+            None,
+            None,
+            Some(json!({"kind": "agent", "target": "v-other", "note": "waiting on peer"})),
+        )
+        .await?;
+        update_task(
+            &pool,
+            td_id,
+            Some("done"),
+            None,
+            None,
+            None,
+            None,
+            Some("cameron"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        append_transcript_chunk(
+            &pool,
+            "sess-x",
+            0,
+            "bafyW",
+            None,
+            Some(0),
+            Some(5),
+            Some(42),
+            None,
+        )
+        .await?;
+
+        let bundle = recall_bundle(&pool, "v-x", Some("sess-x"), 50, 50).await?;
+
+        // Desired config + declared intent (task_1455/1456).
+        assert_eq!(bundle["agent"]["id"], json!("v-x"));
+        assert_eq!(bundle["agent"]["lifecycle_intent"], json!("paused"));
+
+        // Open assigned work only: the open + blocked tasks, NOT the done one; blocked_on surfaced.
+        let open = bundle["open_tasks"].as_array().unwrap();
+        let open_ids: std::collections::BTreeSet<i64> =
+            open.iter().map(|t| t["id"].as_i64().unwrap()).collect();
+        assert!(open_ids.contains(&t_open["id"].as_i64().unwrap()));
+        assert!(open_ids.contains(&tb_id));
+        assert!(
+            !open_ids.contains(&td_id),
+            "done task excluded from the open set: {bundle}"
+        );
+        assert_eq!(bundle["open_task_count"], json!(open.len() as i64));
+        let blocked_entry = open
+            .iter()
+            .find(|t| t["id"].as_i64() == Some(tb_id))
+            .unwrap();
+        assert_eq!(blocked_entry["status"], json!("blocked"));
+        assert_eq!(blocked_entry["blocked_on_kind"], json!("agent"));
+        assert_eq!(blocked_entry["blocked_on_ref"], json!("v-other"));
+
+        // Inbox is surfaced (>=1: the intent-change delivery) and NOT consumed by recall.
+        let inbox_count = bundle["inbox"]["count"].as_i64().unwrap();
+        assert!(
+            inbox_count >= 1,
+            "recall surfaces the pending inbox: {}",
+            bundle["inbox"]
+        );
+        let still = check_notifications(&pool, "v-x", false, 50, None).await?;
+        assert_eq!(
+            still["count"].as_i64().unwrap(),
+            inbox_count,
+            "recall is a read: it must not consume the inbox"
+        );
+
+        // Transcript-chunk-log handle for the recovered session (task_1463).
+        assert_eq!(bundle["transcript"]["session_id"], json!("sess-x"));
+        assert_eq!(bundle["transcript"]["count"], json!(1));
+
+        // Without a session_id the transcript handle is null (board-state recall only).
+        let no_sess = recall_bundle(&pool, "v-x", None, 50, 50).await?;
+        assert_eq!(no_sess["transcript"], Value::Null);
+
+        // Unknown agent -> clean error, not a hollow bundle.
+        assert!(recall_bundle(&pool, "nobody", None, 50, 50).await.is_err());
         Ok(())
     }
 
