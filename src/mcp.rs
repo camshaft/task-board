@@ -389,6 +389,50 @@ pub struct RecallArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ListAgentConfigArgs {
+    pub agent_id: String,
+    /// The config namespace: "decider" (ask 11) or "tool" (ask 4).
+    pub config_kind: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetAgentConfigEntryArgs {
+    pub agent_id: String,
+    /// The config namespace: "decider" (ask 11) or "tool" (ask 4).
+    pub config_kind: String,
+    /// Stable entry id, unique per (agent, config_kind). Reusing an id edits/toggles that entry.
+    pub entry_id: String,
+    /// Toggle without removing. Omit on an edit to keep the current value; defaults true on add.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Call-type-tag array the entry applies to; null/empty = all call types. Omit to keep existing.
+    #[serde(default)]
+    pub scope: Option<serde_json::Value>,
+    /// Opaque per-kind config body (a decider entry = {kind, criteria, bands}). Omit to keep existing.
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    /// Dispatch order; omit to append after the current max (add) or keep (edit).
+    #[serde(default)]
+    pub position: Option<i64>,
+    /// Who is editing (defaults to this session's identity).
+    #[serde(rename = "principal", alias = "actor", alias = "by", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveAgentConfigEntryArgs {
+    pub agent_id: String,
+    pub config_kind: String,
+    pub entry_id: String,
+    /// Who is removing (defaults to this session's identity).
+    #[serde(rename = "principal", alias = "actor", alias = "by", default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestStandDownArgs {
     /// The agent asked to wind down.
     pub agent_id: String,
@@ -2434,6 +2478,63 @@ impl Board {
             a.session_id.as_deref(),
             a.task_limit.unwrap_or(50),
             a.activity_limit.unwrap_or(50),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Read an agent's per-config_kind editable-config set (task_1477, doc_3426 ask 11). ONE read returns {agent_id, config_kind, version, count, entries} in dispatch order (position then id). config_kind namespaces the shared per-agent editable-config surface: `decider` (ask 11; each payload = {kind, criteria, bands}, scope = applies_to_call_types) and `tool` (ask 4). Each entry is the {id, enabled, scope, payload} envelope + position. The harness reads this at session start and re-reads on an agent.config_changed wake (subscribe board + [\"agent\"]); `version` is the watchable key."
+    )]
+    async fn list_agent_config(
+        &self,
+        Parameters(a): Parameters<ListAgentConfigArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        core::list_agent_config_entries(&self.pool, &a.agent_id, &a.config_kind)
+            .await
+            .map_err(err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        description = "Upsert one entry in an agent's config set (task_1477): add a new entry or edit/toggle an existing one by `entry_id`. An omitted field keeps the existing value (edit) or the default (add: enabled=true, scope=null=all call types, payload={}, position appended). `scope`=null clears to all call types. Bumps the (agent, config_kind) version and emits agent.config_changed so a subscribed harness hot-reloads with no restart. Returns the full updated set."
+    )]
+    async fn set_agent_config_entry(
+        &self,
+        Parameters(a): Parameters<SetAgentConfigEntryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::set_agent_config_entry(
+            &self.pool,
+            &a.agent_id,
+            &a.config_kind,
+            &a.entry_id,
+            a.enabled,
+            a.scope.clone(),
+            a.payload.clone(),
+            a.position,
+            actor.as_deref(),
+        )
+        .await
+        .map_err(err)
+        .and_then(ok)
+    }
+
+    #[tool(
+        description = "Remove one entry from an agent's config set (task_1477) by entry_id. Bumps the version + emits agent.config_changed like an edit, so the harness hot-reloads the shrunk set. Returns the set."
+    )]
+    async fn remove_agent_config_entry(
+        &self,
+        Parameters(a): Parameters<RemoveAgentConfigEntryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.me_opt(s(&a.actor));
+        core::remove_agent_config_entry(
+            &self.pool,
+            &a.agent_id,
+            &a.config_kind,
+            &a.entry_id,
+            actor.as_deref(),
         )
         .await
         .map_err(err)

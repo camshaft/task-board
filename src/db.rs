@@ -552,6 +552,42 @@ CREATE TABLE IF NOT EXISTS transcript_chunks (
     created_at  TEXT NOT NULL,
     UNIQUE(session_id, position)
 );
+-- Per-agent editable-config surface (task_1477, doc_3426 ask 11; the reusable shell ask 4
+-- tool-registry task_1459 adopts). A per-agent, per-config_kind ORDERED list of entries, each the
+-- reusable {id, enabled, scope, payload} envelope plus a `position` for reproducible dispatch order.
+-- `config_kind` namespaces the surface so one table + one set of CRUD/read fns serves both asks:
+-- 'decider' (ask 11, payload = {kind, criteria, bands}) and 'tool' (ask 4, payload = granted tool
+-- ids). `scope` is a JSON array of call-type tags (NULL/empty = all call types); `payload` is opaque
+-- JSON the harness interprets -- the board stores the harness-owned scope tags + builtin criteria
+-- names as opaque strings. doc_3428 is the canonical source of truth for the call-type tag set, the
+-- builtin decider names, and the match semantics (empty/absent scope matches all call types; exact
+-- lowercase-hyphen tag match) so board config and harness dispatch stay in sync. Editable as data
+-- (upsert add/edit/toggle, delete); every edit bumps agent_config_versions and emits agent.config_changed.
+CREATE TABLE IF NOT EXISTS agent_config_entries (
+    agent_id    TEXT NOT NULL,
+    config_kind TEXT NOT NULL,
+    entry_id    TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    scope       TEXT,
+    payload     TEXT NOT NULL DEFAULT '{}',
+    position    INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (agent_id, config_kind, entry_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_config_entries ON agent_config_entries(agent_id, config_kind, position);
+-- The watchable version backing the hot-reload wake (task_1477 acceptance 2): one monotonic counter
+-- per (agent_id, config_kind), bumped on every entry add/edit/toggle/remove. The read returns it so
+-- the harness compares versions, and each bump emits agent.config_changed {agent_id, config_kind,
+-- version} in the task_1456 'agent' event class, so a board+['agent'] subscriber wakes and re-reads
+-- with no restart (no dependency on the deferred config_generation, task_1427).
+CREATE TABLE IF NOT EXISTS agent_config_versions (
+    agent_id    TEXT NOT NULL,
+    config_kind TEXT NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (agent_id, config_kind)
+);
 "#;
 
 /// Split the embedded SCHEMA into individual statements for the init apply loop (sqlx has no
