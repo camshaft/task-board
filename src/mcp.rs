@@ -3318,7 +3318,7 @@ impl Board {
     }
 
     #[tool(
-        description = "Merge arbitrary key/value properties into a task's metadata (JSON) without touching its status/assignee — e.g. {\"ipfs_cid\": \"bafy...\", \"collection\": \"crate.tokio.1.53\"}. Returns the merged metadata."
+        description = "Merge custom key/value properties into a task's metadata bag (JSON) -- e.g. {\"ipfs_cid\": \"bafy...\", \"collection\": \"crate.tokio.1.53\"}. Returns the merged metadata. Touches only the free-form metadata, not a task's real fields: it rejects reserved real-column keys (status, assignee, unassign, priority, blocked_on, blocked_on_kind, blocked_on_ref, blocked_on_note, parent_id, project_id) rather than silently merging them as a no-op state change. Use update_task to change status/assignee/priority/blocked_on/parent_id, or move_task to change the project."
     )]
     async fn set_task_props(
         &self,

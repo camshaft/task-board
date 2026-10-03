@@ -3089,6 +3089,52 @@ fn reject_direct_monitor_exempt(metadata: Option<&Value>) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// task_1540: `set_task_props` merges `props` into a task's free-form metadata bag ONLY -- it does
+/// not touch the real columns. So a caller who passes a reserved real-column key (e.g.
+/// `set_task_props(props:{status:"done"})` intending a status transition) gets a silent no-op: the
+/// word lands in `metadata.status` while the real `status` column is unchanged, polluting the lane
+/// (monitor-visible, roll-up-wrong) until a human notices. Fail loud instead -- reject when `props`
+/// names any real-column key, pointing the caller at the tool that actually owns it (`update_task`
+/// for the task's fields, `move_task` for the project). This is the sibling fix to task_802 (the
+/// flat `blocked_on_note` silent no-op). `monitor_exempt` has its own guard
+/// (`reject_direct_monitor_exempt`) with a tailored message, so it is not repeated here.
+fn reject_reserved_prop_keys(props: &Value) -> anyhow::Result<()> {
+    const RESERVED: &[&str] = &[
+        "status",
+        "assignee",
+        "unassign",
+        "priority",
+        "blocked_on",
+        "blocked_on_kind",
+        "blocked_on_ref",
+        "blocked_on_note",
+        "parent_id",
+        "project_id",
+    ];
+    if let Value::Object(m) = props {
+        let mut hit: Vec<&str> = RESERVED
+            .iter()
+            .copied()
+            .filter(|k| m.contains_key(*k))
+            .collect();
+        if !hit.is_empty() {
+            hit.sort_unstable();
+            let list = hit
+                .iter()
+                .map(|k| format!("\"{k}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(BoardError::bad_request(format!(
+                "set_task_props only merges custom metadata and does not touch a task's real \
+                 fields; these keys would silently land in metadata instead of taking effect: \
+                 {list}. Use update_task to change status / assignee / unassign / priority / \
+                 blocked_on / parent_id, or move_task to change the project (project_id)."
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_task(
     pool: &Pool,
@@ -6857,6 +6903,9 @@ pub async fn set_task_props(pool: &Pool, task_id: i64, props: Value) -> anyhow::
     // path. set_task_props is a direct metadata merge, so it must enforce the same rule as
     // create_task / update_task.
     reject_direct_monitor_exempt(Some(&props))?;
+    // task_1540: fail loud on a reserved real-column key (status/assignee/.../project_id) rather than
+    // silently merging it into the metadata bag as a no-op state transition.
+    reject_reserved_prop_keys(&props)?;
     let ts = now_iso();
     let mut tx = pool.begin().await?;
     let row = sqlx::query("SELECT metadata FROM tasks WHERE id=?")
@@ -22252,6 +22301,65 @@ mod tests {
 
         let task = get_task(&pool, tid).await?;
         assert_eq!(task["metadata"], json!({"a": 1, "b": 2, "c": 3}));
+        Ok(())
+    }
+
+    /// task_1540: set_task_props rejects reserved real-column keys (status/assignee/.../project_id)
+    /// instead of silently merging them into the metadata bag as a no-op state transition, while a
+    /// normal custom key still merges. Fail loud, pointing at update_task / move_task.
+    #[tokio::test]
+    async fn set_task_props_rejects_reserved_keys() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+        let p = create_project(&pool, "P", None, Some("a"), None).await?;
+        let pid = p["id"].as_i64().unwrap();
+        let t = create_task(&pool, pid, "T", None, None, None, None, None, None, None).await?;
+        let tid = t["id"].as_i64().unwrap();
+
+        // A status transition written as a prop must be rejected, not silently merged, and the
+        // real status column must be untouched.
+        let err = set_task_props(&pool, tid, json!({"status": "done"}))
+            .await
+            .expect_err("set_task_props must reject a reserved status key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("update_task") && msg.contains("\"status\""),
+            "error names the key and points at update_task: {msg}"
+        );
+        let got = get_task(&pool, tid).await?;
+        assert_eq!(
+            got["status"],
+            json!("todo"),
+            "real status column stays todo -- no silent transition"
+        );
+        assert!(
+            got["metadata"].get("status").is_none(),
+            "the rejected key never reaches the metadata bag"
+        );
+
+        // project_id points at move_task.
+        let err = set_task_props(&pool, tid, json!({"project_id": 2}))
+            .await
+            .expect_err("set_task_props must reject project_id");
+        assert!(
+            err.to_string().contains("move_task"),
+            "project_id points at move_task: {err}"
+        );
+
+        // Multiple reserved keys are all named.
+        let err = set_task_props(&pool, tid, json!({"assignee": "b", "priority": "high"}))
+            .await
+            .expect_err("set_task_props must reject assignee/priority");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"assignee\"") && msg.contains("\"priority\""),
+            "both reserved keys are named: {msg}"
+        );
+
+        // A normal custom metadata key still merges.
+        set_task_props(&pool, tid, json!({"ipfs_cid": "bafyxyz"})).await?;
+        let got = get_task(&pool, tid).await?;
+        assert_eq!(got["metadata"]["ipfs_cid"], json!("bafyxyz"));
         Ok(())
     }
 
