@@ -7729,7 +7729,7 @@ pub async fn invite_to_channel(
     let mut tx = pool.begin().await?;
     let mut hooks: Vec<WebhookDelivery> = Vec::new();
 
-    let ch = sqlx::query("SELECT name FROM channels WHERE id=?")
+    let ch = sqlx::query("SELECT name, dm_key FROM channels WHERE id=?")
         .bind(channel_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -7737,6 +7737,19 @@ pub async fn invite_to_channel(
         anyhow::bail!("no channel {channel_id}");
     };
     let name: Option<String> = ch.try_get("name")?;
+    // task_1447: a private two-party DM is keyed by a non-null dm_key (see dm_channel). Inviting a
+    // third member into it silently pollutes the private DM and exposes its contents to an
+    // unintended member (board-triage once added a peer to its librarian DM while trying to "flag"
+    // them). Reject an invite into a DM, pointing to send_message. A private GROUP channel (dm_key
+    // NULL) is unaffected -- those legitimately accept invites.
+    let dm_key: Option<String> = ch.try_get("dm_key")?;
+    if let Some(dm) = dm_key.as_deref().filter(|k| !k.is_empty()) {
+        let parties = dm.split('\u{0}').collect::<Vec<_>>().join(" <-> ");
+        anyhow::bail!(BoardError::bad_request(format!(
+            "channel_{channel_id} is a private DM ({parties}); invites are not allowed on a DM -- \
+             to notify a peer use send_message."
+        )));
+    }
 
     join_channel(&mut tx, channel_id, agent_id).await?;
     // Deliver the invite explicitly to the invitee (they may not have been a member to hear
@@ -20788,6 +20801,54 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(!members.contains(&"bob"), "unsubscribe leaves the channel");
+        Ok(())
+    }
+
+    /// task_1447: invite_to_channel rejects inviting a third member into a private two-party DM
+    /// (dm_key set), pointing to send_message and leaving the DM's membership untouched, while a
+    /// normal (non-DM) channel still accepts invites.
+    #[tokio::test]
+    async fn invite_rejects_dm_but_allows_group() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let pool = crate::db::init(tmp.path().join("b.db").to_str().unwrap()).await?;
+
+        // A private two-party DM (dm_key set): inviting a third member is rejected.
+        let dm = get_or_create_dm(&pool, "alice", "bob").await?;
+        let dm_id = dm["id"].as_i64().unwrap();
+        let e = invite_to_channel(&pool, dm_id, "carol", Some("alice"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("private DM"), "names it a DM: {e}");
+        assert!(e.contains("send_message"), "points to send_message: {e}");
+        // No third member was added -- membership is still exactly alice + bob (tx rolled back).
+        let after = get_channel(&pool, dm_id, None).await?;
+        let members: BTreeSet<String> = after["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !members.contains("carol"),
+            "no third member added to the DM: {after}"
+        );
+        assert_eq!(members.len(), 2, "DM still exactly two members: {after}");
+
+        // A normal (non-DM) GROUP channel still accepts an invite.
+        let c = create_channel(&pool, "planning", None, Some("alice"), None).await?;
+        let cid = c["id"].as_i64().unwrap();
+        let joined = invite_to_channel(&pool, cid, "carol", Some("alice")).await?;
+        let gmembers: BTreeSet<String> = joined["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            gmembers.contains("carol"),
+            "a non-DM channel still accepts invites: {joined}"
+        );
         Ok(())
     }
 
